@@ -7,8 +7,9 @@ macOS Messages `chat.db` into a normalized SQLite store
 calls for a local Ollama-hosted chat model to query — instead of pasting
 message history into a prompt.
 
-See [`CLAUDE.md`](CLAUDE.md) for full architecture, rationale, schema, and
-known environment quirks.
+See [`docs/DECISIONS.md`](docs/DECISIONS.md) for full architecture, rationale,
+schema, and known environment quirks ([`CLAUDE.md`](CLAUDE.md) is the short
+agent-facing orientation).
 
 ## Quickstart
 

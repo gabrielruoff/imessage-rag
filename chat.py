@@ -15,21 +15,15 @@ from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
 
+import ollama
 import query_tools
-from config import (
-    CHAT_MODEL,
-    CHAT_TIMEOUT,
-    MAX_TOOL_ITERATIONS,
-    OLLAMA_CHAT_PATH,
-    OLLAMA_HOST,
-    OLLAMA_PORT,
-)
-from query_tools import TOOL_DEFINITIONS
-
-CHAT_PATH = OLLAMA_CHAT_PATH
+from config import CHAT_MODEL, MAX_TOOL_ITERATIONS
+from tool_schemas import TOOL_DEFINITIONS
 
 console = Console()
 
+# Keep the tool list below in sync with tool_schemas.TOOL_DEFINITIONS and
+# TOOL_FUNCTIONS -- it deliberately restates a one-line summary of each tool.
 SYSTEM_PROMPT = (
     "You are an assistant with access to the user's iMessage history through "
     "tool calls:\n"
@@ -101,37 +95,18 @@ TOOL_FUNCTIONS = {
 
 
 def ollama_chat_stream(messages, tools=OLLAMA_TOOLS):
-    """POST a streaming /api/chat request, live-rendering markdown content
-    as it arrives and returning the assembled final message dict (same
+    """Stream one chat request via ollama.chat_stream, live-rendering markdown
+    content as it arrives and returning the assembled final message dict (same
     shape as a non-streaming response: role/content/tool_calls).
 
     Pass tools=None to withhold the tool schemas entirely, which is the only
     reliable way to stop the model from calling one."""
-    conn = http.client.HTTPConnection(OLLAMA_HOST, OLLAMA_PORT, timeout=CHAT_TIMEOUT)
-    body = {
-        "model": CHAT_MODEL,
-        "messages": messages,
-        "stream": True,
-    }
-    if tools:
-        body["tools"] = tools
-    payload = json.dumps(body).encode()
-    conn.request("POST", CHAT_PATH, body=payload, headers={"Content-Type": "application/json"})
-    resp = conn.getresponse()
-
     role = "assistant"
     content = ""
     tool_calls = None
     live = None
     try:
-        for line in resp:
-            line = line.strip()
-            if not line:
-                continue
-            chunk = json.loads(line)
-            if "error" in chunk:
-                raise RuntimeError(f"Ollama error: {chunk['error']}")
-            msg = chunk.get("message", {})
+        for msg in ollama.chat_stream(messages, tools):
             role = msg.get("role", role)
             if msg.get("tool_calls"):
                 tool_calls = msg["tool_calls"]
@@ -143,12 +118,9 @@ def ollama_chat_stream(messages, tools=OLLAMA_TOOLS):
                     live.start()
                 content += piece
                 live.update(Markdown(content))
-            if chunk.get("done"):
-                break
     finally:
         if live is not None:
             live.stop()
-        conn.close()
 
     result = {"role": role, "content": content}
     if tool_calls:
