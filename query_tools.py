@@ -59,6 +59,8 @@ MAX_MESSAGE_LIMIT = 50   # search_messages_sql / search_messages_fts
 MAX_VEC_K = 20           # search_messages_vec
 MAX_CONTACTS_LIMIT = 20  # search_contacts_by_name
 MAX_CHATS_LIMIT = 50     # list_chats
+MAX_ID_LIST = 50         # cap on chat_id/handle_id/contact_id/guid list params
+VEC_FILTER_OVERFETCH = 1000  # KNN pool size when a scope filter narrows vec search
 
 TEXT_PREVIEW_CHARS = 300
 
@@ -73,54 +75,130 @@ def _truncate_text_field(rows):
     return rows
 
 
-def search_messages_sql(chat_id=None, handle_id=None, is_from_me=None,
-                         date_from=None, date_to=None, limit=50):
-    """Structured filter search -- no text matching, just facets."""
-    limit = max(1, min(limit, MAX_MESSAGE_LIMIT))
-    clauses, params = [], []
-    if chat_id is not None:
-        clauses.append("m.chat_id = ?"); params.append(chat_id)
-    if handle_id is not None:
-        clauses.append("m.handle_id = ?"); params.append(handle_id)
-    if is_from_me is not None:
-        clauses.append("m.is_from_me = ?"); params.append(int(is_from_me))
-    if date_from is not None:
-        clauses.append("m.date >= ?"); params.append(date_from)
-    if date_to is not None:
-        clauses.append("m.date <= ?"); params.append(date_to)
+def _as_id_list(value):
+    """Normalize a param that may be None, a scalar, or a list into None or
+    a capped list -- lets every id-scoped tool param accept either shape."""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return list(value)[:MAX_ID_LIST]
+    return [value]
 
-    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-    sql = f"""
-        SELECT m.id, m.guid, m.chat_id, m.handle_id, m.is_from_me, {_SENDER_SELECT},
-               m.text, m.date, m.has_attachment
-        FROM messages m
-        {_MSG_JOIN}
-        {where}
-        ORDER BY m.date DESC
-        LIMIT ?
-    """
-    params.append(limit)
+
+def _resolve_contact_handle_ids(con, contact_ids):
+    """Given a list of contact_ids, return the handle_ids they own."""
+    placeholders = ",".join("?" * len(contact_ids))
+    rows = con.execute(
+        f"SELECT id FROM handles WHERE contact_id IN ({placeholders})",
+        contact_ids,
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def _id_filter_clause(column, values):
+    """Build an `column IN (?,...)` fragment + params for a normalized id
+    list, or ("", []) if values is None."""
+    if not values:
+        return "", []
+    placeholders = ",".join("?" * len(values))
+    return f"{column} IN ({placeholders})", list(values)
+
+
+def _resolve_handle_filter(con, handle_id, contact_id):
+    """Merge handle_id and contact_id (each scalar-or-list-or-None) into a
+    single normalized handle_id list, resolving contact_id through handles."""
+    handle_ids = _as_id_list(handle_id) or []
+    contact_ids = _as_id_list(contact_id)
+    if contact_ids:
+        handle_ids = list(handle_ids) + _resolve_contact_handle_ids(con, contact_ids)
+    return handle_ids[:MAX_ID_LIST] or None
+
+
+def _resolve_scope(con, chat_id, handle_id, contact_id):
+    """Resolve scope params into (chat_ids, handle_ids, empty). `empty` is
+    True when a scope param was provided but matched no ids -- the caller
+    should then return [] rather than dropping the filter and over-matching."""
+    chat_requested = chat_id is not None
+    handle_requested = handle_id is not None or contact_id is not None
+    chat_ids = _as_id_list(chat_id)
+    handle_ids = _resolve_handle_filter(con, handle_id, contact_id)
+    empty = (chat_requested and not chat_ids) or (handle_requested and not handle_ids)
+    return chat_ids, handle_ids, empty
+
+
+def search_messages_sql(chat_id=None, handle_id=None, contact_id=None, is_from_me=None,
+                         date_from=None, date_to=None, limit=50):
+    """Structured filter search -- no text matching, just facets. chat_id and
+    handle_id each accept a single id or a list of ids. contact_id (single or
+    list) scopes to a person across every handle they own -- the way to search
+    one person's messages regardless of which phone/email/chat they used."""
+    limit = max(1, min(limit, MAX_MESSAGE_LIMIT))
 
     with contextlib.closing(_connect()) as con:
+        chat_ids, handle_ids, empty = _resolve_scope(con, chat_id, handle_id, contact_id)
+        if empty:
+            return []
+
+        clauses, params = [], []
+        chat_clause, chat_params = _id_filter_clause("m.chat_id", chat_ids)
+        if chat_clause:
+            clauses.append(chat_clause); params.extend(chat_params)
+        handle_clause, handle_params = _id_filter_clause("m.handle_id", handle_ids)
+        if handle_clause:
+            clauses.append(handle_clause); params.extend(handle_params)
+        if is_from_me is not None:
+            clauses.append("m.is_from_me = ?"); params.append(int(is_from_me))
+        if date_from is not None:
+            clauses.append("m.date >= ?"); params.append(date_from)
+        if date_to is not None:
+            clauses.append("m.date <= ?"); params.append(date_to)
+
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        sql = f"""
+            SELECT m.id, m.guid, m.chat_id, m.handle_id, m.is_from_me, {_SENDER_SELECT},
+                   m.text, m.date, m.has_attachment
+            FROM messages m
+            {_MSG_JOIN}
+            {where}
+            ORDER BY m.date DESC
+            LIMIT ?
+        """
+        params.append(limit)
         rows = con.execute(sql, params).fetchall()
     return _truncate_text_field([dict(r) for r in rows])
 
 
-def search_messages_fts(query: str, limit=50):
+def search_messages_fts(query: str, chat_id=None, handle_id=None, contact_id=None, limit=50):
     """Keyword/phrase search via FTS5 (supports FTS5 query syntax:
-    'foo AND bar', '"exact phrase"', 'foo NOT bar', etc.)"""
+    'foo AND bar', '"exact phrase"', 'foo NOT bar', etc.). chat_id/handle_id
+    accept a single id or a list; contact_id (single or list) scopes to a
+    person across every handle they own."""
     limit = max(1, min(limit, MAX_MESSAGE_LIMIT))
     with contextlib.closing(_connect()) as con:
-        rows = con.execute(f"""
+        chat_ids, handle_ids, empty = _resolve_scope(con, chat_id, handle_id, contact_id)
+        if empty:
+            return []
+
+        clauses, params = ["messages_fts MATCH ?"], [query]
+        chat_clause, chat_params = _id_filter_clause("m.chat_id", chat_ids)
+        if chat_clause:
+            clauses.append(chat_clause); params.extend(chat_params)
+        handle_clause, handle_params = _id_filter_clause("m.handle_id", handle_ids)
+        if handle_clause:
+            clauses.append(handle_clause); params.extend(handle_params)
+
+        sql = f"""
             SELECT m.id, m.guid, m.chat_id, m.handle_id, m.is_from_me, {_SENDER_SELECT},
                    m.text, m.date, m.has_attachment
             FROM messages_fts f
             JOIN messages m ON m.id = f.rowid
             {_MSG_JOIN}
-            WHERE messages_fts MATCH ?
+            WHERE {' AND '.join(clauses)}
             ORDER BY rank
             LIMIT ?
-        """, (query, limit)).fetchall()
+        """
+        params.append(limit)
+        rows = con.execute(sql, params).fetchall()
     return _truncate_text_field([dict(r) for r in rows])
 
 
@@ -137,26 +215,44 @@ def _ollama_embed(text: str):
         raise RuntimeError(f"Ollama embedding request failed: {e}") from e
 
 
-def search_messages_vec(query: str, k=10, chat_id=None):
-    """Semantic search: embed the query and find nearest message vectors."""
+def search_messages_vec(query: str, k=10, chat_id=None, handle_id=None, contact_id=None):
+    """Semantic search: embed the query and find nearest message vectors.
+    chat_id/handle_id accept a single id or a list; contact_id (single or
+    list) scopes to a person across every handle they own. Scoped semantic
+    search is best-effort: sqlite-vec picks the nearest vectors first and the
+    scope filter is applied after, so a match beyond the over-fetch pool
+    (VEC_FILTER_OVERFETCH) may be missed -- inherent to brute-force KNN +
+    post-filter."""
     k = max(1, min(k, MAX_VEC_K))
     query_vec = sqlite_vec.serialize_float32(_ollama_embed(query))
 
-    sql = f"""
-        SELECT m.id, m.guid, m.chat_id, m.handle_id, m.is_from_me, {_SENDER_SELECT},
-               m.text, m.date, m.has_attachment, v.distance
-        FROM message_vectors v
-        JOIN messages m ON m.id = v.message_id
-        {_MSG_JOIN}
-        WHERE v.embedding MATCH ? AND k = ?
-    """
-    params = [query_vec, k]
-    if chat_id is not None:
-        sql += " AND m.chat_id = ?"
-        params.append(chat_id)
-    sql += " ORDER BY v.distance"
-
     with contextlib.closing(_connect()) as con:
+        chat_ids, handle_ids, empty = _resolve_scope(con, chat_id, handle_id, contact_id)
+        if empty:
+            return []
+
+        # Over-fetch from the vec index when a scope filter is present, since
+        # the filter is applied after KNN -- otherwise a small k could be fully
+        # consumed by out-of-scope neighbors and return nothing.
+        knn_k = VEC_FILTER_OVERFETCH if (chat_ids or handle_ids) else k
+        sql = f"""
+            SELECT m.id, m.guid, m.chat_id, m.handle_id, m.is_from_me, {_SENDER_SELECT},
+                   m.text, m.date, m.has_attachment, v.distance
+            FROM message_vectors v
+            JOIN messages m ON m.id = v.message_id
+            {_MSG_JOIN}
+            WHERE v.embedding MATCH ? AND k = ?
+        """
+        params = [query_vec, knn_k]
+        chat_clause, chat_params = _id_filter_clause("m.chat_id", chat_ids)
+        if chat_clause:
+            sql += f" AND {chat_clause}"; params.extend(chat_params)
+        handle_clause, handle_params = _id_filter_clause("m.handle_id", handle_ids)
+        if handle_clause:
+            sql += f" AND {handle_clause}"; params.extend(handle_params)
+        sql += " ORDER BY v.distance LIMIT ?"
+        params.append(k)
+
         rows = con.execute(sql, params).fetchall()
     return _truncate_text_field([dict(r) for r in rows])
 
@@ -237,18 +333,40 @@ def search_contacts_by_name(name: str, limit=20):
     return results
 
 
-def list_chats(query=None, limit=50):
+def list_chats(query=None, handle_id=None, contact_id=None, limit=50):
     """List chats (conversations) with resolved participant names -- the bridge
     from a person/chat name to a chat_id, and the way to label a chat_id. Pass
-    `query` to filter by participant name or chat_identifier (substring match)."""
+    `query` to filter by participant name or chat_identifier (substring match,
+    fuzzy). Pass handle_id/contact_id (single id or list) for an exact match on
+    every chat that person actually participates in -- prefer this over `query`
+    once you already have a contact_id from search_contacts_by_name, since a
+    name substring can over- or under-match."""
     limit = max(1, min(limit, MAX_CHATS_LIMIT))
     like = f"%{query}%" if query else None
     with contextlib.closing(_connect()) as con:
+        handle_requested = handle_id is not None or contact_id is not None
+        handle_ids = _resolve_handle_filter(con, handle_id, contact_id)
+        if handle_requested and not handle_ids:
+            return []
+        params = {"like": like, "limit": limit}
+        id_filter_sql = ""
+        if handle_ids:
+            placeholders = ",".join(f":hid{i}" for i in range(len(handle_ids)))
+            id_filter_sql = f"""
+                AND ch.id IN (
+                    SELECT cp2.chat_id FROM chat_participants cp2
+                    WHERE cp2.handle_id IN ({placeholders})
+                )
+            """
+            params.update({f"hid{i}": v for i, v in enumerate(handle_ids)})
+
         # Per-chat participant label list, resolved through handles/contacts.
         # The substring filter and limit are applied in SQL: the HAVING clause
         # is a no-op when `like` is NULL, else it matches the chat_identifier,
         # display_name, or the GROUP_CONCAT'd participant labels. LIKE is
         # case-insensitive for ASCII, matching the prior Python behavior.
+        # id_filter_sql (when handle_ids/contact_id given) restricts to chats
+        # that person actually participates in -- an exact join, not a guess.
         rows = con.execute(
             f"""
             SELECT ch.id, ch.chat_identifier, ch.display_name, ch.is_group, ch.service,
@@ -257,6 +375,7 @@ def list_chats(query=None, limit=50):
             LEFT JOIN chat_participants cp ON cp.chat_id = ch.id
             LEFT JOIN handles h ON h.id = cp.handle_id
             LEFT JOIN contacts c ON c.id = h.contact_id
+            WHERE 1=1 {id_filter_sql}
             GROUP BY ch.id
             HAVING :like IS NULL
                 OR ch.chat_identifier LIKE :like
@@ -265,28 +384,34 @@ def list_chats(query=None, limit=50):
             ORDER BY ch.id
             LIMIT :limit
             """,
-            {"like": like, "limit": limit},
+            params,
         ).fetchall()
 
     return [dict(r) for r in rows]
 
 
-def get_message_reactions(target_message_guid: str):
-    """List the reactions/tapbacks on a message (by its guid), with who reacted.
+def get_message_reactions(target_message_guid):
+    """List the reactions/tapbacks on one or more messages (by guid), with who
+    reacted. Accepts a single guid or a list of guids -- each returned row
+    carries its `target_message_guid` so a batch result stays attributable.
     Message search results include each message's `guid`."""
+    guids = _as_id_list(target_message_guid) or []
+    if not guids:
+        return []
+    placeholders = ",".join("?" * len(guids))
     with contextlib.closing(_connect()) as con:
         rows = con.execute(
             f"""
-            SELECT r.id, r.is_from_me,
+            SELECT r.id, r.target_message_guid, r.is_from_me,
                    CASE WHEN r.is_from_me = 1 THEN 'Me' ELSE {_CONTACT_LABEL} END AS reactor,
                    r.associated_message_type, r.date
             FROM reactions r
             LEFT JOIN handles h ON h.id = r.handle_id
             LEFT JOIN contacts c ON c.id = h.contact_id
-            WHERE r.target_message_guid = ?
+            WHERE r.target_message_guid IN ({placeholders})
             ORDER BY r.date
             """,
-            (target_message_guid,),
+            guids,
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -311,36 +436,71 @@ def get_full_messages(ids):
     return [dict(r) for r in rows]
 
 
-def get_chat_summary_stats(chat_id: int):
-    """Cheap aggregate stats for a chat -- no LLM call needed."""
+def get_chat_summary_stats(chat_id=None, handle_id=None, contact_id=None):
+    """Cheap aggregate stats -- no LLM call needed. chat_id (single id or
+    list) aggregates across one or more chats. handle_id/contact_id (single
+    or list) scopes to a person instead -- e.g. total messages exchanged with
+    someone across every chat/handle they use. At least one of chat_id,
+    handle_id, contact_id must be given."""
+    scope_requested = chat_id is not None or handle_id is not None or contact_id is not None
+    if not scope_requested:
+        raise ValueError("must provide chat_id, handle_id, or contact_id")
     with contextlib.closing(_connect()) as con:
-        row = con.execute("""
+        chat_ids = _as_id_list(chat_id)
+        handle_ids = _resolve_handle_filter(con, handle_id, contact_id)
+        if not chat_ids and not handle_ids:
+            # scope was requested but resolved to nothing -- zeroed stats,
+            # not an unfiltered aggregate over the whole corpus.
+            return {"message_count": 0, "first_message": None,
+                    "last_message": None, "from_me": 0, "from_them": 0}
+
+        clauses, params = [], []
+        chat_clause, chat_params = _id_filter_clause("chat_id", chat_ids)
+        if chat_clause:
+            clauses.append(chat_clause); params.extend(chat_params)
+        handle_clause, handle_params = _id_filter_clause("handle_id", handle_ids)
+        if handle_clause:
+            clauses.append(handle_clause); params.extend(handle_params)
+
+        row = con.execute(f"""
             SELECT
                 COUNT(*) AS message_count,
                 MIN(date) AS first_message,
                 MAX(date) AS last_message,
                 SUM(CASE WHEN is_from_me = 1 THEN 1 ELSE 0 END) AS from_me,
                 SUM(CASE WHEN is_from_me = 0 THEN 1 ELSE 0 END) AS from_them
-            FROM messages WHERE chat_id = ?
-        """, (chat_id,)).fetchone()
+            FROM messages WHERE {' AND '.join(clauses)}
+        """, params).fetchone()
     return dict(row)
 
 
 # --- Tool schemas, for wiring into Claude's tool_use API -------------------
+
+# Shared schema fragment for params that accept either a single id or a list
+# of ids (chat_id, handle_id, contact_id, target_message_guid).
+_ID_OR_LIST_SCHEMA = {
+    "type": ["integer", "array"],
+    "items": {"type": "integer"},
+    "description": "a single id, or a list of ids",
+}
 
 TOOL_DEFINITIONS = [
     {
         "name": "search_messages_sql",
         "description": "Filter messages by chat, sender, or date range. Use for "
                         "structured questions like 'messages from March' or "
-                        "'messages I sent in chat X'. Long message text is "
-                        "truncated -- use get_full_messages(ids) for the "
-                        "complete content of specific messages.",
+                        "'messages I sent in chat X'. Prefer contact_id to scope "
+                        "to one person across every handle/phone/email they use "
+                        "(get it from search_contacts_by_name). chat_id and "
+                        "handle_id each accept a single id or a list of ids. Long "
+                        "message text is truncated -- use get_full_messages(ids) "
+                        "for the complete content of specific messages.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "chat_id": {"type": "integer"},
-                "handle_id": {"type": "integer"},
+                "chat_id": _ID_OR_LIST_SCHEMA,
+                "handle_id": _ID_OR_LIST_SCHEMA,
+                "contact_id": _ID_OR_LIST_SCHEMA,
                 "is_from_me": {"type": "boolean"},
                 "date_from": {"type": "string", "description": "ISO date"},
                 "date_to": {"type": "string", "description": "ISO date"},
@@ -351,13 +511,18 @@ TOOL_DEFINITIONS = [
     {
         "name": "search_messages_fts",
         "description": "Keyword/phrase search across all message text using FTS5 "
-                        "syntax. Long message text is truncated -- use "
+                        "syntax. Optionally scope to a chat/handle/contact (single "
+                        "id or list each; contact_id covers every handle that "
+                        "person owns). Long message text is truncated -- use "
                         "get_full_messages(ids) for the complete content of "
                         "specific messages.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "query": {"type": "string"},
+                "chat_id": _ID_OR_LIST_SCHEMA,
+                "handle_id": _ID_OR_LIST_SCHEMA,
+                "contact_id": _ID_OR_LIST_SCHEMA,
                 "limit": {"type": "integer", "default": 50},
             },
             "required": ["query"],
@@ -367,7 +532,9 @@ TOOL_DEFINITIONS = [
         "name": "search_messages_vec",
         "description": "Semantic search: find messages similar in meaning to a "
                         "natural-language query, even without exact keyword "
-                        "overlap. Long message text is truncated -- use "
+                        "overlap. Optionally scope to a chat/handle/contact "
+                        "(single id or list each; contact_id covers every handle "
+                        "that person owns). Long message text is truncated -- use "
                         "get_full_messages(ids) for the complete content of "
                         "specific messages.",
         "input_schema": {
@@ -375,18 +542,28 @@ TOOL_DEFINITIONS = [
             "properties": {
                 "query": {"type": "string"},
                 "k": {"type": "integer", "default": 10},
-                "chat_id": {"type": "integer"},
+                "chat_id": _ID_OR_LIST_SCHEMA,
+                "handle_id": _ID_OR_LIST_SCHEMA,
+                "contact_id": _ID_OR_LIST_SCHEMA,
             },
             "required": ["query"],
         },
     },
     {
         "name": "get_chat_summary_stats",
-        "description": "Get message counts and date range for a given chat.",
+        "description": "Get message counts and date range. Scope with chat_id "
+                        "(single id or list, aggregates across all of them), or "
+                        "with handle_id/contact_id to get totals for one person "
+                        "across every chat/handle they use (e.g. 'how many "
+                        "messages have I exchanged with X'). At least one of "
+                        "chat_id, handle_id, contact_id is required.",
         "input_schema": {
             "type": "object",
-            "properties": {"chat_id": {"type": "integer"}},
-            "required": ["chat_id"],
+            "properties": {
+                "chat_id": _ID_OR_LIST_SCHEMA,
+                "handle_id": _ID_OR_LIST_SCHEMA,
+                "contact_id": _ID_OR_LIST_SCHEMA,
+            },
         },
     },
     {
@@ -422,24 +599,34 @@ TOOL_DEFINITIONS = [
         "name": "list_chats",
         "description": "List conversations with their resolved participant names. "
                         "Use to find a chat_id from a person/group name, or to "
-                        "learn who a chat_id refers to. Optional `query` filters "
-                        "by participant name or chat identifier.",
+                        "learn who a chat_id refers to. `query` fuzzy-matches by "
+                        "participant name or chat identifier substring. Prefer "
+                        "handle_id/contact_id (single id or list, from "
+                        "search_contacts_by_name) for an exact match on every "
+                        "chat that person actually participates in.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "substring to match against participant names / chat identifier"},
+                "handle_id": _ID_OR_LIST_SCHEMA,
+                "contact_id": _ID_OR_LIST_SCHEMA,
                 "limit": {"type": "integer", "default": 50},
             },
         },
     },
     {
         "name": "get_message_reactions",
-        "description": "List the reactions/tapbacks on a specific message and who "
-                        "reacted. Pass the `guid` from a message search result.",
+        "description": "List the reactions/tapbacks on one or more messages and "
+                        "who reacted. Pass the `guid` (or a list of guids) from "
+                        "message search results.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "target_message_guid": {"type": "string"},
+                "target_message_guid": {
+                    "type": ["string", "array"],
+                    "items": {"type": "string"},
+                    "description": "a single guid, or a list of guids",
+                },
             },
             "required": ["target_message_guid"],
         },

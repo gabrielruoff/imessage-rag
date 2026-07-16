@@ -11,16 +11,16 @@ targeted retrieval.
 
 ## Data sources
 
-- `chat.db` — the real macOS Messages database (found already present in
-  this project folder, ~500MB, ~382k messages across ~1.1k chats / 1,942
-  handles). This is the primary/preferred source — richer and more reliable
-  than parsed `.txt` exports.
-- `address_book.abcddb` (optional, project-local path) — a copy of macOS's
-  Contacts store (normally at `~/Library/Application
+- `source_data/chat.db` — the real macOS Messages database (found already
+  present in this project folder, ~500MB, ~382k messages across ~1.1k chats /
+  ~1.9k handles). This is the primary/preferred source — richer and more
+  reliable than parsed `.txt` exports.
+- `source_data/address_book.abcddb` (optional, project-local path) — a copy
+  of macOS's Contacts store (normally at `~/Library/Application
   Support/AddressBook/Sources/*/AddressBook-v22.abcddb`). `chat.db`'s
   `handle` table only has raw phone numbers/emails, no display names —
   `ingest.py::build_contact_lookup` reads this file (if present at
-  `./address_book.abcddb`) to attach `first_name`/`last_name`/`nickname`/
+  `source_data/address_book.abcddb`) to attach `first_name`/`last_name`/`nickname`/
   `organization` to each row in `handles`, matching by normalized phone
   (last-10-digits) or lowercased email. Best-effort: if the file isn't
   present, these columns are just left NULL.
@@ -164,12 +164,27 @@ targeted retrieval.
   name→id bridge the ID-based tools need), `list_chats` (name/participant →
   chat_id, and resolves a chat_id to its participant names),
   `search_contact_by_handle` (a phone/email/handle_id → contact + the
-  contact's other handles), and `get_message_reactions` (tapbacks on a
-  message by its `guid`). The three `search_messages_*` tools resolve the
-  sender to a human `sender` name (via join to `contacts`) and also return
-  `guid` and `has_attachment` on each row. Includes `TOOL_DEFINITIONS` —
+  contact's other handles), `get_message_reactions` (tapbacks on one or more
+  messages by `guid`), and `get_full_messages` (untruncated text for one or
+  more message ids). The three `search_messages_*` tools resolve the sender
+  to a human `sender` name (via join to `contacts`) and also return `guid`
+  and `has_attachment` on each row; long `text` is truncated to
+  `TEXT_PREVIEW_CHARS` (300 chars) and recoverable via `get_full_messages`.
+  **`chat_id`/`handle_id` params accept a single id or a list of ids** across
+  every message/chat/stats tool, and a **`contact_id` param** (single id or
+  list, resolved through `handles.contact_id` via `_resolve_handle_filter`)
+  scopes to a person across every handle (phone/email) they own — added so a
+  person-centric question ("when did I last talk to X") resolves in ~2 tool
+  calls instead of enumerating each of a contact's handles/chats one at a
+  time. `list_chats` additionally accepts `handle_id`/`contact_id` for an
+  exact chat-participation join, as a precise alternative to its fuzzy
+  `query` substring match. `get_message_reactions` batches over a list of
+  guids, tagging each returned row with its `target_message_guid`.
+  `get_chat_summary_stats` requires at least one of `chat_id`/`handle_id`/
+  `contact_id` (raises `ValueError` otherwise). Includes `TOOL_DEFINITIONS` —
   tool-schema definitions (used by `chat.py`, and directly usable as Claude
-  `tool_use` schemas).
+  `tool_use` schemas); id params use JSON Schema's `"type": ["integer",
+  "array"]` form so both scalar and list calls validate.
 - **`chat.py`** — interactive CLI that chats over the iMessage history via a
   local Ollama-hosted `gemma4:26b-a4b-it-qat`, wiring
   `query_tools.TOOL_DEFINITIONS` into a tool-calling loop (`run_turn` drives
@@ -202,8 +217,16 @@ targeted retrieval.
   needed; all against temp SQLite). `test_migration_and_ingest.py` covers the
   in-place `handles` migration in `create_schema`, FK-safe idempotent re-ingest
   of contacts + handles, and the `query_tools` `search_contacts_by_name` /
-  `list_chats` payload+filter behavior. Run: `.venv/bin/python3 -m unittest
-  discover tests`.
+  `list_chats` payload+filter behavior, including the `chat_id`/`handle_id`
+  list-param and `contact_id`-scoping behavior of `search_messages_sql`,
+  `search_messages_fts`, `list_chats`, `get_chat_summary_stats`, and the
+  batch-guid behavior of `get_message_reactions` (fixture: a contact with two
+  handles across a direct chat and a group chat). Run: `.venv/bin/python3 -m
+  unittest discover tests`. **Do not modify the tests in this directory unless
+  the user specifically asks for test changes, and do not read the test files
+  unless they're directly relevant to the current task** (e.g. the task is
+  about testing itself, or understanding existing coverage is necessary to
+  avoid duplicating or breaking it).
 
 ## Schema (imessage_analysis.db)
 

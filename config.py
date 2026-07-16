@@ -26,10 +26,10 @@ def _resolve(value: str) -> Path:
 
 
 # --- DB paths ---------------------------------------------------------------
-SOURCE_DB = _resolve(os.getenv("SOURCE_DB", "chat.db"))
-SNAPSHOT_DB = _resolve(os.getenv("SNAPSHOT_DB", "chat_snapshot.db"))
+SOURCE_DB = _resolve(os.getenv("SOURCE_DB", "source_data/chat.db"))
+SNAPSHOT_DB = _resolve(os.getenv("SNAPSHOT_DB", "source_data/chat_snapshot.db"))
 TARGET_DB = _resolve(os.getenv("TARGET_DB", "imessage_analysis.db"))
-ADDRESS_BOOK_PATH = _resolve(os.getenv("ADDRESS_BOOK_PATH", "address_book.abcddb"))
+ADDRESS_BOOK_PATH = _resolve(os.getenv("ADDRESS_BOOK_PATH", "source_data/address_book.abcddb"))
 
 # --- Ollama connectivity -----------------------------------------------------
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "localhost")
