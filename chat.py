@@ -10,14 +10,17 @@ import http.client
 import json
 
 import query_tools
+from config import (
+    CHAT_MODEL,
+    CHAT_TIMEOUT,
+    MAX_TOOL_ITERATIONS,
+    OLLAMA_CHAT_PATH,
+    OLLAMA_HOST,
+    OLLAMA_PORT,
+)
 from query_tools import TOOL_DEFINITIONS
 
-OLLAMA_HOST = "localhost"
-OLLAMA_PORT = 11434
-CHAT_PATH = "/api/chat"
-CHAT_MODEL = "gemma4:26b-a4b-it-qat"
-CHAT_TIMEOUT = 300
-MAX_TOOL_ITERATIONS = 8
+CHAT_PATH = OLLAMA_CHAT_PATH
 
 SYSTEM_PROMPT = (
     "You are an assistant with access to the user's iMessage history through "
@@ -93,7 +96,7 @@ def run_turn(messages):
 
 def main():
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    print("Chatting with your iMessage history (gemma via Ollama). Ctrl+C to quit.\n")
+    print(f"Chatting with your iMessage history ({CHAT_MODEL} via Ollama). Ctrl+C to quit.\n")
     while True:
         try:
             user_input = input("you> ").strip()
@@ -109,7 +112,7 @@ def main():
             print(f"[error contacting Ollama: {e}]")
             messages.pop()
             continue
-        print(f"gemma> {reply}\n")
+        print(f"{CHAT_MODEL}> {reply}\n")
 
 
 if __name__ == "__main__":

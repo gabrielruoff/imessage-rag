@@ -7,3 +7,4 @@ imessage_analysis.db
 .venv/
 
 __pycache__/
+.env

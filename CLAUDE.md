@@ -43,6 +43,14 @@ targeted retrieval.
   the live `chat.db`. One file, three capabilities layered on top of each
   other: normalized tables, an FTS5 virtual table for keyword search, and a
   `sqlite-vec` virtual table for embeddings/semantic search.
+- **Append-only / upsert store — ingestion never deletes.** Every run only
+  adds to `imessage_analysis.db`: all writes are `INSERT OR REPLACE` /
+  `INSERT OR IGNORE` idempotent upserts, so re-running (with the same or a
+  different `--senders` filter) accumulates the union of everything ingested
+  and never removes prior rows. Foreign keys are enforced at runtime
+  (`PRAGMA foreign_keys = ON` in `ingest.py::main`, backing the
+  `handles.contact_id -> contacts(id)` reference); a handle with no matching
+  ingested contact gets a NULL `contact_id` rather than a dangling one.
 - **Retrieval, not context-stuffing.** The LLM is meant to query this DB via
   tool calls (SQL filter / FTS5 / vector search) rather than have the whole
   corpus loaded into context. This is what lets the approach scale to
@@ -98,6 +106,19 @@ targeted retrieval.
   still be writing to it) — `ingest.py::snapshot_source` copies it (plus
   sidecars) to `chat_snapshot.db` and checkpoints the WAL there before
   anything reads from it, so the original is never touched.
+- **`address_book.abcddb` contains genuine duplicate contact cards** — e.g.
+  three separate `ZABCDRECORD` rows (distinct `Z_PK`) all own the exact same
+  phone number, one pair with identical first/last name and no last name at
+  all on another duplicate pair. These are unmerged contact cards in the
+  real data (a sync artifact), not a join/query artifact — confirmed by
+  checking `ZLINKID` (Apple's own merged-contact-link column), which is
+  `NULL` on all of them, meaning Apple's own dedup never linked them either.
+  There is no reliable ID to auto-merge on, so no merging is attempted:
+  `ingest.py::build_contact_lookup` keeps one `contacts` row per
+  `ZABCDRECORD`, and each `handles` row's `contact_id` resolves to whichever
+  contact record happens to own that specific phone number/email (first
+  match wins if more than one contact owns the same number, same as before
+  this table existed).
 
 ## Files
 
@@ -108,25 +129,40 @@ targeted retrieval.
   `ROWID` greater than the last recorded run, tracked in the `ingest_state`
   table), `--senders`/`-s` (comma-separated list of phone numbers/emails —
   matched against `handle.id` via `chat_handle_join`; only ingest chats,
-  direct or group, that include at least one of them. Also prunes any
-  out-of-scope chats/messages/reactions/attachments left in
-  `imessage_analysis.db` from a prior unfiltered or differently-filtered
-  run, so the target DB always reflects only the current filter — unless
-  zero chats match, in which case pruning is skipped to avoid wiping the DB
-  on a typo'd number/email).
+  direct or group, that include at least one of them. `--senders` only
+  scopes what *this* run reads from the source; it never deletes anything
+  already in `imessage_analysis.db`. Ingestion is purely additive (see
+  "append-only store" below), so running with different filters accumulates
+  the union of all matched chats across runs rather than replacing the DB
+  with just the latest filter's rows.
 - **`query_tools.py`** — retrieval functions meant to be exposed as LLM tool
   calls: `search_messages_sql` (filter by chat/sender/date), 
   `search_messages_fts` (FTS5 keyword search), `search_messages_vec`
   (embed query via Ollama + `sqlite-vec` nearest-neighbor search),
   `get_chat_summary_stats` (cheap aggregate stats, no LLM needed). Includes
-  `TOOL_DEFINITIONS` — Claude tool-schema definitions ready to wire into a
-  `tool_use` loop.
+  `TOOL_DEFINITIONS` — tool-schema definitions (used by `chat.py`, and
+  directly usable as Claude `tool_use` schemas).
+- **`chat.py`** — interactive CLI that chats over the iMessage history via a
+  local Ollama-hosted `gemma4:26b-a4b-it-qat`, wiring
+  `query_tools.TOOL_DEFINITIONS` into a tool-calling loop (`run_turn` drives
+  up to `MAX_TOOL_ITERATIONS=8` tool round-trips per user turn, calling the
+  `search_messages_*` / `get_chat_summary_stats` functions). This is the
+  realized version of the tool-calling loop listed under "Next steps" below.
+- **`reset_db.py`** — clears all data rows from `imessage_analysis.db` while
+  preserving the schema (tables, FTS5 triggers, `sqlite-vec` table); does NOT
+  touch `chat.db`/`chat_snapshot.db`. Deletes in FK-safe order and guards
+  each `DELETE` on the table actually existing (`sqlite_master` check), so a
+  partial-schema DB won't error. `-f/--force` skips the confirm prompt. Run
+  `ingest.py` afterward to repopulate.
+- **`reset-db.sh`** — thin wrapper that runs `reset_db.py` via
+  `.venv/bin/python3` (passes through args).
 - **`imessage_analysis.db`** — output of a full ingestion run against the
-  real `chat.db` in this repo, **without embeddings yet** (108MB). Verified:
-  ~350k messages + ~32k reactions = ~382k (matches `chat.db`'s
-  `message` count exactly), ~1.1k chats, ~1.9k handles, ~14.9k attachments.
-  FTS5 and `sqlite-vec` mechanics both confirmed working with real test
-  queries.
+  real `chat.db` in this repo (135MB), with a **partial** embedding run
+  present: `message_vectors` holds ~3.5k vectors so far out of ~350k
+  messages (full embedding still pending). Verified: ~350k messages +
+  ~32k reactions = ~382k (matches `chat.db`'s `message` count exactly),
+  ~1.1k chats, ~1.9k handles, ~14.9k attachments, ~260 contacts. FTS5 and
+  `sqlite-vec` mechanics both confirmed working with real test queries.
 - **`data/<sender>.txt`, `data/orphaned.txt`** — sample `.txt` exports, not
   currently used by the pipeline (see Data sources above).
 
@@ -134,7 +170,11 @@ targeted retrieval.
 
 ```
 chats(id, chat_identifier, display_name, is_group, service)
-handles(id, contact_id, service, first_name, last_name, nickname, organization)
+contacts(id, source_uniqueid, first_name, last_name, nickname, organization)
+                                    -- id = ZABCDRECORD.Z_PK from address_book.abcddb, one row per contact card
+handles(id, handle_identifier, contact_id, service, first_name, last_name, nickname, organization)
+                                    -- handle_identifier = raw handle.id (phone/email) from chat.db
+                                    -- contact_id -> contacts.id (nullable, best-effort match)
 chat_participants(chat_id, handle_id)
 messages(id, guid, chat_id, handle_id, is_from_me, text, decode_failed,
          date, date_read, date_delivered, item_type, is_emote, has_attachment)
@@ -171,14 +211,15 @@ built from: `rm -rf .venv && /opt/homebrew/bin/python3 -m venv .venv &&
 
 ## Next steps / not yet built
 
-1. **Run embeddings for real**: `ollama pull nomic-embed-text`, then
-   `python3 ingest.py --since-last` on a machine where Ollama is actually
-   reachable (this hasn't happened yet — `imessage_analysis.db` currently
-   has no vectors in `message_vectors`).
-2. **Wire `query_tools.py`'s `TOOL_DEFINITIONS` into an actual tool-calling
-   loop** against `gemma4:26b-a4b-it-qat` via Ollama (or via Claude, if
-   preferred for the reasoning/analysis layer while keeping embeddings
-   local) — this hasn't been built yet, only the tool functions themselves.
+1. **Finish embeddings**: a partial run exists (~3.5k vectors in
+   `message_vectors`), so this is started but not complete. To fill in the
+   rest: `ollama pull nomic-embed-text`, then `python3 ingest.py --since-last`
+   on a machine where Ollama is actually reachable, until all ~350k
+   messages are embedded.
+2. **Wire `TOOL_DEFINITIONS` into a tool-calling loop** — DONE: `chat.py`
+   implements this against `gemma4:26b-a4b-it-qat` via Ollama. Remaining
+   option: a Claude-backed reasoning/analysis layer over the same tools
+   (keeping embeddings local) if preferred for heavier analysis.
 3. **Enrichment/analysis layer** (sentiment, emotion, topic tagging) —
    discussed as a future layer (batch-tag messages, store as extra columns
    on `messages`, aggregate via SQL for trend questions) but intentionally

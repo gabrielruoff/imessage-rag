@@ -6,11 +6,10 @@ chat_snapshot.db. Run ingest.py afterward to repopulate.
 
 import argparse
 import sqlite3
-from pathlib import Path
 
 import sqlite_vec
 
-DB_PATH = Path(__file__).resolve().parent / "imessage_analysis.db"
+from config import TARGET_DB as DB_PATH
 
 TABLES = [
     # messages_fts is external-content FTS5 over messages; it's kept in
@@ -22,6 +21,7 @@ TABLES = [
     "messages",
     "chat_participants",
     "handles",
+    "contacts",
     "chats",
     "ingest_state",
 ]
@@ -55,9 +55,25 @@ def main() -> None:
         sqlite_vec.load(conn)
         conn.enable_load_extension(False)
 
+        existing = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+            )
+        }
+
         conn.execute("PRAGMA foreign_keys = OFF")
         for table in TABLES:
-            conn.execute(f"DELETE FROM {table}")
+            if table in existing:
+                conn.execute(f"DELETE FROM {table}")
+
+        if "messages_fts" in existing:
+            # Per-row delete triggers only tombstone entries in FTS5's
+            # shadow tables (messages_fts_data/_idx) -- they don't reclaim
+            # the underlying b-tree segments. 'rebuild' resyncs the index
+            # from the now-empty messages table, actually emptying them.
+            conn.execute("INSERT INTO messages_fts(messages_fts) VALUES ('rebuild')")
+
         conn.commit()
         conn.execute("VACUUM")
     finally:

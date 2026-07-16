@@ -1,1 +1,2 @@
+python-dotenv==1.2.2
 sqlite-vec==0.1.9

@@ -19,9 +19,10 @@ import urllib.request
 
 import sqlite_vec
 
-DB_PATH = "imessage_analysis.db"
-OLLAMA_URL = "http://localhost:11434/api/embeddings"
-EMBED_MODEL = "nomic-embed-text"
+from config import EMBED_MODEL, OLLAMA_EMBEDDINGS_PATH, OLLAMA_HOST, OLLAMA_PORT, TARGET_DB
+
+DB_PATH = str(TARGET_DB)
+OLLAMA_URL = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}{OLLAMA_EMBEDDINGS_PATH}"
 
 
 def _connect():

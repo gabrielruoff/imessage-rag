@@ -23,26 +23,26 @@ import datetime
 import http.client
 import json
 import sqlite3
-import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import sqlite_vec
 
-SOURCE_DB = Path("chat.db")
-SNAPSHOT_DB = Path("chat_snapshot.db")
-TARGET_DB = Path("imessage_analysis.db")
-ADDRESS_BOOK_PATH = Path("address_book.abcddb")
-
-OLLAMA_HOST = "localhost"
-OLLAMA_PORT = 11434
-OLLAMA_EMBED_PATH = "/api/embed"  # batch endpoint: {"input": [...]} -> {"embeddings": [...]}
-OLLAMA_TIMEOUT = 60
-EMBED_MODEL = "nomic-embed-text"
-EMBED_DIM = 768  # nomic-embed-text output dimension
-EMBED_BATCH_SIZE = 64   # texts per Ollama request
-EMBED_MAX_WORKERS = 4   # concurrent requests, matches Ollama's default OLLAMA_NUM_PARALLEL
+from config import (
+    ADDRESS_BOOK_PATH,
+    EMBED_BATCH_SIZE,
+    EMBED_DIM,
+    EMBED_MAX_WORKERS,
+    EMBED_MODEL,
+    OLLAMA_EMBED_PATH,
+    OLLAMA_HOST,
+    OLLAMA_PORT,
+    OLLAMA_TIMEOUT,
+    SNAPSHOT_DB,
+    SOURCE_DB,
+    TARGET_DB,
+)
 
 APPLE_EPOCH = datetime.datetime(2001, 1, 1)
 
@@ -159,9 +159,19 @@ CREATE TABLE IF NOT EXISTS chats (
     service TEXT
 );
 
+CREATE TABLE IF NOT EXISTS contacts (
+    id INTEGER PRIMARY KEY,      -- ZABCDRECORD.Z_PK from address_book.abcddb
+    source_uniqueid TEXT,        -- ZABCDRECORD.ZUNIQUEID
+    first_name TEXT,
+    last_name TEXT,
+    nickname TEXT,
+    organization TEXT
+);
+
 CREATE TABLE IF NOT EXISTS handles (
     id INTEGER PRIMARY KEY,
-    contact_id TEXT,
+    handle_identifier TEXT,      -- raw phone number/email from chat.db's handle.id
+    contact_id INTEGER REFERENCES contacts(id),
     service TEXT,
     first_name TEXT,
     last_name TEXT,
@@ -242,12 +252,20 @@ END;
 
 
 def create_schema(con: sqlite3.Connection):
+    cols_before = {row[1]: row[2] for row in con.execute("PRAGMA table_info(handles)")}
+    if cols_before.get("contact_id") == "TEXT":
+        # Old schema: `contact_id TEXT` held the raw phone/email string.
+        con.execute("ALTER TABLE handles RENAME COLUMN contact_id TO handle_identifier")
+
     con.executescript(SCHEMA)
     con.executescript(FTS_SCHEMA)
+
     existing_cols = {row[1] for row in con.execute("PRAGMA table_info(handles)")}
     for col in ("first_name", "last_name", "nickname", "organization"):
         if col not in existing_cols:
             con.execute(f"ALTER TABLE handles ADD COLUMN {col} TEXT")
+    if "contact_id" not in existing_cols:
+        con.execute("ALTER TABLE handles ADD COLUMN contact_id INTEGER REFERENCES contacts(id)")
     con.commit()
 
 
@@ -324,54 +342,89 @@ def normalize_handle_id(raw_id):
 
 
 def build_contact_lookup(db_path=ADDRESS_BOOK_PATH):
-    """Best-effort: read contact names out of a local macOS AddressBook
-    (ZABCDRECORD/ZABCDPHONENUMBER/ZABCDEMAILADDRESS) sqlite file. Returns {}
-    if db_path doesn't exist -- callers should treat that as "no names available"."""
-    if not Path(db_path).exists():
-        return {}
+    """Best-effort: read contacts out of a local macOS AddressBook
+    (ZABCDRECORD/ZABCDPHONENUMBER/ZABCDEMAILADDRESS) sqlite file. Returns
+    ([], {}) if db_path doesn't exist -- callers should treat that as "no
+    contacts available".
 
-    lookup = {}
+    Note: some address books contain genuine duplicate ZABCDRECORD rows for
+    the same person (same name, same phone number, distinct Z_PK) -- these
+    are unmerged contact cards in the source data, not a query artifact, and
+    Apple's own ZLINKID merge-linking column is NULL on them. There's no
+    reliable ID to auto-merge them, so each ZABCDRECORD is kept as its own
+    contact row; a handle maps to whichever contact record actually owns
+    that phone number/email.
+
+    Returns:
+        contacts: list of (z_pk, source_uniqueid, first_name, last_name, nickname, organization)
+                  -- one row per ZABCDRECORD contact.
+        handle_to_contact: dict of normalized handle id -> owning z_pk.
+    """
+    if not Path(db_path).exists():
+        return [], {}
+
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
-        rows = con.execute("""
-            SELECT p.ZFULLNUMBER, NULL AS email,
-                   r.ZFIRSTNAME, r.ZLASTNAME, r.ZNICKNAME, r.ZORGANIZATION
+        contacts = con.execute("""
+            SELECT Z_PK, ZUNIQUEID, ZFIRSTNAME, ZLASTNAME, ZNICKNAME, ZORGANIZATION
+            FROM ZABCDRECORD
+            WHERE Z_ENT = (SELECT Z_ENT FROM Z_PRIMARYKEY WHERE Z_NAME = 'ABCDContact')
+        """).fetchall()
+
+        owner_rows = con.execute("""
+            SELECT p.ZOWNER, p.ZFULLNUMBER, NULL AS email
             FROM ZABCDPHONENUMBER p
-            JOIN ZABCDRECORD r ON r.Z_PK = p.ZOWNER
             UNION ALL
-            SELECT NULL AS phone, e.ZADDRESS,
-                   r.ZFIRSTNAME, r.ZLASTNAME, r.ZNICKNAME, r.ZORGANIZATION
+            SELECT e.ZOWNER, NULL AS phone, e.ZADDRESS
             FROM ZABCDEMAILADDRESS e
-            JOIN ZABCDRECORD r ON r.Z_PK = e.ZOWNER
         """).fetchall()
     finally:
         con.close()
 
-    for phone, email, first, last, nick, org in rows:
+    handle_to_contact = {}
+    for owner, phone, email in owner_rows:
         key = normalize_handle_id(phone if phone is not None else email)
-        if key and key not in lookup:
-            lookup[key] = (first, last, nick, org)
-    return lookup
+        if key and key not in handle_to_contact:
+            handle_to_contact[key] = owner
+    return contacts, handle_to_contact
 
 
-def ingest_handles(src, tgt):
+def ingest_contacts(tgt, contacts):
+    for z_pk, source_uniqueid, first, last, nick, org in contacts:
+        tgt.execute(
+            "INSERT OR REPLACE INTO contacts"
+            "(id, source_uniqueid, first_name, last_name, nickname, organization) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (z_pk, source_uniqueid, first, last, nick, org),
+        )
+    print(f"Ingested {len(contacts)} contacts")
+
+
+def ingest_handles(src, tgt, contacts, handle_to_contact):
     rows = src.execute("SELECT ROWID, id, service FROM handle").fetchall()
-    contacts = build_contact_lookup()
+    contacts_by_id = {c[0]: c for c in contacts}
     matched = 0
-    for rowid, contact_id, service in rows:
-        match = contacts.get(normalize_handle_id(contact_id))
-        if match:
+    for rowid, handle_identifier, service in rows:
+        owner_id = handle_to_contact.get(normalize_handle_id(handle_identifier))
+        contact = contacts_by_id.get(owner_id)
+        if contact:
             matched += 1
-            first_name, last_name, nickname, organization = match
+            contact_id = contact[0]
+            _, _, first_name, last_name, nickname, organization = contact
         else:
+            # No ingested contact owns this handle -- leave contact_id NULL so
+            # the FK to contacts(id) never dangles (owner_id may point at a
+            # ZABCDRECORD that wasn't ingested as an ABCDContact).
+            contact_id = None
             first_name = last_name = nickname = organization = None
         tgt.execute(
             "INSERT OR REPLACE INTO handles"
-            "(id, contact_id, service, first_name, last_name, nickname, organization) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (rowid, contact_id, service, first_name, last_name, nickname, organization),
+            "(id, handle_identifier, contact_id, service, first_name, last_name, nickname, organization) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (rowid, handle_identifier, contact_id, service,
+             first_name, last_name, nickname, organization),
         )
-    print(f"Ingested {len(rows)} handles ({matched} matched to a contact name)")
+    print(f"Ingested {len(rows)} handles ({matched} matched to a contact)")
 
 
 def ingest_messages_and_reactions(src, tgt, since_rowid=0, allowed_chat_ids=None):
@@ -461,48 +514,6 @@ def ingest_attachments(src, tgt, since_rowid=0, allowed_chat_ids=None):
             (rowid, message_id, filename, mime_type, transfer_name),
         )
     print(f"Ingested {len(rows)} attachments")
-
-
-def prune_out_of_scope(tgt: sqlite3.Connection, allowed_chat_ids):
-    """Remove rows for chats outside the current --senders filter that were
-    left behind by an earlier (unfiltered or differently-filtered) run.
-    Ensures the target DB always reflects only the current filter, not just
-    the rows touched by this particular ingest call. No-op if `senders`
-    matched zero chats -- that's almost certainly a typo, and wiping the
-    whole DB on a typo would be far worse than leaving stale data."""
-    if not allowed_chat_ids:
-        return
-
-    ids = list(allowed_chat_ids)
-    placeholders = ",".join("?" for _ in ids)
-
-    tgt.execute(
-        f"DELETE FROM attachments WHERE message_id IN "
-        f"(SELECT id FROM messages WHERE chat_id NOT IN ({placeholders}) OR chat_id IS NULL)",
-        ids,
-    )
-    tgt.execute(
-        f"DELETE FROM reactions WHERE chat_id NOT IN ({placeholders}) OR chat_id IS NULL", ids
-    )
-    n_before = tgt.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-    tgt.execute(
-        f"DELETE FROM messages WHERE chat_id NOT IN ({placeholders}) OR chat_id IS NULL", ids
-    )
-    n_pruned = n_before - tgt.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-
-    if tgt.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='message_vectors'"
-    ).fetchone():
-        tgt.enable_load_extension(True)
-        sqlite_vec.load(tgt)
-        tgt.enable_load_extension(False)
-        tgt.execute("DELETE FROM message_vectors WHERE message_id NOT IN (SELECT id FROM messages)")
-
-    tgt.execute(f"DELETE FROM chat_participants WHERE chat_id NOT IN ({placeholders})", ids)
-    tgt.execute(f"DELETE FROM chats WHERE id NOT IN ({placeholders})", ids)
-
-    if n_pruned:
-        print(f"Pruned {n_pruned} out-of-scope message(s) left over from a prior run")
 
 
 # ---------------------------------------------------------------------------
@@ -623,6 +634,10 @@ def main():
     try:
         tgt = sqlite3.connect(TARGET_DB)
         try:
+            # Enforce the handles.contact_id -> contacts(id) FK. Must run
+            # before any transaction is opened, so it's issued right after
+            # connecting and before any DML.
+            tgt.execute("PRAGMA foreign_keys = ON")
             create_schema(tgt)
 
             since_rowid = 0
@@ -639,11 +654,11 @@ def main():
                           f"phone/email format (e.g. +12015551234)")
 
             ingest_chats(src, tgt, allowed_chat_ids)
-            ingest_handles(src, tgt)
+            contacts, handle_to_contact = build_contact_lookup()
+            ingest_contacts(tgt, contacts)
+            ingest_handles(src, tgt, contacts, handle_to_contact)
             ingest_messages_and_reactions(src, tgt, since_rowid, allowed_chat_ids)
             ingest_attachments(src, tgt, since_rowid, allowed_chat_ids)
-            if senders is not None:
-                prune_out_of_scope(tgt, allowed_chat_ids)
             tgt.commit()
 
             if not args.no_embed:
