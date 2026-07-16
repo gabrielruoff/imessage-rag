@@ -3,13 +3,16 @@ Interactive CLI chat over iMessage history via a local Ollama-hosted Gemma
 model, using tool calling into query_tools.py's retrieval functions.
 
 Usage:
-    .venv/bin/python3 chat.py
+    .venv/bin/python3 chat.py                      # interactive REPL
+    .venv/bin/python3 chat.py -p "your question"   # one-shot: answer and exit
 """
 
+import argparse
 import datetime
 import http.client
 import json
 import readline  # noqa: F401 — enables arrow-key/history line editing in input()
+import sys
 
 from rich.console import Console
 from rich.live import Live
@@ -94,13 +97,15 @@ TOOL_FUNCTIONS = {
 }
 
 
-def ollama_chat_stream(messages, tools=OLLAMA_TOOLS):
+def ollama_chat_stream(messages, tools=OLLAMA_TOOLS, show_model_header=True):
     """Stream one chat request via ollama.chat_stream, live-rendering markdown
     content as it arrives and returning the assembled final message dict (same
     shape as a non-streaming response: role/content/tool_calls).
 
     Pass tools=None to withhold the tool schemas entirely, which is the only
-    reliable way to stop the model from calling one."""
+    reliable way to stop the model from calling one. show_model_header=False
+    skips the "model>" line above the reply (one-shot mode, where nothing
+    else shares the terminal)."""
     role = "assistant"
     content = ""
     tool_calls = None
@@ -113,7 +118,8 @@ def ollama_chat_stream(messages, tools=OLLAMA_TOOLS):
             piece = msg.get("content", "")
             if piece:
                 if live is None:
-                    console.print(f"[bold]{CHAT_MODEL}>[/bold]")
+                    if show_model_header:
+                        console.print(f"[bold]{CHAT_MODEL}>[/bold]")
                     live = Live(Markdown(""), console=console, refresh_per_second=12)
                     live.start()
                 content += piece
@@ -128,7 +134,7 @@ def ollama_chat_stream(messages, tools=OLLAMA_TOOLS):
     return result
 
 
-def run_turn(messages):
+def run_turn(messages, show_model_header=True):
     """Run one user turn to completion, including any tool-call round trips.
 
     All MAX_TOOL_ITERATIONS iterations may call tools. If that budget is
@@ -136,7 +142,7 @@ def run_turn(messages):
     final-turn note folded into the system prompt, forcing an answer out of
     whatever was already gathered."""
     for _ in range(MAX_TOOL_ITERATIONS):
-        message = ollama_chat_stream(messages)
+        message = ollama_chat_stream(messages, show_model_header=show_model_header)
         messages.append(message)
         tool_calls = message.get("tool_calls")
         if not tool_calls:
@@ -167,12 +173,40 @@ def run_turn(messages):
     else:
         head, rest = SYSTEM_PROMPT, messages
     final_messages = [{"role": "system", "content": head + "\n\n" + FINAL_TURN_NOTE}] + rest
-    message = ollama_chat_stream(final_messages, tools=None)
+    message = ollama_chat_stream(final_messages, tools=None, show_model_header=show_model_header)
     messages.append(message)
     return message.get("content", "")
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Chat with your iMessage history via a local Ollama model."
+    )
+    parser.add_argument(
+        "-p",
+        "--prompt",
+        help='run a single prompt non-interactively and exit (quote it: -p "...")',
+    )
+    args = parser.parse_args()
+
+    if args.prompt is not None:
+        prompt = args.prompt.strip()
+        if not prompt:
+            parser.error("prompt is empty")
+        messages = [
+            {"role": "system", "content": _build_system_prompt()},
+            {"role": "user", "content": prompt},
+        ]
+        try:
+            reply = run_turn(messages, show_model_header=False)
+        except (http.client.HTTPException, OSError) as e:
+            print(f"[error contacting Ollama: {e}]")
+            sys.exit(1)
+        # A non-empty reply was already streamed live by ollama_chat_stream.
+        if not reply:
+            print(f"empty content. Return value: {reply!r}")
+        return
+
     messages = [{"role": "system", "content": _build_system_prompt()}]
     print(f"Chatting with your iMessage history ({CHAT_MODEL} via Ollama). Ctrl+C to quit.")
     print("Commands: /clear (reset conversation)\n")

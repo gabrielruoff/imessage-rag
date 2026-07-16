@@ -17,6 +17,7 @@ agent-facing orientation).
 make install          # creates .venv (Homebrew Python required — see CLAUDE.md), installs deps
 python3 ingest.py --no-embed   # snapshot chat.db -> imessage_analysis.db (skip embeddings if Ollama isn't running)
 python3 chat.py                 # interactive CLI chat over your iMessage history
+python3 chat.py -p "who did I text most in June?"   # one-shot: answer one prompt and exit
 ```
 
 Requires a local `chat.db` (already present under `source_data/` for this

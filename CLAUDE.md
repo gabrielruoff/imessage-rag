@@ -13,7 +13,9 @@ Full design history, schema, rationale, and data forensics:
 - Install: `make install` (needs Homebrew Python — python.org builds lack the
   sqlite loadable-extension support sqlite-vec requires)
 - Ingest: `.venv/bin/python3 ingest.py [--no-embed] [--since-last] [--senders=...]`
-- Chat CLI: `.venv/bin/python3 chat.py`
+- Chat CLI: `.venv/bin/python3 chat.py` (interactive REPL), or
+  `chat.py -p "..."` for a one-shot answer (prints only the reply; exit 1 if
+  Ollama is unreachable)
 - Test: `.venv/bin/python3 -m unittest discover tests` (hermetic — no Ollama or real `chat.db`)
 - Lint: `make lint` (ruff, line-length 100, E+F)
 - Reset analysis DB (keeps schema): `make reset-db`

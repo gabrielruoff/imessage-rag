@@ -47,7 +47,7 @@ class RunTurnFallbackTest(unittest.TestCase):
         chat.ollama_chat_stream = self._fake_stream
         self.addCleanup(setattr, chat, "ollama_chat_stream", self._saved_stream)
 
-    def _fake_stream(self, messages, tools=chat.OLLAMA_TOOLS):
+    def _fake_stream(self, messages, tools=chat.OLLAMA_TOOLS, show_model_header=True):
         """Stand in for the one network entry point. Mirrors the real default
         so a call that omits `tools` records the schemas it would have sent.
         Deep-copies because run_turn mutates the caller's list in place."""
@@ -103,7 +103,9 @@ class RunTurnFallbackTest(unittest.TestCase):
         self.assertEqual(final[1], {"role": "user", "content": "hi"})
 
     def test_run_turn_returns_early_when_no_tool_calls(self):
-        chat.ollama_chat_stream = lambda messages, tools=chat.OLLAMA_TOOLS: dict(FINAL_REPLY)
+        chat.ollama_chat_stream = (
+            lambda messages, tools=chat.OLLAMA_TOOLS, show_model_header=True: dict(FINAL_REPLY)
+        )
         reply = chat.run_turn([{"role": "system", "content": chat.SYSTEM_PROMPT}])
         self.assertEqual(reply, "the final answer")
 
