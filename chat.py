@@ -51,6 +51,12 @@ SYSTEM_PROMPT = (
     "guess or invent messages. Cite dates when relevant."
 )
 
+FINAL_TURN_NOTE = (
+    "This is your final turn -- no tool calls remain. Answer the user now using only "
+    "the information already gathered; do not call any more tools. If the information "
+    "gathered is incomplete, say so plainly rather than guessing."
+)
+
 OLLAMA_TOOLS = [
     {
         "type": "function",
@@ -76,17 +82,22 @@ TOOL_FUNCTIONS = {
 }
 
 
-def ollama_chat_stream(messages):
+def ollama_chat_stream(messages, tools=OLLAMA_TOOLS):
     """POST a streaming /api/chat request, live-rendering markdown content
     as it arrives and returning the assembled final message dict (same
-    shape as a non-streaming response: role/content/tool_calls)."""
+    shape as a non-streaming response: role/content/tool_calls).
+
+    Pass tools=None to withhold the tool schemas entirely, which is the only
+    reliable way to stop the model from calling one."""
     conn = http.client.HTTPConnection(OLLAMA_HOST, OLLAMA_PORT, timeout=CHAT_TIMEOUT)
-    payload = json.dumps({
+    body = {
         "model": CHAT_MODEL,
         "messages": messages,
-        "tools": OLLAMA_TOOLS,
         "stream": True,
-    }).encode()
+    }
+    if tools:
+        body["tools"] = tools
+    payload = json.dumps(body).encode()
     conn.request("POST", CHAT_PATH, body=payload, headers={"Content-Type": "application/json"})
     resp = conn.getresponse()
 
@@ -128,7 +139,12 @@ def ollama_chat_stream(messages):
 
 
 def run_turn(messages):
-    """Run one user turn to completion, including any tool-call round trips."""
+    """Run one user turn to completion, including any tool-call round trips.
+
+    All MAX_TOOL_ITERATIONS iterations may call tools. If that budget is
+    exhausted, one final request is made with the tools withheld and a
+    final-turn note folded into the system prompt, forcing an answer out of
+    whatever was already gathered."""
     for _ in range(MAX_TOOL_ITERATIONS):
         message = ollama_chat_stream(messages)
         messages.append(message)
@@ -151,7 +167,19 @@ def run_turn(messages):
             console.print(f"  [tool call] {name}({args}) -> {count}", style="dim cyan")
             messages.append({"role": "tool", "content": json.dumps(result)})
 
-    return "(gave up after too many tool calls)"
+    # Budget exhausted. gemma4's Ollama renderer keeps only the *first* system
+    # message and drops later ones, so the note has to be folded into the system
+    # prompt rather than appended as its own turn. Extend messages[0] as found
+    # rather than rebuilding from SYSTEM_PROMPT -- callers may seed a system
+    # prompt with extra context that must survive into this request.
+    if messages and messages[0]["role"] == "system":
+        head, rest = messages[0]["content"], messages[1:]
+    else:
+        head, rest = SYSTEM_PROMPT, messages
+    final_messages = [{"role": "system", "content": head + "\n\n" + FINAL_TURN_NOTE}] + rest
+    message = ollama_chat_stream(final_messages, tools=None)
+    messages.append(message)
+    return message.get("content", "")
 
 
 def main():
@@ -172,7 +200,7 @@ def main():
             continue
         messages.append({"role": "user", "content": user_input})
         try:
-            run_turn(messages)
+            reply = run_turn(messages)
         except (http.client.HTTPException, OSError) as e:
             print(f"[error contacting Ollama: {e}]")
             messages.pop()
@@ -180,6 +208,10 @@ def main():
         except KeyboardInterrupt:
             print()
             break
+        # A non-empty reply was already streamed live by ollama_chat_stream;
+        # only surface the return value when there was nothing to render.
+        if not reply:
+            print(f"empty content. Return value: {reply!r}")
         print()
 
 

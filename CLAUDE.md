@@ -198,8 +198,14 @@ targeted retrieval.
 - **`chat.py`** — interactive CLI that chats over the iMessage history via a
   local Ollama-hosted `gemma4:26b-a4b-it-qat`, wiring
   `query_tools.TOOL_DEFINITIONS` into a tool-calling loop (`run_turn` drives
-  up to `MAX_TOOL_ITERATIONS` tool round-trips per user turn — default 8 —
-  calling all eight `query_tools` functions). The model name, host, timeouts,
+  up to `MAX_TOOL_ITERATIONS` tool round-trips per user turn — default 20 —
+  calling all nine `query_tools` functions). If that budget is exhausted,
+  `run_turn` makes one extra answer-only request with the tool schemas
+  withheld and `FINAL_TURN_NOTE` folded into the system prompt, so a turn
+  always ends in a real answer rather than a give-up string (withholding the
+  tools is load-bearing: the note alone does not stop the model from calling
+  one — see the gemma4 renderer quirk under "Known environment quirks").
+  The model name, host, timeouts,
   and iteration cap all come from `config.py` (so the model default above can
   be changed without editing code), and the system prompt advertises the full
   tool set, telling the model to resolve a person/group name to a
@@ -275,6 +281,23 @@ sandbox's FUSE mount of the host folder doesn't support the
 lives on local disk there. If it ever recurs, the workaround is: copy
 `chat.db` to local disk, run `ingest.py` there, copy the resulting
 `imessage_analysis.db` back.
+
+**gemma4's Ollama renderer honors only the FIRST system message.** Ollama
+(0.32.0) renders `gemma4` with a builtin Go renderer (`renderers.Gemma4Renderer`),
+not a Modelfile template — `ollama show --template gemma4:26b-a4b-it-qat` returns
+only the stub `{{ .Prompt }}`, so this behavior is invisible to inspection and has
+to be probed. Any system message after the first is **silently dropped**: a
+mid-conversation or trailing `{"role": "system", ...}` reminder never reaches the
+model (verified — the model's `thinking` field showed it had never seen the text).
+To steer the model mid-turn, fold the text into the first system message instead,
+as `chat.py::run_turn` does with `FINAL_TURN_NOTE`. This is model-specific:
+`qwen3:30b-a3b` (what a local `.env` currently sets `CHAT_MODEL` to) *does* render a
+trailing system message — but folding into the first system message is correct for
+both, so `run_turn` does that unconditionally rather than branching on model.
+Related, and true of both models: prompting alone does not reliably stop a tool call
+— the `tools` schemas must actually be withheld from the request. Also note both are
+*thinking* models returning a `thinking` field alongside `content`; `chat.py`
+deliberately renders only `content`.
 
 **DB paths are anchored to the repo, not the CWD.** `config.py` resolves the
 four DB-path constants (`SOURCE_DB`, `SNAPSHOT_DB`, `TARGET_DB`,
