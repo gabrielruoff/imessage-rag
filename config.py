@@ -52,4 +52,4 @@ EMBED_DIM = int(os.getenv("EMBED_DIM", "768"))  # nomic-embed-text output dimens
 EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "64"))  # texts per Ollama request
 # concurrent requests, matches Ollama's default OLLAMA_NUM_PARALLEL
 EMBED_MAX_WORKERS = int(os.getenv("EMBED_MAX_WORKERS", "4"))
-MAX_TOOL_ITERATIONS = int(os.getenv("MAX_TOOL_ITERATIONS", "8"))  # tool round-trips/turn
+MAX_TOOL_ITERATIONS = int(os.getenv("MAX_TOOL_ITERATIONS", "20"))  # tool round-trips/turn
