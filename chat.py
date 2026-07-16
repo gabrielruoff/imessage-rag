@@ -5,6 +5,7 @@ model, using tool calling into query_tools.py's retrieval functions.
 Usage:
     .venv/bin/python3 chat.py                      # interactive REPL
     .venv/bin/python3 chat.py -p "your question"   # one-shot: answer and exit
+    .venv/bin/python3 chat.py -m qwen3:8b          # override the chat model
 """
 
 import argparse
@@ -99,7 +100,7 @@ OLLAMA_TOOLS = [
 TOOL_FUNCTIONS = {t["name"]: getattr(query_tools, t["name"]) for t in TOOL_DEFINITIONS}
 
 
-def ollama_chat_stream(messages, tools=OLLAMA_TOOLS, show_model_header=True):
+def ollama_chat_stream(messages, tools=OLLAMA_TOOLS, show_model_header=True, model=None):
     """Stream one chat request via ollama.chat_stream, live-rendering markdown
     content as it arrives and returning the assembled final message dict (same
     shape as a non-streaming response: role/content/tool_calls).
@@ -107,13 +108,14 @@ def ollama_chat_stream(messages, tools=OLLAMA_TOOLS, show_model_header=True):
     Pass tools=None to withhold the tool schemas entirely, which is the only
     reliable way to stop the model from calling one. show_model_header=False
     skips the "model>" line above the reply (one-shot mode, where nothing
-    else shares the terminal)."""
+    else shares the terminal). model=None uses CHAT_MODEL from config."""
+    model = model or CHAT_MODEL
     role = "assistant"
     content = ""
     tool_calls = None
     live = None
     try:
-        for msg in ollama.chat_stream(messages, tools):
+        for msg in ollama.chat_stream(messages, tools, model=model):
             role = msg.get("role", role)
             if msg.get("tool_calls"):
                 tool_calls = msg["tool_calls"]
@@ -121,7 +123,7 @@ def ollama_chat_stream(messages, tools=OLLAMA_TOOLS, show_model_header=True):
             if piece:
                 if live is None:
                     if show_model_header:
-                        console.print(f"[bold]{CHAT_MODEL}>[/bold]")
+                        console.print(f"[bold]{model}>[/bold]")
                     live = Live(Markdown(""), console=console, refresh_per_second=12)
                     live.start()
                 content += piece
@@ -144,7 +146,7 @@ def _estimate_tokens(text):
     return max(1, len(text) // 4)
 
 
-def run_turn(messages, show_model_header=True):
+def run_turn(messages, show_model_header=True, model=None):
     """Run one user turn to completion, including any tool-call round trips.
 
     All MAX_TOOL_ITERATIONS iterations may call tools. If that budget is
@@ -152,7 +154,7 @@ def run_turn(messages, show_model_header=True):
     final-turn note folded into the system prompt, forcing an answer out of
     whatever was already gathered."""
     for _ in range(MAX_TOOL_ITERATIONS):
-        message = ollama_chat_stream(messages, show_model_header=show_model_header)
+        message = ollama_chat_stream(messages, show_model_header=show_model_header, model=model)
         messages.append(message)
         tool_calls = message.get("tool_calls")
         if not tool_calls:
@@ -188,7 +190,9 @@ def run_turn(messages, show_model_header=True):
     else:
         head, rest = SYSTEM_PROMPT, messages
     final_messages = [{"role": "system", "content": head + "\n\n" + FINAL_TURN_NOTE}] + rest
-    message = ollama_chat_stream(final_messages, tools=None, show_model_header=show_model_header)
+    message = ollama_chat_stream(
+        final_messages, tools=None, show_model_header=show_model_header, model=model
+    )
     messages.append(message)
     return message.get("content", "")
 
@@ -202,6 +206,13 @@ def main():
         "--prompt",
         help='run a single prompt non-interactively and exit (quote it: -p "...")',
     )
+    parser.add_argument(
+        "-m",
+        "--model",
+        default=CHAT_MODEL,
+        help="override the chat model for this run (default: CHAT_MODEL from .env, "
+        "currently %(default)s)",
+    )
     args = parser.parse_args()
 
     if args.prompt is not None:
@@ -213,7 +224,7 @@ def main():
             {"role": "user", "content": prompt},
         ]
         try:
-            reply = run_turn(messages, show_model_header=False)
+            reply = run_turn(messages, show_model_header=False, model=args.model)
         except (http.client.HTTPException, OSError) as e:
             print(f"[error contacting Ollama: {e}]")
             sys.exit(1)
@@ -223,7 +234,7 @@ def main():
         return
 
     messages = [{"role": "system", "content": _build_system_prompt()}]
-    print(f"Chatting with your iMessage history ({CHAT_MODEL} via Ollama). Ctrl+C to quit.")
+    print(f"Chatting with your iMessage history ({args.model} via Ollama). Ctrl+C to quit.")
     print("Commands: /clear (reset conversation)\n")
     while True:
         try:
@@ -239,7 +250,7 @@ def main():
             continue
         messages.append({"role": "user", "content": user_input})
         try:
-            reply = run_turn(messages)
+            reply = run_turn(messages, model=args.model)
         except (http.client.HTTPException, OSError) as e:
             print(f"[error contacting Ollama: {e}]")
             messages.pop()

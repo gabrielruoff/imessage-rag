@@ -47,11 +47,11 @@ class RunTurnFallbackTest(unittest.TestCase):
         chat.ollama_chat_stream = self._fake_stream
         self.addCleanup(setattr, chat, "ollama_chat_stream", self._saved_stream)
 
-    def _fake_stream(self, messages, tools=chat.OLLAMA_TOOLS, show_model_header=True):
-        """Stand in for the one network entry point. Mirrors the real default
-        so a call that omits `tools` records the schemas it would have sent.
+    def _fake_stream(self, messages, tools=chat.OLLAMA_TOOLS, show_model_header=True, model=None):
+        """Stand in for the one network entry point. Mirrors the real defaults
+        so a call that omits `tools` or `model` records what it would have sent.
         Deep-copies because run_turn mutates the caller's list in place."""
-        self.calls.append({"messages": copy.deepcopy(messages), "tools": tools})
+        self.calls.append({"messages": copy.deepcopy(messages), "tools": tools, "model": model})
         # Answer only once the tools are withheld -- otherwise keep burning
         # the budget, which is what drives run_turn into the fallback.
         if tools is None:
@@ -102,10 +102,17 @@ class RunTurnFallbackTest(unittest.TestCase):
         # The user turn survives rather than being consumed as the prompt.
         self.assertEqual(final[1], {"role": "user", "content": "hi"})
 
+    def test_model_override_reaches_every_request(self):
+        chat.run_turn([{"role": "system", "content": chat.SYSTEM_PROMPT}], model="other-model")
+        self.assertEqual(len(self.calls), 3)  # 2 budgeted iterations + 1 final
+        for call in self.calls:
+            self.assertEqual(call["model"], "other-model")
+
     def test_run_turn_returns_early_when_no_tool_calls(self):
-        chat.ollama_chat_stream = (
-            lambda messages, tools=chat.OLLAMA_TOOLS, show_model_header=True: dict(FINAL_REPLY)
-        )
+        def immediate_reply(messages, tools=chat.OLLAMA_TOOLS, show_model_header=True, model=None):
+            return dict(FINAL_REPLY)
+
+        chat.ollama_chat_stream = immediate_reply
         reply = chat.run_turn([{"role": "system", "content": chat.SYSTEM_PROMPT}])
         self.assertEqual(reply, "the final answer")
 

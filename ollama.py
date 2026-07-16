@@ -15,16 +15,17 @@ from config import (
 )
 
 
-def chat_stream(messages, tools=None):
+def chat_stream(messages, tools=None, model=None):
     """POST a streaming request to the chat endpoint (OLLAMA_CHAT_PATH) and
     yield each chunk's `message` dict as it arrives. Raises RuntimeError if
     the server streams an error chunk.
 
     Pass tools=None to withhold the tool schemas entirely, which is the only
-    reliable way to stop the model from calling one."""
+    reliable way to stop the model from calling one. model=None uses
+    CHAT_MODEL from config."""
     conn = http.client.HTTPConnection(OLLAMA_HOST, OLLAMA_PORT, timeout=CHAT_TIMEOUT)
     body = {
-        "model": CHAT_MODEL,
+        "model": model or CHAT_MODEL,
         "messages": messages,
         "stream": True,
     }
