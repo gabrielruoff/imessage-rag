@@ -172,11 +172,9 @@ CREATE TABLE IF NOT EXISTS handles (
     id INTEGER PRIMARY KEY,
     handle_identifier TEXT,      -- raw phone number/email from chat.db's handle.id
     contact_id INTEGER REFERENCES contacts(id),
-    service TEXT,
-    first_name TEXT,
-    last_name TEXT,
-    nickname TEXT,
-    organization TEXT
+    service TEXT
+    -- name/org intentionally NOT stored here: they live on contacts and are
+    -- resolved via contact_id. See build_contact_lookup / ingest_handles.
 );
 
 CREATE TABLE IF NOT EXISTS chat_participants (
@@ -227,6 +225,9 @@ CREATE TABLE IF NOT EXISTS ingest_state (
 CREATE INDEX IF NOT EXISTS idx_messages_chat_date ON messages(chat_id, date);
 CREATE INDEX IF NOT EXISTS idx_messages_handle ON messages(handle_id);
 CREATE INDEX IF NOT EXISTS idx_reactions_target ON reactions(target_message_guid);
+CREATE INDEX IF NOT EXISTS idx_handles_identifier ON handles(handle_identifier);
+CREATE INDEX IF NOT EXISTS idx_handles_contact_id ON handles(contact_id);
+CREATE INDEX IF NOT EXISTS idx_chat_participants_handle ON chat_participants(handle_id);
 """
 
 FTS_SCHEMA = """
@@ -257,15 +258,23 @@ def create_schema(con: sqlite3.Connection):
         # Old schema: `contact_id TEXT` held the raw phone/email string.
         con.execute("ALTER TABLE handles RENAME COLUMN contact_id TO handle_identifier")
 
+    # Migrate an existing (old-layout) handles table to the new column set BEFORE
+    # running SCHEMA -- SCHEMA creates idx_handles_contact_id ON handles(contact_id),
+    # which would fail if that column weren't present yet. (On a fresh DB cols_before
+    # is empty and SCHEMA creates handles complete, so this block is skipped.) The
+    # REFERENCES contacts(id) target need not exist yet; FKs resolve at DML time.
+    if cols_before:
+        existing_cols = {row[1] for row in con.execute("PRAGMA table_info(handles)")}
+        if "contact_id" not in existing_cols:
+            con.execute("ALTER TABLE handles ADD COLUMN contact_id INTEGER REFERENCES contacts(id)")
+        # Drop the old denormalized name/org columns: they were a pure copy of the
+        # linked contacts row (contact_id) and are now resolved via join instead.
+        for col in ("first_name", "last_name", "nickname", "organization"):
+            if col in existing_cols:
+                con.execute(f"ALTER TABLE handles DROP COLUMN {col}")
+
     con.executescript(SCHEMA)
     con.executescript(FTS_SCHEMA)
-
-    existing_cols = {row[1] for row in con.execute("PRAGMA table_info(handles)")}
-    for col in ("first_name", "last_name", "nickname", "organization"):
-        if col not in existing_cols:
-            con.execute(f"ALTER TABLE handles ADD COLUMN {col} TEXT")
-    if "contact_id" not in existing_cols:
-        con.execute("ALTER TABLE handles ADD COLUMN contact_id INTEGER REFERENCES contacts(id)")
     con.commit()
 
 
@@ -410,19 +419,17 @@ def ingest_handles(src, tgt, contacts, handle_to_contact):
         if contact:
             matched += 1
             contact_id = contact[0]
-            _, _, first_name, last_name, nickname, organization = contact
         else:
             # No ingested contact owns this handle -- leave contact_id NULL so
             # the FK to contacts(id) never dangles (owner_id may point at a
-            # ZABCDRECORD that wasn't ingested as an ABCDContact).
+            # ZABCDRECORD that wasn't ingested as an ABCDContact). Names/org are
+            # resolved from contacts via contact_id, not stored on the handle.
             contact_id = None
-            first_name = last_name = nickname = organization = None
         tgt.execute(
             "INSERT OR REPLACE INTO handles"
-            "(id, handle_identifier, contact_id, service, first_name, last_name, nickname, organization) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (rowid, handle_identifier, contact_id, service,
-             first_name, last_name, nickname, organization),
+            "(id, handle_identifier, contact_id, service) "
+            "VALUES (?, ?, ?, ?)",
+            (rowid, handle_identifier, contact_id, service),
         )
     print(f"Ingested {len(rows)} handles ({matched} matched to a contact)")
 
@@ -586,7 +593,8 @@ def embed_messages(
         return chunk, vecs
 
     n_done, n_err, n_processed, n_logged = 0, 0, 0, 0
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+    pool = ThreadPoolExecutor(max_workers=max_workers)
+    try:
         future_to_chunk = {pool.submit(process, chunk): chunk for chunk in chunks}
         for future in as_completed(future_to_chunk):
             chunk = future_to_chunk[future]
@@ -606,6 +614,16 @@ def embed_messages(
                 tgt.commit()
                 print(f"  ...{n_processed}/{len(rows)}")
                 n_logged = n_processed
+    except KeyboardInterrupt:
+        # Don't wait on in-flight worker threads (each blocked on an Ollama
+        # HTTP call) -- drop anything not yet started and commit whatever
+        # finished so it isn't lost.
+        print("\nInterrupted -- cancelling remaining embedding batches...")
+        pool.shutdown(wait=False, cancel_futures=True)
+        tgt.commit()
+        print(f"Embedded {n_done} messages before interrupt ({n_err} errors)")
+        raise
+    pool.shutdown(wait=True)
     tgt.commit()
     print(f"Embedded {n_done} messages ({n_err} errors)")
 
@@ -675,4 +693,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nInterrupted, exiting.")
+        sys.exit(130)

@@ -10,11 +10,26 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Anchor DB paths so they're independent of the current working directory:
+# relative paths (defaults or relative env overrides) resolve against this
+# file's directory (the repo root), while absolute env values are used as-is.
+# This keeps reset_db.py / ingest.py / query_tools.py all pointed at the same
+# DB regardless of where they're launched from. (Trade-off: the /tmp
+# dev-sandbox workaround must copy the scripts alongside the data, or set an
+# absolute SOURCE_DB/TARGET_DB env override.)
+_ROOT = Path(__file__).resolve().parent
+
+
+def _resolve(value: str) -> Path:
+    p = Path(value)
+    return p if p.is_absolute() else _ROOT / p
+
+
 # --- DB paths ---------------------------------------------------------------
-SOURCE_DB = Path(os.getenv("SOURCE_DB", "chat.db"))
-SNAPSHOT_DB = Path(os.getenv("SNAPSHOT_DB", "chat_snapshot.db"))
-TARGET_DB = Path(os.getenv("TARGET_DB", "imessage_analysis.db"))
-ADDRESS_BOOK_PATH = Path(os.getenv("ADDRESS_BOOK_PATH", "address_book.abcddb"))
+SOURCE_DB = _resolve(os.getenv("SOURCE_DB", "chat.db"))
+SNAPSHOT_DB = _resolve(os.getenv("SNAPSHOT_DB", "chat_snapshot.db"))
+TARGET_DB = _resolve(os.getenv("TARGET_DB", "imessage_analysis.db"))
+ADDRESS_BOOK_PATH = _resolve(os.getenv("ADDRESS_BOOK_PATH", "address_book.abcddb"))
 
 # --- Ollama connectivity -----------------------------------------------------
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "localhost")

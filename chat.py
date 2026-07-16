@@ -8,6 +8,7 @@ Usage:
 
 import http.client
 import json
+import readline  # noqa: F401 — enables arrow-key/history line editing in input()
 
 import query_tools
 from config import (
@@ -24,11 +25,24 @@ CHAT_PATH = OLLAMA_CHAT_PATH
 
 SYSTEM_PROMPT = (
     "You are an assistant with access to the user's iMessage history through "
-    "tool calls: search_messages_sql (filter by chat/sender/date), "
-    "search_messages_fts (keyword search), search_messages_vec (semantic/topic "
-    "search), and get_chat_summary_stats (message counts for a chat). Always "
-    "call a tool to look up message content before answering -- never guess "
-    "or invent messages. Cite dates when relevant."
+    "tool calls:\n"
+    "- search_messages_sql (filter by chat/sender/date)\n"
+    "- search_messages_fts (keyword search)\n"
+    "- search_messages_vec (semantic/topic search)\n"
+    "- get_chat_summary_stats (message counts for a chat)\n"
+    "- search_contacts_by_name (name/org -> contact + their handle_ids)\n"
+    "- list_chats (name/participant -> chat_id, or label a chat_id)\n"
+    "- search_contact_by_handle (a phone/email/handle_id -> contact name)\n"
+    "- get_message_reactions (tapbacks on a message, by its guid)\n"
+    "- get_full_messages (full untruncated text for one or more message ids, "
+    "when a search result was truncated)\n"
+    "When a question names a person or group, first use search_contacts_by_name "
+    "or list_chats to resolve it to the handle_id / chat_id the message-search "
+    "tools need. Message results already include a `sender` name, a `guid`, and "
+    "has_attachment. Message search results truncate long text -- use "
+    "get_full_messages with the message `id` if you need the complete content. "
+    "Always call a tool to look up message content before answering -- never "
+    "guess or invent messages. Cite dates when relevant."
 )
 
 OLLAMA_TOOLS = [
@@ -48,6 +62,11 @@ TOOL_FUNCTIONS = {
     "search_messages_fts": query_tools.search_messages_fts,
     "search_messages_vec": query_tools.search_messages_vec,
     "get_chat_summary_stats": query_tools.get_chat_summary_stats,
+    "search_contact_by_handle": query_tools.search_contact_by_handle,
+    "search_contacts_by_name": query_tools.search_contacts_by_name,
+    "list_chats": query_tools.list_chats,
+    "get_message_reactions": query_tools.get_message_reactions,
+    "get_full_messages": query_tools.get_full_messages,
 }
 
 
@@ -112,6 +131,9 @@ def main():
             print(f"[error contacting Ollama: {e}]")
             messages.pop()
             continue
+        except KeyboardInterrupt:
+            print()
+            break
         print(f"{CHAT_MODEL}> {reply}\n")
 
 
