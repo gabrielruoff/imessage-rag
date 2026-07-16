@@ -7,9 +7,8 @@ chat_snapshot.db. Run ingest.py afterward to repopulate.
 import argparse
 import sqlite3
 
-import sqlite_vec
-
 from config import TARGET_DB as DB_PATH
+from db import load_vec_extension
 
 TABLES = [
     # messages_fts is external-content FTS5 over messages; it's kept in
@@ -51,9 +50,7 @@ def main() -> None:
 
     conn = sqlite3.connect(DB_PATH)
     try:
-        conn.enable_load_extension(True)
-        sqlite_vec.load(conn)
-        conn.enable_load_extension(False)
+        load_vec_extension(conn)
 
         existing = {
             row[0]

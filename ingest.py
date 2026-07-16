@@ -23,6 +23,7 @@ import datetime
 import http.client
 import json
 import sqlite3
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -43,6 +44,7 @@ from config import (
     SOURCE_DB,
     TARGET_DB,
 )
+from db import load_vec_extension
 
 APPLE_EPOCH = datetime.datetime(2001, 1, 1)
 
@@ -313,6 +315,16 @@ def resolve_allowed_chat_ids(src, senders):
     return {r[0] for r in rows}
 
 
+def _chat_id_filter_sql(column, allowed_chat_ids, params):
+    """Build an 'AND <column> IN (...)' fragment for an optional chat_id
+    allowlist, extending params in place. Returns '' if no filter."""
+    if allowed_chat_ids is None:
+        return ""
+    placeholders = ",".join("?" for _ in allowed_chat_ids)
+    params.extend(allowed_chat_ids)
+    return f"AND {column} IN ({placeholders})"
+
+
 def ingest_chats(src, tgt, allowed_chat_ids=None):
     rows = src.execute("""
         SELECT ROWID, chat_identifier, display_name, service_name, room_name
@@ -436,11 +448,7 @@ def ingest_handles(src, tgt, contacts, handle_to_contact):
 
 def ingest_messages_and_reactions(src, tgt, since_rowid=0, allowed_chat_ids=None):
     params = [since_rowid]
-    chat_filter = ""
-    if allowed_chat_ids is not None:
-        placeholders = ",".join("?" for _ in allowed_chat_ids)
-        chat_filter = f"AND cmj.chat_id IN ({placeholders})"
-        params.extend(allowed_chat_ids)
+    chat_filter = _chat_id_filter_sql("cmj.chat_id", allowed_chat_ids, params)
 
     query = f"""
         SELECT
@@ -500,12 +508,9 @@ def ingest_messages_and_reactions(src, tgt, since_rowid=0, allowed_chat_ids=None
 def ingest_attachments(src, tgt, since_rowid=0, allowed_chat_ids=None):
     params = [since_rowid]
     join_clause = ""
-    chat_filter = ""
     if allowed_chat_ids is not None:
-        placeholders = ",".join("?" for _ in allowed_chat_ids)
         join_clause = "JOIN chat_message_join cmj ON cmj.message_id = maj.message_id"
-        chat_filter = f"AND cmj.chat_id IN ({placeholders})"
-        params.extend(allowed_chat_ids)
+    chat_filter = _chat_id_filter_sql("cmj.chat_id", allowed_chat_ids, params)
 
     rows = src.execute(f"""
         SELECT a.ROWID, maj.message_id, a.filename, a.mime_type, a.transfer_name
@@ -516,7 +521,8 @@ def ingest_attachments(src, tgt, since_rowid=0, allowed_chat_ids=None):
     """, params).fetchall()
     for rowid, message_id, filename, mime_type, transfer_name in rows:
         tgt.execute(
-            "INSERT OR REPLACE INTO attachments(id, message_id, filename, mime_type, transfer_name) "
+            "INSERT OR REPLACE INTO attachments"
+            "(id, message_id, filename, mime_type, transfer_name) "
             "VALUES (?, ?, ?, ?, ?)",
             (rowid, message_id, filename, mime_type, transfer_name),
         )
@@ -558,9 +564,7 @@ def ollama_embed_batch(texts: list) -> list:
 
 
 def build_vec_table(tgt: sqlite3.Connection):
-    tgt.enable_load_extension(True)
-    sqlite_vec.load(tgt)
-    tgt.enable_load_extension(False)
+    load_vec_extension(tgt)
     tgt.execute(f"""
         CREATE VIRTUAL TABLE IF NOT EXISTS message_vectors USING vec0(
             message_id INTEGER PRIMARY KEY,

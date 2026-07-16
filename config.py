@@ -34,8 +34,11 @@ ADDRESS_BOOK_PATH = _resolve(os.getenv("ADDRESS_BOOK_PATH", "source_data/address
 # --- Ollama connectivity -----------------------------------------------------
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "localhost")
 OLLAMA_PORT = int(os.getenv("OLLAMA_PORT", "11434"))
-OLLAMA_EMBED_PATH = os.getenv("OLLAMA_EMBED_PATH", "/api/embed")  # batch: {"input": [...]} -> {"embeddings": [...]}
-OLLAMA_EMBEDDINGS_PATH = os.getenv("OLLAMA_EMBEDDINGS_PATH", "/api/embeddings")  # single-item embed endpoint
+# batch: {"input": [...]} -> {"embeddings": [...]}
+OLLAMA_EMBED_PATH = os.getenv("OLLAMA_EMBED_PATH", "/api/embed")
+OLLAMA_EMBEDDINGS_PATH = os.getenv(  # single-item embed endpoint
+    "OLLAMA_EMBEDDINGS_PATH", "/api/embeddings"
+)
 OLLAMA_CHAT_PATH = os.getenv("OLLAMA_CHAT_PATH", "/api/chat")
 OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "60"))
 CHAT_TIMEOUT = int(os.getenv("CHAT_TIMEOUT", "300"))
@@ -47,5 +50,6 @@ CHAT_MODEL = os.getenv("CHAT_MODEL", "gemma4:26b-a4b-it-qat")
 # --- Tunables -----------------------------------------------------------------
 EMBED_DIM = int(os.getenv("EMBED_DIM", "768"))  # nomic-embed-text output dimension
 EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "64"))  # texts per Ollama request
-EMBED_MAX_WORKERS = int(os.getenv("EMBED_MAX_WORKERS", "4"))  # concurrent requests, matches Ollama's default OLLAMA_NUM_PARALLEL
-MAX_TOOL_ITERATIONS = int(os.getenv("MAX_TOOL_ITERATIONS", "8"))  # max tool round-trips per chat.py turn
+# concurrent requests, matches Ollama's default OLLAMA_NUM_PARALLEL
+EMBED_MAX_WORKERS = int(os.getenv("EMBED_MAX_WORKERS", "4"))
+MAX_TOOL_ITERATIONS = int(os.getenv("MAX_TOOL_ITERATIONS", "8"))  # tool round-trips/turn

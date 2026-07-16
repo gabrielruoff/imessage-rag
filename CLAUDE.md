@@ -125,6 +125,16 @@ targeted retrieval.
 
 ## Files
 
+- **`README.md`** — short human quickstart (purpose, `make install` /
+  `ingest.py` / `chat.py`); this file (`CLAUDE.md`) is the full reference.
+- **`pyproject.toml`** — `ruff` configuration (`line-length = 100`,
+  `select = ["E", "F"]`). See "Linting" below.
+- **`db.py`** — single shared helper, `load_vec_extension(con)`, wrapping the
+  three-line `enable_load_extension` / `sqlite_vec.load` / disable sequence
+  needed on any raw `sqlite3.Connection` before it can touch a `vec0` virtual
+  table. Used by `query_tools.py::_connect`, `ingest.py::build_vec_table`, and
+  `reset_db.py::main` so the extension-loading incantation exists in one
+  place.
 - **`config.py`** — single source of runtime configuration, imported by
   `ingest.py`, `query_tools.py`, and `chat.py`. Reads every setting from the
   environment (calling `python-dotenv`'s `load_dotenv()` first, so a local
@@ -284,8 +294,9 @@ python.org framework build also ships a recent SQLite, but is excluded for the
 loadable-extension reason described next.
 
 **`.venv` must be built from a Python whose `sqlite3` module supports
-loadable extensions**, since `sqlite_vec.load(conn)` (used in
-`ingest.py::build_vec_table` and `query_tools.py::_connect`) requires
+loadable extensions**, since `sqlite_vec.load(conn)` (wrapped by
+`db.py::load_vec_extension`, used from `ingest.py::build_vec_table`,
+`query_tools.py::_connect`, and `reset_db.py::main`) requires
 `conn.enable_load_extension()` to exist. The **python.org macOS installer
 build** (framework build, e.g. `/usr/local/bin/python3.14`) is compiled
 without this support and raises
@@ -293,11 +304,17 @@ without this support and raises
 'enable_load_extension'`. **Homebrew's Python** (e.g.
 `/opt/homebrew/bin/python3`) does support it and is what `.venv` should be
 built from: `rm -rf .venv && /opt/homebrew/bin/python3 -m venv .venv &&
-.venv/bin/pip install -r requirements.txt`. `requirements.txt` pins three
+.venv/bin/pip install -r requirements.txt`. `requirements.txt` pins four
 third-party deps — `python-dotenv==1.2.2` (used by `config.py`),
-`sqlite-vec==0.1.9` (the vector extension), and `rich==13.9.4` (used by
-`chat.py` to stream/render the model's markdown replies in the terminal);
-everything else is stdlib.
+`sqlite-vec==0.1.9` (the vector extension), `rich==13.9.4` (used by
+`chat.py` to stream/render the model's markdown replies in the terminal),
+and `ruff==0.15.21` (linting, see below); everything else is stdlib.
+
+## Linting
+
+`ruff check .` (config in `pyproject.toml`: `line-length = 100`,
+`select = ["E", "F"]`), or `make lint`. Runs in CI as the `lint` job in
+`.github/workflows/ci.yml`, alongside the existing `compile-check` job.
 
 ## Next steps / not yet built
 

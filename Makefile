@@ -1,7 +1,10 @@
-.PHONY: reset-db ollama-start ollama-stop install
+.PHONY: reset-db ollama-start ollama-stop install lint
 
 reset-db:
 	./reset-db.sh -f
+
+lint:
+	.venv/bin/ruff check .
 
 install:
 	test -d .venv || /opt/homebrew/bin/python3 -m venv .venv

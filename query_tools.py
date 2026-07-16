@@ -20,6 +20,7 @@ import urllib.request
 import sqlite_vec
 
 from config import EMBED_MODEL, OLLAMA_EMBEDDINGS_PATH, OLLAMA_HOST, OLLAMA_PORT, TARGET_DB
+from db import load_vec_extension
 
 DB_PATH = str(TARGET_DB)
 OLLAMA_URL = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}{OLLAMA_EMBEDDINGS_PATH}"
@@ -27,9 +28,7 @@ OLLAMA_URL = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}{OLLAMA_EMBEDDINGS_PATH}"
 
 def _connect():
     con = sqlite3.connect(DB_PATH)
-    con.enable_load_extension(True)
-    sqlite_vec.load(con)
-    con.enable_load_extension(False)
+    load_vec_extension(con)
     con.row_factory = sqlite3.Row
     return con
 
@@ -104,6 +103,16 @@ def _id_filter_clause(column, values):
     return f"{column} IN ({placeholders})", list(values)
 
 
+def _append_id_filters(clauses, params, chat_ids, handle_ids, prefix="m."):
+    """Append chat_id/handle_id IN-clauses (if non-empty) to a shared
+    clauses/params list -- the common tail of every scoped message query."""
+    for column, ids in ((f"{prefix}chat_id", chat_ids), (f"{prefix}handle_id", handle_ids)):
+        clause, cparams = _id_filter_clause(column, ids)
+        if clause:
+            clauses.append(clause)
+            params.extend(cparams)
+
+
 def _resolve_handle_filter(con, handle_id, contact_id):
     """Merge handle_id and contact_id (each scalar-or-list-or-None) into a
     single normalized handle_id list, resolving contact_id through handles."""
@@ -140,18 +149,16 @@ def search_messages_sql(chat_id=None, handle_id=None, contact_id=None, is_from_m
             return []
 
         clauses, params = [], []
-        chat_clause, chat_params = _id_filter_clause("m.chat_id", chat_ids)
-        if chat_clause:
-            clauses.append(chat_clause); params.extend(chat_params)
-        handle_clause, handle_params = _id_filter_clause("m.handle_id", handle_ids)
-        if handle_clause:
-            clauses.append(handle_clause); params.extend(handle_params)
+        _append_id_filters(clauses, params, chat_ids, handle_ids)
         if is_from_me is not None:
-            clauses.append("m.is_from_me = ?"); params.append(int(is_from_me))
+            clauses.append("m.is_from_me = ?")
+            params.append(int(is_from_me))
         if date_from is not None:
-            clauses.append("m.date >= ?"); params.append(date_from)
+            clauses.append("m.date >= ?")
+            params.append(date_from)
         if date_to is not None:
-            clauses.append("m.date <= ?"); params.append(date_to)
+            clauses.append("m.date <= ?")
+            params.append(date_to)
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         sql = f"""
@@ -180,12 +187,7 @@ def search_messages_fts(query: str, chat_id=None, handle_id=None, contact_id=Non
             return []
 
         clauses, params = ["messages_fts MATCH ?"], [query]
-        chat_clause, chat_params = _id_filter_clause("m.chat_id", chat_ids)
-        if chat_clause:
-            clauses.append(chat_clause); params.extend(chat_params)
-        handle_clause, handle_params = _id_filter_clause("m.handle_id", handle_ids)
-        if handle_clause:
-            clauses.append(handle_clause); params.extend(handle_params)
+        _append_id_filters(clauses, params, chat_ids, handle_ids)
 
         sql = f"""
             SELECT m.id, m.guid, m.chat_id, m.handle_id, m.is_from_me, {_SENDER_SELECT},
@@ -235,24 +237,20 @@ def search_messages_vec(query: str, k=10, chat_id=None, handle_id=None, contact_
         # the filter is applied after KNN -- otherwise a small k could be fully
         # consumed by out-of-scope neighbors and return nothing.
         knn_k = VEC_FILTER_OVERFETCH if (chat_ids or handle_ids) else k
+        clauses, params = ["v.embedding MATCH ?", "k = ?"], [query_vec, knn_k]
+        _append_id_filters(clauses, params, chat_ids, handle_ids)
+        params.append(k)
+
         sql = f"""
             SELECT m.id, m.guid, m.chat_id, m.handle_id, m.is_from_me, {_SENDER_SELECT},
                    m.text, m.date, m.has_attachment, v.distance
             FROM message_vectors v
             JOIN messages m ON m.id = v.message_id
             {_MSG_JOIN}
-            WHERE v.embedding MATCH ? AND k = ?
+            WHERE {' AND '.join(clauses)}
+            ORDER BY v.distance
+            LIMIT ?
         """
-        params = [query_vec, knn_k]
-        chat_clause, chat_params = _id_filter_clause("m.chat_id", chat_ids)
-        if chat_clause:
-            sql += f" AND {chat_clause}"; params.extend(chat_params)
-        handle_clause, handle_params = _id_filter_clause("m.handle_id", handle_ids)
-        if handle_clause:
-            sql += f" AND {handle_clause}"; params.extend(handle_params)
-        sql += " ORDER BY v.distance LIMIT ?"
-        params.append(k)
-
         rows = con.execute(sql, params).fetchall()
     return _truncate_text_field([dict(r) for r in rows])
 
@@ -455,12 +453,7 @@ def get_chat_summary_stats(chat_id=None, handle_id=None, contact_id=None):
                     "last_message": None, "from_me": 0, "from_them": 0}
 
         clauses, params = [], []
-        chat_clause, chat_params = _id_filter_clause("chat_id", chat_ids)
-        if chat_clause:
-            clauses.append(chat_clause); params.extend(chat_params)
-        handle_clause, handle_params = _id_filter_clause("handle_id", handle_ids)
-        if handle_clause:
-            clauses.append(handle_clause); params.extend(handle_params)
+        _append_id_filters(clauses, params, chat_ids, handle_ids, prefix="")
 
         row = con.execute(f"""
             SELECT
@@ -607,7 +600,10 @@ TOOL_DEFINITIONS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "substring to match against participant names / chat identifier"},
+                "query": {
+                    "type": "string",
+                    "description": "substring to match against participant names / chat identifier",
+                },
                 "handle_id": _ID_OR_LIST_SCHEMA,
                 "contact_id": _ID_OR_LIST_SCHEMA,
                 "limit": {"type": "integer", "default": 50},
