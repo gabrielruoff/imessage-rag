@@ -10,6 +10,10 @@ import http.client
 import json
 import readline  # noqa: F401 — enables arrow-key/history line editing in input()
 
+from rich.console import Console
+from rich.live import Live
+from rich.markdown import Markdown
+
 import query_tools
 from config import (
     CHAT_MODEL,
@@ -22,6 +26,8 @@ from config import (
 from query_tools import TOOL_DEFINITIONS
 
 CHAT_PATH = OLLAMA_CHAT_PATH
+
+console = Console()
 
 SYSTEM_PROMPT = (
     "You are an assistant with access to the user's iMessage history through "
@@ -70,26 +76,61 @@ TOOL_FUNCTIONS = {
 }
 
 
-def ollama_chat(messages):
+def ollama_chat_stream(messages):
+    """POST a streaming /api/chat request, live-rendering markdown content
+    as it arrives and returning the assembled final message dict (same
+    shape as a non-streaming response: role/content/tool_calls)."""
     conn = http.client.HTTPConnection(OLLAMA_HOST, OLLAMA_PORT, timeout=CHAT_TIMEOUT)
     payload = json.dumps({
         "model": CHAT_MODEL,
         "messages": messages,
         "tools": OLLAMA_TOOLS,
-        "stream": False,
+        "stream": True,
     }).encode()
     conn.request("POST", CHAT_PATH, body=payload, headers={"Content-Type": "application/json"})
     resp = conn.getresponse()
-    body = json.loads(resp.read())
-    if "error" in body:
-        raise RuntimeError(f"Ollama error: {body['error']}")
-    return body["message"]
+
+    role = "assistant"
+    content = ""
+    tool_calls = None
+    live = None
+    try:
+        for line in resp:
+            line = line.strip()
+            if not line:
+                continue
+            chunk = json.loads(line)
+            if "error" in chunk:
+                raise RuntimeError(f"Ollama error: {chunk['error']}")
+            msg = chunk.get("message", {})
+            role = msg.get("role", role)
+            if msg.get("tool_calls"):
+                tool_calls = msg["tool_calls"]
+            piece = msg.get("content", "")
+            if piece:
+                if live is None:
+                    console.print(f"[bold]{CHAT_MODEL}>[/bold]")
+                    live = Live(Markdown(""), console=console, refresh_per_second=12)
+                    live.start()
+                content += piece
+                live.update(Markdown(content))
+            if chunk.get("done"):
+                break
+    finally:
+        if live is not None:
+            live.stop()
+        conn.close()
+
+    result = {"role": role, "content": content}
+    if tool_calls:
+        result["tool_calls"] = tool_calls
+    return result
 
 
 def run_turn(messages):
     """Run one user turn to completion, including any tool-call round trips."""
     for _ in range(MAX_TOOL_ITERATIONS):
-        message = ollama_chat(messages)
+        message = ollama_chat_stream(messages)
         messages.append(message)
         tool_calls = message.get("tool_calls")
         if not tool_calls:
@@ -107,7 +148,7 @@ def run_turn(messages):
                 except Exception as e:
                     result = {"error": str(e)}
             count = len(result) if isinstance(result, list) else "ok"
-            print(f"  [tool call] {name}({args}) -> {count}")
+            console.print(f"  [tool call] {name}({args}) -> {count}", style="dim cyan")
             messages.append({"role": "tool", "content": json.dumps(result)})
 
     return "(gave up after too many tool calls)"
@@ -115,7 +156,8 @@ def run_turn(messages):
 
 def main():
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    print(f"Chatting with your iMessage history ({CHAT_MODEL} via Ollama). Ctrl+C to quit.\n")
+    print(f"Chatting with your iMessage history ({CHAT_MODEL} via Ollama). Ctrl+C to quit.")
+    print("Commands: /clear (reset conversation)\n")
     while True:
         try:
             user_input = input("you> ").strip()
@@ -124,9 +166,13 @@ def main():
             break
         if not user_input:
             continue
+        if user_input == "/clear":
+            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+            console.print("[dim]conversation cleared[/dim]\n")
+            continue
         messages.append({"role": "user", "content": user_input})
         try:
-            reply = run_turn(messages)
+            run_turn(messages)
         except (http.client.HTTPException, OSError) as e:
             print(f"[error contacting Ollama: {e}]")
             messages.pop()
@@ -134,7 +180,7 @@ def main():
         except KeyboardInterrupt:
             print()
             break
-        print(f"{CHAT_MODEL}> {reply}\n")
+        print()
 
 
 if __name__ == "__main__":

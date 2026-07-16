@@ -293,9 +293,11 @@ without this support and raises
 'enable_load_extension'`. **Homebrew's Python** (e.g.
 `/opt/homebrew/bin/python3`) does support it and is what `.venv` should be
 built from: `rm -rf .venv && /opt/homebrew/bin/python3 -m venv .venv &&
-.venv/bin/pip install -r requirements.txt`. `requirements.txt` pins just two
-third-party deps — `python-dotenv==1.2.2` (used by `config.py`) and
-`sqlite-vec==0.1.9` (the vector extension); everything else is stdlib.
+.venv/bin/pip install -r requirements.txt`. `requirements.txt` pins three
+third-party deps — `python-dotenv==1.2.2` (used by `config.py`),
+`sqlite-vec==0.1.9` (the vector extension), and `rich==13.9.4` (used by
+`chat.py` to stream/render the model's markdown replies in the terminal);
+everything else is stdlib.
 
 ## Next steps / not yet built
 
