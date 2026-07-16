@@ -1,0 +1,9 @@
+.idea/
+data/
+address_book.abcddb*
+chat.db*
+chat_snapshot.db*
+imessage_analysis.db
+.venv/
+
+__pycache__/

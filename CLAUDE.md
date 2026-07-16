@@ -1,0 +1,188 @@
+# textmessagething
+
+## Goal
+
+Make iMessage history queryable and analyzable by an LLM — both casual chat
+("what did we say about the trip?") and analysis (sentiment/trend/topic
+questions over time), for conversations that may scale to hundreds of MB or
+GB. The data cannot be pasted into a chat window or read wholesale by an LLM
+at query time — it needs to be parsed into a structured store that supports
+targeted retrieval.
+
+## Data sources
+
+- `chat.db` — the real macOS Messages database (found already present in
+  this project folder, ~500MB, ~382k messages across ~1.1k chats / 1,942
+  handles). This is the primary/preferred source — richer and more reliable
+  than parsed `.txt` exports.
+- `address_book.abcddb` (optional, project-local path) — a copy of macOS's
+  Contacts store (normally at `~/Library/Application
+  Support/AddressBook/Sources/*/AddressBook-v22.abcddb`). `chat.db`'s
+  `handle` table only has raw phone numbers/emails, no display names —
+  `ingest.py::build_contact_lookup` reads this file (if present at
+  `./address_book.abcddb`) to attach `first_name`/`last_name`/`nickname`/
+  `organization` to each row in `handles`, matching by normalized phone
+  (last-10-digits) or lowercased email. Best-effort: if the file isn't
+  present, these columns are just left NULL.
+- `data/<sender>.txt` — a sample export from the `imessage-exporter` CLI tool
+  (https://github.com/ReagentX/imessage-exporter), representing the
+  alternative/portable input format for cases where someone only has a `.txt`
+  export rather than direct access to `chat.db`. Format: blank-line delimited
+  blocks of `timestamp (+ optional read-receipt)` / `sender ("Me" or a
+  phone/short-code)` / `body (can be multiline, or an attachment file path)`.
+  **The `.txt` parser was not built** — we pivoted to ingesting `chat.db`
+  directly once we found it in the project. If a `.txt`-only path is ever
+  needed again, this format is the one to target.
+
+## Architecture decisions (with rationale)
+
+- **Language: Python 3.** Ingestion is a one-time/periodic batch ETL job, not
+  a latency-sensitive service — Python's `sqlite3` + ecosystem support
+  outweighed any need for Rust-level speed.
+- **Storage: SQLite**, a new file (`imessage_analysis.db`) kept separate from
+  the live `chat.db`. One file, three capabilities layered on top of each
+  other: normalized tables, an FTS5 virtual table for keyword search, and a
+  `sqlite-vec` virtual table for embeddings/semantic search.
+- **Retrieval, not context-stuffing.** The LLM is meant to query this DB via
+  tool calls (SQL filter / FTS5 / vector search) rather than have the whole
+  corpus loaded into context. This is what lets the approach scale to
+  arbitrarily large exports.
+- **Vector search: `sqlite-vec`**, not a dedicated vector store (Pinecone,
+  Weaviate, etc.). Rationale: this is a single person's message history, not
+  a multi-tenant/distributed workload — `sqlite-vec` keeps everything in one
+  file with no extra service to run, and its brute-force/ANN search is fast
+  enough at this scale (low millions of vectors). A dedicated vector store
+  would only make sense if the scope grew to many users' histories or
+  required massive concurrent ANN search.
+- **LLM stack is fully local**: generation via Ollama running
+  `gemma4:26b-a4b-it-qat` (confirmed real model: Gemma 4, 25.2B params / 4B
+  active MoE, QAT-quantized, ~15GB RAM, 64K–256K context, agentic-tuned).
+  Embeddings via Ollama running `nomic-embed-text` (768-dim, 8192-token
+  context, small footprint, most proven `sqlite-vec` integration). Chose
+  local embeddings specifically because generation is already local and
+  there's no reason to send personal message text to an external API.
+  (Alternative considered: `embeddinggemma`, same vendor family as the
+  generator — reasonable if stack consistency matters more than proven
+  integration track record.)
+
+## Key technical findings
+
+- **`message.text` is NULL for ~99% of rows** (~379.5k of ~382k in this
+  data). The actual text lives in the `attributedBody` BLOB as an
+  `NSAttributedString`/`NSKeyedArchiver` typedstream — there's no native
+  Python decoder for this.
+- **Decoder used: the `streamtyped` byte-pattern approach** from
+  `imessage-exporter`'s Rust source
+  (`imessage-database/src/util/streamtyped.rs`), ported to Python in
+  `ingest.py::decode_streamtyped`. Technique: find the start marker
+  `0x01 0x2B`, find the end marker `0x86 0x84`, decode the UTF-8 bytes
+  between them, then drop a fixed prefix (1 char if clean UTF-8 decode, 3 if
+  it had to lossy-decode). This only recovers plain text, not styling or
+  inline attachment position — that would require the fuller typedstream
+  deserializer (`imessage-exporter`'s `typedstream.rs` + their `crabstep`
+  crate), which we deliberately did not port since we only need body text.
+  **Result on real data: 0 decode failures across all ~350k non-reaction
+  messages.**
+- **Timestamps are nanoseconds since 2001-01-01** ("Mac absolute time"), not
+  Unix epoch — converted via `apple_ns_to_iso()` in `ingest.py`.
+- **No single table has a full message record** — had to join `message` +
+  `handle` (sender) + `chat_message_join` (message→chat, not a direct FK on
+  `message`) + `chat_handle_join` (chat participants, for group threads) +
+  `message_attachment_join` + `attachment`.
+- **Reactions/tapbacks are stored as rows in the `message` table**
+  (`associated_message_type != 0`, ~32k of them here) pointing at a target
+  message via `associated_message_guid` — these are not real messages and
+  are split into their own `reactions` table during ingestion rather than
+  mixed into the message stream.
+- **`chat.db` is live** (has `-wal`/`-shm` sidecars since Messages.app may
+  still be writing to it) — `ingest.py::snapshot_source` copies it (plus
+  sidecars) to `chat_snapshot.db` and checkpoints the WAL there before
+  anything reads from it, so the original is never touched.
+
+## Files
+
+- **`ingest.py`** — full pipeline: snapshot → decode → normalize into
+  `imessage_analysis.db` → build FTS5 → build `sqlite-vec` table → embed via
+  local Ollama. Flags: `--no-embed` (skip embedding, e.g. if Ollama isn't
+  running), `--since-last` (incremental — only ingest messages with
+  `ROWID` greater than the last recorded run, tracked in the `ingest_state`
+  table), `--senders`/`-s` (comma-separated list of phone numbers/emails —
+  matched against `handle.id` via `chat_handle_join`; only ingest chats,
+  direct or group, that include at least one of them. Also prunes any
+  out-of-scope chats/messages/reactions/attachments left in
+  `imessage_analysis.db` from a prior unfiltered or differently-filtered
+  run, so the target DB always reflects only the current filter — unless
+  zero chats match, in which case pruning is skipped to avoid wiping the DB
+  on a typo'd number/email).
+- **`query_tools.py`** — retrieval functions meant to be exposed as LLM tool
+  calls: `search_messages_sql` (filter by chat/sender/date), 
+  `search_messages_fts` (FTS5 keyword search), `search_messages_vec`
+  (embed query via Ollama + `sqlite-vec` nearest-neighbor search),
+  `get_chat_summary_stats` (cheap aggregate stats, no LLM needed). Includes
+  `TOOL_DEFINITIONS` — Claude tool-schema definitions ready to wire into a
+  `tool_use` loop.
+- **`imessage_analysis.db`** — output of a full ingestion run against the
+  real `chat.db` in this repo, **without embeddings yet** (108MB). Verified:
+  ~350k messages + ~32k reactions = ~382k (matches `chat.db`'s
+  `message` count exactly), ~1.1k chats, ~1.9k handles, ~14.9k attachments.
+  FTS5 and `sqlite-vec` mechanics both confirmed working with real test
+  queries.
+- **`data/<sender>.txt`, `data/orphaned.txt`** — sample `.txt` exports, not
+  currently used by the pipeline (see Data sources above).
+
+## Schema (imessage_analysis.db)
+
+```
+chats(id, chat_identifier, display_name, is_group, service)
+handles(id, contact_id, service, first_name, last_name, nickname, organization)
+chat_participants(chat_id, handle_id)
+messages(id, guid, chat_id, handle_id, is_from_me, text, decode_failed,
+         date, date_read, date_delivered, item_type, is_emote, has_attachment)
+reactions(id, target_message_guid, chat_id, handle_id, is_from_me,
+          associated_message_type, date)
+attachments(id, message_id, filename, mime_type, transfer_name)
+ingest_state(key, value)          -- tracks last_message_rowid for --since-last
+messages_fts                       -- FTS5 external-content table over messages.text
+message_vectors                    -- sqlite-vec vec0 table, message_id -> FLOAT[768]
+```
+
+## Known environment quirks
+
+While building this, ingestion had to be run from `/tmp` inside the dev
+sandbox rather than directly against the mounted project folder — the
+sandbox's FUSE mount of the host folder doesn't support the
+`PRAGMA wal_checkpoint` operation SQLite needs during the snapshot step
+(disk I/O error). This should **not** occur on a real Mac since `chat.db`
+lives on local disk there. If it ever recurs, the workaround is: copy
+`chat.db` to local disk, run `ingest.py` there, copy the resulting
+`imessage_analysis.db` back.
+
+**`.venv` must be built from a Python whose `sqlite3` module supports
+loadable extensions**, since `sqlite_vec.load(conn)` (used in
+`ingest.py::build_vec_table` and `query_tools.py::_connect`) requires
+`conn.enable_load_extension()` to exist. The **python.org macOS installer
+build** (framework build, e.g. `/usr/local/bin/python3.14`) is compiled
+without this support and raises
+`AttributeError: 'sqlite3.Connection' object has no attribute
+'enable_load_extension'`. **Homebrew's Python** (e.g.
+`/opt/homebrew/bin/python3`) does support it and is what `.venv` should be
+built from: `rm -rf .venv && /opt/homebrew/bin/python3 -m venv .venv &&
+.venv/bin/pip install -r requirements.txt`.
+
+## Next steps / not yet built
+
+1. **Run embeddings for real**: `ollama pull nomic-embed-text`, then
+   `python3 ingest.py --since-last` on a machine where Ollama is actually
+   reachable (this hasn't happened yet — `imessage_analysis.db` currently
+   has no vectors in `message_vectors`).
+2. **Wire `query_tools.py`'s `TOOL_DEFINITIONS` into an actual tool-calling
+   loop** against `gemma4:26b-a4b-it-qat` via Ollama (or via Claude, if
+   preferred for the reasoning/analysis layer while keeping embeddings
+   local) — this hasn't been built yet, only the tool functions themselves.
+3. **Enrichment/analysis layer** (sentiment, emotion, topic tagging) —
+   discussed as a future layer (batch-tag messages, store as extra columns
+   on `messages`, aggregate via SQL for trend questions) but intentionally
+   deferred — focus so far has been the storage/retrieval foundation, not
+   the analysis types themselves.
+4. **`.txt` parser** — not built; only needed if `chat.db` access isn't
+   available for some future conversation/export.
