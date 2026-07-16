@@ -147,6 +147,14 @@ def ollama_chat_stream(messages, tools=OLLAMA_TOOLS, show_model_header=True):
     return result
 
 
+def _estimate_tokens(text):
+    """Rough token count (~4 chars/token). Ollama exposes no tokenizer
+    endpoint, and the real cost of a tool result only shows up inside the
+    *next* request's aggregate prompt_eval_count, so an upfront per-call
+    estimate is the best available."""
+    return max(1, len(text) // 4)
+
+
 def run_turn(messages, show_model_header=True):
     """Run one user turn to completion, including any tool-call round trips.
 
@@ -173,8 +181,13 @@ def run_turn(messages, show_model_header=True):
                 except Exception as e:
                     result = {"error": str(e)}
             count = len(result) if isinstance(result, list) else "ok"
-            console.print(f"  [tool call] {name}({args}) -> {count}", style="dim cyan")
-            messages.append({"role": "tool", "content": json.dumps(result)})
+            result_json = json.dumps(result)
+            console.print(
+                f"  [tool call] {name}({args}) -> {count}"
+                f" (~{_estimate_tokens(result_json)} tokens)",
+                style="dim cyan",
+            )
+            messages.append({"role": "tool", "content": result_json})
 
     # Budget exhausted. gemma4's Ollama renderer keeps only the *first* system
     # message and drops later ones, so the note has to be folded into the system
