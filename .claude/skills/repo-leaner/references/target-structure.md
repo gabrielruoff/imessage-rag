@@ -1,6 +1,6 @@
 # Target Lean Python Structure
 
-The layout to measure the repo against in Phase 3. This is the *recommended* end state; because scope is moderate, recommend incremental moves toward it, not a big-bang reorg. Always adapt to the repo's real domain — don't impose folders it doesn't need.
+The layout to measure the repo against in step A3. This is the *recommended* end state; because scope is moderate, recommend incremental moves toward it, not a big-bang reorg. Always adapt to the repo's real domain — don't impose folders it doesn't need.
 
 ## Recommended layout
 

@@ -1,6 +1,6 @@
 # Vibe-Code & Merge-Scar Smells
 
-Signatures of rapidly generated or heavily AI-merged Python repos. Hunt for these in Phase 1 and cite concrete instances. Presence of a smell is a finding; a cluster of them in one file makes it a top refactor target.
+Signatures of rapidly generated or heavily AI-merged Python repos. Hunt for these in step A1 and cite concrete instances. Presence of a smell is a finding; a cluster of them in one file makes it a top refactor target.
 
 ## Duplication & drift (highest priority)
 
