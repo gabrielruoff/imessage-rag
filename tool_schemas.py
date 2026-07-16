@@ -67,14 +67,16 @@ TOOL_DEFINITIONS = [
         },
     },
     {
-        "name": "search_messages_vec",
-        "description": "Semantic search: find messages similar in meaning to a "
-                        "natural-language query, even without exact keyword "
-                        "overlap. Optionally scope to a chat/handle/contact "
-                        "(single id or list each; contact_id covers every handle "
-                        "that person owns). Long message text is truncated -- use "
-                        "get_full_messages(ids) for the complete content of "
-                        "specific messages.",
+        "name": "search_conversations",
+        "description": "Semantic search over conversation chunks (windows of "
+                        "consecutive messages in one chat, with speakers "
+                        "labeled): finds conversations similar in meaning to a "
+                        "natural-language query, even without keyword overlap. "
+                        "Best for topic/theme/analysis questions. Optionally "
+                        "scope by chat_id, by handle_id/contact_id (that "
+                        "person's chats), and/or a date range. Each result has "
+                        "a text preview -- expand one with "
+                        "get_conversation(chunk_id).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -83,8 +85,86 @@ TOOL_DEFINITIONS = [
                 "chat_id": _ID_OR_LIST_SCHEMA,
                 "handle_id": _ID_OR_LIST_SCHEMA,
                 "contact_id": _ID_OR_LIST_SCHEMA,
+                "date_from": {"type": "string", "description": _DATE_PARAM_DESC},
+                "date_to": {"type": "string", "description": _DATE_PARAM_DESC},
             },
             "required": ["query"],
+        },
+    },
+    {
+        "name": "search_messages_hybrid",
+        "description": "The best default search: runs keyword search and "
+                        "semantic conversation search together and merges the "
+                        "rankings (reciprocal-rank fusion). Returns ranked "
+                        "conversation chunks, each tagged matched_by "
+                        "('keyword' and/or 'semantic'). Same scoping as "
+                        "search_conversations. Expand a result with "
+                        "get_conversation(chunk_id).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "k": {"type": "integer", "default": 10},
+                "chat_id": _ID_OR_LIST_SCHEMA,
+                "handle_id": _ID_OR_LIST_SCHEMA,
+                "contact_id": _ID_OR_LIST_SCHEMA,
+                "date_from": {"type": "string", "description": _DATE_PARAM_DESC},
+                "date_to": {"type": "string", "description": _DATE_PARAM_DESC},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "find_similar_conversations",
+        "description": "More-like-this: given a chunk_id from a previous "
+                        "conversation search, find other conversations about "
+                        "similar things (e.g. the same topic in another chat or "
+                        "time period). Uses the stored vector -- cheap. Accepts "
+                        "the same chat/handle/contact/date filters as "
+                        "search_conversations.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "chunk_id": {"type": "integer"},
+                "k": {"type": "integer", "default": 10},
+                "chat_id": _ID_OR_LIST_SCHEMA,
+                "handle_id": _ID_OR_LIST_SCHEMA,
+                "contact_id": _ID_OR_LIST_SCHEMA,
+                "date_from": {"type": "string", "description": _DATE_PARAM_DESC},
+                "date_to": {"type": "string", "description": _DATE_PARAM_DESC},
+            },
+            "required": ["chunk_id"],
+        },
+    },
+    {
+        "name": "get_conversation",
+        "description": "Expand a conversation chunk (by chunk_id from "
+                        "search_conversations / search_messages_hybrid / "
+                        "find_similar_conversations) into its full messages, "
+                        "with senders, dates, and guids.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "chunk_id": {"type": "integer"},
+            },
+            "required": ["chunk_id"],
+        },
+    },
+    {
+        "name": "get_message_context",
+        "description": "Get the messages immediately before and after one "
+                        "message in its chat -- turns a single search hit into "
+                        "a readable stretch of conversation. Pass a message "
+                        "`id` from any message search result; the target row "
+                        "is flagged is_target.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "message_id": {"type": "integer"},
+                "before": {"type": "integer", "default": 10},
+                "after": {"type": "integer", "default": 10},
+            },
+            "required": ["message_id"],
         },
     },
     {

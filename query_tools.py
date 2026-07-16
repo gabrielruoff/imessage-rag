@@ -2,10 +2,17 @@
 Query layer over imessage_analysis.db, meant to be exposed as LLM tool calls
 (Claude tool_use / function-calling) rather than pre-loading data into context.
 
-Three retrieval modes:
-  - search_messages_sql   structured filters (chat, sender, date range)
-  - search_messages_fts   keyword / phrase search via FTS5
-  - search_messages_vec   semantic search via sqlite-vec + Ollama embeddings
+Retrieval modes:
+  - search_messages_sql     structured filters (chat, sender, date range)
+  - search_messages_fts     keyword / phrase search via FTS5
+  - search_conversations    semantic search over conversation chunks
+                            (sqlite-vec + Ollama embeddings)
+  - search_messages_hybrid  keyword + semantic together, fused with
+                            reciprocal-rank fusion
+
+plus expansion helpers: get_conversation (a chunk's messages),
+get_message_context (messages around any hit), find_similar_conversations
+(more-like-this from a chunk's stored vector), get_full_messages.
 
 Each returns a small list of dicts, meant to be fed back to the LLM as tool
 results -- never the whole table.
@@ -13,13 +20,14 @@ results -- never the whole table.
 
 import contextlib
 import datetime
+import re
 import sqlite3
 
 import sqlite_vec
 
 from config import TARGET_DB
-from db import load_vec_extension
-from ollama import embed_one
+from db import CONTACT_LABEL_SQL, load_vec_extension
+from embeddings import embed_texts
 
 DB_PATH = str(TARGET_DB)
 
@@ -32,14 +40,9 @@ def _connect():
 
 
 # Human-readable label for a contact/handle: nickname > "First Last" > raw
-# handle_identifier. Reused wherever a message's sender needs a name. Assumes
-# the query LEFT JOINs handles AS h and contacts AS c (on h.contact_id).
-_CONTACT_LABEL = (
-    "COALESCE("
-    "NULLIF(c.nickname, ''), "
-    "NULLIF(TRIM(COALESCE(c.first_name, '') || ' ' || COALESCE(c.last_name, '')), ''), "
-    "h.handle_identifier)"
-)
+# handle_identifier (shared with ingest.py's chunk builder via db.py).
+# Assumes the query LEFT JOINs handles AS h and contacts AS c.
+_CONTACT_LABEL = CONTACT_LABEL_SQL
 
 # Resolve a message's sender: "Me" when is_from_me, else the contact label.
 # Requires the join below.
@@ -53,22 +56,27 @@ _MSG_JOIN = (
 # used when the model omits the arg; these are enforced regardless of what
 # the model asks for, so a tool call can't blow up prompt size.
 MAX_MESSAGE_LIMIT = 50   # search_messages_sql / search_messages_fts
-MAX_VEC_K = 20           # search_messages_vec
+MAX_VEC_K = 20           # chunk-search tools (search_conversations etc.)
 MAX_CONTACTS_LIMIT = 20  # search_contacts_by_name
 MAX_CHATS_LIMIT = 50     # list_chats
 MAX_ID_LIST = 50         # cap on chat_id/handle_id/contact_id/guid list params
-VEC_FILTER_OVERFETCH = 1000  # KNN pool size when a scope filter narrows vec search
+MAX_CONTEXT_MESSAGES = 25   # get_message_context before/after ceiling
+MAX_SCOPE_CHATS = 500       # cap on the person -> chats expansion for chunk search
+MAX_CHUNK_MESSAGES = 200    # get_conversation row ceiling
+HYBRID_POOL = 30            # per-arm candidate depth fed into RRF
+RRF_K = 60                  # standard reciprocal-rank-fusion constant
 
-TEXT_PREVIEW_CHARS = 300
+TEXT_PREVIEW_CHARS = 300    # message rows
+CHUNK_PREVIEW_CHARS = 500   # chunk rows (get_conversation returns the messages)
 
 
-def _truncate_text_field(rows):
-    """Cap each row's `text` field for prompt size; full text is available
-    via get_full_messages(ids)."""
+def _truncate_text_field(rows, limit=TEXT_PREVIEW_CHARS):
+    """Cap each row's `text` field for prompt size; full content is available
+    via get_full_messages(ids) / get_conversation(chunk_id)."""
     for r in rows:
         text = r.get("text")
-        if text and len(text) > TEXT_PREVIEW_CHARS:
-            r["text"] = text[:TEXT_PREVIEW_CHARS] + "…"
+        if text and len(text) > limit:
+            r["text"] = text[:limit] + "…"
     return rows
 
 
@@ -260,42 +268,302 @@ def search_messages_fts(query: str, chat_id=None, handle_id=None, contact_id=Non
     return _truncate_text_field([dict(r) for r in rows])
 
 
-def search_messages_vec(query: str, k=10, chat_id=None, handle_id=None, contact_id=None):
-    """Semantic search: embed the query and find nearest message vectors.
-    chat_id/handle_id accept a single id or a list; contact_id (single or
-    list) scopes to a person across every handle they own. Scoped semantic
-    search is best-effort: sqlite-vec picks the nearest vectors first and the
-    scope filter is applied after, so a match beyond the over-fetch pool
-    (VEC_FILTER_OVERFETCH) may be missed -- inherent to brute-force KNN +
-    post-filter."""
+# --- Conversation-chunk search ----------------------------------------------
+
+# Label for the chat a chunk belongs to: its display_name, else the resolved
+# participant names. The subquery's h/c aliases are what _CONTACT_LABEL
+# expects; enclosing queries must alias chunks AS ck and chats AS ch to stay
+# out of its way.
+_CHUNK_PARTICIPANTS = (
+    "COALESCE(NULLIF(ch.display_name, ''), "
+    "(SELECT GROUP_CONCAT(" + _CONTACT_LABEL + ", ', ') "
+    " FROM chat_participants cp "
+    " JOIN handles h ON h.id = cp.handle_id "
+    " LEFT JOIN contacts c ON c.id = h.contact_id "
+    " WHERE cp.chat_id = ck.chat_id))"
+)
+
+_CHUNK_SELECT = (
+    f"SELECT ck.id AS chunk_id, ck.chat_id, {_CHUNK_PARTICIPANTS} AS participants, "
+    "ck.first_date, ck.last_date, ck.n_messages, "
+    "ck.first_message_id, ck.last_message_id"
+)
+
+
+def _resolve_chat_scope(con, chat_id, handle_id, contact_id):
+    """Resolve scope params into (chat_ids, empty) for chunk-level search.
+    Chunks belong to whole chats, so handle_id/contact_id scope to the chats
+    that person participates in (an exact chat_participants join); when chat
+    and person params are both given, the scopes intersect, matching the AND
+    semantics of the message-level tools. `empty` mirrors _resolve_scope:
+    True when a scope was requested but matched nothing."""
+    chat_ids = _as_id_list(chat_id)
+    if chat_id is not None and not chat_ids:
+        return None, True
+    handle_requested = handle_id is not None or contact_id is not None
+    if handle_requested:
+        handle_ids = _resolve_handle_filter(con, handle_id, contact_id)
+        if not handle_ids:
+            return None, True
+        placeholders = ",".join("?" * len(handle_ids))
+        # ORDER BY makes the MAX_SCOPE_CHATS truncation deterministic
+        person_chats = [r[0] for r in con.execute(
+            f"SELECT DISTINCT chat_id FROM chat_participants "
+            f"WHERE handle_id IN ({placeholders}) ORDER BY chat_id", handle_ids,
+        ).fetchall()][:MAX_SCOPE_CHATS]
+        if chat_ids:
+            person_set = set(person_chats)
+            chat_ids = [c for c in chat_ids if c in person_set]
+        else:
+            chat_ids = person_chats
+        if not chat_ids:
+            return None, True
+    return chat_ids, False
+
+
+def _day_bounds(date_from, date_to):
+    """Convert optional ISO date bounds into inclusive day numbers matching
+    chunk_vectors' first_day/last_day metadata (see db.iso_to_day). date_to
+    reuses _normalize_date_bound's half-open upper bound, stepped back one
+    microsecond so e.g. '2026-01-02' maps to Jan 2's day number, not Jan 3's."""
+    from_day = to_day = None
+    if date_from is not None:
+        from_day = datetime.datetime.fromisoformat(
+            _normalize_date_bound(date_from)).toordinal()
+    if date_to is not None:
+        upper = datetime.datetime.fromisoformat(_normalize_date_bound(date_to, upper=True))
+        to_day = (upper - datetime.timedelta(microseconds=1)).toordinal()
+    return from_day, to_day
+
+
+def _chunk_knn(con, query_vec, k, chat_ids, from_day, to_day, exclude_chunk_id=None):
+    """KNN over chunk_vectors with scope/date pushed down as vec0 metadata
+    constraints (applied inside the scan -- no over-fetch needed). A chunk
+    overlaps the date range when last_day >= from AND first_day <= to."""
+    fetch_k = k + 1 if exclude_chunk_id is not None else k
+    clauses, params = ["v.embedding MATCH ?", "k = ?"], [query_vec, fetch_k]
+    if chat_ids:
+        placeholders = ",".join("?" * len(chat_ids))
+        clauses.append(f"v.chat_id IN ({placeholders})")
+        params.extend(chat_ids)
+    if from_day is not None:
+        clauses.append("v.last_day >= ?")
+        params.append(from_day)
+    if to_day is not None:
+        clauses.append("v.first_day <= ?")
+        params.append(to_day)
+
+    rows = con.execute(f"""
+        {_CHUNK_SELECT}, v.distance, ck.text
+        FROM chunk_vectors v
+        JOIN chunks ck ON ck.id = v.chunk_id
+        LEFT JOIN chats ch ON ch.id = ck.chat_id
+        WHERE {' AND '.join(clauses)}
+        ORDER BY v.distance
+    """, params).fetchall()
+    rows = [dict(r) for r in rows]
+    if exclude_chunk_id is not None:
+        rows = [r for r in rows if r["chunk_id"] != exclude_chunk_id][:k]
+    return rows
+
+
+def search_conversations(query: str, k=10, chat_id=None, handle_id=None, contact_id=None,
+                         date_from=None, date_to=None):
+    """Semantic search over conversation chunks: embed the query and find the
+    nearest chunk vectors. chat_id/handle_id/contact_id (single id or list
+    each) scope to chats / a person's chats; date_from/date_to accept the
+    same ISO forms as search_messages_sql and match any chunk whose time span
+    overlaps the range. Results carry a text preview -- expand one with
+    get_conversation(chunk_id)."""
     k = max(1, min(k, MAX_VEC_K))
-    query_vec = sqlite_vec.serialize_float32(embed_one(query))
+    query_vec = sqlite_vec.serialize_float32(embed_texts([query], kind="query")[0])
 
     with contextlib.closing(_connect()) as con:
-        chat_ids, handle_ids, empty = _resolve_scope(con, chat_id, handle_id, contact_id)
+        chat_ids, empty = _resolve_chat_scope(con, chat_id, handle_id, contact_id)
         if empty:
             return []
+        from_day, to_day = _day_bounds(date_from, date_to)
+        rows = _chunk_knn(con, query_vec, k, chat_ids, from_day, to_day)
+    return _truncate_text_field(rows, CHUNK_PREVIEW_CHARS)
 
-        # Over-fetch from the vec index when a scope filter is present, since
-        # the filter is applied after KNN -- otherwise a small k could be fully
-        # consumed by out-of-scope neighbors and return nothing.
-        knn_k = VEC_FILTER_OVERFETCH if (chat_ids or handle_ids) else k
-        clauses, params = ["v.embedding MATCH ?", "k = ?"], [query_vec, knn_k]
-        _append_id_filters(clauses, params, chat_ids, handle_ids)
-        params.append(k)
 
-        sql = f"""
+def find_similar_conversations(chunk_id: int, k=10, chat_id=None, handle_id=None,
+                               contact_id=None, date_from=None, date_to=None):
+    """More-like-this: find conversation chunks semantically similar to an
+    existing one, using its stored vector (no embedding request needed). The
+    source chunk itself is excluded. Same scope/date filters as
+    search_conversations."""
+    k = max(1, min(k, MAX_VEC_K))
+    with contextlib.closing(_connect()) as con:
+        row = con.execute(
+            "SELECT embedding FROM chunk_vectors WHERE chunk_id = ?", (chunk_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"chunk {chunk_id} has no embedding (does it exist / "
+                             f"has embedding finished?)")
+        chat_ids, empty = _resolve_chat_scope(con, chat_id, handle_id, contact_id)
+        if empty:
+            return []
+        from_day, to_day = _day_bounds(date_from, date_to)
+        rows = _chunk_knn(con, row["embedding"], k, chat_ids, from_day, to_day,
+                          exclude_chunk_id=chunk_id)
+    return _truncate_text_field(rows, CHUNK_PREVIEW_CHARS)
+
+
+def get_conversation(chunk_id: int):
+    """Expand a chunk into its full messages: every message in the chunk's
+    chat within the chunk's time window (so overlap-carried messages and
+    system events that didn't render into the chunk text appear too).
+    Returns the chunk's metadata plus a `messages` list."""
+    with contextlib.closing(_connect()) as con:
+        chunk = con.execute(f"""
+            {_CHUNK_SELECT}
+            FROM chunks ck
+            LEFT JOIN chats ch ON ch.id = ck.chat_id
+            WHERE ck.id = ?
+        """, (chunk_id,)).fetchone()
+        if chunk is None:
+            return None
+        chunk = dict(chunk)
+
+        rows = con.execute(f"""
             SELECT m.id, m.guid, m.chat_id, m.handle_id, m.is_from_me, {_SENDER_SELECT},
-                   m.text, m.date, m.has_attachment, v.distance
-            FROM message_vectors v
-            JOIN messages m ON m.id = v.message_id
+                   m.text, m.date, m.has_attachment
+            FROM messages m
             {_MSG_JOIN}
-            WHERE {' AND '.join(clauses)}
-            ORDER BY v.distance
+            WHERE m.chat_id = ? AND m.date >= ? AND m.date <= ?
+            ORDER BY m.date, m.id
             LIMIT ?
+        """, (chunk["chat_id"], chunk["first_date"], chunk["last_date"],
+              MAX_CHUNK_MESSAGES)).fetchall()
+    chunk["messages"] = _truncate_text_field([dict(r) for r in rows])
+    return chunk
+
+
+def get_message_context(message_id: int, before=10, after=10):
+    """The messages surrounding one message in its chat, in time order --
+    turns any single search hit (FTS, SQL, or a message inside a chunk) into
+    a readable stretch of conversation. The target row is flagged
+    is_target=True. Returns [] if the message id doesn't exist."""
+    before = max(0, min(int(before), MAX_CONTEXT_MESSAGES))
+    after = max(0, min(int(after), MAX_CONTEXT_MESSAGES))
+    with contextlib.closing(_connect()) as con:
+        target = con.execute(
+            "SELECT id, chat_id, date FROM messages WHERE id = ?", (message_id,)
+        ).fetchone()
+        if target is None:
+            return []
+
+        select = f"""
+            SELECT m.id, m.guid, m.chat_id, m.handle_id, m.is_from_me, {_SENDER_SELECT},
+                   m.text, m.date, m.has_attachment
+            FROM messages m
+            {_MSG_JOIN}
         """
-        rows = con.execute(sql, params).fetchall()
-    return _truncate_text_field([dict(r) for r in rows])
+        # (date, id) row-value comparisons: same total order as the ORDER BY,
+        # id as tiebreak for identical timestamps.
+        prev_rows = con.execute(select + """
+            WHERE m.chat_id = ? AND (m.date, m.id) < (?, ?)
+            ORDER BY m.date DESC, m.id DESC
+            LIMIT ?
+        """, (target["chat_id"], target["date"], target["id"], before)).fetchall()
+        next_rows = con.execute(select + """
+            WHERE m.chat_id = ? AND (m.date, m.id) >= (?, ?)
+            ORDER BY m.date, m.id
+            LIMIT ?
+        """, (target["chat_id"], target["date"], target["id"], after + 1)).fetchall()
+
+    rows = [dict(r) for r in reversed(prev_rows)] + [dict(r) for r in next_rows]
+    for r in rows:
+        r["is_target"] = r["id"] == message_id
+    return _truncate_text_field(rows)
+
+
+def _fts_or_query(query: str) -> str:
+    """Turn free text into a forgiving FTS5 query: each term quoted (so
+    natural-language punctuation can't break FTS5 syntax) and OR-joined --
+    any-term match, with rank still rewarding more/denser matches."""
+    terms = re.findall(r"\w+", query)
+    return " OR ".join(f'"{t}"' for t in terms)
+
+
+def search_messages_hybrid(query: str, k=10, chat_id=None, handle_id=None, contact_id=None,
+                           date_from=None, date_to=None):
+    """Keyword (FTS5 over messages) and semantic (chunk vectors) search run
+    together and fused with reciprocal-rank fusion; FTS hits vote for the
+    chunk containing them. Returns ranked conversation chunks, each tagged
+    with matched_by ('keyword' and/or 'semantic') and rrf_score. Both arms
+    apply the same chat/person/date scope."""
+    k = max(1, min(k, MAX_VEC_K))
+    query_vec = sqlite_vec.serialize_float32(embed_texts([query], kind="query")[0])
+
+    with contextlib.closing(_connect()) as con:
+        chat_ids, empty = _resolve_chat_scope(con, chat_id, handle_id, contact_id)
+        if empty:
+            return []
+        from_day, to_day = _day_bounds(date_from, date_to)
+
+        vec_rows = _chunk_knn(con, query_vec, HYBRID_POOL, chat_ids, from_day, to_day)
+        vec_ranks = {r["chunk_id"]: rank for rank, r in enumerate(vec_rows)}
+
+        fts_ranks = {}
+        fts_query = _fts_or_query(query)
+        if fts_query:
+            clauses = ["messages_fts MATCH ?", "m.chunk_id IS NOT NULL"]
+            params = [fts_query]
+            clause, cparams = _id_filter_clause("m.chat_id", chat_ids)
+            if clause:
+                clauses.append(clause)
+                params.extend(cparams)
+            if date_from is not None:
+                clauses.append("m.date >= ?")
+                params.append(_normalize_date_bound(date_from))
+            if date_to is not None:
+                clauses.append("m.date < ?")
+                params.append(_normalize_date_bound(date_to, upper=True))
+            # Aggregate to chunks in SQL (best-ranked message hit per chunk)
+            # so a few chatty chunks can't consume the candidate pool.
+            hits = con.execute(f"""
+                SELECT m.chunk_id
+                FROM messages_fts f
+                JOIN messages m ON m.id = f.rowid
+                WHERE {' AND '.join(clauses)}
+                GROUP BY m.chunk_id
+                ORDER BY MIN(rank)
+                LIMIT ?
+            """, params + [HYBRID_POOL]).fetchall()
+            fts_ranks = {row["chunk_id"]: rank for rank, row in enumerate(hits)}
+
+        scores = {}
+        for ranks in (vec_ranks, fts_ranks):
+            for cid, rank in ranks.items():
+                scores[cid] = scores.get(cid, 0.0) + 1.0 / (RRF_K + rank + 1)
+        top = sorted(scores, key=scores.get, reverse=True)[:k]
+        if not top:
+            return []
+
+        by_id = {r["chunk_id"]: r for r in vec_rows}
+        missing = [cid for cid in top if cid not in by_id]
+        if missing:
+            placeholders = ",".join("?" * len(missing))
+            for r in con.execute(f"""
+                {_CHUNK_SELECT}, NULL AS distance, ck.text
+                FROM chunks ck
+                LEFT JOIN chats ch ON ch.id = ck.chat_id
+                WHERE ck.id IN ({placeholders})
+            """, missing).fetchall():
+                by_id[r["chunk_id"]] = dict(r)
+
+    results = []
+    for cid in top:
+        r = by_id.get(cid)
+        if r is None:
+            continue
+        r["rrf_score"] = round(scores[cid], 6)
+        r["matched_by"] = [name for name, ranks in
+                           (("semantic", vec_ranks), ("keyword", fts_ranks)) if cid in ranks]
+        results.append(r)
+    return _truncate_text_field(results, CHUNK_PREVIEW_CHARS)
 
 
 def search_contact_by_handle(handle_id=None, handle_identifier=None):

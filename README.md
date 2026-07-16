@@ -3,9 +3,9 @@
 Makes iMessage history queryable and analyzable by an LLM. Ingests the
 macOS Messages `chat.db` into a normalized SQLite store
 (`imessage_analysis.db`) with keyword search (FTS5) and semantic search
-(`sqlite-vec` + local Ollama embeddings), then exposes that store as tool
-calls for a local Ollama-hosted chat model to query — instead of pasting
-message history into a prompt.
+over conversation chunks (`sqlite-vec` + local Ollama embeddings), then
+exposes that store as tool calls for a local Ollama-hosted chat model to
+query — instead of pasting message history into a prompt.
 
 See [`docs/DECISIONS.md`](docs/DECISIONS.md) for full architecture, rationale,
 schema, and known environment quirks ([`CLAUDE.md`](CLAUDE.md) is the short
@@ -21,8 +21,8 @@ python3 chat.py -p "who did I text most in June?"   # one-shot: answer one promp
 ```
 
 Requires a local `chat.db` (already present under `source_data/` for this
-project) and, for embeddings/chat, Ollama running `gemma4:26b-a4b-it-qat` and
-`gemma4:26b-a4b-it-qat` (`make ollama-start`).
+project) and, for embeddings/chat, Ollama (`make ollama-start`) running
+`nomic-embed-text` (embeddings) and `gemma4:26b-a4b-it-qat` (chat).
 
 ## Other commands
 

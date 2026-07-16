@@ -30,9 +30,14 @@ console = Console()
 SYSTEM_PROMPT = (
     "You are an assistant with access to the user's iMessage history through "
     "tool calls:\n"
-    "- search_messages_sql (filter by chat/sender/date)\n"
-    "- search_messages_fts (keyword search)\n"
-    "- search_messages_vec (semantic/topic search)\n"
+    "- search_messages_hybrid (keyword + semantic search over conversations -- "
+    "the best default search)\n"
+    "- search_conversations (semantic/topic search over conversation chunks)\n"
+    "- search_messages_fts (exact keyword/phrase search over messages)\n"
+    "- search_messages_sql (filter messages by chat/sender/date)\n"
+    "- find_similar_conversations (more conversations like a chunk_id)\n"
+    "- get_conversation (a chunk_id -> its full messages)\n"
+    "- get_message_context (messages before/after one message id)\n"
     "- get_chat_summary_stats (message counts for a chat)\n"
     "- search_contacts_by_name (name/org -> contact + their handle_ids)\n"
     "- list_chats (name/participant -> chat_id, or label a chat_id)\n"
@@ -41,10 +46,14 @@ SYSTEM_PROMPT = (
     "- get_full_messages (full untruncated text for one or more message ids, "
     "when a search result was truncated)\n"
     "When a question names a person or group, first use search_contacts_by_name "
-    "or list_chats to resolve it to the handle_id / chat_id the message-search "
-    "tools need. Message results already include a `sender` name, a `guid`, and "
-    "has_attachment. Message search results truncate long text -- use "
-    "get_full_messages with the message `id` if you need the complete content. "
+    "or list_chats to resolve it to the handle_id / chat_id / contact_id the "
+    "search tools need. For 'what did we say about X' or topic/analysis "
+    "questions, prefer search_messages_hybrid or search_conversations; their "
+    "results are conversation chunks with a truncated text preview -- expand a "
+    "promising chunk_id with get_conversation. For a single message hit, "
+    "get_message_context shows the surrounding exchange. Message results "
+    "already include a `sender` name, a `guid`, and has_attachment; use "
+    "get_full_messages with message `id`s if you need complete long texts. "
     "Always call a tool to look up message content before answering -- never "
     "guess or invent messages. Cite dates when relevant."
 )
@@ -87,7 +96,11 @@ OLLAMA_TOOLS = [
 TOOL_FUNCTIONS = {
     "search_messages_sql": query_tools.search_messages_sql,
     "search_messages_fts": query_tools.search_messages_fts,
-    "search_messages_vec": query_tools.search_messages_vec,
+    "search_conversations": query_tools.search_conversations,
+    "search_messages_hybrid": query_tools.search_messages_hybrid,
+    "find_similar_conversations": query_tools.find_similar_conversations,
+    "get_conversation": query_tools.get_conversation,
+    "get_message_context": query_tools.get_message_context,
     "get_chat_summary_stats": query_tools.get_chat_summary_stats,
     "search_contact_by_handle": query_tools.search_contact_by_handle,
     "search_contacts_by_name": query_tools.search_contacts_by_name,

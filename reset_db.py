@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Clears all data from imessage_analysis.db while preserving its schema
-(tables, FTS5, sqlite-vec virtual table). Does NOT touch chat.db /
-chat_snapshot.db. Run ingest.py afterward to repopulate.
+(tables, FTS5 triggers). The sqlite-vec chunk_vectors table is the one
+exception: it's dropped, not emptied, because its vector dimension is bound
+to the embedding model that built it -- ingest.py recreates it. Does NOT
+touch chat.db / chat_snapshot.db. Run ingest.py afterward to repopulate.
 """
 
 import argparse
@@ -14,7 +16,7 @@ TABLES = [
     # messages_fts is external-content FTS5 over messages; it's kept in
     # sync by triggers (messages_ai/ad/au) that fire when messages rows
     # change, so it must not be deleted separately/first here.
-    "message_vectors",
+    "chunks",
     "attachments",
     "reactions",
     "messages",
@@ -24,6 +26,12 @@ TABLES = [
     "chats",
     "ingest_state",
 ]
+
+# Dropped outright rather than emptied: their declared vector dimension is
+# bound to the embedding model that built them, and ingest.py recreates them
+# (build_vec_table) sized to whatever EMBED_MODEL is current. message_vectors
+# is the legacy per-message table, superseded by chunk_vectors.
+DROP_TABLES = ["chunk_vectors", "message_vectors"]
 
 
 def main() -> None:
@@ -60,6 +68,9 @@ def main() -> None:
         }
 
         conn.execute("PRAGMA foreign_keys = OFF")
+        for table in DROP_TABLES:
+            if table in existing:
+                conn.execute(f"DROP TABLE {table}")
         for table in TABLES:
             if table in existing:
                 conn.execute(f"DELETE FROM {table}")

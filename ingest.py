@@ -7,7 +7,9 @@ Pipeline:
   3. Join message/handle/chat/attachment tables into a normalized schema,
      enriching handles with contact names from ./address_book.abcddb if present
   4. Build an FTS5 index over message text
-  5. Build a sqlite-vec table and embed messages via local Ollama (gemma4:26b-a4b-it-qat)
+  5. Group messages into conversation chunks (session-gap + size splitting,
+     speaker labels, context header) and embed the chunks via local Ollama
+     (nomic-embed-text) into a sqlite-vec table
 
 Usage:
     python3 ingest.py                  # full pipeline
@@ -20,12 +22,31 @@ Usage:
 
 import argparse
 import datetime
+import http.client
+import json
+import re
 import sqlite3
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from config import ADDRESS_BOOK_PATH, SNAPSHOT_DB, SOURCE_DB, TARGET_DB
-from embed import build_vec_table, embed_messages
+import sqlite_vec
+
+from config import (
+    ADDRESS_BOOK_PATH,
+    CHUNK_GAP_MINUTES,
+    CHUNK_MAX_CHARS,
+    CHUNK_MIN_CHARS,
+    CHUNK_OVERLAP_MESSAGES,
+    EMBED_BATCH_SIZE,
+    EMBED_MAX_WORKERS,
+    EMBED_MODEL,
+    SNAPSHOT_DB,
+    SOURCE_DB,
+    TARGET_DB,
+)
+from db import CONTACT_LABEL_SQL, iso_to_day, load_vec_extension
+from embeddings import detect_embed_dim, embed_texts
 
 APPLE_EPOCH = datetime.datetime(2001, 1, 1)
 
@@ -179,7 +200,22 @@ CREATE TABLE IF NOT EXISTS messages (
     date_delivered TEXT,
     item_type INTEGER,
     is_emote INTEGER,
-    has_attachment INTEGER DEFAULT 0
+    has_attachment INTEGER DEFAULT 0,
+    chunk_id INTEGER              -- chunks.id whose text this message was rendered into
+);
+
+CREATE TABLE IF NOT EXISTS chunks (
+    -- AUTOINCREMENT so ids are never reused: tail chunks get deleted and
+    -- rebuilt on incremental runs, and a reused id could alias a stale
+    -- chunk_vectors row onto a different chunk.
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER,
+    first_message_id INTEGER,
+    last_message_id INTEGER,
+    first_date TEXT,
+    last_date TEXT,
+    n_messages INTEGER,
+    text TEXT                     -- composed conversation text, exactly as embedded
 );
 
 CREATE TABLE IF NOT EXISTS reactions (
@@ -207,6 +243,8 @@ CREATE TABLE IF NOT EXISTS ingest_state (
 
 CREATE INDEX IF NOT EXISTS idx_messages_chat_date ON messages(chat_id, date);
 CREATE INDEX IF NOT EXISTS idx_messages_handle ON messages(handle_id);
+CREATE INDEX IF NOT EXISTS idx_messages_chunk ON messages(chunk_id);
+CREATE INDEX IF NOT EXISTS idx_chunks_chat ON chunks(chat_id);
 CREATE INDEX IF NOT EXISTS idx_reactions_target ON reactions(target_message_guid);
 CREATE INDEX IF NOT EXISTS idx_handles_identifier ON handles(handle_identifier);
 CREATE INDEX IF NOT EXISTS idx_handles_contact_id ON handles(contact_id);
@@ -228,7 +266,10 @@ CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
     INSERT INTO messages_fts(messages_fts, rowid, text) VALUES ('delete', old.id, old.text);
 END;
 
-CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+-- UPDATE OF text (not any column): chunk building stamps chunk_id on every
+-- message, and an unscoped trigger would pointlessly rewrite the FTS entry
+-- for each of those updates.
+CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE OF text ON messages BEGIN
     INSERT INTO messages_fts(messages_fts, rowid, text) VALUES ('delete', old.id, old.text);
     INSERT INTO messages_fts(rowid, text) VALUES (new.id, new.text);
 END;
@@ -255,6 +296,16 @@ def create_schema(con: sqlite3.Connection):
         for col in ("first_name", "last_name", "nickname", "organization"):
             if col in existing_cols:
                 con.execute(f"ALTER TABLE handles DROP COLUMN {col}")
+
+    # Pre-chunking messages table: add chunk_id before SCHEMA runs, since
+    # SCHEMA creates idx_messages_chunk ON messages(chunk_id).
+    msg_cols = {row[1] for row in con.execute("PRAGMA table_info(messages)")}
+    if msg_cols and "chunk_id" not in msg_cols:
+        con.execute("ALTER TABLE messages ADD COLUMN chunk_id INTEGER")
+
+    # The update trigger used to fire on ANY messages update; drop it so
+    # FTS_SCHEMA recreates it scoped to UPDATE OF text (see comment there).
+    con.execute("DROP TRIGGER IF EXISTS messages_au")
 
     con.executescript(SCHEMA)
     con.executescript(FTS_SCHEMA)
@@ -511,6 +562,283 @@ def ingest_attachments(src, tgt, since_rowid=0, allowed_chat_ids=None):
 
 
 # ---------------------------------------------------------------------------
+# Conversation chunks
+# ---------------------------------------------------------------------------
+
+# A message contributes a line to a chunk if it has text or an attachment;
+# system events with neither stay chunk_id NULL and never trigger rebuilds.
+_RENDERABLE = "(m.text IS NOT NULL OR m.has_attachment = 1)"
+
+_MAX_HEADER_NAMES = 6
+
+
+def _chunk_header(who, first_date):
+    return f"Conversation with {who} on {first_date[:10]}:"
+
+
+def _render_line(labels, att_types, msg):
+    msg_id, is_from_me, handle_id, text, _date, _has_attachment = msg
+    sender = "Me" if is_from_me else (labels.get(handle_id) or "Unknown")
+    if text:
+        return f"{sender}: {text}"
+    kinds = att_types.get(msg_id)
+    return f"{sender}: [attachment: {', '.join(kinds)}]" if kinds else f"{sender}: [attachment]"
+
+
+def _chat_label(tgt, labels, chat_id):
+    """Header name for a chat: its display_name, else its participants."""
+    row = tgt.execute("SELECT display_name FROM chats WHERE id = ?", (chat_id,)).fetchone()
+    if row and row[0]:
+        return row[0]
+    names = [labels[r[0]] for r in tgt.execute(
+        "SELECT handle_id FROM chat_participants WHERE chat_id = ? ORDER BY handle_id",
+        (chat_id,)) if labels.get(r[0])]
+    if not names:
+        return "unknown"
+    label = ", ".join(names[:_MAX_HEADER_NAMES])
+    if len(names) > _MAX_HEADER_NAMES:
+        label += f" +{len(names) - _MAX_HEADER_NAMES} others"
+    return label
+
+
+def _flush_chunk(tgt, chat_id, who, chunk_msgs):
+    """Write one chunk row and stamp chunk_id on its messages. A message
+    carried into the next chunk by the size-split overlap keeps the first
+    chunk_id it was assigned (the `chunk_id IS NULL` guard)."""
+    first, last = chunk_msgs[0][0], chunk_msgs[-1][0]
+    text = "\n".join([_chunk_header(who, first[4])] + [line for _, line in chunk_msgs])
+    cur = tgt.execute(
+        "INSERT INTO chunks(chat_id, first_message_id, last_message_id, "
+        " first_date, last_date, n_messages, text) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (chat_id, first[0], last[0], first[4], last[4], len(chunk_msgs), text),
+    )
+    ids = [m[0] for m, _ in chunk_msgs]
+    placeholders = ",".join("?" * len(ids))
+    tgt.execute(
+        f"UPDATE messages SET chunk_id = ? WHERE chunk_id IS NULL AND id IN ({placeholders})",
+        [cur.lastrowid] + ids,
+    )
+
+
+def build_chunks(tgt: sqlite3.Connection, gap_minutes=CHUNK_GAP_MINUTES,
+                 max_chars=CHUNK_MAX_CHARS, overlap_messages=CHUNK_OVERLAP_MESSAGES):
+    """Group not-yet-chunked messages into conversation chunks: per chat,
+    ordered by (date, id), split when the gap between two messages exceeds
+    gap_minutes (a session boundary) or the composed text would exceed
+    max_chars (a size split, which carries the last overlap_messages messages
+    into the next chunk for continuity -- unless the carried text alone would
+    already overflow max_chars, in which case no overlap is carried so a
+    chunk can never consist solely of repeated messages). Chunk text is a
+    context header plus
+    one "{sender}: {text}" line per message, so speakers and participants are
+    part of what gets embedded.
+
+    Incremental behavior: a chat that received new messages has its final
+    chunk deleted and rebuilt from that chunk's first message, so a resumed
+    conversation extends one coherent chunk instead of splitting at the
+    ingest boundary. Chunks and their vectors are derived artifacts -- this
+    is the one deletion in the pipeline, and it never touches source-derived
+    rows. (If messages ever arrive with dates *earlier* than already-chunked
+    ones, they form their own chunk out of id order -- still a valid chunk,
+    just not merged into its older neighbors.)
+    """
+    pending_chats = [r[0] for r in tgt.execute(f"""
+        SELECT DISTINCT m.chat_id FROM messages m
+        WHERE m.chunk_id IS NULL AND m.chat_id IS NOT NULL
+          AND m.date IS NOT NULL AND {_RENDERABLE}
+    """)]
+    if not pending_chats:
+        print("Chunks up to date (0 built)")
+        return 0
+
+    labels = {row[0]: row[1] for row in tgt.execute(f"""
+        SELECT h.id, {CONTACT_LABEL_SQL} FROM handles h
+        LEFT JOIN contacts c ON c.id = h.contact_id
+    """)}
+    has_vec_table = tgt.execute(
+        "SELECT 1 FROM sqlite_master WHERE name = 'chunk_vectors'").fetchone() is not None
+
+    gap = datetime.timedelta(minutes=gap_minutes)
+    n_chunks_before = tgt.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    n_msgs = 0
+    for chat_id in pending_chats:
+        # Rebuild the chat's tail chunk so the pending messages extend it.
+        # The rebuild must re-include the tail's overlap prefix -- messages
+        # carried into it by a size split keep their *first* chunk's id, so
+        # `chunk_id IS NULL` alone would miss them; `id >= first_message_id`
+        # picks up exactly those (they stay stamped to their original chunk
+        # via _flush_chunk's NULL guard).
+        tail = tgt.execute(
+            "SELECT id, first_message_id FROM chunks "
+            "WHERE chat_id = ? ORDER BY id DESC LIMIT 1",
+            (chat_id,)).fetchone()
+        rebuild_cond, rebuild_params = "m.chunk_id IS NULL", []
+        if tail:
+            if has_vec_table:
+                tgt.execute("DELETE FROM chunk_vectors WHERE chunk_id = ?", (tail[0],))
+            tgt.execute("UPDATE messages SET chunk_id = NULL WHERE chunk_id = ?", (tail[0],))
+            tgt.execute("DELETE FROM chunks WHERE id = ?", (tail[0],))
+            rebuild_cond = "(m.chunk_id IS NULL OR m.id >= ?)"
+            rebuild_params = [tail[1]]
+
+        rows = tgt.execute(f"""
+            SELECT m.id, m.is_from_me, m.handle_id, m.text, m.date, m.has_attachment
+            FROM messages m
+            WHERE m.chat_id = ? AND {rebuild_cond} AND m.date IS NOT NULL
+              AND {_RENDERABLE}
+            ORDER BY m.date, m.id
+        """, [chat_id] + rebuild_params).fetchall()
+        if not rows:
+            continue
+
+        att_types = {}
+        for msg_id, kind in tgt.execute(f"""
+            SELECT a.message_id, COALESCE(a.mime_type, a.transfer_name, 'file')
+            FROM attachments a JOIN messages m ON m.id = a.message_id
+            WHERE m.chat_id = ? AND {rebuild_cond}
+        """, [chat_id] + rebuild_params):
+            att_types.setdefault(msg_id, []).append(kind)
+
+        who = _chat_label(tgt, labels, chat_id)
+        chunk_msgs, cur_len, prev_dt = [], 0, None
+        for msg in rows:
+            line = _render_line(labels, att_types, msg)
+            dt = datetime.datetime.fromisoformat(msg[4])
+            if chunk_msgs and dt - prev_dt > gap:
+                _flush_chunk(tgt, chat_id, who, chunk_msgs)
+                chunk_msgs, cur_len = [], 0  # session boundary: no overlap carried
+            elif chunk_msgs and cur_len + len(line) + 1 > max_chars:
+                _flush_chunk(tgt, chat_id, who, chunk_msgs)
+                chunk_msgs = chunk_msgs[-overlap_messages:] if overlap_messages else []
+                cur_len = sum(len(li) + 1 for _, li in chunk_msgs)
+                if cur_len + len(line) + 1 > max_chars:
+                    # Oversized overlap (very long messages): carrying it would
+                    # immediately overflow again and flush a chunk made only of
+                    # already-chunked repeats -- start clean instead.
+                    chunk_msgs, cur_len = [], 0
+            chunk_msgs.append((msg, line))
+            cur_len += len(line) + 1
+            prev_dt = dt
+        if chunk_msgs:
+            _flush_chunk(tgt, chat_id, who, chunk_msgs)
+        n_msgs += len(rows)
+
+    tgt.commit()
+    n_built = tgt.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] - n_chunks_before
+    print(f"Built {n_built} conversation chunks covering {n_msgs} messages "
+          f"({len(pending_chats)} chats)")
+    return n_built
+
+
+# ---------------------------------------------------------------------------
+# Embeddings (sqlite-vec + Ollama)
+# ---------------------------------------------------------------------------
+
+def build_vec_table(tgt: sqlite3.Connection, dim: int):
+    """Create chunk_vectors sized to the model's (detected) embedding
+    dimension. Refuses to proceed if existing vectors were built by a
+    different model or at a different dimension -- mixing embedding spaces
+    silently corrupts search. Also drops the legacy per-message
+    message_vectors table (replaced by chunk-level embeddings)."""
+    load_vec_extension(tgt)
+    tgt.execute("DROP TABLE IF EXISTS message_vectors")
+
+    existing = tgt.execute(
+        "SELECT sql FROM sqlite_master WHERE name = 'chunk_vectors'").fetchone()
+    prev_model = get_state(tgt, "embed_model")
+    if existing:
+        match = re.search(r"FLOAT\[(\d+)\]", existing[0], re.IGNORECASE)
+        existing_dim = int(match.group(1)) if match else None
+        if existing_dim != dim or (prev_model and prev_model != EMBED_MODEL):
+            n_vectors = tgt.execute("SELECT COUNT(*) FROM chunk_vectors").fetchone()[0]
+            if n_vectors:
+                raise SystemExit(
+                    f"chunk_vectors holds {n_vectors} vectors from "
+                    f"{prev_model or 'an unknown model'} (dim {existing_dim}), but "
+                    f"EMBED_MODEL is now {EMBED_MODEL} (dim {dim}). Mixing embedding "
+                    f"spaces corrupts search -- run reset_db.py and re-ingest."
+                )
+            tgt.execute("DROP TABLE chunk_vectors")
+
+    # chat_id / first_day / last_day are vec0 *metadata columns*: sqlite-vec
+    # (>= 0.1.6) applies WHERE constraints on them inside the KNN scan, so
+    # scoped/date-bounded semantic search needs no over-fetch + post-filter.
+    # Days are integers (db.iso_to_day) -- TEXT metadata longer than 12 bytes
+    # is slow to filter on. cosine, not the L2 default: gemma4's mean-pooled
+    # embeddings aren't length-normalized.
+    tgt.execute(f"""
+        CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vectors USING vec0(
+            chunk_id INTEGER PRIMARY KEY,
+            embedding FLOAT[{dim}] distance_metric=cosine,
+            chat_id INTEGER,
+            first_day INTEGER,
+            last_day INTEGER
+        )
+    """)
+    set_state(tgt, "embed_model", EMBED_MODEL)
+    set_state(tgt, "embed_dim", dim)
+
+
+def embed_chunks(
+    tgt: sqlite3.Connection,
+    min_chars=CHUNK_MIN_CHARS,
+    batch_size=EMBED_BATCH_SIZE,
+    max_workers=EMBED_MAX_WORKERS,
+    batch_log_every=200,
+):
+    rows = tgt.execute("""
+        SELECT c.id, c.chat_id, c.first_date, c.last_date, c.text
+        FROM chunks c
+        LEFT JOIN chunk_vectors v ON v.chunk_id = c.id
+        WHERE v.chunk_id IS NULL
+          AND length(c.text) >= ?
+    """, (min_chars,)).fetchall()
+
+    print(f"Embedding {len(rows)} conversation chunks via Ollama ({EMBED_MODEL})...")
+    batches = [rows[i:i + batch_size] for i in range(0, len(rows), batch_size)]
+
+    def process(batch):
+        return batch, embed_texts([r[4] for r in batch], kind="document")
+
+    n_done, n_err, n_processed, n_logged = 0, 0, 0, 0
+    pool = ThreadPoolExecutor(max_workers=max_workers)
+    try:
+        future_to_batch = {pool.submit(process, batch): batch for batch in batches}
+        for future in as_completed(future_to_batch):
+            batch = future_to_batch[future]
+            try:
+                batch, vecs = future.result()
+            except (http.client.HTTPException, OSError, RuntimeError, json.JSONDecodeError):
+                n_err += len(batch)
+                continue
+            tgt.executemany(
+                "INSERT OR REPLACE INTO chunk_vectors"
+                "(chunk_id, embedding, chat_id, first_day, last_day) VALUES (?, ?, ?, ?, ?)",
+                [(chunk_id, sqlite_vec.serialize_float32(vec), chat_id,
+                  iso_to_day(first_date), iso_to_day(last_date))
+                 for (chunk_id, chat_id, first_date, last_date, _), vec in zip(batch, vecs)],
+            )
+            n_done += len(batch)
+            n_processed += len(batch)
+            if n_processed - n_logged >= batch_log_every:
+                tgt.commit()
+                print(f"  ...{n_processed}/{len(rows)}")
+                n_logged = n_processed
+    except KeyboardInterrupt:
+        # Don't wait on in-flight worker threads (each blocked on an Ollama
+        # HTTP call) -- drop anything not yet started and commit whatever
+        # finished so it isn't lost.
+        print("\nInterrupted -- cancelling remaining embedding batches...")
+        pool.shutdown(wait=False, cancel_futures=True)
+        tgt.commit()
+        print(f"Embedded {n_done} chunks before interrupt ({n_err} errors)")
+        raise
+    pool.shutdown(wait=True)
+    tgt.commit()
+    print(f"Embedded {n_done} chunks ({n_err} errors)")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -534,6 +862,10 @@ def main():
     try:
         tgt = sqlite3.connect(TARGET_DB)
         try:
+            # Loaded unconditionally (not just before embedding): the chunk
+            # builder deletes a rebuilt tail chunk's row from chunk_vectors,
+            # which needs the vec0 module registered even under --no-embed.
+            load_vec_extension(tgt)
             # Enforce the handles.contact_id -> contacts(id) FK. Must run
             # before any transaction is opened, so it's issued right after
             # connecting and before any DML.
@@ -561,9 +893,20 @@ def main():
             ingest_attachments(src, tgt, since_rowid, allowed_chat_ids)
             tgt.commit()
 
+            # Chunk building is cheap and local -- always runs. Only the
+            # Ollama embedding pass is gated by --no-embed.
+            build_chunks(tgt)
+
             if not args.no_embed:
-                build_vec_table(tgt)
-                embed_messages(tgt)
+                try:
+                    dim = detect_embed_dim()
+                except (http.client.HTTPException, OSError, RuntimeError) as e:
+                    raise SystemExit(
+                        f"Cannot reach Ollama to embed ({e}) -- is it running? "
+                        f"Re-run with --no-embed to skip embedding."
+                    ) from None
+                build_vec_table(tgt, dim)
+                embed_chunks(tgt)
                 tgt.commit()
             else:
                 print("Skipping embedding step (--no-embed)")
