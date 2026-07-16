@@ -95,7 +95,28 @@ targeted retrieval.
   **Result on real data: 0 decode failures across all ~350k non-reaction
   messages.**
 - **Timestamps are nanoseconds since 2001-01-01** ("Mac absolute time"), not
-  Unix epoch — converted via `apple_ns_to_iso()` in `ingest.py`.
+  Unix epoch — converted via `apple_ns_to_iso()` in `ingest.py`. **The resulting ISO
+  strings are UTC with no offset suffix** — `apple_ns_to_iso` does
+  `APPLE_EPOCH + timedelta(...)` on a naive `datetime` (no `tzinfo`,
+  no `.astimezone()`), and since Apple's Mac-absolute-time reference date
+  (2001-01-01 00:00:00) is itself defined in UTC, the naive arithmetic result is
+  numerically UTC — it's just missing the `Z`/`+00:00` marker that would say so.
+  Because they're compared as plain strings, `date_from`/`date_to` bounds must be
+  normalized before they reach SQL — `query_tools.py::_normalize_date_bound` does
+  this for both `search_messages_sql` and `get_chat_summary_stats`: it parses the
+  bound, converts a tz-aware one (`...-05:00`, `...Z`) to naive UTC, and returns an
+  upper bound **half-open**, advanced by one unit of whatever granularity the caller
+  wrote (`_date_bound_step`), so `date_to='2026-01-02'` becomes `date <
+  '2026-01-03T00:00:00'` and covers the whole day. A bare `date <= '2026-01-02'`
+  would instead match only exactly midnight and silently drop the day — the bug this
+  guards against. An unparseable bound raises `ValueError` (surfaced to the model as
+  a tool error) rather than quietly matching nothing. **Normalize the parameter, never
+  the column**: wrapping `date` in a SQL function would discard
+  `idx_messages_chat_date`, and SQLite's `datetime()` emits a space-separated,
+  second-truncated string that mis-compares against these `T`-separated stored
+  values anyway. `chat.py`'s system prompt (`_build_system_prompt()`) still tells the
+  model the current UTC time each turn — it can't know "now" otherwise — but UTC
+  conversion is now a hint, not what correctness rests on.
 - **No single table has a full message record** — had to join `message` +
   `handle` (sender) + `chat_message_join` (message→chat, not a direct FK on
   `message`) + `chat_handle_join` (chat participants, for group threads) +
@@ -191,13 +212,31 @@ targeted retrieval.
   `query` substring match. `get_message_reactions` batches over a list of
   guids, tagging each returned row with its `target_message_guid`.
   `get_chat_summary_stats` requires at least one of `chat_id`/`handle_id`/
-  `contact_id` (raises `ValueError` otherwise). Includes `TOOL_DEFINITIONS` —
+  `contact_id` (raises `ValueError` otherwise), and returns `attachment_count`/
+  `reaction_count` alongside the message counts/date range; takes an optional
+  `is_from_me` filter (narrows to only sent or only received messages), an
+  optional `date_from`/`date_to` range, and an optional `group_by_chat` flag
+  (returns one row per `chat_id` instead of a single pooled total, for
+  comparing activity across chats). `attachment_count` counts rows in
+  `attachments` joined through `messages` — individual attachments, so a message
+  carrying three photos counts three, not one. **Every filter scopes all three
+  counts alike**: `messages`, `reactions`, and `attachments`-through-`messages`
+  all expose the same `chat_id`/`handle_id`/`is_from_me`/`date` columns, so each
+  table's WHERE is built from the one prefix-parameterized `_stats_filters()`
+  helper — that's what keeps `is_from_me=True` meaning "messages, attachments,
+  and reactions I sent" rather than narrowing only the message count. Both
+  count subqueries sit in the SELECT list ahead of the WHERE, so their params
+  bind first (`att_params + reaction_params + params`); under `group_by_chat`
+  they correlate on the outer `messages.chat_id` and therefore re-apply only the
+  handle/is_from_me/date filters, not `chat_ids`. Includes `TOOL_DEFINITIONS` —
   tool-schema definitions (used by `chat.py`, and directly usable as Claude
   `tool_use` schemas); id params use JSON Schema's `"type": ["integer",
   "array"]` form so both scalar and list calls validate.
 - **`chat.py`** — interactive CLI that chats over the iMessage history via a
   local Ollama-hosted `gemma4:26b-a4b-it-qat`, wiring
   `query_tools.TOOL_DEFINITIONS` into a tool-calling loop (`run_turn` drives
+  up to `MAX_TOOL_ITERATIONS` tool round-trips per user turn — default 20 —
+  calling all eight `query_tools` functions). The model name, host, timeouts,
   up to `MAX_TOOL_ITERATIONS` tool round-trips per user turn — default 20 —
   calling all nine `query_tools` functions). If that budget is exhausted,
   `run_turn` makes one extra answer-only request with the tool schemas
@@ -211,7 +250,16 @@ targeted retrieval.
   tool set, telling the model to resolve a person/group name to a
   handle_id/chat_id (via `search_contacts_by_name` / `list_chats`) before
   message search. This is the realized version of the tool-calling loop listed
-  under "Next steps" below.
+  under "Next steps" below. `_build_system_prompt()` appends the current UTC
+  date/time (computed fresh each call, not baked into the static
+  `SYSTEM_PROMPT` constant) plus an explicit UTC-conversion instruction, and is
+  called at both places the message list is (re)built (session start and
+  `/clear`) — needed because the model has no other way to know today's date,
+  which it must have to resolve "yesterday"/"this morning" into a bound at all.
+  The UTC-conversion half of that instruction is now belt-and-braces rather than
+  load-bearing: `_normalize_date_bound` (see "Key technical findings" above)
+  accepts an offset-carrying bound and converts it itself, so a model that
+  forgets to convert still gets a correct answer.
 - **`reset_db.py`** — clears all data rows from `imessage_analysis.db` while
   preserving the schema (tables, FTS5 triggers, `sqlite-vec` table); does NOT
   touch `chat.db`/`chat_snapshot.db`. Deletes in FK-safe order and guards
@@ -337,7 +385,9 @@ and `ruff==0.15.21` (linting, see below); everything else is stdlib.
 
 `ruff check .` (config in `pyproject.toml`: `line-length = 100`,
 `select = ["E", "F"]`), or `make lint`. Runs in CI as the `lint` job in
-`.github/workflows/ci.yml`, alongside the existing `compile-check` job.
+`.github/workflows/ci.yml`, alongside the `compile-check` and `test` jobs
+(the latter runs `python -m unittest discover tests` — hermetic, no Ollama
+or real `chat.db` needed).
 
 ## Next steps / not yet built
 

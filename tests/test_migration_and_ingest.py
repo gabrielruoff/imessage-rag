@@ -143,24 +143,43 @@ class QueryToolsTest(unittest.TestCase):
             )
             con.execute("INSERT INTO chat_participants(chat_id, handle_id) VALUES (100, 50)")
             con.execute("INSERT INTO chat_participants(chat_id, handle_id) VALUES (101, 51)")
+            # 1001 sits mid-day with sub-second precision, matching how
+            # apple_ns_to_iso really stores dates -- an all-midnight fixture
+            # can't tell an inclusive date_to from one that drops the day.
             con.executemany(
                 "INSERT INTO messages(id, guid, chat_id, handle_id, is_from_me, text, "
-                "date, has_attachment) VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
+                "date, has_attachment) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 [
-                    (1000, "guid-1000", 100, 50, 0, "hi from phone", "2026-01-01T00:00:00"),
-                    (1001, "guid-1001", 100, 50, 1, "hi back", "2026-01-02T00:00:00"),
-                    (1002, "guid-1002", 101, 51, 0, "hi from email in group", "2026-01-03T00:00:00"),
+                    (1000, "guid-1000", 100, 50, 0, "hi from phone",
+                     "2026-01-01T00:00:00", 0),
+                    (1001, "guid-1001", 100, 50, 1, "hi back",
+                     "2026-01-02T13:46:50.648660", 1),
+                    (1002, "guid-1002", 101, 51, 0, "hi from email in group",
+                     "2026-01-03T00:00:00", 1),
                 ],
             )
-            con.execute(
-                "INSERT INTO reactions(id, target_message_guid, chat_id, handle_id, "
-                "is_from_me, associated_message_type, date) VALUES "
-                "(2000, 'guid-1000', 100, 50, 0, 2000, '2026-01-01T00:05:00')"
+            # Two attachments on one message, so attachment_count can't be
+            # mistaken for a count of messages-carrying-attachments.
+            con.executemany(
+                "INSERT INTO attachments(id, message_id, filename, mime_type, transfer_name) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [
+                    (3000, 1001, "/tmp/a.jpg", "image/jpeg", "a.jpg"),
+                    (3001, 1001, "/tmp/b.jpg", "image/jpeg", "b.jpg"),
+                    (3002, 1002, "/tmp/c.pdf", "application/pdf", "c.pdf"),
+                ],
             )
-            con.execute(
+            # Reaction 2002 is_from_me=1 carries the counterparty's handle_id,
+            # matching real ingested data -- that's what makes handle/contact
+            # scoping work for messages and reactions I sent.
+            con.executemany(
                 "INSERT INTO reactions(id, target_message_guid, chat_id, handle_id, "
-                "is_from_me, associated_message_type, date) VALUES "
-                "(2001, 'guid-1002', 101, 51, 0, 2000, '2026-01-03T00:05:00')"
+                "is_from_me, associated_message_type, date) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (2000, "guid-1000", 100, 50, 0, 2000, "2026-01-01T00:05:00"),
+                    (2001, "guid-1002", 101, 51, 0, 2000, "2026-01-03T00:05:00"),
+                    (2002, "guid-1000", 100, 50, 1, 2000, "2026-01-01T00:06:00"),
+                ],
             )
             con.commit()
         finally:
@@ -229,9 +248,10 @@ class QueryToolsTest(unittest.TestCase):
             query_tools.get_chat_summary_stats()
 
     def test_get_message_reactions_single_guid_still_works(self):
+        # guid-1000 carries two reactions (theirs and mine) -- see setUp.
         rows = query_tools.get_message_reactions("guid-1000")
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["target_message_guid"], "guid-1000")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({r["target_message_guid"] for r in rows}, {"guid-1000"})
 
     def test_get_message_reactions_batch_guids(self):
         rows = query_tools.get_message_reactions(["guid-1000", "guid-1002"])
@@ -245,6 +265,150 @@ class QueryToolsTest(unittest.TestCase):
 
         rows = query_tools.search_messages_fts("email", contact_id=2)
         self.assertEqual({r["id"] for r in rows}, {1002})
+
+    def test_get_chat_summary_stats_counts_individual_attachments(self):
+        stats = query_tools.get_chat_summary_stats(chat_id=100)
+        self.assertEqual(stats["message_count"], 2)
+        # Chat 100 has one message carrying attachments, but two attachments on
+        # it -- attachment_count counts the attachments, not the messages.
+        self.assertEqual(stats["attachment_count"], 2)
+        # chat 100 has two reactions, both on guid-1000 (see setUp).
+        self.assertEqual(stats["reaction_count"], 2)
+
+    def test_get_chat_summary_stats_is_from_me_filters(self):
+        stats = query_tools.get_chat_summary_stats(chat_id=100, is_from_me=True)
+        self.assertEqual(stats["message_count"], 1)
+        self.assertEqual(stats["from_me"], 1)
+        self.assertEqual(stats["from_them"], 0)
+
+    def test_get_chat_summary_stats_is_from_me_scopes_every_count(self):
+        # is_from_me narrows attachments and reactions too, not just messages:
+        # of chat 100's two reactions only 2002 is mine, and both attachments
+        # hang off 1001, which I sent.
+        mine = query_tools.get_chat_summary_stats(chat_id=100, is_from_me=True)
+        self.assertEqual(mine["reaction_count"], 1)
+        self.assertEqual(mine["attachment_count"], 2)
+
+        theirs = query_tools.get_chat_summary_stats(chat_id=100, is_from_me=False)
+        self.assertEqual(theirs["reaction_count"], 1)
+        self.assertEqual(theirs["attachment_count"], 0)
+
+    def test_get_chat_summary_stats_group_by_chat(self):
+        rows = query_tools.get_chat_summary_stats(chat_id=[100, 101], group_by_chat=True)
+        by_chat = {r["chat_id"]: r for r in rows}
+        self.assertEqual(set(by_chat), {100, 101})
+        self.assertEqual(by_chat[100]["message_count"], 2)
+        self.assertEqual(by_chat[100]["reaction_count"], 2)
+        self.assertEqual(by_chat[100]["attachment_count"], 2)
+        self.assertEqual(by_chat[101]["message_count"], 1)
+        self.assertEqual(by_chat[101]["reaction_count"], 1)
+        self.assertEqual(by_chat[101]["attachment_count"], 1)
+
+    def test_get_chat_summary_stats_date_range_filters(self):
+        # chat 100: msg 1000 @ 2026-01-01T00:00:00 (reactions @ 00:05, 00:06),
+        # msg 1001 @ 2026-01-02T13:46:50.648660 (see setUp). date_from excludes
+        # 1000 and both its reactions.
+        stats = query_tools.get_chat_summary_stats(chat_id=100, date_from="2026-01-02")
+        self.assertEqual(stats["message_count"], 1)
+        self.assertEqual(stats["reaction_count"], 0)
+
+        # A bare date_to covers the whole day named -- no T23:59:59 needed.
+        stats = query_tools.get_chat_summary_stats(chat_id=100, date_to="2026-01-01")
+        self.assertEqual(stats["message_count"], 1)
+        self.assertEqual(stats["reaction_count"], 2)
+
+    def test_get_chat_summary_stats_group_by_chat_respects_date_range(self):
+        rows = query_tools.get_chat_summary_stats(
+            chat_id=[100, 101], date_from="2026-01-02", group_by_chat=True
+        )
+        by_chat = {r["chat_id"]: r for r in rows}
+        self.assertEqual(by_chat[100]["message_count"], 1)
+        self.assertEqual(by_chat[100]["reaction_count"], 0)
+        self.assertEqual(by_chat[101]["message_count"], 1)
+        self.assertEqual(by_chat[101]["reaction_count"], 1)
+
+    def test_search_messages_sql_date_from_supports_full_datetime(self):
+        rows = query_tools.search_messages_sql(chat_id=100, date_from="2026-01-01T12:00:00")
+        self.assertEqual({r["id"] for r in rows}, {1001})
+
+    def test_search_messages_sql_bare_date_to_covers_whole_day(self):
+        # The regression: 1001 sits at 13:46 on Jan 2, so a date_to of
+        # '2026-01-02' compared as a plain string would drop it.
+        rows = query_tools.search_messages_sql(chat_id=100, date_to="2026-01-02")
+        self.assertEqual({r["id"] for r in rows}, {1000, 1001})
+
+    def test_search_messages_sql_single_day_range(self):
+        # date_from == date_to is how "what did we say on Jan 2" arrives.
+        rows = query_tools.search_messages_sql(
+            chat_id=100, date_from="2026-01-02", date_to="2026-01-02"
+        )
+        self.assertEqual({r["id"] for r in rows}, {1001})
+
+    def test_date_to_is_inclusive_of_the_unit_named(self):
+        # 1001 is at 13:46:50.648660. A second-granularity bound includes its
+        # own second; the second before it does not.
+        rows = query_tools.search_messages_sql(chat_id=100, date_to="2026-01-02T13:46:50")
+        self.assertIn(1001, {r["id"] for r in rows})
+
+        rows = query_tools.search_messages_sql(chat_id=100, date_to="2026-01-02T13:46:49")
+        self.assertNotIn(1001, {r["id"] for r in rows})
+
+    def test_date_bounds_accept_utc_offset(self):
+        # 08:46:50-05:00 is the same instant as the stored 13:46:50 UTC, so an
+        # offset bound must select exactly what its UTC equivalent selects --
+        # the tool converts rather than trusting the caller to have done it.
+        offset = query_tools.search_messages_sql(
+            chat_id=100, date_from="2026-01-02T08:46:50-05:00"
+        )
+        utc = query_tools.search_messages_sql(chat_id=100, date_from="2026-01-02T13:46:50")
+        self.assertEqual({r["id"] for r in offset}, {r["id"] for r in utc})
+        self.assertEqual({r["id"] for r in offset}, {1001})
+
+    def test_date_bounds_accept_z_suffix(self):
+        rows = query_tools.search_messages_sql(chat_id=100, date_from="2026-01-02T13:46:50Z")
+        self.assertEqual({r["id"] for r in rows}, {1001})
+
+    def test_date_to_with_space_separator_keeps_second_granularity(self):
+        # fromisoformat accepts a space in place of 'T'. The bound must not be
+        # mistaken for a bare date and advanced by a whole day -- '...13:46:49'
+        # names a second, so 1001 at 13:46:50.648660 sits outside it.
+        rows = query_tools.search_messages_sql(chat_id=100, date_to="2026-01-02 13:46:49")
+        self.assertNotIn(1001, {r["id"] for r in rows})
+
+        rows = query_tools.search_messages_sql(chat_id=100, date_to="2026-01-02 13:46:50")
+        self.assertIn(1001, {r["id"] for r in rows})
+
+    def test_date_to_with_comma_decimal_mark_keeps_microsecond_granularity(self):
+        # ISO 8601 allows ',' as the decimal mark and fromisoformat accepts it.
+        # A fractional bound advances by 1 microsecond, so ',648659' ends just
+        # before 1001's .648660 -- a seconds-granularity misread would let a
+        # whole extra second in.
+        rows = query_tools.search_messages_sql(
+            chat_id=100, date_to="2026-01-02T13:46:50,648659"
+        )
+        self.assertNotIn(1001, {r["id"] for r in rows})
+
+    def test_date_to_compact_form_keeps_second_granularity(self):
+        # Compact ISO ('20260102T134649') has no colons to count -- it must
+        # still read as second granularity, not hour.
+        rows = query_tools.search_messages_sql(chat_id=100, date_to="20260102T134649")
+        self.assertNotIn(1001, {r["id"] for r in rows})
+
+        rows = query_tools.search_messages_sql(chat_id=100, date_to="20260102T134650")
+        self.assertIn(1001, {r["id"] for r in rows})
+
+    def test_malformed_date_bound_raises_rather_than_matching_nothing(self):
+        # A silent empty result would read as "no messages that day" to the
+        # model; the ValueError reaches it as a tool error instead.
+        with self.assertRaises(ValueError):
+            query_tools.search_messages_sql(chat_id=100, date_from="last tuesday")
+        with self.assertRaises(ValueError):
+            query_tools.get_chat_summary_stats(chat_id=100, date_to="01/02/2026")
+
+    def test_get_chat_summary_stats_group_by_chat_with_empty_scope(self):
+        self.assertEqual(
+            query_tools.get_chat_summary_stats(contact_id=999, group_by_chat=True), []
+        )
 
 
 if __name__ == "__main__":

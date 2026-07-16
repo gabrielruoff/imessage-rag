@@ -6,6 +6,7 @@ Usage:
     .venv/bin/python3 chat.py
 """
 
+import datetime
 import http.client
 import json
 import readline  # noqa: F401 — enables arrow-key/history line editing in input()
@@ -50,6 +51,23 @@ SYSTEM_PROMPT = (
     "Always call a tool to look up message content before answering -- never "
     "guess or invent messages. Cite dates when relevant."
 )
+
+def _build_system_prompt():
+    """SYSTEM_PROMPT plus the current UTC date/time, computed fresh each time --
+    message dates in the DB are stored as unlabeled-UTC ISO strings (see
+    query_tools.search_messages_sql's docstring), so the model needs both
+    'what time is it now' and 'the DB is UTC, not local' to correctly convert a
+    timezone-relative request (e.g. '1-3pm EST yesterday') before calling
+    date_from/date_to on search_messages_sql or get_chat_summary_stats."""
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return (
+        f"{SYSTEM_PROMPT}\n\n"
+        f"The current date/time is {now} (UTC). All message dates in the "
+        "database, and the date_from/date_to arguments those tools take, are "
+        "UTC with no offset suffix -- if the user's question is relative to a "
+        "timezone or to 'now' (e.g. 'yesterday', '3pm EST', 'this morning'), "
+        "convert it to UTC before calling the tool."
+    )
 
 FINAL_TURN_NOTE = (
     "This is your final turn -- no tool calls remain. Answer the user now using only "
@@ -183,7 +201,7 @@ def run_turn(messages):
 
 
 def main():
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages = [{"role": "system", "content": _build_system_prompt()}]
     print(f"Chatting with your iMessage history ({CHAT_MODEL} via Ollama). Ctrl+C to quit.")
     print("Commands: /clear (reset conversation)\n")
     while True:
@@ -195,7 +213,7 @@ def main():
         if not user_input:
             continue
         if user_input == "/clear":
-            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+            messages = [{"role": "system", "content": _build_system_prompt()}]
             console.print("[dim]conversation cleared[/dim]\n")
             continue
         messages.append({"role": "user", "content": user_input})

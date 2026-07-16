@@ -12,6 +12,7 @@ results -- never the whole table.
 """
 
 import contextlib
+import datetime
 import json
 import sqlite3
 import urllib.error
@@ -113,6 +114,58 @@ def _append_id_filters(clauses, params, chat_ids, handle_ids, prefix="m."):
             params.extend(cparams)
 
 
+def _date_bound_step(value):
+    """How far to advance an upper date bound: one unit of the smallest field
+    the caller actually wrote. Read off the raw string because fromisoformat
+    parses '2026-01-02' and '2026-01-02T00:00:00' into the same datetime.
+
+    fromisoformat accepts any single character as the date/time separator (it
+    is isoformat(sep=...)'s inverse -- '2026-01-02 13:46:50' parses fine), so
+    the time part is found positionally, after the 10-char extended date or
+    8-char compact date, not by splitting on 'T'."""
+    time_part = value[11:] if "-" in value[:5] else value[9:]
+    for sep in ("+", "-", "Z", "z"):          # drop any UTC offset suffix
+        time_part = time_part.partition(sep)[0]
+    if not time_part:
+        return datetime.timedelta(days=1)
+    if "." in time_part or "," in time_part:  # ISO allows a comma decimal mark
+        return datetime.timedelta(microseconds=1)
+    return {
+        2: datetime.timedelta(hours=1),       # '13' / compact or extended
+        4: datetime.timedelta(minutes=1),     # '13:46' / '1346'
+        6: datetime.timedelta(seconds=1),     # '13:46:50' / '134650'
+    }.get(len(time_part.replace(":", "")), datetime.timedelta(seconds=1))
+
+
+def _normalize_date_bound(value, upper=False):
+    """Parse an ISO date/datetime into the unlabeled-UTC string form the `date`
+    columns are stored in (see the module docstring on storage format).
+
+    An upper bound comes back half-open -- advanced by one unit of whatever
+    granularity the caller wrote -- so date_to='2026-01-02' means "through the
+    end of Jan 2" and pairs with `date < ?`. Compared as a plain string, a bare
+    date would otherwise match only exactly midnight and silently drop the day.
+
+    A tz-aware bound ('...-05:00', '...Z') is converted to UTC here, so a caller
+    that skips the conversion still gets a correct answer. An unparseable bound
+    raises ValueError rather than quietly matching nothing.
+    """
+    if value is None:
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"invalid ISO date {value!r}: expected '2026-01-02' or "
+            f"'2026-01-02T13:00:00' (optionally with a UTC offset) -- {e}"
+        ) from None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    if upper:
+        parsed += _date_bound_step(value)
+    return parsed.isoformat()
+
+
 def _resolve_handle_filter(con, handle_id, contact_id):
     """Merge handle_id and contact_id (each scalar-or-list-or-None) into a
     single normalized handle_id list, resolving contact_id through handles."""
@@ -140,7 +193,13 @@ def search_messages_sql(chat_id=None, handle_id=None, contact_id=None, is_from_m
     """Structured filter search -- no text matching, just facets. chat_id and
     handle_id each accept a single id or a list of ids. contact_id (single or
     list) scopes to a person across every handle they own -- the way to search
-    one person's messages regardless of which phone/email/chat they used."""
+    one person's messages regardless of which phone/email/chat they used.
+    date_from/date_to accept an ISO date ('2026-01-01') or full ISO datetime
+    ('2026-01-01T13:00:00') -- a full datetime narrows to a time-of-day range,
+    not just a day. date_to covers the whole unit named, so date_to='2026-01-01'
+    includes all of Jan 1. Message dates are stored in UTC; a bound carrying an
+    offset ('2026-01-01T13:00:00-05:00', '...Z') is converted to UTC for you,
+    and a bound without one is taken as already-UTC."""
     limit = max(1, min(limit, MAX_MESSAGE_LIMIT))
 
     with contextlib.closing(_connect()) as con:
@@ -155,10 +214,10 @@ def search_messages_sql(chat_id=None, handle_id=None, contact_id=None, is_from_m
             params.append(int(is_from_me))
         if date_from is not None:
             clauses.append("m.date >= ?")
-            params.append(date_from)
+            params.append(_normalize_date_bound(date_from))
         if date_to is not None:
-            clauses.append("m.date <= ?")
-            params.append(date_to)
+            clauses.append("m.date < ?")
+            params.append(_normalize_date_bound(date_to, upper=True))
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         sql = f"""
@@ -434,12 +493,48 @@ def get_full_messages(ids):
     return [dict(r) for r in rows]
 
 
-def get_chat_summary_stats(chat_id=None, handle_id=None, contact_id=None):
+_ZERO_STATS = {"message_count": 0, "first_message": None, "last_message": None,
+               "from_me": 0, "from_them": 0, "attachment_count": 0, "reaction_count": 0}
+
+
+def _stats_filters(prefix, chat_ids, handle_ids, is_from_me, date_from, date_to):
+    """(clauses, params) scoping one table of the stats query. messages,
+    reactions, and attachments-joined-through-messages all expose the same
+    chat_id/handle_id/is_from_me/date columns, so building each table's filter
+    from here keeps every count on a row describing the same slice."""
+    clauses, params = [], []
+    _append_id_filters(clauses, params, chat_ids, handle_ids, prefix=prefix)
+    if is_from_me is not None:
+        clauses.append(f"{prefix}is_from_me = ?")
+        params.append(int(is_from_me))
+    if date_from is not None:
+        clauses.append(f"{prefix}date >= ?")
+        params.append(_normalize_date_bound(date_from))
+    if date_to is not None:
+        clauses.append(f"{prefix}date < ?")
+        params.append(_normalize_date_bound(date_to, upper=True))
+    return clauses, params
+
+
+def get_chat_summary_stats(chat_id=None, handle_id=None, contact_id=None,
+                            is_from_me=None, date_from=None, date_to=None,
+                            group_by_chat=False):
     """Cheap aggregate stats -- no LLM call needed. chat_id (single id or
     list) aggregates across one or more chats. handle_id/contact_id (single
     or list) scopes to a person instead -- e.g. total messages exchanged with
     someone across every chat/handle they use. At least one of chat_id,
-    handle_id, contact_id must be given."""
+    handle_id, contact_id must be given. Pass is_from_me to narrow to only
+    sent or only received messages (e.g. 'how many messages have I sent X').
+    date_from/date_to accept an ISO date ('2026-01-01') or full ISO datetime
+    ('2026-01-01T13:00:00'); date_to covers the whole unit named, so
+    date_to='2026-01-01' includes all of Jan 1. Dates are stored in UTC and a
+    bound carrying an offset ('...-05:00', '...Z') is converted for you. Pass
+    group_by_chat=True to get one row per chat_id instead of a single pooled
+    total -- useful for comparing activity across chats. Each row also includes
+    attachment_count (individual attachments, so a message with three photos
+    counts three) and reaction_count. Every filter applies to all three counts
+    alike -- is_from_me=True means messages, attachments, and reactions you
+    sent."""
     scope_requested = chat_id is not None or handle_id is not None or contact_id is not None
     if not scope_requested:
         raise ValueError("must provide chat_id, handle_id, or contact_id")
@@ -449,11 +544,49 @@ def get_chat_summary_stats(chat_id=None, handle_id=None, contact_id=None):
         if not chat_ids and not handle_ids:
             # scope was requested but resolved to nothing -- zeroed stats,
             # not an unfiltered aggregate over the whole corpus.
-            return {"message_count": 0, "first_message": None,
-                    "last_message": None, "from_me": 0, "from_them": 0}
+            return [] if group_by_chat else dict(_ZERO_STATS)
 
-        clauses, params = [], []
-        _append_id_filters(clauses, params, chat_ids, handle_ids, prefix="")
+        filters = (is_from_me, date_from, date_to)
+        clauses, params = _stats_filters("", chat_ids, handle_ids, *filters)
+        where = " AND ".join(clauses)
+
+        if group_by_chat:
+            # Both subqueries correlate on the outer chat_id, which already
+            # carries the chat scope -- so they only re-apply the handle/
+            # is_from_me/date filters, not chat_ids.
+            att_clauses, att_params = _stats_filters("am.", None, handle_ids, *filters)
+            att_sql = (
+                "SELECT COUNT(*) FROM attachments a JOIN messages am ON a.message_id = am.id "
+                f"WHERE {' AND '.join(['am.chat_id = messages.chat_id'] + att_clauses)}"
+            )
+            reaction_clauses, reaction_params = _stats_filters("r.", None, handle_ids, *filters)
+            reaction_sql = (
+                "SELECT COUNT(*) FROM reactions r WHERE "
+                f"{' AND '.join(['r.chat_id = messages.chat_id'] + reaction_clauses)}"
+            )
+            rows = con.execute(f"""
+                SELECT
+                    chat_id,
+                    COUNT(*) AS message_count,
+                    MIN(date) AS first_message,
+                    MAX(date) AS last_message,
+                    SUM(CASE WHEN is_from_me = 1 THEN 1 ELSE 0 END) AS from_me,
+                    SUM(CASE WHEN is_from_me = 0 THEN 1 ELSE 0 END) AS from_them,
+                    ({att_sql}) AS attachment_count,
+                    ({reaction_sql}) AS reaction_count
+                FROM messages WHERE {where}
+                GROUP BY chat_id
+                ORDER BY chat_id
+            """, att_params + reaction_params + params).fetchall()
+            return [dict(r) for r in rows]
+
+        att_clauses, att_params = _stats_filters("am.", chat_ids, handle_ids, *filters)
+        att_sql = (
+            "SELECT COUNT(*) FROM attachments a JOIN messages am ON a.message_id = am.id "
+            f"WHERE {' AND '.join(att_clauses)}"
+        )
+        reaction_clauses, reaction_params = _stats_filters("r.", chat_ids, handle_ids, *filters)
+        reaction_where = " AND ".join(reaction_clauses)
 
         row = con.execute(f"""
             SELECT
@@ -461,9 +594,11 @@ def get_chat_summary_stats(chat_id=None, handle_id=None, contact_id=None):
                 MIN(date) AS first_message,
                 MAX(date) AS last_message,
                 SUM(CASE WHEN is_from_me = 1 THEN 1 ELSE 0 END) AS from_me,
-                SUM(CASE WHEN is_from_me = 0 THEN 1 ELSE 0 END) AS from_them
-            FROM messages WHERE {' AND '.join(clauses)}
-        """, params).fetchone()
+                SUM(CASE WHEN is_from_me = 0 THEN 1 ELSE 0 END) AS from_them,
+                ({att_sql}) AS attachment_count,
+                (SELECT COUNT(*) FROM reactions r WHERE {reaction_where}) AS reaction_count
+            FROM messages WHERE {where}
+        """, att_params + reaction_params + params).fetchone()
     return dict(row)
 
 
@@ -476,6 +611,16 @@ _ID_OR_LIST_SCHEMA = {
     "items": {"type": "integer"},
     "description": "a single id, or a list of ids",
 }
+
+# Shared description for date_from/date_to params. Bounds are normalized by
+# _normalize_date_bound, so this advertises what that accepts.
+_DATE_PARAM_DESC = (
+    "ISO date ('2026-01-01') or ISO datetime ('2026-01-01T13:00:00'). date_to "
+    "covers the whole unit named: '2026-01-01' means through the end of Jan 1, "
+    "'2026-01-01T13:00' through the end of that minute. Stored dates are UTC; "
+    "pass UTC, or include an offset ('2026-01-01T13:00:00-05:00', '...Z') and "
+    "it will be converted for you."
+)
 
 TOOL_DEFINITIONS = [
     {
@@ -495,8 +640,8 @@ TOOL_DEFINITIONS = [
                 "handle_id": _ID_OR_LIST_SCHEMA,
                 "contact_id": _ID_OR_LIST_SCHEMA,
                 "is_from_me": {"type": "boolean"},
-                "date_from": {"type": "string", "description": "ISO date"},
-                "date_to": {"type": "string", "description": "ISO date"},
+                "date_from": {"type": "string", "description": _DATE_PARAM_DESC},
+                "date_to": {"type": "string", "description": _DATE_PARAM_DESC},
                 "limit": {"type": "integer", "default": 50},
             },
         },
@@ -544,18 +689,31 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "get_chat_summary_stats",
-        "description": "Get message counts and date range. Scope with chat_id "
+        "description": "Get message counts, date range, attachment_count "
+                        "(individual attachments -- a message with three photos "
+                        "counts three), and reaction_count. Scope with chat_id "
                         "(single id or list, aggregates across all of them), or "
                         "with handle_id/contact_id to get totals for one person "
                         "across every chat/handle they use (e.g. 'how many "
-                        "messages have I exchanged with X'). At least one of "
-                        "chat_id, handle_id, contact_id is required.",
+                        "messages have I exchanged with X'). Pass is_from_me to "
+                        "narrow to only sent or only received messages. Pass "
+                        "date_from/date_to to narrow to a date or datetime "
+                        "range. Every filter applies to all three counts alike "
+                        "-- is_from_me=true counts the messages, attachments, "
+                        "and reactions you sent. Pass group_by_chat=true "
+                        "to get one row per chat instead of a single pooled "
+                        "total, for comparing activity across chats. At least "
+                        "one of chat_id, handle_id, contact_id is required.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "chat_id": _ID_OR_LIST_SCHEMA,
                 "handle_id": _ID_OR_LIST_SCHEMA,
                 "contact_id": _ID_OR_LIST_SCHEMA,
+                "is_from_me": {"type": "boolean"},
+                "date_from": {"type": "string", "description": _DATE_PARAM_DESC},
+                "date_to": {"type": "string", "description": _DATE_PARAM_DESC},
+                "group_by_chat": {"type": "boolean", "default": False},
             },
         },
     },
