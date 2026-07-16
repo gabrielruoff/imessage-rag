@@ -1,4 +1,5 @@
-"""Smoke tests for chat.run_turn's tool-budget fallback.
+"""Smoke tests for chat.run_turn's tool-budget fallback and the tool-result
+size cap (chat._cap_tool_result).
 
 No Ollama and no real chat.db required -- chat.ollama_chat_stream is swapped
 for a stub, so nothing opens a socket or a database. Covers the two
@@ -13,6 +14,7 @@ Run from the repo root:  python3 -m unittest discover tests
 
 import copy
 import io
+import json
 import unittest
 
 from rich.console import Console
@@ -115,6 +117,48 @@ class RunTurnFallbackTest(unittest.TestCase):
         chat.ollama_chat_stream = immediate_reply
         reply = chat.run_turn([{"role": "system", "content": chat.SYSTEM_PROMPT}])
         self.assertEqual(reply, "the final answer")
+
+
+class CapToolResultTest(unittest.TestCase):
+    """Whatever the shape or size of a tool result, _cap_tool_result must hand
+    Ollama valid JSON no larger than TOOL_RESULT_MAX_CHARS -- an oversized
+    tool message makes Ollama silently drop the whole conversation."""
+
+    def setUp(self):
+        # from-import binding again: patch on chat, not config. 500 keeps the
+        # test fixtures small.
+        self._saved_cap = chat.TOOL_RESULT_MAX_CHARS
+        chat.TOOL_RESULT_MAX_CHARS = 500
+        self.addCleanup(setattr, chat, "TOOL_RESULT_MAX_CHARS", self._saved_cap)
+
+    def cap(self, result):
+        return chat._cap_tool_result(result, json.dumps(result))
+
+    def test_small_result_passes_through_unchanged(self):
+        result = [{"id": 1, "text": "hi"}]
+        self.assertEqual(self.cap(result), json.dumps(result))
+
+    def test_oversized_list_is_cut_at_whole_rows(self):
+        rows = [{"id": i, "text": "x" * 40} for i in range(50)]
+        capped = json.loads(self.cap(rows))
+        self.assertIs(capped["truncated"], True)
+        self.assertEqual(capped["rows_total"], 50)
+        self.assertGreaterEqual(capped["rows_returned"], 1)
+        # every kept row is complete and identical to the original
+        self.assertEqual(capped["rows"], rows[: capped["rows_returned"]])
+        self.assertLessEqual(len(json.dumps(capped)), 500)
+
+    def test_oversized_non_list_keeps_a_labeled_fragment(self):
+        capped = json.loads(self.cap({"blob": "y" * 2000}))
+        self.assertIs(capped["truncated"], True)
+        self.assertIn("partial_json", capped)
+        self.assertLessEqual(len(json.dumps(capped)), 500)
+
+    def test_single_row_busting_the_cap_falls_back_to_a_fragment(self):
+        capped = json.loads(self.cap([{"text": "z" * 2000}]))
+        self.assertIs(capped["truncated"], True)
+        self.assertIn("partial_json", capped)
+        self.assertLessEqual(len(json.dumps(capped)), 500)
 
 
 if __name__ == "__main__":

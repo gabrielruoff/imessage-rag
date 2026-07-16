@@ -367,6 +367,21 @@ Related, and true of both models: prompting alone does not reliably stop a tool 
 *thinking* models returning a `thinking` field alongside `content`; `chat.py`
 deliberately renders only `content`.
 
+**Ollama silently drops the conversation when one message exceeds the context
+window.** Ollama (0.32.0) fits a request by keeping the first system message
+plus the longest *suffix of whole messages* that fits in the model's context
+window. A single tool result bigger than the window (observed: an unlimited
+`get_chat_summary_stats(group_by_chat=True)` dump, 555 rows / ~114KB ≈ 35k
+tokens vs the 32k window) means no suffix fits, so the model receives *only
+the system prompt* — no user question, no data — and confabulates a question
+from the system prompt's example text (verified by probing: a marker planted
+in a 20k-char tool message is retrievable, `prompt_eval_count` ≈ 10.7k; at
+60k chars `prompt_eval_count` collapses to 19 and the marker is gone). There
+is no error and `truncated` stays 0 in the runner log. Defenses: every tool
+that can return one row per chat/message caps its row count
+(`_shared.MAX_STATS_ROWS` etc.), and `chat.run_turn` hard-caps any tool
+result at `TOOL_RESULT_MAX_CHARS` before appending it to the conversation.
+
 **DB paths are anchored to the repo, not the CWD.** `config.py` resolves the
 four DB-path constants (`SOURCE_DB`, `SNAPSHOT_DB`, `TARGET_DB`,
 `ADDRESS_BOOK_PATH`) relative to `config.py`'s own directory when the value is

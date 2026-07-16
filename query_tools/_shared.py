@@ -45,6 +45,7 @@ MAX_MESSAGE_LIMIT = 50   # search_messages_sql / search_messages_fts
 MAX_VEC_K = 20           # chunk-search tools (search_conversations etc.)
 MAX_CONTACTS_LIMIT = 20  # search_contacts_by_name
 MAX_CHATS_LIMIT = 50     # list_chats
+MAX_STATS_ROWS = 50      # get_chat_summary_stats group_by_chat=True
 MAX_ID_LIST = 50         # cap on chat_id/handle_id/contact_id/guid list params
 MAX_CONTEXT_MESSAGES = 25   # get_message_context before/after ceiling
 MAX_SCOPE_CHATS = 500       # cap on the person -> chats expansion for chunk search
@@ -68,12 +69,20 @@ def _truncate_text_field(rows, limit=TEXT_PREVIEW_CHARS):
 
 def _as_id_list(value):
     """Normalize a param that may be None, a scalar, or a list into None or
-    a capped list -- lets every id-scoped tool param accept either shape."""
+    a capped non-empty list -- lets every id-scoped tool param accept either
+    shape. An explicit empty list means "no filter", same as omitting the
+    param (LLMs pass [] to mean that), so it normalizes to None too."""
     if value is None:
         return None
     if isinstance(value, (list, tuple)):
-        return list(value)[:MAX_ID_LIST]
+        return list(value)[:MAX_ID_LIST] or None
     return [value]
+
+
+def _scope_requested(*values):
+    """True when any of the given id params is a real (non-empty) scope --
+    an explicit [] counts as omitted, matching _as_id_list."""
+    return any(_as_id_list(v) is not None for v in values)
 
 
 def _resolve_contact_handle_ids(con, contact_ids):
@@ -169,11 +178,13 @@ def _resolve_handle_filter(con, handle_id, contact_id):
 
 def _resolve_scope(con, chat_id, handle_id, contact_id):
     """Resolve scope params into (chat_ids, handle_ids, empty). `empty` is
-    True when a scope param was provided but matched no ids -- the caller
-    should then return [] rather than dropping the filter and over-matching."""
-    chat_requested = chat_id is not None
-    handle_requested = handle_id is not None or contact_id is not None
+    True when a non-empty scope param was provided but matched no ids -- the
+    caller should then return [] rather than dropping the filter and
+    over-matching. An explicit empty list is treated as an omitted param."""
     chat_ids = _as_id_list(chat_id)
+    handle_requested = _scope_requested(handle_id, contact_id)
     handle_ids = _resolve_handle_filter(con, handle_id, contact_id)
-    empty = (chat_requested and not chat_ids) or (handle_requested and not handle_ids)
+    # chat_ids needs no such check: a chat_id never resolves through a lookup,
+    # so a requested chat scope is always non-empty after normalization.
+    empty = handle_requested and not handle_ids
     return chat_ids, handle_ids, empty

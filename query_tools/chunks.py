@@ -24,6 +24,7 @@ from ._shared import (
     _id_filter_clause,
     _normalize_date_bound,
     _resolve_handle_filter,
+    _scope_requested,
     _truncate_text_field,
 )
 
@@ -64,10 +65,11 @@ def _resolve_chat_scope(con, chat_id, handle_id, contact_id):
     and person params are both given, the scopes intersect, matching the AND
     semantics of the message-level tools. `empty` mirrors _resolve_scope:
     True when a scope was requested but matched nothing."""
+    # chat_ids needs no emptiness check: a chat_id never resolves through a
+    # lookup, so a requested chat scope is always non-empty after
+    # normalization (and an explicit [] normalizes to "no filter").
     chat_ids = _as_id_list(chat_id)
-    if chat_id is not None and not chat_ids:
-        return None, True
-    handle_requested = handle_id is not None or contact_id is not None
+    handle_requested = _scope_requested(handle_id, contact_id)
     if handle_requested:
         handle_ids = _resolve_handle_filter(con, handle_id, contact_id)
         if not handle_ids:

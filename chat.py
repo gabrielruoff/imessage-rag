@@ -21,7 +21,7 @@ from rich.markdown import Markdown
 
 import ollama
 import query_tools
-from config import CHAT_MODEL, MAX_TOOL_ITERATIONS
+from config import CHAT_MODEL, MAX_TOOL_ITERATIONS, TOOL_RESULT_MAX_CHARS
 from tool_schemas import TOOL_DEFINITIONS
 
 console = Console()
@@ -40,7 +40,8 @@ SYSTEM_PROMPT = (
     "- find_similar_conversations (more conversations like a chunk_id)\n"
     "- get_conversation (a chunk_id -> its full messages)\n"
     "- get_message_context (messages before/after one message id)\n"
-    "- get_chat_summary_stats (message counts for a chat)\n"
+    "- get_chat_summary_stats (message counts for a chat, a person, or the whole "
+    "database; group_by_chat ranks the top chats by activity)\n"
     "- search_contacts_by_name (name/org -> contact + their handle_ids)\n"
     "- list_chats (name/participant -> chat_id, or label a chat_id)\n"
     "- search_contact_by_handle (a phone/email/handle_id -> contact name)\n"
@@ -146,6 +147,44 @@ def _estimate_tokens(text):
     return max(1, len(text) // 4)
 
 
+def _cap_tool_result(result, result_json):
+    """Cap one tool result's JSON at TOOL_RESULT_MAX_CHARS while keeping it
+    valid JSON. An oversized tool message makes Ollama silently drop it AND
+    every message before it (only the system prompt survives), so the model
+    would answer with no user question in context. List results (the only
+    shape that gets big in practice) are cut at whole-row boundaries so every
+    kept row stays parseable; anything else keeps a prefix explicitly labeled
+    as a fragment."""
+    if len(result_json) <= TOOL_RESULT_MAX_CHARS:
+        return result_json
+    note = (
+        f"result was {len(result_json)} chars, over the {TOOL_RESULT_MAX_CHARS}-char "
+        "cap; re-call with narrower filters or a smaller limit"
+    )
+    if isinstance(result, list) and result:
+        # Proportional first guess, then halve until the wrapper fits.
+        keep = max(1, len(result) * TOOL_RESULT_MAX_CHARS // len(result_json))
+        while True:
+            capped = json.dumps({
+                "truncated": True, "rows_total": len(result), "rows_returned": keep,
+                "note": note, "rows": result[:keep],
+            })
+            if len(capped) <= TOOL_RESULT_MAX_CHARS:
+                return capped
+            if keep == 1:
+                break  # a single row alone busts the cap -- fragment it below
+            keep = max(1, keep // 2)
+    # JSON-escaping the fragment can inflate it, so leave envelope headroom
+    # and halve on the (rare) overshoot.
+    cut = TOOL_RESULT_MAX_CHARS - 200
+    while True:
+        capped = json.dumps({"truncated": True, "note": note,
+                             "partial_json": result_json[:cut]})
+        if len(capped) <= TOOL_RESULT_MAX_CHARS or cut == 0:
+            return capped
+        cut //= 2
+
+
 def run_turn(messages, show_model_header=True, model=None):
     """Run one user turn to completion, including any tool-call round trips.
 
@@ -172,7 +211,7 @@ def run_turn(messages, show_model_header=True, model=None):
                 except Exception as e:
                     result = {"error": str(e)}
             count = len(result) if isinstance(result, list) else "ok"
-            result_json = json.dumps(result)
+            result_json = _cap_tool_result(result, json.dumps(result))
             console.print(
                 f"  [tool call] {name}({args}) -> {count}"
                 f" (~{_estimate_tokens(result_json)} tokens)",

@@ -104,6 +104,12 @@ chunk_vectors                     -- sqlite-vec vec0 table: chunk_id ->
   `reset_db.py` + re-ingest. Skipping nomic's task prefixes measurably
   degrades retrieval — set `EMBED_DOC_PREFIX`/`EMBED_QUERY_PREFIX` to `''`
   only for prefix-less models.
+- Ollama fits a request by keeping the first system message + the longest
+  suffix of whole messages that fits the context window: one tool result
+  bigger than the window silently leaves the model with ONLY the system
+  prompt (no user question), and it confabulates. So per-row tools cap their
+  row count and `chat.run_turn` caps every tool result at
+  `TOOL_RESULT_MAX_CHARS` (see docs/DECISIONS.md).
 - gemma4's Ollama renderer honors only the FIRST system message; fold
   mid-conversation steering into it (see `chat.run_turn`). Withholding the
   tool schemas is the only reliable way to stop a tool call — prompting alone

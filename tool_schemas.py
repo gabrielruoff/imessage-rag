@@ -182,8 +182,11 @@ TOOL_DEFINITIONS = [
                         "-- is_from_me=true counts the messages, attachments, "
                         "and reactions you sent. Pass group_by_chat=true "
                         "to get one row per chat instead of a single pooled "
-                        "total, for comparing activity across chats. At least "
-                        "one of chat_id, handle_id, contact_id is required.",
+                        "total, for comparing activity across chats -- rows "
+                        "are the top `limit` chats by message count (e.g. "
+                        "'who do I text the most'). With no "
+                        "scope params at all, aggregates the whole database "
+                        "(e.g. 'how many messages total').",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -194,6 +197,8 @@ TOOL_DEFINITIONS = [
                 "date_from": {"type": "string", "description": _DATE_PARAM_DESC},
                 "date_to": {"type": "string", "description": _DATE_PARAM_DESC},
                 "group_by_chat": {"type": "boolean", "default": False},
+                "limit": {"type": "integer", "default": 25,
+                          "description": "max rows when group_by_chat=true"},
             },
         },
     },
@@ -230,7 +235,9 @@ TOOL_DEFINITIONS = [
         "name": "list_chats",
         "description": "List conversations with their resolved participant names. "
                         "Use to find a chat_id from a person/group name, or to "
-                        "learn who a chat_id refers to. `query` fuzzy-matches by "
+                        "learn who a chat_id refers to (pass chat_id -- single "
+                        "id or list -- to label chat_ids you already have, e.g. "
+                        "from get_chat_summary_stats). `query` fuzzy-matches by "
                         "participant name or chat identifier substring. Prefer "
                         "handle_id/contact_id (single id or list, from "
                         "search_contacts_by_name) for an exact match on every "
@@ -242,6 +249,7 @@ TOOL_DEFINITIONS = [
                     "type": "string",
                     "description": "substring to match against participant names / chat identifier",
                 },
+                "chat_id": _ID_OR_LIST_SCHEMA,
                 "handle_id": _ID_OR_LIST_SCHEMA,
                 "contact_id": _ID_OR_LIST_SCHEMA,
                 "limit": {"type": "integer", "default": 50},

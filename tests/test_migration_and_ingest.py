@@ -233,6 +233,12 @@ class QueryToolsTest(unittest.TestCase):
         chats = query_tools.list_chats(handle_id=50)
         self.assertEqual({c["id"] for c in chats}, {100})
 
+    def test_list_chats_empty_handle_id_list_means_no_filter(self):
+        self.assertEqual(
+            {c["id"] for c in query_tools.list_chats(handle_id=[])},
+            {c["id"] for c in query_tools.list_chats()},
+        )
+
     def test_get_chat_summary_stats_with_chat_id_list(self):
         stats = query_tools.get_chat_summary_stats(chat_id=[100, 101])
         self.assertEqual(stats["message_count"], 3)
@@ -243,9 +249,17 @@ class QueryToolsTest(unittest.TestCase):
         self.assertEqual(stats["from_me"], 1)
         self.assertEqual(stats["from_them"], 2)
 
-    def test_get_chat_summary_stats_requires_a_scope(self):
-        with self.assertRaises(ValueError):
-            query_tools.get_chat_summary_stats()
+    def test_get_chat_summary_stats_unscoped_aggregates_whole_db(self):
+        stats = query_tools.get_chat_summary_stats()
+        self.assertEqual(stats["message_count"], 3)
+
+    def test_get_chat_summary_stats_empty_scope_list_means_no_filter(self):
+        stats = query_tools.get_chat_summary_stats(handle_id=[])
+        self.assertEqual(stats["message_count"], 3)
+
+    def test_get_chat_summary_stats_unknown_contact_returns_zeros(self):
+        stats = query_tools.get_chat_summary_stats(contact_id=999999)
+        self.assertEqual(stats["message_count"], 0)
 
     def test_get_message_reactions_single_guid_still_works(self):
         # guid-1000 carries two reactions (theirs and mine) -- see setUp.
@@ -303,6 +317,20 @@ class QueryToolsTest(unittest.TestCase):
         self.assertEqual(by_chat[101]["message_count"], 1)
         self.assertEqual(by_chat[101]["reaction_count"], 1)
         self.assertEqual(by_chat[101]["attachment_count"], 1)
+
+    def test_get_chat_summary_stats_group_by_chat_ranks_and_limits(self):
+        # Unscoped: chat 100 (2 msgs) outranks chat 101 (1 msg); chat 102 has
+        # no messages so it never produces a row.
+        rows = query_tools.get_chat_summary_stats(group_by_chat=True)
+        self.assertEqual([r["chat_id"] for r in rows], [100, 101])
+
+        top = query_tools.get_chat_summary_stats(group_by_chat=True, limit=1)
+        self.assertEqual([r["chat_id"] for r in top], [100])
+        # The per-chat subqueries still correlate correctly through the
+        # ranking CTE.
+        self.assertEqual(top[0]["message_count"], 2)
+        self.assertEqual(top[0]["reaction_count"], 2)
+        self.assertEqual(top[0]["attachment_count"], 2)
 
     def test_get_chat_summary_stats_date_range_filters(self):
         # chat 100: msg 1000 @ 2026-01-01T00:00:00 (reactions @ 00:05, 00:06),

@@ -68,6 +68,13 @@ EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "64"))  # texts per Ollama 
 # concurrent requests, matches Ollama's default OLLAMA_NUM_PARALLEL
 EMBED_MAX_WORKERS = int(os.getenv("EMBED_MAX_WORKERS", "4"))
 MAX_TOOL_ITERATIONS = int(os.getenv("MAX_TOOL_ITERATIONS", "20"))  # tool round-trips/turn
+# Hard cap on one tool result's JSON (chars) before it goes into the chat
+# context. Ollama sizes truncation per whole *message*: any single message
+# larger than the model's context window is silently dropped along with all
+# messages before it, leaving the model only the system prompt -- so an
+# oversized tool result must be cut client-side. ~60k chars of dense JSON is
+# ~20k tokens, comfortably inside the 32k window gemma4 runs with.
+TOOL_RESULT_MAX_CHARS = int(os.getenv("TOOL_RESULT_MAX_CHARS", "60000"))
 
 # --- Conversation chunking ------------------------------------------------------
 # Messages are embedded as conversation chunks, not individually: contiguous

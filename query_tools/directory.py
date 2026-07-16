@@ -9,11 +9,13 @@ from db import CONTACT_LABEL_SQL
 from ._shared import (
     MAX_CHATS_LIMIT,
     MAX_CONTACTS_LIMIT,
+    MAX_STATS_ROWS,
     _append_id_filters,
     _as_id_list,
     _connect,
     _normalize_date_bound,
     _resolve_handle_filter,
+    _scope_requested,
 )
 
 
@@ -93,9 +95,11 @@ def search_contacts_by_name(name: str, limit=20):
     return results
 
 
-def list_chats(query=None, handle_id=None, contact_id=None, limit=50):
+def list_chats(query=None, chat_id=None, handle_id=None, contact_id=None, limit=50):
     """List chats (conversations) with resolved participant names -- the bridge
     from a person/chat name to a chat_id, and the way to label a chat_id. Pass
+    chat_id (single id or list) to label specific chats you already have ids
+    for (e.g. rows from get_chat_summary_stats group_by_chat=True). Pass
     `query` to filter by participant name or chat_identifier (substring match,
     fuzzy). Pass handle_id/contact_id (single id or list) for an exact match on
     every chat that person actually participates in -- prefer this over `query`
@@ -104,15 +108,20 @@ def list_chats(query=None, handle_id=None, contact_id=None, limit=50):
     limit = max(1, min(limit, MAX_CHATS_LIMIT))
     like = f"%{query}%" if query else None
     with contextlib.closing(_connect()) as con:
-        handle_requested = handle_id is not None or contact_id is not None
+        handle_requested = _scope_requested(handle_id, contact_id)
         handle_ids = _resolve_handle_filter(con, handle_id, contact_id)
         if handle_requested and not handle_ids:
             return []
         params = {"like": like, "limit": limit}
         id_filter_sql = ""
+        chat_ids = _as_id_list(chat_id)
+        if chat_ids:
+            placeholders = ",".join(f":cid{i}" for i in range(len(chat_ids)))
+            id_filter_sql += f" AND ch.id IN ({placeholders})"
+            params.update({f"cid{i}": v for i, v in enumerate(chat_ids)})
         if handle_ids:
             placeholders = ",".join(f":hid{i}" for i in range(len(handle_ids)))
-            id_filter_sql = f"""
+            id_filter_sql += f"""
                 AND ch.id IN (
                     SELECT cp2.chat_id FROM chat_participants cp2
                     WHERE cp2.handle_id IN ({placeholders})
@@ -175,75 +184,86 @@ def _stats_filters(prefix, chat_ids, handle_ids, is_from_me, date_from, date_to)
 
 def get_chat_summary_stats(chat_id=None, handle_id=None, contact_id=None,
                             is_from_me=None, date_from=None, date_to=None,
-                            group_by_chat=False):
+                            group_by_chat=False, limit=25):
     """Cheap aggregate stats -- no LLM call needed. chat_id (single id or
     list) aggregates across one or more chats. handle_id/contact_id (single
     or list) scopes to a person instead -- e.g. total messages exchanged with
-    someone across every chat/handle they use. At least one of chat_id,
-    handle_id, contact_id must be given. Pass is_from_me to narrow to only
+    someone across every chat/handle they use. With no scope at all the whole
+    database is aggregated (e.g. 'how many messages total'); group_by_chat
+    then ranks every chat. Pass is_from_me to narrow to only
     sent or only received messages (e.g. 'how many messages have I sent X').
     date_from/date_to accept an ISO date ('2026-01-01') or full ISO datetime
     ('2026-01-01T13:00:00'); date_to covers the whole unit named, so
     date_to='2026-01-01' includes all of Jan 1. Dates are stored in UTC and a
     bound carrying an offset ('...-05:00', '...Z') is converted for you. Pass
     group_by_chat=True to get one row per chat_id instead of a single pooled
-    total -- useful for comparing activity across chats. Each row also includes
+    total -- useful for comparing activity across chats; rows are the top
+    `limit` chats by message_count (an unlimited dump of every chat would
+    overflow the chat model's context window). Each row also includes
     attachment_count (individual attachments, so a message with three photos
     counts three) and reaction_count. Every filter applies to all three counts
     alike -- is_from_me=True means messages, attachments, and reactions you
     sent."""
-    scope_requested = chat_id is not None or handle_id is not None or contact_id is not None
-    if not scope_requested:
-        raise ValueError("must provide chat_id, handle_id, or contact_id")
     with contextlib.closing(_connect()) as con:
         chat_ids = _as_id_list(chat_id)
+        handle_requested = _scope_requested(handle_id, contact_id)
         handle_ids = _resolve_handle_filter(con, handle_id, contact_id)
-        if not chat_ids and not handle_ids:
-            # scope was requested but resolved to nothing -- zeroed stats,
-            # not an unfiltered aggregate over the whole corpus.
+        if handle_requested and not handle_ids:
+            # a person scope was requested but resolved to nothing -- zeroed
+            # stats, not an unfiltered aggregate over the whole corpus.
             return [] if group_by_chat else dict(_ZERO_STATS)
 
         filters = (is_from_me, date_from, date_to)
         clauses, params = _stats_filters("", chat_ids, handle_ids, *filters)
-        where = " AND ".join(clauses)
+        where = " AND ".join(clauses) or "1=1"
 
         if group_by_chat:
-            # Both subqueries correlate on the outer chat_id, which already
-            # carries the chat scope -- so they only re-apply the handle/
-            # is_from_me/date filters, not chat_ids.
+            # The CTE ranks chats on the messages table alone, so the
+            # correlated attachment/reaction subqueries run only for the
+            # <= MAX_STATS_ROWS rows that survive the limit -- not for every
+            # chat in the corpus. Both subqueries correlate on the surviving
+            # row's chat_id, which already carries the chat scope, so they
+            # only re-apply the handle/is_from_me/date filters, not chat_ids.
             att_clauses, att_params = _stats_filters("am.", None, handle_ids, *filters)
             att_sql = (
                 "SELECT COUNT(*) FROM attachments a JOIN messages am ON a.message_id = am.id "
-                f"WHERE {' AND '.join(['am.chat_id = messages.chat_id'] + att_clauses)}"
+                f"WHERE {' AND '.join(['am.chat_id = t.chat_id'] + att_clauses)}"
             )
             reaction_clauses, reaction_params = _stats_filters("r.", None, handle_ids, *filters)
             reaction_sql = (
                 "SELECT COUNT(*) FROM reactions r WHERE "
-                f"{' AND '.join(['r.chat_id = messages.chat_id'] + reaction_clauses)}"
+                f"{' AND '.join(['r.chat_id = t.chat_id'] + reaction_clauses)}"
             )
             rows = con.execute(f"""
-                SELECT
-                    chat_id,
-                    COUNT(*) AS message_count,
-                    MIN(date) AS first_message,
-                    MAX(date) AS last_message,
-                    SUM(CASE WHEN is_from_me = 1 THEN 1 ELSE 0 END) AS from_me,
-                    SUM(CASE WHEN is_from_me = 0 THEN 1 ELSE 0 END) AS from_them,
+                WITH top_chats AS (
+                    SELECT
+                        chat_id,
+                        COUNT(*) AS message_count,
+                        MIN(date) AS first_message,
+                        MAX(date) AS last_message,
+                        SUM(CASE WHEN is_from_me = 1 THEN 1 ELSE 0 END) AS from_me,
+                        SUM(CASE WHEN is_from_me = 0 THEN 1 ELSE 0 END) AS from_them
+                    FROM messages WHERE {where}
+                    GROUP BY chat_id
+                    ORDER BY message_count DESC
+                    LIMIT ?
+                )
+                SELECT t.*,
                     ({att_sql}) AS attachment_count,
                     ({reaction_sql}) AS reaction_count
-                FROM messages WHERE {where}
-                GROUP BY chat_id
-                ORDER BY chat_id
-            """, att_params + reaction_params + params).fetchall()
+                FROM top_chats t
+                ORDER BY t.message_count DESC
+            """, params + [max(1, min(limit, MAX_STATS_ROWS))]
+                 + att_params + reaction_params).fetchall()
             return [dict(r) for r in rows]
 
         att_clauses, att_params = _stats_filters("am.", chat_ids, handle_ids, *filters)
         att_sql = (
             "SELECT COUNT(*) FROM attachments a JOIN messages am ON a.message_id = am.id "
-            f"WHERE {' AND '.join(att_clauses)}"
+            f"WHERE {' AND '.join(att_clauses) or '1=1'}"
         )
         reaction_clauses, reaction_params = _stats_filters("r.", chat_ids, handle_ids, *filters)
-        reaction_where = " AND ".join(reaction_clauses)
+        reaction_where = " AND ".join(reaction_clauses) or "1=1"
 
         row = con.execute(f"""
             SELECT

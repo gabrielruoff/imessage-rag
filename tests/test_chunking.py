@@ -296,6 +296,13 @@ class TestChunkQueryTools(ChunkFixture):
         # scope that matches nothing returns [] rather than over-matching
         self.assertEqual(query_tools.search_conversations("ski", contact_id=999), [])
 
+    def test_search_conversations_empty_scope_lists_mean_no_filter(self):
+        # LLMs pass [] for an omitted param -- it must behave as unscoped,
+        # not as a scope that matched nothing.
+        rows = query_tools.search_conversations("ski plans", k=3, chat_id=[], handle_id=[])
+        self.assertEqual([r["chunk_id"] for r in rows],
+                         [self.chunk_a, self.chunk_c, self.chunk_b])
+
     def test_find_similar_conversations_excludes_source(self):
         rows = query_tools.find_similar_conversations(self.chunk_a, k=2)
         self.assertEqual([r["chunk_id"] for r in rows], [self.chunk_c, self.chunk_b])
