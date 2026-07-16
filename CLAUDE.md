@@ -26,18 +26,19 @@ Full design history, schema, rationale, and data forensics:
 
 ## Architecture
 
-`ingest.py` runs the whole pipeline: snapshot the live `chat.db`, decode
+`ingest.py` runs the source pipeline: snapshot the live `chat.db`, decode
 `attributedBody` blobs, upsert into `imessage_analysis.db` (append-only —
-re-runs never delete source-derived rows), build FTS5, group each chat's
-messages into conversation chunks (split on a > `CHUNK_GAP_MINUTES` silence or
-at `CHUNK_MAX_CHARS`, with `CHUNK_OVERLAP_MESSAGES` carried across size
-splits; rendered with a participants/date header and speaker labels), then
-embed the chunks into the sqlite-vec `chunk_vectors` table (resumable — only
-chunks without a vector are embedded). Messages are embedded as chunks, not
-individually: most messages ("ok", "lol") carry no retrievable meaning alone,
-and chunking cuts vector count ~5–10x. Each vector carries
-`chat_id`/`first_day`/`last_day` as vec0 metadata columns, so scoped semantic
-search filters *inside* the KNN scan; distance is cosine.
+re-runs never delete source-derived rows), build FTS5. `chunking.py` builds
+the derived artifacts: group each chat's messages into conversation chunks
+(split on a > `CHUNK_GAP_MINUTES` silence or at `CHUNK_MAX_CHARS`, with
+`CHUNK_OVERLAP_MESSAGES` carried across size splits; rendered with a
+participants/date header and speaker labels), then embed the chunks into the
+sqlite-vec `chunk_vectors` table (resumable — only chunks without a vector
+are embedded); `ingest.py` runs and re-exports both stages. Messages are
+embedded as chunks, not individually: most messages ("ok", "lol") carry no
+retrievable meaning alone, and chunking cuts vector count ~5–10x. Each vector
+carries `chat_id`/`first_day`/`last_day` as vec0 metadata columns, so scoped
+semantic search filters *inside* the KNN scan; distance is cosine.
 
 Models (both local, via Ollama): chat = `gemma4:26b-a4b-it-qat`; embeddings =
 `nomic-embed-text` — Ollama 0.32.0 refuses `/api/embed` for generation
@@ -46,18 +47,22 @@ prefixes (`search_document: ` / `search_query: `) are applied by default and
 the embedding dimension is auto-detected at ingest time, so switching
 embedders is a `.env` change + `reset_db.py` + re-ingest.
 
-Module map: `query_tools.py` holds the thirteen retrieval functions the LLM
-calls (message-level SQL/FTS search, context expansion, full text, reactions;
-chunk-level semantic search, hybrid FTS+semantic fused with reciprocal-rank
-fusion, more-like-this, chunk → its messages; summary stats; name/handle/chat
-resolution); `tool_schemas.py` their JSON schemas; `chat.py` the CLI
-tool-calling loop over Ollama; `ollama.py` the Ollama chat-streaming HTTP;
-`embeddings.py` the shared embedding client (doc/query prefixes, `EMBED_DIM`
-override, `detect_embed_dim`) used by both ingest (documents) and
-query_tools (queries) so both sides embed identically; `config.py` all
-env-driven settings (defaults work with no `.env`; see `.env.example`);
-`db.py` shared sqlite helpers (`load_vec_extension`, `CONTACT_LABEL_SQL`,
-`iso_to_day`).
+Module map: `query_tools/` holds the thirteen retrieval functions the LLM
+calls — `messages.py` (message-level SQL/FTS search, context expansion, full
+text, reactions), `chunks.py` (chunk-level semantic search, hybrid
+FTS+semantic fused with reciprocal-rank fusion, more-like-this, chunk → its
+messages), `directory.py` (summary stats; name/handle/chat resolution),
+`_shared.py` (connection, result caps, date-bound and scope resolution), all
+re-exported from `__init__.py` so `import query_tools` is the only import
+callers need (`DB_PATH`/`embed_texts` are patchable package attributes,
+resolved through the package at call time); `tool_schemas.py` their JSON
+schemas; `chat.py` the CLI tool-calling loop over Ollama; `ollama.py` the
+Ollama chat-streaming HTTP; `embeddings.py` the shared embedding client
+(doc/query prefixes, `EMBED_DIM` override, `detect_embed_dim`) used by both
+ingest (documents) and query_tools (queries) so both sides embed identically;
+`config.py` all env-driven settings (defaults work with no `.env`; see
+`.env.example`); `db.py` shared sqlite helpers (`load_vec_extension`,
+`CONTACT_LABEL_SQL`, `iso_to_day`, `get_state`/`set_state`).
 
 ## Schema (imessage_analysis.db)
 
@@ -119,9 +124,10 @@ chunk_vectors                     -- sqlite-vec vec0 table: chunk_id ->
   `text` is truncated to `TEXT_PREVIEW_CHARS` (chunk previews to
   `CHUNK_PREVIEW_CHARS`), recoverable via `get_full_messages` /
   `get_conversation`.
-- New tool = function in `query_tools.py` + schema in `tool_schemas.py` +
-  entries in `chat.py`'s `TOOL_FUNCTIONS` and `SYSTEM_PROMPT` tool list (keep
-  all four in sync).
+- New tool = function in the right `query_tools/` module (re-export it from
+  `__init__.py`) + schema in `tool_schemas.py` (same `name` as the function —
+  `chat.py` derives its dispatch table from that) + a one-line entry in
+  `chat.py`'s `SYSTEM_PROMPT` tool list (keep all three in sync).
 - All tunables (models, hosts, timeouts, batch sizes, chunking) live in
   `config.py` / `.env.example`; never hardcode them elsewhere.
 - Runtime deps go in `requirements.txt`, dev-only tools in

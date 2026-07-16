@@ -1,6 +1,7 @@
-"""Small helpers shared between ingest.py, query_tools.py, and reset_db.py:
-sqlite-vec extension loading, the contact-label SQL fragment, and the
-ISO-date -> day-number conversion used by chunk_vectors' metadata columns."""
+"""Small helpers shared between ingest.py, chunking.py, query_tools, and
+reset_db.py: sqlite-vec extension loading, the contact-label SQL fragment,
+the ISO-date -> day-number conversion used by chunk_vectors' metadata
+columns, and the ingest_state key/value accessors."""
 
 import datetime
 
@@ -22,6 +23,20 @@ CONTACT_LABEL_SQL = (
     "NULLIF(TRIM(COALESCE(c.first_name, '') || ' ' || COALESCE(c.last_name, '')), ''), "
     "h.handle_identifier)"
 )
+
+
+def get_state(con, key, default=None):
+    """Read one ingest_state value (last_message_rowid, embed_model, ...)."""
+    row = con.execute("SELECT value FROM ingest_state WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def set_state(con, key, value):
+    con.execute(
+        "INSERT INTO ingest_state(key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, str(value)),
+    )
 
 
 def iso_to_day(iso_date: str) -> int:

@@ -121,8 +121,8 @@ Feasibility notes against the current toolset are at the bottom.
   ("am I warmer than in 2020", "when did they start pulling away" *at
   scale*) really want per-message sentiment stored as columns. Small-sample
   versions work today by having the model read excerpts, but corpus-wide
-  trends need the batch sentiment/topic tagging already penciled in as
-  next-step #3 in `CLAUDE.md`.
+  trends need a batch sentiment/topic tagging pass (see the enrichment-layer
+  discussion in [`DECISIONS.md`](DECISIONS.md)).
 
 **Design caution:** prompts like "who was right in the fight" and the grief
 prompts are the most magnetic and the most sensitive. The system prompt

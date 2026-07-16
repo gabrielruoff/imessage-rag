@@ -25,8 +25,9 @@ from tool_schemas import TOOL_DEFINITIONS
 
 console = Console()
 
-# Keep the tool list below in sync with tool_schemas.TOOL_DEFINITIONS and
-# TOOL_FUNCTIONS -- it deliberately restates a one-line summary of each tool.
+# Keep the tool list below in sync with tool_schemas.TOOL_DEFINITIONS -- it
+# deliberately restates a one-line summary of each tool. (TOOL_FUNCTIONS is
+# derived from TOOL_DEFINITIONS, so it never needs a manual edit.)
 SYSTEM_PROMPT = (
     "You are an assistant with access to the user's iMessage history through "
     "tool calls:\n"
@@ -93,21 +94,9 @@ OLLAMA_TOOLS = [
     for t in TOOL_DEFINITIONS
 ]
 
-TOOL_FUNCTIONS = {
-    "search_messages_sql": query_tools.search_messages_sql,
-    "search_messages_fts": query_tools.search_messages_fts,
-    "search_conversations": query_tools.search_conversations,
-    "search_messages_hybrid": query_tools.search_messages_hybrid,
-    "find_similar_conversations": query_tools.find_similar_conversations,
-    "get_conversation": query_tools.get_conversation,
-    "get_message_context": query_tools.get_message_context,
-    "get_chat_summary_stats": query_tools.get_chat_summary_stats,
-    "search_contact_by_handle": query_tools.search_contact_by_handle,
-    "search_contacts_by_name": query_tools.search_contacts_by_name,
-    "list_chats": query_tools.list_chats,
-    "get_message_reactions": query_tools.get_message_reactions,
-    "get_full_messages": query_tools.get_full_messages,
-}
+# Every schema name must be a query_tools function of the same name; a
+# missing one fails here at import time, not at the model's first call.
+TOOL_FUNCTIONS = {t["name"]: getattr(query_tools, t["name"]) for t in TOOL_DEFINITIONS}
 
 
 def ollama_chat_stream(messages, tools=OLLAMA_TOOLS, show_model_header=True):
