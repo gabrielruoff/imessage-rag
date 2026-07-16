@@ -44,11 +44,11 @@ OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "60"))
 CHAT_TIMEOUT = int(os.getenv("CHAT_TIMEOUT", "300"))
 
 # --- Models -------------------------------------------------------------------
-EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "gemma4:26b-a4b-it-qat")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gemma4:26b-a4b-it-qat")
 
 # --- Tunables -----------------------------------------------------------------
-EMBED_DIM = int(os.getenv("EMBED_DIM", "768"))  # nomic-embed-text output dimension
+EMBED_DIM = int(os.getenv("EMBED_DIM", "768"))  # gemma4:26b-a4b-it-qat output dimension
 EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "64"))  # texts per Ollama request
 # concurrent requests, matches Ollama's default OLLAMA_NUM_PARALLEL
 EMBED_MAX_WORKERS = int(os.getenv("EMBED_MAX_WORKERS", "4"))

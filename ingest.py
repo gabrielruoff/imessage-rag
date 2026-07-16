@@ -7,7 +7,7 @@ Pipeline:
   3. Join message/handle/chat/attachment tables into a normalized schema,
      enriching handles with contact names from ./address_book.abcddb if present
   4. Build an FTS5 index over message text
-  5. Build a sqlite-vec table and embed messages via local Ollama (nomic-embed-text)
+  5. Build a sqlite-vec table and embed messages via local Ollama (gemma4:26b-a4b-it-qat)
 
 Usage:
     python3 ingest.py                  # full pipeline

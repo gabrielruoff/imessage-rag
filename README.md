@@ -19,7 +19,7 @@ python3 chat.py                 # interactive CLI chat over your iMessage histor
 ```
 
 Requires a local `chat.db` (already present under `source_data/` for this
-project) and, for embeddings/chat, Ollama running `nomic-embed-text` and
+project) and, for embeddings/chat, Ollama running `gemma4:26b-a4b-it-qat` and
 `gemma4:26b-a4b-it-qat` (`make ollama-start`).
 
 ## Other commands

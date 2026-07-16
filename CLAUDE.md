@@ -65,7 +65,7 @@ targeted retrieval.
 - **LLM stack is fully local**: generation via Ollama running
   `gemma4:26b-a4b-it-qat` (confirmed real model: Gemma 4, 25.2B params / 4B
   active MoE, QAT-quantized, ~15GB RAM, 64K–256K context, agentic-tuned).
-  Embeddings via Ollama running `nomic-embed-text` (768-dim, 8192-token
+  Embeddings via Ollama running `gemma4:26b-a4b-it-qat` (768-dim, 8192-token
   context, small footprint, most proven `sqlite-vec` integration). Chose
   local embeddings specifically because generation is already local and
   there's no reason to send personal message text to an external API.
@@ -164,7 +164,7 @@ targeted retrieval.
   (`SOURCE_DB`, `SNAPSHOT_DB`, `TARGET_DB`, `ADDRESS_BOOK_PATH`), Ollama
   connectivity (`OLLAMA_HOST`, `OLLAMA_PORT`, `OLLAMA_EMBED_PATH`,
   `OLLAMA_EMBEDDINGS_PATH`, `OLLAMA_CHAT_PATH`, `OLLAMA_TIMEOUT`,
-  `CHAT_TIMEOUT`), models (`EMBED_MODEL` = `nomic-embed-text`, `CHAT_MODEL` =
+  `CHAT_TIMEOUT`), models (`EMBED_MODEL` = `gemma4:26b-a4b-it-qat`, `CHAT_MODEL` =
   `gemma4:26b-a4b-it-qat`), and tunables (`EMBED_DIM` = 768, `EMBED_BATCH_SIZE`,
   `EMBED_MAX_WORKERS`, `MAX_TOOL_ITERATIONS`).
 - **`.env.example` / `.env`** — `.env.example` is the committed template: every
@@ -393,7 +393,7 @@ or real `chat.db` needed).
 
 1. **Finish embeddings**: a partial run exists (~3.5k vectors in
    `message_vectors`), so this is started but not complete. To fill in the
-   rest: `ollama pull nomic-embed-text`, then `python3 ingest.py --since-last`
+   rest: `ollama pull gemma4:26b-a4b-it-qat`, then `python3 ingest.py --since-last`
    on a machine where Ollama is actually reachable, until all ~350k
    messages are embedded.
 2. **Wire `TOOL_DEFINITIONS` into a tool-calling loop** — DONE: `chat.py`
