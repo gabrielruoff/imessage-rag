@@ -9,7 +9,6 @@ Usage: topics.py [--k K] [--relabel] [--model MODEL]
   --model overrides TOPIC_MODEL for the label pass.
 """
 
-import sys
 import argparse
 import random
 from array import array
@@ -22,7 +21,7 @@ import ollama
 import progress
 import config
 from config import TARGET_DB, TOPIC_K, TOPIC_KMEANS_ITERS, TOPIC_LABEL_SAMPLES
-from db import connect, get_state, set_state
+from db import connect_default, get_state, run_cli, set_state
 
 # Module attribute so tests can patch it; _connect() reads it at call time.
 DB_PATH = TARGET_DB
@@ -43,7 +42,7 @@ _RETRY_NUDGE = (
 
 
 def _connect():
-    return connect(DB_PATH, rows=False)
+    return connect_default(DB_PATH, rows=False)
 
 
 def _load_vectors(con):
@@ -293,8 +292,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\nInterrupted, exiting.")
-        sys.exit(130)
+    run_cli(main)

@@ -101,11 +101,14 @@ messages), `directory.py` (summary stats; name/handle/chat resolution),
 sender), `analytics_time.py` (activity patterns with local-tz Python
 bucketing; response dynamics over messages + the sessions table),
 `analytics_social.py` (reaction stats; milestones), `analytics_language.py`
-(word trends/LSM/distinctive terms from the lexicon tables; group dynamics)
+(word trends/LSM/distinctive terms from the lexicon tables),
+`analytics_group.py` (group dynamics; imports the lexicon/LSM primitives from
+`analytics_language.py`)
 — person scope means *that person's chats* for all analytics tools except
 `get_word_frequency`,
 `_shared.py` (connection, result caps, date-bound and scope resolution,
-`_REAL_MESSAGE_CLAUSES` excluding emote/system rows from every aggregate), all
+`_REAL_MESSAGE_CLAUSES` excluding emote/system rows from every aggregate, and
+`member_key` — the single source of participant-identity merging), all
 re-exported from `__init__.py` so `import query_tools` is the only import
 callers need (`DB_PATH`/`embed_texts` are patchable package attributes,
 resolved through the package at call time); `tool_schemas.py` their JSON
@@ -115,7 +118,8 @@ Ollama chat-streaming HTTP; `embeddings.py` the shared embedding client
 ingest (documents) and query_tools (queries) so both sides embed identically;
 `config.py` all env-driven settings (defaults work with no `.env`; see
 `.env.example`); `db.py` shared sqlite helpers (`load_vec_extension`,
-`CONTACT_LABEL_SQL`, `iso_to_day`, `get_state`/`set_state`); `progress.py` the
+`CONTACT_LABEL_SQL`, `iso_to_day`, `get_state`/`set_state`, plus the batch-CLI
+`connect_default` and `run_cli` boilerplate); `progress.py` the
 shared CLI progress helper (`track(desc, total=...)` — a rich bar on a TTY,
 periodic `  ...N/Total` lines when piped, silent under `PROGRESS_STYLE=off`;
 progress never drives commit cadence); `schema.py` the
@@ -126,13 +130,17 @@ with initiator/ender), `lexicon_build.py` (`person_period_lexicon` +
 `dyad_terms`, full rebuilds — dyad_terms preserves `llm_verdict` curation);
 `function_words.py` the bundled open LSM lexicon + tokenize/emoji/laugh
 regexes + GoEmotions labels. Standalone batch CLIs: `annotate.py` (LLM chunk
-annotations + dyad-term curation via `ollama.chat_once_json`),
+annotations + dyad-term curation via `ollama.chat_once_json`; the distilled
+kNN tier lives in `annotate_distill.py`, which annotate.py calls),
 `topics.py` (k-means topic clusters + LLM labels), `wrapped.py` (markdown
 report composing the query tools deterministically; LLM only narrates
-computed numbers). `eval/evalkit/` is the analytics eval harness (stdlib-only;
-imports the app in-process, lazily — env overrides must be set before app
-modules import): `cases.py` suite loading/validation, `roster.py` roster
-resolution, `recipes.py` SQL ground-truth recipes, `manifest.py`
+computed numbers — the `_sec_*` section builders live in
+`wrapped_sections.py`). `eval/evalkit/` is the analytics eval harness
+(stdlib-only; imports the app in-process, lazily — env overrides must be set
+before app modules import): `cases.py` suite loading/validation, `roster.py`
+roster resolution, `recipes/` SQL ground-truth recipes (a package: `_base.py`
+holds the `@recipe` registry + shared helpers, one module per suite family
+registers its recipes on import), `manifest.py`
 corpus-fingerprinted ground truth, `runner.py` the transcript-capturing sweep,
 `checks.py` deterministic grading, `p3.py` LLM-graded checks, `report.py` the
 scorecard. Its slow loops (`run`, `manifest`'s ground truth, `p3 --judge`)
@@ -265,5 +273,11 @@ chunk_vectors                     -- sqlite-vec vec0 table: chunk_id ->
   `chat.py`'s `SYSTEM_PROMPT` tool list (keep all three in sync).
 - All tunables (models, hosts, timeouts, batch sizes, chunking) live in
   `config.py` / `.env.example`; never hardcode them elsewhere.
+- Participant-identity merging (me / contact / handle / unknown) has one home:
+  `query_tools/_shared.member_key`. Modules keep thin named wrappers for their
+  exact contracts (`_person_key` maps no-identity rows to `None`, the others to
+  an `"unknown"` bucket) — never re-implement the key logic.
 - Runtime deps go in `requirements.txt`, dev-only tools in
   `requirements-dev.txt` (both pinned).
+- Audit artifacts (`REPO_REVIEW.md`, `REPO_FIX_PLAN.md`) are local working
+  files, gitignored — never commit them.

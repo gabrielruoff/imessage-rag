@@ -26,7 +26,7 @@ class TestThinkTriState(unittest.TestCase):
             def __init__(self, *a, **k):
                 pass
 
-            def request(self, method, path, body=None, headers=None):
+            def request(self, _method, path, body=None, **_kwargs):
                 sent.update(json.loads(body))
 
             def getresponse(self):

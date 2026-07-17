@@ -36,6 +36,7 @@ from ._shared import (
     _resolve_chat_scope,
     _truncate_text_field,
     _validate_include,
+    member_key,
 )
 
 # Only tapback *additions*; removals (3000s) and strays (2, 3, 1000, ...) are
@@ -70,14 +71,11 @@ def _resolve_reaction_type(reaction_type):
 
 
 def _person_key(contact_id, handle_id):
-    """Merge key for grouping per-person rows: duplicate handles of one
-    contact collapse; from-me/system rows (handle_id 0/None, no contact)
-    have no person and return None."""
-    if contact_id is not None:
-        return f"contact:{contact_id}"
-    if handle_id:
-        return f"handle:{handle_id}"
-    return None
+    """Merge key for grouping per-person rows (thin wrapper over
+    _shared.member_key): duplicate handles of one contact collapse;
+    from-me/system rows (handle_id 0/None, no contact) have no person and
+    return None."""
+    return member_key(False, contact_id, handle_id, unknown=None)
 
 
 def _receipt(row):

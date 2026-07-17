@@ -6,6 +6,7 @@ columns, and the ingest_state key/value accessors."""
 import datetime
 import re
 import sqlite3
+import sys
 
 import sqlite_vec
 
@@ -27,6 +28,26 @@ def connect(path, vec=True, rows=True):
     if rows:
         con.row_factory = sqlite3.Row
     return con
+
+
+def connect_default(path, *, vec=True, rows=True):
+    """The one home for the batch CLIs' connection defaults. The per-module
+    ``_connect()`` wrappers (annotate.py, topics.py, wrapped.py,
+    eval/evalkit recipes) are documented test-patch seams: they keep their
+    module-level DB path attribute and delegate here, so the defaults are
+    defined once."""
+    return connect(path, vec=vec, rows=rows)
+
+
+def run_cli(main):
+    """Shared ``__main__`` tail for the batch CLIs (annotate.py, topics.py,
+    wrapped.py): exit with main()'s return code (None -> 0) and turn
+    Ctrl-C / EOF into the conventional exit 130."""
+    try:
+        sys.exit(main() or 0)
+    except (EOFError, KeyboardInterrupt):
+        print("\nInterrupted, exiting.")
+        sys.exit(130)
 
 
 # Human-readable label for a contact/handle: nickname > "First Last" > raw

@@ -1,6 +1,7 @@
-"""lexicon_build.py + query_tools/analytics_language.py: the person-period
-lexicon and dyad-terms pipelines, and the get_word_trends /
-get_group_dynamics tools -- all against a hand-scripted fixture DB with
+"""lexicon_build.py + query_tools/analytics_language.py (get_word_trends) +
+query_tools/analytics_group.py (get_group_dynamics): the person-period
+lexicon and dyad-terms pipelines and both tools -- all against a
+hand-scripted fixture DB with
 known dates and token counts, so every aggregate has one right answer.
 Hermetic: temp sqlite file, no Ollama, no real chat.db. sessions and
 chunk_annotations rows are hand-planted (their pipelines live in other
@@ -18,7 +19,7 @@ import lexicon_build
 import query_tools
 import schema
 from db import load_vec_extension
-from query_tools import analytics_language
+from query_tools import analytics_group, analytics_language
 
 
 def _msg(mid, chat, handle, from_me, text, date):
@@ -407,27 +408,27 @@ class WordTrendsTest(LanguageFixture):
 
 class GroupDynamicsTest(LanguageFixture):
     def test_error_on_direct_chat_and_missing_chat_id(self):
-        r = analytics_language.get_group_dynamics(chat_id=10)
+        r = analytics_group.get_group_dynamics(chat_id=10)
         self.assertIn("error", r)
         with self.assertRaises(ValueError):
-            analytics_language.get_group_dynamics(chat_id=None)
+            analytics_group.get_group_dynamics(chat_id=None)
 
     def test_every_chat_in_the_list_is_validated_not_just_the_first(self):
         # Chat 10 is 1:1: smuggled in behind a group id it would silently
         # skew every member share, so the whole call must be refused.
-        r = analytics_language.get_group_dynamics(chat_id=[11, 10])
+        r = analytics_group.get_group_dynamics(chat_id=[11, 10])
         self.assertIn("error", r)
         self.assertIn("1:1", r["error"])
-        r = analytics_language.get_group_dynamics(chat_id=[11, 999999])
+        r = analytics_group.get_group_dynamics(chat_id=[11, 999999])
         self.assertIn("error", r)
         self.assertIn("not found", r["error"])
 
     def test_unknown_include_section_raises(self):
         with self.assertRaises(ValueError):
-            analytics_language.get_group_dynamics(chat_id=11, include=["members", "bogus"])
+            analytics_group.get_group_dynamics(chat_id=11, include=["members", "bogus"])
 
     def test_members_share_and_word_counts(self):
-        r = analytics_language.get_group_dynamics(chat_id=11, include=["members"])
+        r = analytics_group.get_group_dynamics(chat_id=11, include=["members"])
         by_name = {m["member"]: m for m in r["members"]}
         self.assertEqual(set(by_name), {"Me", "Bob Jones", "+15550002222"})
         for member in by_name.values():
@@ -439,29 +440,29 @@ class GroupDynamicsTest(LanguageFixture):
         self.assertTrue(by_name["Me"]["is_me"])
 
     def test_gini_zero_for_equal_shares_with_drift(self):
-        r = analytics_language.get_group_dynamics(chat_id=11, include=["gini"])
+        r = analytics_group.get_group_dynamics(chat_id=11, include=["gini"])
         self.assertEqual(r["gini"]["gini"], 0.0)
         self.assertEqual(r["gini"]["n_members"], 3)
         self.assertEqual(r["gini"]["drift"],
                          [{"period": "2026", "gini": 0.0, "n_members": 3}])
 
     def test_lurkers_lists_silent_participant(self):
-        r = analytics_language.get_group_dynamics(chat_id=11, include=["lurkers"])
+        r = analytics_group.get_group_dynamics(chat_id=11, include=["lurkers"])
         self.assertEqual(r["lurkers"], [{"member": "+15550003333", "messages": 0}])
 
     def test_igniters_from_sessions_and_unavailable_when_empty(self):
-        r = analytics_language.get_group_dynamics(chat_id=11, include=["igniters"])
+        r = analytics_group.get_group_dynamics(chat_id=11, include=["igniters"])
         self.assertEqual(r["igniters"]["n_sessions"], 3)
         self.assertEqual(r["igniters"]["leaderboard"][0],
                          {"member": "+15550002222", "sessions_started": 2,
                           "share": 0.667})
         self.assertEqual(r["igniters"]["leaderboard"][1]["member"], "Me")
         self._execute("DELETE FROM sessions")
-        r = analytics_language.get_group_dynamics(chat_id=11, include=["igniters"])
+        r = analytics_group.get_group_dynamics(chat_id=11, include=["igniters"])
         self.assertFalse(r["igniters"]["available"])
 
     def test_adjacency_pairs_respect_gap_gate(self):
-        r = analytics_language.get_group_dynamics(chat_id=11, include=["adjacency"])
+        r = analytics_group.get_group_dynamics(chat_id=11, include=["adjacency"])
         pairs = {(p["replier"], p["replied_to"]): p["count"]
                  for p in r["adjacency"]["pairs"]}
         # m23 follows m22 by 16 min > ADJACENCY_MINUTES: no Me -> Carol pair.
@@ -471,10 +472,10 @@ class GroupDynamicsTest(LanguageFixture):
         })
 
     def test_group_lsm_per_member_and_unavailable_without_lexicon(self):
-        r = analytics_language.get_group_dynamics(chat_id=11, include=["group_lsm"])
+        r = analytics_group.get_group_dynamics(chat_id=11, include=["group_lsm"])
         self.assertFalse(r["group_lsm"]["available"])
         self._build_lexicon()
-        r = analytics_language.get_group_dynamics(chat_id=11, include=["group_lsm"])
+        r = analytics_group.get_group_dynamics(chat_id=11, include=["group_lsm"])
         members = r["group_lsm"]["members"]
         self.assertEqual({m["member"] for m in members},
                          {"Me", "Bob Jones", "+15550002222"})

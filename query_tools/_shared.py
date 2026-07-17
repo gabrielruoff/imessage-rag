@@ -65,6 +65,24 @@ CHUNK_PREVIEW_CHARS = 500   # chunk rows (get_conversation returns the messages)
 _REAL_MESSAGE_CLAUSES = ("COALESCE(m.is_emote, 0) = 0", "COALESCE(m.item_type, 0) = 0")
 
 
+def member_key(is_from_me, contact_id, handle_id, *, unknown="unknown"):
+    """The one home for participant identity when merging per-person rows in
+    Python (SQL can't: from-me rows carry handle_id=0 with no handles row, and
+    a contact may own several duplicate handle rows). 'me' for my side, else
+    the handle's contact (duplicate handles collapse), else the bare handle.
+    `unknown` is what a row with no identity (is_from_me=0 + handle_id=0
+    system noise) maps to: the default keeps such rows in an "unknown"
+    bucket; analytics_social passes None to drop them instead. Callers keep
+    thin named wrappers preserving their exact contracts."""
+    if is_from_me:
+        return "me"
+    if contact_id is not None:
+        return f"contact:{contact_id}"
+    if handle_id:
+        return f"handle:{handle_id}"
+    return unknown
+
+
 def _truncate_text_field(rows, limit=TEXT_PREVIEW_CHARS):
     """Cap each row's `text` field for prompt size; full content is available
     via get_full_messages(ids) / get_conversation(chunk_id)."""
@@ -109,6 +127,25 @@ def _scope_requested(*values):
     """True when any of the given id params is a real (non-empty) scope --
     an explicit [] counts as omitted, matching _as_id_list."""
     return any(_as_id_list(v) is not None for v in values)
+
+
+def _participant_roster(con, chat_ids):
+    """Roster seed rows for a chat list: one row per distinct handle in
+    chat_participants -- (handle_id, contact_id, label) -- so silent members
+    still appear. Shared by analytics.get_chat_participant_stats and the
+    group-dynamics lurkers section; each caller does its own post-processing."""
+    placeholders = ",".join("?" * len(chat_ids))
+    return con.execute(
+        f"""
+        SELECT DISTINCT h.id AS handle_id, h.contact_id,
+               {CONTACT_LABEL_SQL} AS label
+        FROM chat_participants cp
+        JOIN handles h ON h.id = cp.handle_id
+        LEFT JOIN contacts c ON c.id = h.contact_id
+        WHERE cp.chat_id IN ({placeholders})
+        """,
+        chat_ids,
+    ).fetchall()
 
 
 def _resolve_contact_handle_ids(con, contact_ids):

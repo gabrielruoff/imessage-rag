@@ -19,6 +19,7 @@ from ._shared import (
     _MSG_COLS,
     _MSG_JOIN,
     _connect,
+    _date_clauses,
     _id_filter_clause,
     _normalize_date_bound,
     _resolve_chat_scope,
@@ -195,12 +196,7 @@ def _fts_chunk_ranks(con, query, chat_ids, date_from, date_to):
     if clause:
         clauses.append(clause)
         params.extend(cparams)
-    if date_from is not None:
-        clauses.append("m.date >= ?")
-        params.append(_normalize_date_bound(date_from))
-    if date_to is not None:
-        clauses.append("m.date < ?")
-        params.append(_normalize_date_bound(date_to, upper=True))
+    _date_clauses(clauses, params, date_from, date_to)
     # Aggregate to chunks in SQL (best-ranked message hit per chunk)
     # so a few chatty chunks can't consume the candidate pool.
     hits = con.execute(f"""

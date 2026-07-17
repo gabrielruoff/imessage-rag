@@ -14,8 +14,8 @@ from ._shared import (
     _append_id_filters,
     _as_id_list,
     _connect,
+    _date_clauses,
     _envelope,
-    _normalize_date_bound,
     _resolve_scope,
     _truncate_text_field,
 )
@@ -49,12 +49,7 @@ def search_messages_sql(chat_id=None, handle_id=None, contact_id=None, is_from_m
         if is_from_me is not None:
             clauses.append("m.is_from_me = ?")
             params.append(int(is_from_me))
-        if date_from is not None:
-            clauses.append("m.date >= ?")
-            params.append(_normalize_date_bound(date_from))
-        if date_to is not None:
-            clauses.append("m.date < ?")
-            params.append(_normalize_date_bound(date_to, upper=True))
+        _date_clauses(clauses, params, date_from, date_to)
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         total = con.execute(

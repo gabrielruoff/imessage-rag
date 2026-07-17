@@ -21,8 +21,8 @@ Layout: messages.py (message-level tools), chunks.py (chunk/semantic/hybrid
 tools), directory.py (contact/chat resolution + stats), analytics.py
 (participant stats, word frequency), analytics_time.py (activity patterns,
 response dynamics), analytics_social.py (reaction stats, milestones),
-analytics_language.py (word trends, group dynamics), _shared.py
-(connection, caps, scope/date helpers). Every
+analytics_language.py (word trends), analytics_group.py (group dynamics),
+_shared.py (connection, caps, scope/date helpers). Every
 tool is re-exported here, so `import query_tools` stays the only import
 callers need -- add new tools to the right submodule and to __all__ below.
 DB_PATH and embed_texts are module attributes by contract: tests patch them
@@ -36,10 +36,8 @@ from .analytics import (
     get_chat_participant_stats,
     get_word_frequency,
 )
-from .analytics_language import (
-    get_group_dynamics,
-    get_word_trends,
-)
+from .analytics_group import get_group_dynamics
+from .analytics_language import get_word_trends
 from .analytics_social import (
     get_milestones,
     get_reaction_stats,

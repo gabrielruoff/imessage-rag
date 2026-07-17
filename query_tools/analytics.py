@@ -17,7 +17,7 @@ import collections
 import contextlib
 import re
 
-from db import CONTACT_LABEL_SQL, tapback_name
+from db import tapback_name
 
 from ._shared import (
     MAX_STATS_ROWS,
@@ -28,7 +28,9 @@ from ._shared import (
     _connect,
     _date_clauses,
     _id_filter_clause,
+    _participant_roster,
     _resolve_scope,
+    member_key,
 )
 
 
@@ -52,17 +54,10 @@ def get_chat_participant_stats(chat_id, date_from=None, date_to=None):
 
     # Participants are merged in Python, not SQL: from-me rows carry
     # handle_id=0 (no handles row), and a contact may own several duplicate
-    # handle rows -- so the merge key is "me" for is_from_me, else the
-    # handle's contact_id, else the bare handle. The rare is_from_me=0 +
-    # handle_id=0 rows (system noise) land in an "unknown" bucket.
-    def merge_key(is_from_me, contact_id_, handle_id_):
-        if is_from_me:
-            return "me"
-        if contact_id_ is not None:
-            return f"contact:{contact_id_}"
-        if handle_id_:
-            return f"handle:{handle_id_}"
-        return "unknown"
+    # handle rows -- _shared.member_key is the single source of that merge
+    # key. This module's contract keeps the rare is_from_me=0 + handle_id=0
+    # rows (system noise) in an "unknown" bucket (member_key's default).
+    merge_key = member_key
 
     participants = {}
 
@@ -82,19 +77,7 @@ def get_chat_participant_stats(chat_id, date_from=None, date_to=None):
 
     with contextlib.closing(_connect()) as con:
         # Seed from chat_participants so silent members still get a row.
-        placeholders = ",".join("?" * len(chat_ids))
-        seed = con.execute(
-            f"""
-            SELECT DISTINCT h.id AS handle_id, h.contact_id,
-                   {CONTACT_LABEL_SQL} AS label
-            FROM chat_participants cp
-            JOIN handles h ON h.id = cp.handle_id
-            LEFT JOIN contacts c ON c.id = h.contact_id
-            WHERE cp.chat_id IN ({placeholders})
-            """,
-            chat_ids,
-        ).fetchall()
-        for r in seed:
+        for r in _participant_roster(con, chat_ids):
             row = row_for(merge_key(False, r["contact_id"], r["handle_id"]))
             row["participant"] = r["label"]
             row["contact_id"] = r["contact_id"]

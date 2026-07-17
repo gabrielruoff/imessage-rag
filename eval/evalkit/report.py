@@ -29,6 +29,65 @@ def grade_error(grade):
     return None
 
 
+def _prev_axis_means(prev):
+    """{suite_id: {axis: mean}} from a previous scorecard (empty when none)."""
+    if not prev:
+        return {}
+    return {
+        sid: {ax: v["mean"] for ax, v in block["axes"].items()}
+        for sid, block in prev.get("suites", {}).items()
+    }
+
+
+def _suite_axes(scored, targets, prev_means):
+    """One suite's per-axis stats (mean vs target, delta vs previous run).
+    Returns (axes_out, missed): missed is True when any scored axis with a
+    target came in under it -- the overall_pass input."""
+    axes_out, missed = {}, False
+    for axis in cases.AXES:
+        target = targets.get(axis)
+        mean = (
+            round(sum(g["axes"][axis] for g in scored) / len(scored), 3)
+            if scored else None
+        )
+        passed = mean is not None and target is not None and mean >= target
+        if scored and target is not None and not passed:
+            missed = True
+        prev_mean = prev_means.get(axis)
+        axes_out[axis] = {
+            "mean": mean,
+            "target": target,
+            "pass": passed if scored else None,
+            "delta_vs_prev": (
+                round(mean - prev_mean, 3)
+                if mean is not None and prev_mean is not None
+                else None
+            ),
+        }
+    return axes_out, missed
+
+
+def _regressions(prev, suites_out):
+    """(newly_failing, newly_passing) case ids vs the previous scorecard."""
+    prev_failing = {
+        f["id"] for s in prev.get("suites", {}).values() for f in s["failing_cases"]
+    }
+    cur_failing = {f["id"] for s in suites_out.values() for f in s["failing_cases"]}
+    return sorted(cur_failing - prev_failing), sorted(prev_failing - cur_failing)
+
+
+def _suite_failing(scored, lever_histogram):
+    """A suite's failing cases (any axis 0), accumulating their levers into
+    the shared histogram."""
+    failing = []
+    for g in sorted(scored, key=lambda g: g["id"]):
+        if any(g["axes"][a] == 0 for a in cases.AXES):
+            failing.append({"id": g["id"], "axes": g["axes"], "levers": g.get("levers", [])})
+            for lever in g.get("levers", []):
+                lever_histogram[lever] = lever_histogram.get(lever, 0) + 1
+    return failing
+
+
 def build_scorecard(run_doc, suites, grades, p3_block=None, prev=None, transcript_ids=(),
                     malformed_grades=()):
     """Aggregate per plan §3.8. `grades` are §3.7 dicts; blocked cases are
@@ -39,11 +98,7 @@ def build_scorecard(run_doc, suites, grades, p3_block=None, prev=None, transcrip
     by_suite = {}
     for grade in grades:
         by_suite.setdefault(_suite_of(grade), []).append(grade)
-
-    prev_means = {}
-    if prev:
-        for sid, block in prev.get("suites", {}).items():
-            prev_means[sid] = {ax: v["mean"] for ax, v in block["axes"].items()}
+    prev_means = _prev_axis_means(prev)
 
     suites_out = {}
     lever_histogram = {}
@@ -54,40 +109,16 @@ def build_scorecard(run_doc, suites, grades, p3_block=None, prev=None, transcrip
         scored = [g for g in suite_grades if not g.get("blocked")]
         blocked = [g for g in suite_grades if g.get("blocked")]
         blocked_cases.extend(g["id"] for g in blocked)
-        targets = targets_by_suite.get(sid, {})
-        axes_out = {}
-        for axis in cases.AXES:
-            target = targets.get(axis)
-            mean = (
-                round(sum(g["axes"][axis] for g in scored) / len(scored), 3)
-                if scored else None
-            )
-            passed = mean is not None and target is not None and mean >= target
-            if scored and target is not None and not passed:
-                overall_pass = False
-            axes_out[axis] = {
-                "mean": mean,
-                "target": target,
-                "pass": passed if scored else None,
-                "delta_vs_prev": (
-                    round(mean - prev_means[sid][axis], 3)
-                    if mean is not None and sid in prev_means and axis in prev_means[sid]
-                    and prev_means[sid][axis] is not None
-                    else None
-                ),
-            }
-        failing = []
-        for g in sorted(scored, key=lambda g: g["id"]):
-            if any(g["axes"][a] == 0 for a in cases.AXES):
-                failing.append({"id": g["id"], "axes": g["axes"], "levers": g.get("levers", [])})
-                for lever in g.get("levers", []):
-                    lever_histogram[lever] = lever_histogram.get(lever, 0) + 1
+        axes_out, missed = _suite_axes(
+            scored, targets_by_suite.get(sid, {}), prev_means.get(sid, {}))
+        if missed:
+            overall_pass = False
         suites_out[sid] = {
             "n": len(suite_grades),
             "graded": len(scored),
             "blocked": len(blocked),
             "axes": axes_out,
-            "failing_cases": failing,
+            "failing_cases": _suite_failing(scored, lever_histogram),
         }
 
     graded_ids = {g["id"] for g in grades}
@@ -111,17 +142,12 @@ def build_scorecard(run_doc, suites, grades, p3_block=None, prev=None, transcrip
         "blocked_cases": sorted(blocked_cases),
     }
     if prev:
-        prev_failing = {
-            f["id"] for s in prev.get("suites", {}).values() for f in s["failing_cases"]
-        }
-        cur_failing = {f["id"] for s in suites_out.values() for f in s["failing_cases"]}
-        scorecard["newly_failing"] = sorted(cur_failing - prev_failing)
-        scorecard["newly_passing"] = sorted(prev_failing - cur_failing)
+        scorecard["newly_failing"], scorecard["newly_passing"] = _regressions(
+            prev, suites_out)
     return scorecard
 
 
-def render_markdown(scorecard, grades):
-    evidence_by_id = {g["id"]: g for g in grades}
+def _md_header(scorecard):
     lines = [f"# Scorecard -- run `{scorecard['run_id']}`", ""]
     lines.append(f"- model: `{scorecard['model']}`")
     if scorecard["compared_to"]:
@@ -131,9 +157,11 @@ def render_markdown(scorecard, grades):
         f"- corpus: {fp.get('message_count')} messages through {fp.get('max_message_date')}"
     )
     lines.append(f"- overall: {'PASS' if scorecard['overall_pass'] else 'FAIL'}")
-    lines.append("")
-    lines.append("## Suites")
-    lines.append("")
+    return lines
+
+
+def _md_suite_table(scorecard):
+    lines = ["", "## Suites", ""]
     header = "| suite | graded | blocked |"
     sep = "|---|---|---|"
     for axis in cases.AXES:
@@ -151,15 +179,21 @@ def render_markdown(scorecard, grades):
                 delta = f", {a['delta_vs_prev']:+.3f}" if a["delta_vs_prev"] is not None else ""
                 row += f" {a['mean']:.2f} vs {a['target']} ({mark}{delta}) |"
         lines.append(row)
+    return lines
 
-    lines += ["", "## Lever histogram", ""]
+
+def _md_levers(scorecard):
+    lines = ["", "## Lever histogram", ""]
     if scorecard["lever_histogram"]:
         for lever, count in scorecard["lever_histogram"].items():
             lines.append(f"- `{lever}`: {count}")
     else:
         lines.append("(no failing cases)")
+    return lines
 
-    lines += ["", "## Failing cases", ""]
+
+def _md_failing_cases(scorecard, evidence_by_id):
+    lines = ["", "## Failing cases", ""]
     any_failing = False
     for sid, block in scorecard["suites"].items():
         for failing in block["failing_cases"]:
@@ -172,7 +206,11 @@ def render_markdown(scorecard, grades):
                 lines.append(f"  - [{ev.get('axis')}] {ev.get('note')} ({ev.get('ref', '')})")
     if not any_failing:
         lines.append("(none)")
+    return lines
 
+
+def _md_footers(scorecard):
+    lines = []
     if scorecard["run_flags"]:
         lines += ["", "## Run flags", ""]
         lines += [f"- {flag}" for flag in scorecard["run_flags"]]
@@ -192,6 +230,18 @@ def render_markdown(scorecard, grades):
     if scorecard["blocked_cases"]:
         lines += ["", f"**Blocked (bug) cases, excluded from means:** "
                       f"{', '.join(scorecard['blocked_cases'])}"]
+    return lines
+
+
+def render_markdown(scorecard, grades):
+    evidence_by_id = {g["id"]: g for g in grades}
+    lines = (
+        _md_header(scorecard)
+        + _md_suite_table(scorecard)
+        + _md_levers(scorecard)
+        + _md_failing_cases(scorecard, evidence_by_id)
+        + _md_footers(scorecard)
+    )
     return "\n".join(lines) + "\n"
 
 

@@ -9,3 +9,6 @@ __pycache__/
 .env
 
 **.DS_STORE
+# repo-leaner audit artifacts (local working files, never committed)
+REPO_REVIEW.md
+REPO_FIX_PLAN.md

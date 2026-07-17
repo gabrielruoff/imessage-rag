@@ -124,56 +124,43 @@ def _volume_section(series, granularity):
     return section
 
 
-def get_activity_patterns(chat_id=None, handle_id=None, contact_id=None,
-                          date_from=None, date_to=None, granularity="month",
-                          include=None):
-    """When-do-we-talk analytics, bucketed in the local timezone: `heatmap`
-    (7x24 weekday-by-hour message counts), `volume_series` (per-period
-    sent/received at granularity 'day'|'month'|'year'; a day series past
-    MAX_SERIES_BUCKETS auto-coarsens to month with a note), `late_night`
-    (share of messages in the configured late-night hour window; an unscoped
-    call adds a top-contacts leaderboard over 1:1 chats), `busiest_days`
-    (top 10 local dates), `streaks` (longest run of consecutive active days
-    and the longest drought). Messages only, reactions excluded.
-    include=["heatmap", ...] selects a subset of sections; no scope
-    aggregates the whole corpus."""
-    if granularity not in _GRANULARITIES:
-        raise ValueError(f"unknown granularity {granularity!r}: expected one of "
-                         f"{', '.join(_GRANULARITIES)}")
-    sections = _validate_include(include, _ACTIVITY_SECTIONS, "get_activity_patterns")
-    unscoped = not _scope_requested(chat_id, handle_id, contact_id)
-    tz = _local_tz()
-    want_leaderboard = unscoped and "late_night" in sections
+def _activity_rows(con, chat_ids, date_from, date_to):
+    """(date, is_from_me, chat_id) for every real message in scope,
+    date-ordered -- the single pass _scan_activity consumes."""
+    clauses, params = ["m.date IS NOT NULL", *_REAL_MESSAGE_CLAUSES], []
+    _append_id_filters(clauses, params, chat_ids, None)
+    _date_clauses(clauses, params, date_from, date_to)
+    return con.execute(
+        f"SELECT m.date, m.is_from_me, m.chat_id FROM messages m "
+        f"WHERE {' AND '.join(clauses)} ORDER BY m.date, m.id",
+        params,
+    ).fetchall()
 
-    with contextlib.closing(_connect()) as con:
-        chat_ids, empty = _resolve_chat_scope(con, chat_id, handle_id, contact_id)
-        rows = []
-        if not empty:
-            clauses, params = ["m.date IS NOT NULL", *_REAL_MESSAGE_CLAUSES], []
-            _append_id_filters(clauses, params, chat_ids, None)
-            _date_clauses(clauses, params, date_from, date_to)
-            rows = con.execute(
-                f"SELECT m.date, m.is_from_me, m.chat_id FROM messages m "
-                f"WHERE {' AND '.join(clauses)} ORDER BY m.date, m.id",
-                params,
-            ).fetchall()
-        contact_by_chat = {}
-        if want_leaderboard:
-            # Attribute each 1:1 chat's traffic (both sides) to its contact;
-            # group chats are skipped -- a late-night group message has no
-            # single counterparty to credit.
-            contact_by_chat = {
-                r[0]: (r[1], r[2])
-                for r in con.execute(f"""
-                    SELECT cp.chat_id, COALESCE(h.contact_id, -h.id) AS ckey,
-                           {CONTACT_LABEL_SQL} AS label
-                    FROM chat_participants cp
-                    JOIN chats ch ON ch.id = cp.chat_id AND ch.is_group = 0
-                    JOIN handles h ON h.id = cp.handle_id
-                    LEFT JOIN contacts c ON c.id = h.contact_id
-                """).fetchall()
-            }
 
+def _late_night_contact_map(con):
+    """{chat_id: (contact key, label)} for the late-night leaderboard.
+    Attributes each 1:1 chat's traffic (both sides) to its contact; group
+    chats are skipped -- a late-night group message has no single
+    counterparty to credit."""
+    return {
+        r[0]: (r[1], r[2])
+        for r in con.execute(f"""
+            SELECT cp.chat_id, COALESCE(h.contact_id, -h.id) AS ckey,
+                   {CONTACT_LABEL_SQL} AS label
+            FROM chat_participants cp
+            JOIN chats ch ON ch.id = cp.chat_id AND ch.is_group = 0
+            JOIN handles h ON h.id = cp.handle_id
+            LEFT JOIN contacts c ON c.id = h.contact_id
+        """).fetchall()
+    }
+
+
+def _scan_activity(rows, tz, granularity, contact_by_chat, want_leaderboard):
+    """One date-ordered pass over the message rows, accumulating every
+    section's raw counts at once (they share the per-row local-time
+    conversion and prev-message state): the 7x24 heatmap, the volume series,
+    per-local-day counts, the late-night tally (with the optional per-contact
+    split), and the longest silence."""
     heat = [[0] * 24 for _ in range(7)]
     series = {}                       # period -> [sent, received]
     day_counts = collections.Counter()  # local 'YYYY-MM-DD' -> count
@@ -206,70 +193,125 @@ def get_activity_patterns(chat_id=None, handle_id=None, contact_id=None,
                 drought = (gap, prev_local.isoformat(), loc.isoformat())
         prev_utc, prev_local = utc, loc
 
+    return {
+        "heat": heat,
+        "series": series,
+        "day_counts": day_counts,
+        "late_n": late_n,
+        "per_contact": per_contact,
+        "drought": drought,
+    }
+
+
+def _heatmap_section(heat):
+    return {
+        "weekdays": _WEEKDAY_NAMES,
+        "counts": heat,
+        "note": "rows are weekdays (Monday first), columns are local hours 0-23",
+    }
+
+
+def _late_night_section(late_n, total, per_contact, want_leaderboard):
+    section = {
+        "start_hour": LATE_NIGHT_START_HOUR,
+        "end_hour": LATE_NIGHT_END_HOUR,
+        "n": late_n,
+        "total": total,
+        "share": round(late_n / total, 4) if total else None,
+    }
+    if want_leaderboard:
+        board = [
+            {"contact": v["label"], "messages": v["total"],
+             "late_night": v["late"],
+             "share": round(v["late"] / v["total"], 4)}
+            for v in per_contact.values() if v["total"] >= MIN_LEADERBOARD_MESSAGES
+        ]
+        board.sort(key=lambda r: (-r["share"], -r["messages"], r["contact"]))
+        section["top_contacts"] = board[:MAX_LEADERBOARD_ROWS]
+        section["top_contacts_note"] = (
+            f"1:1 chats with >= {MIN_LEADERBOARD_MESSAGES} messages; "
+            "both sides of each chat counted")
+    return section
+
+
+def _busiest_days_section(day_counts):
+    return [
+        {"day": day, "count": n}
+        for day, n in sorted(day_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:10]
+    ]
+
+
+def _streaks_section(day_counts, drought):
+    longest = None
+    ordinals = sorted(datetime.date.fromisoformat(d).toordinal() for d in day_counts)
+    if ordinals:
+        best_len = run_len = 1
+        best_end = run_start = ordinals[0]
+        best_start = ordinals[0]
+        for prev, cur in zip(ordinals, ordinals[1:]):
+            if cur == prev + 1:
+                run_len += 1
+            else:
+                run_start, run_len = cur, 1
+            if run_len > best_len:
+                best_len, best_start, best_end = run_len, run_start, cur
+        longest = {
+            "days": best_len,
+            "start": datetime.date.fromordinal(best_start).isoformat(),
+            "end": datetime.date.fromordinal(best_end).isoformat(),
+        }
+    return {
+        "longest_streak": longest,
+        "longest_drought": None if drought is None else {
+            "days": round(drought[0] / 86400, 1),
+            "from": drought[1],
+            "to": drought[2],
+        },
+    }
+
+
+def get_activity_patterns(chat_id=None, handle_id=None, contact_id=None,
+                          date_from=None, date_to=None, granularity="month",
+                          include=None):
+    """When-do-we-talk analytics, bucketed in the local timezone: `heatmap`
+    (7x24 weekday-by-hour message counts), `volume_series` (per-period
+    sent/received at granularity 'day'|'month'|'year'; a day series past
+    MAX_SERIES_BUCKETS auto-coarsens to month with a note), `late_night`
+    (share of messages in the configured late-night hour window; an unscoped
+    call adds a top-contacts leaderboard over 1:1 chats), `busiest_days`
+    (top 10 local dates), `streaks` (longest run of consecutive active days
+    and the longest drought). Messages only, reactions excluded.
+    include=["heatmap", ...] selects a subset of sections; no scope
+    aggregates the whole corpus."""
+    if granularity not in _GRANULARITIES:
+        raise ValueError(f"unknown granularity {granularity!r}: expected one of "
+                         f"{', '.join(_GRANULARITIES)}")
+    sections = _validate_include(include, _ACTIVITY_SECTIONS, "get_activity_patterns")
+    unscoped = not _scope_requested(chat_id, handle_id, contact_id)
+    tz = _local_tz()
+    want_leaderboard = unscoped and "late_night" in sections
+
+    with contextlib.closing(_connect()) as con:
+        chat_ids, empty = _resolve_chat_scope(con, chat_id, handle_id, contact_id)
+        rows = [] if empty else _activity_rows(con, chat_ids, date_from, date_to)
+        contact_by_chat = _late_night_contact_map(con) if want_leaderboard else {}
+
+    scan = _scan_activity(rows, tz, granularity, contact_by_chat, want_leaderboard)
+
     total = len(rows)
     result = {"timezone": _tz_label(tz), "message_count": total}
 
     if "heatmap" in sections:
-        result["heatmap"] = {
-            "weekdays": _WEEKDAY_NAMES,
-            "counts": heat,
-            "note": "rows are weekdays (Monday first), columns are local hours 0-23",
-        }
+        result["heatmap"] = _heatmap_section(scan["heat"])
     if "volume_series" in sections:
-        result["volume_series"] = _volume_section(series, granularity)
+        result["volume_series"] = _volume_section(scan["series"], granularity)
     if "late_night" in sections:
-        section = {
-            "start_hour": LATE_NIGHT_START_HOUR,
-            "end_hour": LATE_NIGHT_END_HOUR,
-            "n": late_n,
-            "total": total,
-            "share": round(late_n / total, 4) if total else None,
-        }
-        if want_leaderboard:
-            board = [
-                {"contact": v["label"], "messages": v["total"],
-                 "late_night": v["late"],
-                 "share": round(v["late"] / v["total"], 4)}
-                for v in per_contact.values() if v["total"] >= MIN_LEADERBOARD_MESSAGES
-            ]
-            board.sort(key=lambda r: (-r["share"], -r["messages"], r["contact"]))
-            section["top_contacts"] = board[:MAX_LEADERBOARD_ROWS]
-            section["top_contacts_note"] = (
-                f"1:1 chats with >= {MIN_LEADERBOARD_MESSAGES} messages; "
-                "both sides of each chat counted")
-        result["late_night"] = section
+        result["late_night"] = _late_night_section(
+            scan["late_n"], total, scan["per_contact"], want_leaderboard)
     if "busiest_days" in sections:
-        result["busiest_days"] = [
-            {"day": day, "count": n}
-            for day, n in sorted(day_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:10]
-        ]
+        result["busiest_days"] = _busiest_days_section(scan["day_counts"])
     if "streaks" in sections:
-        longest = None
-        ordinals = sorted(datetime.date.fromisoformat(d).toordinal() for d in day_counts)
-        if ordinals:
-            best_len = run_len = 1
-            best_end = run_start = ordinals[0]
-            best_start = ordinals[0]
-            for prev, cur in zip(ordinals, ordinals[1:]):
-                if cur == prev + 1:
-                    run_len += 1
-                else:
-                    run_start, run_len = cur, 1
-                if run_len > best_len:
-                    best_len, best_start, best_end = run_len, run_start, cur
-            longest = {
-                "days": best_len,
-                "start": datetime.date.fromordinal(best_start).isoformat(),
-                "end": datetime.date.fromordinal(best_end).isoformat(),
-            }
-        result["streaks"] = {
-            "longest_streak": longest,
-            "longest_drought": None if drought is None else {
-                "days": round(drought[0] / 86400, 1),
-                "from": drought[1],
-                "to": drought[2],
-            },
-        }
+        result["streaks"] = _streaks_section(scan["day_counts"], scan["drought"])
     return result
 
 
