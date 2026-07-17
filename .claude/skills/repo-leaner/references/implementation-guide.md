@@ -6,7 +6,7 @@ For steps B5–B6, after approval. Goal: apply the approved plan safely in an **
 
 Work in a dedicated worktree, not the user's checkout. This is the default so the fix run never switches the user's branch or disturbs their in-progress work.
 
-- Record the baseline test result **in the user's current checkout first** (before creating the worktree), so you're comparing against the real starting state. If tests were already failing, say so; you can only promise "no *new* breakage," not green-from-red.
+- The baseline test result was already recorded in the approved plan (its **Baseline** line) when the plan was built — use that as the starting state; don't re-run it. If the plan says tests were already failing, you can only promise "no *new* breakage," not green-from-red. If the plan somehow lacks a baseline, record one in the user's checkout before creating the worktree.
 - Note: a worktree does **not** require a clean working tree in the user's checkout — their uncommitted changes stay put and are irrelevant to the new worktree. So there's no need to block on a dirty tree here.
 - Create the worktree on a fresh branch, in a sibling directory outside the repo so it doesn't get scanned as part of the repo. If the harness provides a worktree tool (e.g. `EnterWorktree`), prefer it; otherwise:
   ```bash
