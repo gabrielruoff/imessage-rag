@@ -214,12 +214,20 @@ def _judge_annotations(samples, run_id):
 
 # --- P3.3 topics sampler --------------------------------------------------------
 
+# Chunks per cluster shown to the label-quality judge. Deliberately NOT
+# config.TOPIC_LABEL_SAMPLES: that value is tuned for the label pass, whose
+# samples are centroid-ranked (and so need to be many, to escape the short
+# filler chunks nearest the centroid). These are picked ORDER BY c.id, so more
+# of them buys no representativeness -- it only grows the judge prompt (each
+# chunk is truncated to 800 chars and all are joined into one user message),
+# which Ollama would silently drop past the context window rather than error.
+_JUDGE_SAMPLES = 5
+
 
 def cmd_topics_sample(args):
     run_dir = _run_dir(args)
     db_path = resolve_db_path(args.db)
 
-    import config
     from db import get_state
 
     con = sqlite3.connect(db_path)
@@ -244,7 +252,7 @@ def cmd_topics_sample(args):
         chunks = con.execute(
             "SELECT c.id, c.text FROM chunk_topics ct JOIN chunks c ON c.id = ct.chunk_id "
             "WHERE ct.cluster_id = ? ORDER BY c.id LIMIT ?",
-            (cluster["cluster_id"], config.TOPIC_LABEL_SAMPLES),
+            (cluster["cluster_id"], _JUDGE_SAMPLES),
         ).fetchall()
         samples.append({
             "cluster_id": cluster["cluster_id"],

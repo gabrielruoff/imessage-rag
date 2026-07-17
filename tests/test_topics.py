@@ -11,6 +11,7 @@ from unittest import mock
 
 import sqlite_vec
 
+import config
 import ollama
 import schema
 import topics
@@ -180,6 +181,52 @@ class TestLabelPass(TopicsFixture):
         self.assertEqual(fake.call_count, 2)
         self.assertEqual({r[1] for r in self.topic_rows()}, {"New A", "New B"})
         self.assertEqual(self.cluster_of(), assign_before)   # assignments untouched
+
+
+class TestLabelModelPlumbing(TopicsFixture):
+    """The label pass used to accept a model= it never passed, silently
+    falling through to CHAT_MODEL inside ollama.chat_once."""
+
+    def test_label_pass_uses_topic_config(self):
+        # Non-default sentinels: with the real defaults TOPIC_THINK is None and
+        # TOPIC_TIMEOUT is CHAT_TIMEOUT, so asserting against them would pass
+        # even if _ask_json hardcoded the values or read the CHAT_* vars.
+        # assertIs on think, not assertEqual -- False vs None is the whole point
+        # of the tri-state, and False == 0 would not catch a collapsed sentinel.
+        self.seed_vectors()
+        replies = [_reply({"label": "A"}), _reply({"label": "B"})]
+        with mock.patch.object(config, "TOPIC_MODEL", "topic-sentinel"), \
+             mock.patch.object(config, "TOPIC_THINK", False), \
+             mock.patch.object(config, "TOPIC_TIMEOUT", 999), \
+             mock.patch.object(ollama, "chat_once", side_effect=replies) as fake:
+            topics.main(["--k", "2"])
+        self.assertEqual(fake.call_count, 2)
+        for call in fake.call_args_list:
+            self.assertEqual(call.kwargs["model"], "topic-sentinel")
+            self.assertEqual(call.kwargs["timeout"], 999)
+            self.assertIs(call.kwargs["think"], False)
+            self.assertEqual(call.kwargs["format"], "json")
+
+    def test_model_flag_overrides_topic_model(self):
+        self.seed_vectors()
+        replies = [_reply({"label": "A"}), _reply({"label": "B"})]
+        with mock.patch.object(ollama, "chat_once", side_effect=replies) as fake:
+            topics.main(["--k", "2", "--model", "some-other-model"])
+        for call in fake.call_args_list:
+            self.assertEqual(call.kwargs["model"], "some-other-model")
+
+    def test_relabel_honors_model_flag(self):
+        self.seed_vectors()
+        with mock.patch.object(ollama, "chat_once",
+                               side_effect=[_reply({"label": "A"}),
+                                            _reply({"label": "B"})]):
+            topics.main(["--k", "2"])
+        with mock.patch.object(ollama, "chat_once",
+                               side_effect=[_reply({"label": "C"}),
+                                            _reply({"label": "D"})]) as fake:
+            topics.main(["--relabel", "--model", "relabel-model"])
+        for call in fake.call_args_list:
+            self.assertEqual(call.kwargs["model"], "relabel-model")
 
 
 if __name__ == "__main__":

@@ -3,9 +3,10 @@ pushed into sqlite-vec (scratch vec0 centroid table + per-chunk KNN), centroid
 updates in plain Python via array('f') -- no numpy. After clustering, an LLM
 label pass names each cluster from the chunks nearest its centroid.
 
-Usage: topics.py [--k K] [--relabel]
+Usage: topics.py [--k K] [--relabel] [--model MODEL]
   --relabel re-runs ONLY the label pass, for ALL clusters (default runs
   clustering, then labels clusters WHERE label IS NULL).
+  --model overrides TOPIC_MODEL for the label pass.
 """
 
 import sys
@@ -19,6 +20,7 @@ import sqlite_vec
 
 import ollama
 import progress
+import config
 from config import TARGET_DB, TOPIC_K, TOPIC_KMEANS_ITERS, TOPIC_LABEL_SAMPLES
 from db import connect, get_state, set_state
 
@@ -172,9 +174,10 @@ def persist_clusters(con, assignments, embed_model, dim, k):
 # LLM label pass
 # ---------------------------------------------------------------------------
 
-def label_clusters(con, relabel=False, samples=TOPIC_LABEL_SAMPLES):
+def label_clusters(con, relabel=False, samples=TOPIC_LABEL_SAMPLES, model=None):
     """Name clusters from their most-central chunks. Default labels only
-    clusters WHERE label IS NULL (resumable); --relabel renames all."""
+    clusters WHERE label IS NULL (resumable); --relabel renames all.
+    model=None uses TOPIC_MODEL."""
     where = "" if relabel else " WHERE label IS NULL"
     cluster_ids = [r[0] for r in con.execute(
         f"SELECT cluster_id FROM topics{where} ORDER BY cluster_id")]
@@ -224,10 +227,13 @@ def label_clusters(con, relabel=False, samples=TOPIC_LABEL_SAMPLES):
                 f"SELECT text FROM chunks WHERE id IN ({placeholders})", sample_ids)]
             prompt = "\n\n---\n\n".join(t[:_SAMPLE_TEXT_CHARS] for t in texts if t)
 
+            # The TOPIC_* settings are resolved through config at call time,
+            # so tests can patch that seam.
             data = ollama.chat_once_json([
                 {"role": "system", "content": _LABEL_SYSTEM},
                 {"role": "user", "content": prompt},
-            ], retry_nudge=_RETRY_NUDGE)
+            ], model=model or config.TOPIC_MODEL, retry_nudge=_RETRY_NUDGE,
+                timeout=config.TOPIC_TIMEOUT, think=config.TOPIC_THINK)
             label = data.get("label") if isinstance(data, dict) else None
             if not isinstance(label, str) or not label.strip():
                 print(f"  cluster {cluster_id}: unusable label response, skipped")
@@ -256,6 +262,9 @@ def main(argv=None):
                         help=f"number of clusters (default {TOPIC_K})")
     parser.add_argument("--relabel", action="store_true",
                         help="re-run only the label pass, for all clusters")
+    parser.add_argument("--model", default=None,
+                        help=f"Ollama model for the label pass "
+                             f"(default {config.TOPIC_MODEL})")
     args = parser.parse_args(argv)
 
     con = _connect()
@@ -269,7 +278,7 @@ def main(argv=None):
                   "embedding) first; nothing to cluster.")
             return
         if args.relabel:
-            label_clusters(con, relabel=True)
+            label_clusters(con, relabel=True, model=args.model)
             return
 
         embed_model = get_state(con, "embed_model") or "unknown"
@@ -278,7 +287,7 @@ def main(argv=None):
         state_dim = get_state(con, "embed_dim")
         persist_clusters(con, assignments, embed_model,
                          int(state_dim) if state_dim else dim, k)
-        label_clusters(con)
+        label_clusters(con, model=args.model)
     finally:
         con.close()
 

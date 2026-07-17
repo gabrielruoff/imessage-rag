@@ -24,8 +24,8 @@ Full design history, schema, rationale, and data forensics:
   [--dry-run]` — resumable, commits as it goes, Ctrl-C safe. Bare = top
   `ANNOTATE_TOP_DYADS` chats only; `--terms` is a mode switch, not an addition.
 - Topic clusters: `make topics`, or `.venv/bin/python3 topics.py [--k K]
-  [--relabel]` — k-means over chunk_vectors (assignment in sqlite-vec), then an
-  LLM label pass
+  [--relabel] [--model M]` — k-means over chunk_vectors (assignment in
+  sqlite-vec), then an LLM label pass
 - Everything, in order: `make pipeline` (ingest → annotate → topics). These
   MUST run sequentially and the target is written to stay serial under `make
   -j`: they hold a SQLite write lock across many LLM calls (concurrent runs
@@ -75,6 +75,15 @@ models, so the chat model cannot double as the embedder. Nomic's task
 prefixes (`search_document: ` / `search_query: `) are applied by default and
 the embedding dimension is auto-detected at ingest time, so switching
 embedders is a `.env` change + `reset_db.py` + re-ingest.
+
+Each LLM pipeline picks its own generation model: `CHAT_MODEL` (chat.py, plus
+`--model`), `ANNOTATE_MODEL` (annotate.py, `--model`), `TOPIC_MODEL`
+(topics.py, `--model`), `WRAPPED_MODEL` (wrapped.py). Empty = inherit
+`CHAT_MODEL`, so the defaults are a single knob until you need otherwise; the
+same inherit-from-chat rule covers `*_THINK` and `*_TIMEOUT`. `EMBED_MODEL` is
+deliberately NOT per-pipeline — query-side and document-side embeddings must
+come from one model or retrieval silently degrades (see the gotcha below), and
+ingest runs no generation model at all.
 
 Module map: `query_tools/` holds the twenty-one retrieval functions the LLM
 calls — `messages.py` (message-level SQL/FTS search, context expansion, full
@@ -200,8 +209,21 @@ chunk_vectors                     -- sqlite-vec vec0 table: chunk_id ->
 - `chunk_annotations` is guarded like `chunk_vectors`: `annotate.py` records
   `annotate_model` in `ingest_state` and refuses to annotate with a different
   model while the table is non-empty — switching ANNOTATE_MODEL means
-  emptying `chunk_annotations` first. `topics.py`'s `topic_model_k` guard is
-  warn-only (a rebuild simply replaces the clustering).
+  emptying `chunk_annotations` first. Per-pipeline model vars make this easier
+  to trip, not less: the guard is unchanged. `topics.py`'s `topic_model_k`
+  guard is warn-only (a rebuild simply replaces the clustering).
+- `think` is per-call, not global: `ollama.chat_once`/`chat_stream` take
+  `think=` with a `_UNSET` default. The tri-state is load-bearing — `None`
+  means *omit* the flag (some models reject a `think` option) and is NOT the
+  same as `False` (send `think: false`), so never default the param to `None`.
+  On a thinking model the flag dominates everything else: qwen3:4b labels a
+  topic in 3.2s with `think=false` vs 85s with it on — slower than a 30B.
+- `TOPIC_LABEL_SAMPLES` defaults to 30 for a non-obvious reason: label samples
+  are ranked by similarity to the cluster centroid, and a big cluster's most
+  *central* chunks are its shortest ("ok", "yeah"). At 5 samples the whole
+  prompt can be ~250 chars and the model accurately names it "Short
+  confirmation responses". Raising it past ~30 risks the context window
+  (~1200 chars/sample), where an oversized message is dropped, not rejected.
 - `chat.db` is live (WAL sidecars): only ever read the snapshot
   (`ingest.snapshot_source`), never the original.
 - Ingestion is append-only by design; `--senders` scopes what a run reads, it

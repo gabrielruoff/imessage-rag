@@ -257,6 +257,8 @@ def narrate_section(title, stats):
             {"role": "user", "content": f"Section: {title}\nStats JSON:\n{payload}"},
         ],
         model=config.WRAPPED_MODEL,
+        timeout=config.WRAPPED_TIMEOUT,
+        think=config.WRAPPED_THINK,
     )
     return (reply.get("content") or "").strip() or None
 

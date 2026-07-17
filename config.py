@@ -49,8 +49,20 @@ CHAT_MODEL = os.getenv("CHAT_MODEL", "gemma4:26b-a4b-it-qat")
 # 'false' disables the hidden thinking pass (much faster per tool round-trip),
 # 'true' forces it on. Unset (the default) omits the flag so Ollama uses the
 # model's own default -- required for models that reject a "think" option.
-_chat_think = os.getenv("CHAT_THINK", "").strip().lower()
-CHAT_THINK = None if _chat_think == "" else _chat_think in ("1", "true", "yes")
+#
+# The tri-state matters: None means "omit the flag entirely", which is NOT the
+# same as False ("send think: false"). Some models reject the option outright,
+# so the distinction has to survive all the way to the request body.
+
+
+def _think(name, default=None):
+    raw = os.getenv(name, "").strip().lower()
+    if raw == "":
+        return default
+    return raw in ("1", "true", "yes")
+
+
+CHAT_THINK = _think("CHAT_THINK")
 
 # --- CLI progress -------------------------------------------------------------
 # How the batch CLIs report progress. 'auto' (the default) draws a live rich
@@ -128,12 +140,35 @@ ANNOTATE_TOP_DYADS = int(os.getenv("ANNOTATE_TOP_DYADS", "20"))
 ANNOTATE_COMMIT_EVERY = int(os.getenv("ANNOTATE_COMMIT_EVERY", "50"))
 
 # --- Topic clustering (topics.py) -------------------------------------------------
+# Empty = use CHAT_MODEL (same convention as ANNOTATE_MODEL/WRAPPED_MODEL).
+# The topic_model_k guard in ingest_state stays warn-only -- a rebuild just
+# replaces the clustering, so mixing models across runs costs nothing.
+TOPIC_MODEL = os.getenv("TOPIC_MODEL", "") or CHAT_MODEL
+# Unset = inherit CHAT_THINK. Worth setting to false independently: the label
+# pass is one short JSON object per cluster, where a thinking pass is pure
+# latency (measured 85s -> 3.2s per call on qwen3:4b) and buys no quality.
+TOPIC_THINK = _think("TOPIC_THINK", CHAT_THINK)
+_topic_timeout = os.getenv("TOPIC_TIMEOUT", "").strip()
+TOPIC_TIMEOUT = int(_topic_timeout) if _topic_timeout else CHAT_TIMEOUT
 TOPIC_K = int(os.getenv("TOPIC_K", "50"))
 TOPIC_KMEANS_ITERS = int(os.getenv("TOPIC_KMEANS_ITERS", "15"))
-TOPIC_LABEL_SAMPLES = int(os.getenv("TOPIC_LABEL_SAMPLES", "5"))
+# Chunks shown to the LLM per cluster, ranked by cosine similarity to the
+# cluster centroid. 30, not 5: the most-central chunks of a big cluster are
+# also its *shortest* ("ok", "yeah") -- the centroid of 2700 chunks looks like
+# filler -- so 5 samples can be a ~250-char prompt, and the model correctly but
+# uselessly names it "Short confirmation responses". 30 reaches the actual
+# topic. Raising this further needs a prompt-size check: at ~1200 chars per
+# sample, 30 tops out around 36k chars (~12k tokens), and a message past the
+# context window is silently dropped rather than erroring (see the Ollama
+# truncation gotcha in CLAUDE.md).
+TOPIC_LABEL_SAMPLES = int(os.getenv("TOPIC_LABEL_SAMPLES", "30"))
 
 # --- wrapped.py --------------------------------------------------------------------
 WRAPPED_MODEL = os.getenv("WRAPPED_MODEL", "") or CHAT_MODEL
+# Unset = inherit CHAT_THINK / CHAT_TIMEOUT.
+WRAPPED_THINK = _think("WRAPPED_THINK", CHAT_THINK)
+_wrapped_timeout = os.getenv("WRAPPED_TIMEOUT", "").strip()
+WRAPPED_TIMEOUT = int(_wrapped_timeout) if _wrapped_timeout else CHAT_TIMEOUT
 WRAPPED_TOP_CONTACTS = int(os.getenv("WRAPPED_TOP_CONTACTS", "8"))
 # Auto-exclude contacts who went abruptly silent (>= WRAPPED_SILENT_MONTHS
 # before corpus end, >= WRAPPED_SILENT_MIN_MESSAGES lifetime) from the
