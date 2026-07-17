@@ -160,7 +160,10 @@ CREATE TABLE IF NOT EXISTS chunk_annotations (
     valence REAL,                    -- -1..1
     emotions_json TEXT,              -- JSON list of GoEmotions labels
     depth INTEGER,                   -- 1 (logistics) .. 5 (heart-to-heart)
-    events_json TEXT                 -- JSON list of good-news/gratitude events
+    events_json TEXT,                -- JSON list of good-news/gratitude events
+    source TEXT DEFAULT 'llm'        -- 'llm' or 'distilled' (annotate.py provenance;
+                                     -- distilled rows have empty events and can be
+                                     -- re-annotated by an LLM tier)
 );
 
 CREATE TABLE IF NOT EXISTS topics (
@@ -235,6 +238,13 @@ def create_schema(con: sqlite3.Connection):
     msg_cols = {row[1] for row in con.execute("PRAGMA table_info(messages)")}
     if msg_cols and "chunk_id" not in msg_cols:
         con.execute("ALTER TABLE messages ADD COLUMN chunk_id INTEGER")
+
+    # Pre-distillation chunk_annotations: add the provenance column. The
+    # DEFAULT stamps existing rows 'llm', which is correct -- every row
+    # predating the column was LLM-produced.
+    ann_cols = {row[1] for row in con.execute("PRAGMA table_info(chunk_annotations)")}
+    if ann_cols and "source" not in ann_cols:
+        con.execute("ALTER TABLE chunk_annotations ADD COLUMN source TEXT DEFAULT 'llm'")
 
     # The update trigger used to fire on ANY messages update; drop it so
     # FTS_SCHEMA recreates it scoped to UPDATE OF text (see comment there).

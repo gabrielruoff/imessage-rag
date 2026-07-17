@@ -55,42 +55,56 @@ sections in one call, so prefer them over counting search results.
 ### Optional LLM passes
 
 Two separate batch CLIs. Nothing above depends on them — they add extra
-depth. Both are slow (overnight-scale on a full history), both commit as they
-go, and both are safe to Ctrl-C: re-running resumes where you left off rather
-than redoing work.
+depth. Both commit as they go and are safe to Ctrl-C: re-running resumes
+where you left off rather than redoing work.
 
 To cover everything:
 
 ```sh
-make annotate-all    # annotate every chunk, then curate inside-joke candidates
+make annotate        # annotate every chunk, then curate inside-joke candidates
 make topics          # cluster + label topics
 ```
 
 Run them one at a time. They can't run in parallel — each holds a SQLite write
-lock across many LLM calls, so a concurrent run dies with `database is locked`,
-and there'd be nothing to gain anyway since Ollama serializes inference. `make
-pipeline` runs ingest, annotation, and topics back to back in the right order
-(and stays sequential even under `make -j`).
-
-`make annotate` is the cheaper variant: same two passes, but the chunk pass
-covers only the top chats. Both targets, and every job below, print live
-progress with a percentage and an ETA.
+lock across many LLM calls, so a concurrent run dies with `database is locked`.
+(Within one job, LLM requests do fan out: `make ollama-start` runs Ollama with
+4 parallel slots and `annotate.py` keeps `ANNOTATE_WORKERS` requests in flight,
+worth ~2x on the LLM passes.) `make pipeline` runs ingest, annotation, and
+topics back to back in the right order (and stays sequential even under
+`make -j`).
 
 **`annotate.py`** has two modes, and one run only does one of them:
 
-- Bare, it annotates *chunks* (valence, emotions, depth, events). Its default
-  scope is not the whole corpus — it covers the top `ANNOTATE_TOP_DYADS`
-  chats by message count (default 20) as a cost guard. Pass `--all` for
-  everything, or `--top-dyads N` for a different cutoff.
+- Bare, it annotates *chunks* (valence, emotions, depth, events). `--quality`
+  picks how (default `ANNOTATE_QUALITY`, `distilled`):
+  - `distilled` LLM-labels a random seed sample once (`ANNOTATE_SEED_TARGET`,
+    default 450 — roughly half an hour, and only ever paid once), then
+    classifies every remaining chunk from its already-computed embedding by
+    nearest-seed vote: the whole corpus in about a minute, always corpus-wide.
+    Valence and depth match LLM fidelity, emotions run a little rougher, and
+    *events are left empty* — extracting quotes is the one thing the shortcut
+    can't do.
+  - `fast` / `balanced` / `max` are the real-LLM-call-per-chunk tiers (each
+    slower and more faithful than the last; hours to days corpus-wide), and
+    the only source of events. They cover the top `ANNOTATE_TOP_DYADS` chats
+    (default 20) bare, honor `--all` / `--top-dyads N`, and with
+    `--upgrade-distilled` also replace distilled rows in scope — so an
+    overnight `--quality fast --upgrade-distilled` is how events get filled
+    in for the chats that matter.
 - `--terms` instead curates `dyad_terms` verdicts, which is what gives
   `get_word_trends` its inside-joke section. It's a mode switch, so a bare run
   never touches terms — this is the second run you need.
 
+(`make annotate-all` passes `--all`, which only changes anything if you've set
+an LLM quality tier — under the default `distilled` both targets already cover
+the whole corpus.)
+
 `--dry-run` prints the pending scope and exits without calling Ollama or
-writing, which is worth doing before `--all` to see how many chunks you're
-signing up for. `--limit N` caps a single run. `annotate.py` records its model
-and refuses to mix models into a non-empty `chunk_annotations` table, so
-changing `ANNOTATE_MODEL` means emptying that table first.
+writing, which is worth doing before an LLM-tier `--all` to see how many
+chunks you're signing up for. `--limit N` caps a single run. `annotate.py`
+records its model and refuses to mix models into a non-empty
+`chunk_annotations` table (distilled rows count — they inherit the seed
+model's bias), so changing `ANNOTATE_MODEL` means emptying that table first.
 
 **`topics.py`** needs no flags — one bare run clusters every embedded chunk
 into `TOPIC_K` clusters (default 50) and then labels them. It requires an
@@ -116,7 +130,8 @@ shows who made the cut before anything is generated. Override with
 `--out`.
 
 Tunables (session gap, late-night hours, `LOCAL_TZ`, dyad-term thresholds,
-topic `k`, wrapped roster size) all live in `.env` — see `.env.example`.
+annotation quality/workers/seed pool, topic `k`, wrapped roster size) all
+live in `.env` — see `.env.example`.
 
 ### Progress output
 

@@ -553,6 +553,106 @@ End-to-end *response-quality* evaluation (does the model pick the right tool
 and read the result correctly?) is specified but not yet run — see
 [`ANALYTICS_TEST_PLAN.md`](ANALYTICS_TEST_PLAN.md).
 
+## 2026-07-17: annotate.py quality presets (reasoning effort + batching)
+
+A full-corpus annotate run against `gpt-oss:20b` projected ~158 hours.
+Profiling one request showed the time goes to the model's *hidden reasoning
+pass*, not the answer: at default effort it emitted ~2,000 chars of thinking
+before an ~80-char JSON annotation (10.8s wall; prompt eval was 20ms).
+`think: "low"` cut that to ~260 chars and 2.7s with an equivalent answer.
+Batching several chunks into one request amortizes what remains: 6–12 chunks
+per request ran at ~1.0s/chunk (plateaus past ~6; batching *without* low
+effort only reached 4.4s/chunk — effort is the primary lever, batching the
+secondary one).
+
+Quality was checked by re-annotating 24 max-quality-annotated chunks and
+measuring agreement, calibrated against the noise floor of re-running the
+max path on itself (valence MAE 0.12, depth exact 50%/±1 100%, emotion
+Jaccard 0.52 — the task is inherently noisy):
+
+- low effort, single (balanced): valence MAE 0.23, depth ±1 100%, emotion
+  Jaccard 0.59 — within the model's own run-to-run noise, but it surfaces
+  fewer good_news/gratitude events (3 vs 9 on the sample).
+- low effort, batch 8 (fast): depth ±1 88%, emotion Jaccard 0.34 — slightly
+  below the noise floor; acceptable for corpus-scale aggregates.
+
+Hence `--quality {fast,balanced,max}` (env `ANNOTATE_QUALITY`, default
+**balanced**), with `ANNOTATE_THINK`/`ANNOTATE_BATCH_SIZE` as fine-grained
+overrides. `max` is the original behavior. Implementation notes:
+
+- Ollama's `think` accepts effort strings (`low`/`medium`/`high`) on gpt-oss
+  and booleans on toggle models (qwen3). gpt-oss **silently returns empty
+  content for `think: false`** — every annotation would be "skipped", so the
+  presets use `"low"`, never `false`. gemma4 tolerates `"low"`; models that
+  reject `think` outright drop it for the rest of the run (warned once).
+- Batched replies are keyed by chunk id (`{"<id>": {...}}`); any id the
+  reply misses or mangles falls back to a single-chunk request, so batching
+  can't lose rows — worst case it costs one extra request.
+- Estimated wall time for the ~58k-chunk default scope: max ~140h,
+  balanced ~48h, fast ~16–35h.
+
+## 2026-07-17: distilled annotations (kNN over chunk_vectors) + LLM concurrency
+
+Even the fast preset left full-corpus annotation at ~24h+ (and re-measured on
+*random* corpus chunks the LLM tiers run ~1.7x slower than the top-dyad
+benchmarks above — balanced is really ~5s/chunk, ~100h corpus-wide). The
+target was ≤15 min, and no per-chunk-LLM design reaches it locally, so the
+default tier now stops calling the LLM per chunk:
+
+**`--quality distilled` (new default)**: LLM-label a random corpus-wide seed
+sample (`ANNOTATE_SEED_TARGET`, 450), then classify every remaining chunk by
+a distance-weighted vote of its `ANNOTATE_KNN_K` (10) nearest seeds in the
+*existing* `chunk_vectors` embedding space — sqlite-vec itself is the KNN
+engine (a temp vec0 seed table), so there's no numpy/sklearn dependency.
+Measured ~0.3ms/chunk: the full 74k corpus classifies in well under a
+minute; a cold start (no seeds) is ~20–40 min of seeding.
+
+Held-out agreement (317 train / 120 test random seeds, vs balanced LLM
+labels), calibrated against the LLM's own run-to-run noise (valence MAE
+0.12, depth ±1 100%, emotion Jaccard 0.52 when re-run against itself):
+
+| | valence MAE | depth ±1 | emotion Jaccard |
+|---|---|---|---|
+| fast preset (vs max) | 0.23 | 88% | 0.34 |
+| distilled kNN | 0.25 | 95% | 0.27 |
+
+i.e. valence/depth at LLM fidelity, emotions slightly below the fast preset.
+Hyperparameters (k 5–40, weight sharpening, vote thresholds) barely move any
+metric; the emotion vote keeps top-≤3 labels with ≥0.15 of the weighted vote.
+
+**Events are deliberately NOT distilled.** Excerpt extraction is generative,
+and the "cheap filter → LLM confirm" idea died on measurement: ~13% of
+random chunks contain a good_news/gratitude event, and the embedding filter
+must flag ~70% of chunks to catch ~90% of them. So distilled rows carry
+`events_json='[]'` plus a `source='distilled'` provenance column (DEFAULT
+'llm' backfills pre-existing rows via ALTER in create_schema), and the
+`--upgrade-distilled` flag lets an LLM tier re-annotate distilled rows in
+scope — the intended path for filling events where they matter (e.g.
+overnight `--quality fast --upgrade-distilled` over the top dyads). Only
+`source='llm'` rows train the kNN vote. The `annotate_model` guard covers
+distilled rows too: they inherit the seed model's bias.
+
+Seed-pool caveats: any pre-existing `source='llm'` row counts toward
+`ANNOTATE_SEED_TARGET`, so a pool inherited from an earlier scoped LLM run
+(e.g. top dyads) is biased toward those chats rather than random — the
+agreement table above was measured on a genuinely random pool. The seed
+sample draws from distilled rows as well as unannotated ones (relabeling
+them `'llm'`), so raising `ANNOTATE_SEED_TARGET` and rerunning grows the
+pool even after the corpus is fully classified.
+
+**Concurrency (`ANNOTATE_WORKERS`, 4)**: every LLM pass (chunk tiers, seed
+pass, --terms) fans requests over a thread pool, mirroring
+`chunking.embed_chunks` — workers only do HTTP; validation, SQLite writes,
+commits and progress stay on the main thread. Pays off only when the server
+runs parallel slots, so `make ollama-start` now sets `OLLAMA_NUM_PARALLEL=4`.
+Measured on gpt-oss:20b at 4/4: ~2x (5.16 → 2.65 s/chunk sequential-vs-8-in-
+flight; batch-8 prompts × 4 workers reach ~1.4s/chunk). It does not scale to
+4x: Apple-Silicon decode is memory-bandwidth-bound and MoE experts diverge
+across concurrent sequences, so weight reads only partially amortize. RAM
+cost ~0.6 GB; Ollama scales total context so each slot keeps the full 32k
+window. Against a serial server the extra workers just queue (CHAT_TIMEOUT
+covers the wait), which is why 4 is a safe default.
+
 ## Linting
 
 `ruff check .` (config in `pyproject.toml`: `line-length = 100`,

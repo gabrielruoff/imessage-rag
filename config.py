@@ -138,6 +138,34 @@ DYAD_TERM_TOP_K = int(os.getenv("DYAD_TERM_TOP_K", "50"))
 ANNOTATE_MODEL = os.getenv("ANNOTATE_MODEL", "") or CHAT_MODEL
 ANNOTATE_TOP_DYADS = int(os.getenv("ANNOTATE_TOP_DYADS", "20"))
 ANNOTATE_COMMIT_EVERY = int(os.getenv("ANNOTATE_COMMIT_EVERY", "50"))
+# Speed/quality preset (annotate.py --quality overrides). 'distilled' (the
+# default) LLM-labels a random seed sample, then kNN-classifies every other
+# chunk from its chunk_vectors embedding (~20s corpus-wide; valence/depth at
+# LLM fidelity, emotions rougher, events left empty). The LLM-per-chunk
+# tiers -- where on a reasoning model the hidden thinking pass dominates
+# per-chunk wall time -- are 'max' (one chunk per request, model-default
+# reasoning effort), 'balanced' (low effort, ~3x faster, agreement with
+# 'max' within the model's own run-to-run noise but fewer events found)
+# and 'fast' (low effort + batched requests, ~4-8x faster, noisier labels).
+ANNOTATE_QUALITY = (os.getenv("ANNOTATE_QUALITY", "") or "distilled").strip().lower()
+# Fine-grained preset overrides (empty/0 = use the preset's value).
+# ANNOTATE_THINK becomes Ollama's `think`: 'low'/'medium'/'high' for
+# reasoning-effort models (gpt-oss), 'true'/'false' for toggle models
+# (qwen3). gpt-oss silently returns EMPTY output for think=false -- use the
+# effort levels there.
+ANNOTATE_THINK = os.getenv("ANNOTATE_THINK", "").strip().lower()
+ANNOTATE_BATCH_SIZE = int(os.getenv("ANNOTATE_BATCH_SIZE") or "0")
+# Concurrent LLM requests for the annotate/terms/seed passes. >1 only pays
+# off when the Ollama server itself runs parallel slots (OLLAMA_NUM_PARALLEL
+# -- `make ollama-start` sets 4); against a serial server extra workers just
+# queue harmlessly. Measured ~2x at 4/4 on gpt-oss:20b (MoE decode is
+# memory-bandwidth-bound, so it does not scale to 4x).
+ANNOTATE_WORKERS = int(os.getenv("ANNOTATE_WORKERS", "4"))
+# The distilled preset: LLM-labeled seed annotations to accumulate before
+# the kNN pass (agreement plateaus around 300-450 seeds), and the number of
+# nearest seed neighbours that vote for each classified chunk.
+ANNOTATE_SEED_TARGET = int(os.getenv("ANNOTATE_SEED_TARGET", "450"))
+ANNOTATE_KNN_K = int(os.getenv("ANNOTATE_KNN_K", "10"))
 
 # --- Topic clustering (topics.py) -------------------------------------------------
 # Empty = use CHAT_MODEL (same convention as ANNOTATE_MODEL/WRAPPED_MODEL).

@@ -82,7 +82,7 @@ class TestAnnotateChunks(AnnotateFixture):
             "events": [],
         })
         with mock.patch.object(ollama, "chat_once", return_value=reply) as fake:
-            annotate.main(["--all"])
+            annotate.main(["--all", "--quality", "max"])
         self.assertEqual(fake.call_count, 1)
         valence, emotions_json, depth, events_json = self.annotation()
         self.assertEqual(valence, 1.0)
@@ -105,7 +105,7 @@ class TestAnnotateChunks(AnnotateFixture):
             ],
         })
         with mock.patch.object(ollama, "chat_once", return_value=reply):
-            annotate.main(["--all"])
+            annotate.main(["--all", "--quality", "max"])
         events = json.loads(self.annotation()[3])
         self.assertEqual(len(events), 2)
         self.assertEqual(events[0]["kind"], "good_news")
@@ -117,7 +117,7 @@ class TestAnnotateChunks(AnnotateFixture):
     def test_malformed_json_retries_once_then_skips(self):
         bad = _reply("this is not json {")
         with mock.patch.object(ollama, "chat_once", return_value=bad) as fake:
-            annotate.main(["--all"])
+            annotate.main(["--all", "--quality", "max"])
         self.assertEqual(fake.call_count, 2)                # one retry, no more
         self.assertEqual(self.n_annotations(), 0)           # skipped: retried next run
         # the retry carried a corrective nudge
@@ -127,10 +127,10 @@ class TestAnnotateChunks(AnnotateFixture):
     def test_resumable_second_run_skips_annotated(self):
         reply = _reply({"valence": 0, "emotions": [], "depth": 1, "events": []})
         with mock.patch.object(ollama, "chat_once", return_value=reply):
-            annotate.main(["--all"])
+            annotate.main(["--all", "--quality", "max"])
         self.assertEqual(self.n_annotations(), 1)
         with mock.patch.object(ollama, "chat_once") as fake:
-            annotate.main(["--all"])
+            annotate.main(["--all", "--quality", "max"])
         fake.assert_not_called()
 
     def test_model_guard_exits_on_mismatch_with_rows(self):
@@ -141,7 +141,7 @@ class TestAnnotateChunks(AnnotateFixture):
         self.con.commit()
         with mock.patch.object(ollama, "chat_once") as fake:
             with self.assertRaises(SystemExit):
-                annotate.main(["--all"])
+                annotate.main(["--all", "--quality", "max"])
         fake.assert_not_called()
 
     def test_model_guard_allows_mismatch_when_table_empty(self):
@@ -149,13 +149,13 @@ class TestAnnotateChunks(AnnotateFixture):
         self.con.commit()
         reply = _reply({"valence": 0, "emotions": [], "depth": 1, "events": []})
         with mock.patch.object(ollama, "chat_once", return_value=reply):
-            annotate.main(["--all"])
+            annotate.main(["--all", "--quality", "max"])
         self.assertEqual(self.n_annotations(), 1)
         self.assertEqual(get_state(self.con, "annotate_model"), ANNOTATE_MODEL)
 
     def test_dry_run_writes_nothing(self):
         with mock.patch.object(ollama, "chat_once") as fake:
-            annotate.main(["--all", "--dry-run"])
+            annotate.main(["--all", "--quality", "max", "--dry-run"])
         fake.assert_not_called()
         self.assertEqual(self.n_annotations(), 0)
         self.assertIsNone(get_state(self.con, "annotate_model"))

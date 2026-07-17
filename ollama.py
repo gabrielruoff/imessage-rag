@@ -41,9 +41,11 @@ def chat_once(messages, model=None, format=None, timeout=None, think=_UNSET):
     response's `message` dict. format='json' turns on Ollama JSON mode (the
     batch annotation/labeling path). Raises RuntimeError on an error body.
 
-    think=False disables a thinking model's hidden reasoning pass for this
-    call only; omitted uses CHAT_THINK. Per-call because the batch pipelines
-    want it off (it is pure latency on a short JSON answer) while interactive
+    think: True/False for toggle models (qwen3), or an effort level string
+    ('low'/'medium'/'high') for reasoning-effort models (gpt-oss); False
+    disables a thinking model's hidden reasoning pass for this call only;
+    omitted uses CHAT_THINK. Per-call because the batch pipelines want it
+    low/off (it is pure latency on a short JSON answer) while interactive
     chat may want it on."""
     conn = http.client.HTTPConnection(
         OLLAMA_HOST, OLLAMA_PORT, timeout=timeout or CHAT_TIMEOUT
@@ -89,6 +91,11 @@ _JSON_RETRY_NUDGE = (
 )
 
 
+# Flipped when the model rejects the `think` option so a run degrades to
+# no reasoning control once instead of erroring on every request.
+_think_unsupported = False
+
+
 def chat_once_json(messages, model=None, retry_nudge=_JSON_RETRY_NUDGE,
                    timeout=None, think=_UNSET):
     """chat_once(format='json') -> parsed dict, retrying once with a
@@ -96,12 +103,25 @@ def chat_once_json(messages, model=None, retry_nudge=_JSON_RETRY_NUDGE,
     also fails (the caller skips the row -- batch callers pick it up again on
     their next run). Callers with a task-specific output shape pass their own
     retry_nudge so the correction names the exact JSON expected.
-    timeout/think forward to chat_once (per-pipeline overrides)."""
+    timeout/think forward to chat_once (per-pipeline overrides); models that
+    reject an explicit `think` value degrade to no reasoning control for the
+    rest of the process instead of erroring on every request."""
+    global _think_unsupported
     for _ in range(2):
+        send_think = None if _think_unsupported else think
         # chat_once is resolved as a module global at call time (the tests'
         # patch seam).
-        reply = chat_once(messages, model=model, format="json",
-                          timeout=timeout, think=think)
+        try:
+            reply = chat_once(messages, model=model, format="json",
+                              timeout=timeout, think=send_think)
+        except RuntimeError as exc:
+            explicit = send_think is not _UNSET and send_think is not None
+            if not (explicit and "think" in str(exc).lower()):
+                raise
+            _think_unsupported = True
+            print(f"  model rejected think={think!r}; continuing without reasoning control")
+            reply = chat_once(messages, model=model, format="json",
+                              timeout=timeout, think=None)
         content = reply.get("content") or ""
         try:
             data = json.loads(content)

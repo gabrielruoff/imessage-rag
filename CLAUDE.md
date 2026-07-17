@@ -18,11 +18,18 @@ Full design history, schema, rationale, and data forensics:
 - Chat CLI: `.venv/bin/python3 chat.py` (interactive REPL), or
   `chat.py -p "..."` for a one-shot answer (prints only the reply; exit 1 if
   Ollama is unreachable)
-- Annotate chunks (batch LLM, overnight-scale): `make annotate` (default chunk
-  scope + `--terms`) / `make annotate-all` (whole corpus + `--terms`), or
-  `.venv/bin/python3 annotate.py [--all | --top-dyads N] [--terms] [--limit N]
-  [--dry-run]` — resumable, commits as it goes, Ctrl-C safe. Bare = top
-  `ANNOTATE_TOP_DYADS` chats only; `--terms` is a mode switch, not an addition.
+- Annotate chunks: `make annotate` (chunks + `--terms`) / `make annotate-all`
+  (`--all` + `--terms`), or `.venv/bin/python3 annotate.py [--all |
+  --top-dyads N] [--terms] [--limit N] [--quality distilled|fast|balanced|max]
+  [--upgrade-distilled] [--dry-run]` — resumable, commits as it goes, Ctrl-C
+  safe. Default quality `distilled`: LLM-labels a random ~`ANNOTATE_SEED_TARGET`
+  seed sample, then kNN-classifies the whole corpus from `chunk_vectors`
+  (~1 min warm; corpus-wide, scope flags don't apply; events left empty).
+  LLM tiers (`fast`/`balanced`/`max`, slow → slower, higher fidelity + events)
+  scope to top `ANNOTATE_TOP_DYADS` chats bare, honor `--all`, and with
+  `--upgrade-distilled` re-annotate kNN rows in scope (how events get filled
+  for chats that matter). LLM passes fan out over `ANNOTATE_WORKERS`; `--terms`
+  is a mode switch, not an addition. See docs/DECISIONS.md for measurements.
 - Topic clusters: `make topics`, or `.venv/bin/python3 topics.py [--k K]
   [--relabel] [--model M]` — k-means over chunk_vectors (assignment in
   sqlite-vec), then an LLM label pass
@@ -171,8 +178,9 @@ dyad_terms(chat_id, term, lift, n_uses, first_message_id,
          coined_by_handle_id, coined_is_me, llm_verdict)
                                   -- chat-distinctive vocabulary; llm_verdict
                                   -- (annotate.py --terms) survives rebuilds
-chunk_annotations(chunk_id, valence, emotions_json, depth, events_json)
-                                  -- LLM batch annotations (annotate.py)
+chunk_annotations(chunk_id, valence, emotions_json, depth, events_json,
+         source)                  -- batch annotations (annotate.py); source
+                                  -- 'llm' or 'distilled' (kNN, empty events)
 topics(cluster_id, label, n_chunks); chunk_topics(chunk_id, cluster_id)
                                   -- k-means topic clusters (topics.py)
 messages_fts                      -- FTS5 external-content table over messages.text
@@ -209,9 +217,15 @@ chunk_vectors                     -- sqlite-vec vec0 table: chunk_id ->
 - `chunk_annotations` is guarded like `chunk_vectors`: `annotate.py` records
   `annotate_model` in `ingest_state` and refuses to annotate with a different
   model while the table is non-empty — switching ANNOTATE_MODEL means
-  emptying `chunk_annotations` first. Per-pipeline model vars make this easier
-  to trip, not less: the guard is unchanged. `topics.py`'s `topic_model_k`
-  guard is warn-only (a rebuild simply replaces the clustering).
+  emptying `chunk_annotations` first (distilled rows inherit the seed model's
+  bias, so the guard covers them too). Per-pipeline model vars make this
+  easier to trip, not less: the guard is unchanged. `topics.py`'s
+  `topic_model_k` guard is warn-only (a rebuild simply replaces the
+  clustering).
+- `chunk_annotations.source` is `'distilled'` for kNN-classified rows: their
+  `events_json` is always `[]` (events can't be distilled — LLM-only), so
+  event-based aggregates silently undercount until an LLM tier with
+  `--upgrade-distilled` has covered the chats in question.
 - `think` is per-call, not global: `ollama.chat_once`/`chat_stream` take
   `think=` with a `_UNSET` default. The tri-state is load-bearing — `None`
   means *omit* the flag (some models reject a `think` option) and is NOT the
