@@ -15,10 +15,16 @@ from config import (
 )
 
 
+class OllamaResponseError(RuntimeError):
+    """Error chunk streamed back by the Ollama server (e.g. a tool-call the
+    model emitted that Ollama could not parse). Often transient: re-sending
+    the same request lets the model re-sample."""
+
+
 def chat_stream(messages, tools=None, model=None):
     """POST a streaming request to the chat endpoint (OLLAMA_CHAT_PATH) and
-    yield each chunk's `message` dict as it arrives. Raises RuntimeError if
-    the server streams an error chunk.
+    yield each chunk's `message` dict as it arrives. Raises OllamaResponseError
+    if the server streams an error chunk.
 
     Pass tools=None to withhold the tool schemas entirely, which is the only
     reliable way to stop the model from calling one. model=None uses
@@ -46,7 +52,7 @@ def chat_stream(messages, tools=None, model=None):
                 continue
             chunk = json.loads(line)
             if "error" in chunk:
-                raise RuntimeError(f"Ollama error: {chunk['error']}")
+                raise OllamaResponseError(f"Ollama error: {chunk['error']}")
             yield chunk.get("message", {})
             if chunk.get("done"):
                 break
