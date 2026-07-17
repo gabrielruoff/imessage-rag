@@ -13,15 +13,24 @@ Full design history, schema, rationale, and data forensics:
 
 - Install: `make install` (needs Homebrew Python — python.org builds lack the
   sqlite loadable-extension support sqlite-vec requires)
-- Ingest: `.venv/bin/python3 ingest.py [--no-embed] [--since-last] [--senders=...]`
+- Ingest: `make ingest`, or `.venv/bin/python3 ingest.py [--no-embed]
+  [--since-last] [--senders=...]`
 - Chat CLI: `.venv/bin/python3 chat.py` (interactive REPL), or
   `chat.py -p "..."` for a one-shot answer (prints only the reply; exit 1 if
   Ollama is unreachable)
-- Annotate chunks (batch LLM, overnight-scale): `.venv/bin/python3 annotate.py
-  [--all | --top-dyads N] [--terms] [--limit N] [--dry-run]` — resumable,
-  commits as it goes, Ctrl-C safe
-- Topic clusters: `.venv/bin/python3 topics.py [--k K] [--relabel]` — k-means
-  over chunk_vectors (assignment in sqlite-vec), then an LLM label pass
+- Annotate chunks (batch LLM, overnight-scale): `make annotate` (default chunk
+  scope + `--terms`) / `make annotate-all` (whole corpus + `--terms`), or
+  `.venv/bin/python3 annotate.py [--all | --top-dyads N] [--terms] [--limit N]
+  [--dry-run]` — resumable, commits as it goes, Ctrl-C safe. Bare = top
+  `ANNOTATE_TOP_DYADS` chats only; `--terms` is a mode switch, not an addition.
+- Topic clusters: `make topics`, or `.venv/bin/python3 topics.py [--k K]
+  [--relabel]` — k-means over chunk_vectors (assignment in sqlite-vec), then an
+  LLM label pass
+- Everything, in order: `make pipeline` (ingest → annotate → topics). These
+  MUST run sequentially and the target is written to stay serial under `make
+  -j`: they hold a SQLite write lock across many LLM calls (concurrent runs
+  die with `database is locked`) and contend for one serialized Ollama
+  instance, so parallelism costs correctness and buys nothing.
 - Wrapped report: `.venv/bin/python3 wrapped.py [--year YYYY] [--contact NAME]
   [--no-llm] [--yes]` — markdown; previews the featured roster (with
   silent-contact auto-exclusions) before generating
@@ -83,7 +92,10 @@ Ollama chat-streaming HTTP; `embeddings.py` the shared embedding client
 ingest (documents) and query_tools (queries) so both sides embed identically;
 `config.py` all env-driven settings (defaults work with no `.env`; see
 `.env.example`); `db.py` shared sqlite helpers (`load_vec_extension`,
-`CONTACT_LABEL_SQL`, `iso_to_day`, `get_state`/`set_state`); `schema.py` the
+`CONTACT_LABEL_SQL`, `iso_to_day`, `get_state`/`set_state`); `progress.py` the
+shared CLI progress helper (`track(desc, total=...)` — a rich bar on a TTY,
+periodic `  ...N/Total` lines when piped, silent under `PROGRESS_STYLE=off`;
+progress never drives commit cadence); `schema.py` the
 analysis-DB DDL + in-place migration (`create_schema`, run and re-exported
 by `ingest.py`). Derived-analytics pipelines (all run by `ingest.py` after
 chunking, and re-exported from it): `sessions.py` (gap-split session rows

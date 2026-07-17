@@ -19,6 +19,7 @@ splitting rules.
 import datetime
 import sqlite3
 
+import progress
 from config import SESSION_GAP_MINUTES
 from db import get_state, set_state
 from query_tools._shared import _REAL_MESSAGE_CLAUSES
@@ -86,26 +87,28 @@ def build_sessions(tgt: sqlite3.Connection, gap_minutes=None) -> int:
     ).fetchall()]
 
     n_built = 0
-    for cid in chat_ids:
-        tgt.execute("DELETE FROM sessions WHERE chat_id = ?", (cid,))
-        msgs = tgt.execute(
-            f"SELECT m.id, m.handle_id, m.is_from_me, m.date FROM messages m "
-            f"WHERE m.chat_id = ? AND {_RENDERABLE_WHERE} ORDER BY m.date, m.id",
-            (cid,),
-        ).fetchall()
-        current = []
-        prev_dt = None
-        for row in msgs:
-            cur_dt = datetime.datetime.fromisoformat(row[3])
-            if current and cur_dt - prev_dt > gap:
+    with progress.track("Building sessions", total=len(chat_ids)) as p:
+        for cid in chat_ids:
+            tgt.execute("DELETE FROM sessions WHERE chat_id = ?", (cid,))
+            msgs = tgt.execute(
+                f"SELECT m.id, m.handle_id, m.is_from_me, m.date FROM messages m "
+                f"WHERE m.chat_id = ? AND {_RENDERABLE_WHERE} ORDER BY m.date, m.id",
+                (cid,),
+            ).fetchall()
+            current = []
+            prev_dt = None
+            for row in msgs:
+                cur_dt = datetime.datetime.fromisoformat(row[3])
+                if current and cur_dt - prev_dt > gap:
+                    _insert_session(tgt, cid, current)
+                    n_built += 1
+                    current = []
+                current.append(row)
+                prev_dt = cur_dt
+            if current:
                 _insert_session(tgt, cid, current)
                 n_built += 1
-                current = []
-            current.append(row)
-            prev_dt = cur_dt
-        if current:
-            _insert_session(tgt, cid, current)
-            n_built += 1
+            p.advance()
 
     max_id = tgt.execute(
         f"SELECT MAX(m.id) FROM messages m WHERE {_RENDERABLE_WHERE}"

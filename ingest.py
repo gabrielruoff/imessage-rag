@@ -28,6 +28,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
+import progress
 from chunking import build_chunks, build_vec_table, embed_chunks
 from config import ADDRESS_BOOK_PATH, SNAPSHOT_DB, SOURCE_DB, TARGET_DB
 from db import get_state, load_vec_extension, set_state, strip_reaction_guid_prefix
@@ -314,39 +315,51 @@ def ingest_messages_and_reactions(src, tgt, since_rowid=0, allowed_chat_ids=None
     n_failed = 0
     max_rowid = since_rowid
 
-    for row in src.execute(query, params):
-        (rowid, guid, chat_id, handle_id, is_from_me,
-         raw_text, attributed_body, date, date_read, date_delivered,
-         item_type, is_emote, has_attachment,
-         assoc_type, assoc_guid) = row
+    # The row loop streams its cursor (the corpus is too big to fetchall), so
+    # the total has to be asked for separately to report a percentage. Same
+    # FROM/WHERE as the stream so the count reflects exactly what follows.
+    n_total = src.execute(f"""
+        SELECT COUNT(*)
+        FROM message m
+        LEFT JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+        WHERE m.ROWID > ? {chat_filter}
+    """, params).fetchone()[0]
 
-        max_rowid = max(max_rowid, rowid)
-        text, decode_failed = resolve_text(raw_text, attributed_body)
-        if decode_failed:
-            n_failed += 1
+    with progress.track("Ingesting messages", total=n_total) as p:
+        for row in src.execute(query, params):
+            (rowid, guid, chat_id, handle_id, is_from_me,
+             raw_text, attributed_body, date, date_read, date_delivered,
+             item_type, is_emote, has_attachment,
+             assoc_type, assoc_guid) = row
 
-        if assoc_type and assoc_type != 0:
-            # This row is a tapback/reaction on another message, not a message itself.
-            tgt.execute(
-                "INSERT OR REPLACE INTO reactions"
-                "(id, target_message_guid, chat_id, handle_id, is_from_me, "
-                " associated_message_type, date) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (rowid, strip_reaction_guid_prefix(assoc_guid), chat_id, handle_id,
-                 is_from_me, assoc_type, apple_ns_to_iso(date)),
-            )
-            n_react += 1
-        else:
-            tgt.execute(
-                "INSERT OR REPLACE INTO messages"
-                "(id, guid, chat_id, handle_id, is_from_me, text, decode_failed, "
-                " date, date_read, date_delivered, item_type, is_emote, has_attachment) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (rowid, guid, chat_id, handle_id, is_from_me, text, decode_failed,
-                 apple_ns_to_iso(date), apple_ns_to_iso(date_read),
-                 apple_ns_to_iso(date_delivered), item_type, is_emote,
-                 1 if has_attachment else 0),
-            )
-            n_msg += 1
+            max_rowid = max(max_rowid, rowid)
+            text, decode_failed = resolve_text(raw_text, attributed_body)
+            if decode_failed:
+                n_failed += 1
+
+            if assoc_type and assoc_type != 0:
+                # This row is a tapback/reaction on another message, not a message itself.
+                tgt.execute(
+                    "INSERT OR REPLACE INTO reactions"
+                    "(id, target_message_guid, chat_id, handle_id, is_from_me, "
+                    " associated_message_type, date) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (rowid, strip_reaction_guid_prefix(assoc_guid), chat_id, handle_id,
+                     is_from_me, assoc_type, apple_ns_to_iso(date)),
+                )
+                n_react += 1
+            else:
+                tgt.execute(
+                    "INSERT OR REPLACE INTO messages"
+                    "(id, guid, chat_id, handle_id, is_from_me, text, decode_failed, "
+                    " date, date_read, date_delivered, item_type, is_emote, has_attachment) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (rowid, guid, chat_id, handle_id, is_from_me, text, decode_failed,
+                     apple_ns_to_iso(date), apple_ns_to_iso(date_read),
+                     apple_ns_to_iso(date_delivered), item_type, is_emote,
+                     1 if has_attachment else 0),
+                )
+                n_msg += 1
+            p.advance()
 
     set_state(tgt, "last_message_rowid", max_rowid)
     print(f"Ingested {n_msg} messages, {n_react} reactions, {n_failed} decode failures")

@@ -52,6 +52,16 @@ CHAT_MODEL = os.getenv("CHAT_MODEL", "gemma4:26b-a4b-it-qat")
 _chat_think = os.getenv("CHAT_THINK", "").strip().lower()
 CHAT_THINK = None if _chat_think == "" else _chat_think in ("1", "true", "yes")
 
+# --- CLI progress -------------------------------------------------------------
+# How the batch CLIs report progress. 'auto' (the default) draws a live rich
+# progress bar when stdout is a terminal and falls back to periodic plain
+# lines when piped or redirected; 'plain' forces the lines; 'off' silences
+# progress entirely (start/summary lines still print).
+PROGRESS_STYLE = os.getenv("PROGRESS_STYLE", "auto").strip().lower()
+# Items between progress lines in plain (non-terminal) mode. Purely cosmetic
+# -- it never affects how often a job commits.
+PROGRESS_LOG_EVERY = int(os.getenv("PROGRESS_LOG_EVERY", "200"))
+
 # --- Tunables -----------------------------------------------------------------
 # Embedding dimension override. Unset/0 (the default) means auto-detect the
 # model's native output size with a probe request at ingest time. Setting it
@@ -67,6 +77,10 @@ EMBED_QUERY_PREFIX = os.getenv("EMBED_QUERY_PREFIX", "search_query: ")
 EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "64"))  # texts per Ollama request
 # concurrent requests, matches Ollama's default OLLAMA_NUM_PARALLEL
 EMBED_MAX_WORKERS = int(os.getenv("EMBED_MAX_WORKERS", "4"))
+# Embedded chunks between commits during embed_chunks -- the resumability
+# granularity if the run is interrupted (annotate.py's ANNOTATE_COMMIT_EVERY
+# is the analogous knob there).
+EMBED_COMMIT_EVERY = int(os.getenv("EMBED_COMMIT_EVERY", "200"))
 MAX_TOOL_ITERATIONS = int(os.getenv("MAX_TOOL_ITERATIONS", "20"))  # tool round-trips/turn
 # Minimum gap (minutes) between two consecutive same-sender messages for the
 # second to count as a double-text rather than a multi-part message.

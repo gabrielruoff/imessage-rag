@@ -19,6 +19,7 @@ from math import sqrt
 import sqlite_vec
 
 import ollama
+import progress
 from config import TARGET_DB, TOPIC_K, TOPIC_KMEANS_ITERS, TOPIC_LABEL_SAMPLES
 from db import get_state, load_vec_extension, set_state
 
@@ -111,41 +112,54 @@ def cluster_chunks(con, k, iters=TOPIC_KMEANS_ITERS):
     print(f"Clustering {n} chunks into k={k} topics (dim {dim})...")
 
     assignments = {}
-    for iteration in range(iters):
-        con.execute(f"DROP TABLE IF EXISTS {_SCRATCH_TABLE}")
-        con.execute(f"""
-            CREATE VIRTUAL TABLE {_SCRATCH_TABLE} USING vec0(
-                centroid_id INTEGER PRIMARY KEY,
-                vec FLOAT[{dim}] distance_metric=cosine
+    # Two stacked bars on a terminal: the outer one tracks iterations -- the
+    # only overall signal k-means has, so iters is an upper bound and early
+    # stop simply finishes it early -- the inner one the KNN scan within an
+    # iteration. bar_only on both: the per-iteration summary print below is
+    # the record that belongs in a log.
+    with progress.track("k-means (all iterations)", total=iters,
+                        transient=True, bar_only=True) as overall:
+        for iteration in range(iters):
+            con.execute(f"DROP TABLE IF EXISTS {_SCRATCH_TABLE}")
+            con.execute(f"""
+                CREATE VIRTUAL TABLE {_SCRATCH_TABLE} USING vec0(
+                    centroid_id INTEGER PRIMARY KEY,
+                    vec FLOAT[{dim}] distance_metric=cosine
+                )
+            """)
+            con.executemany(
+                f"INSERT INTO {_SCRATCH_TABLE}(centroid_id, vec) VALUES (?, ?)",
+                [(cluster_id, sqlite_vec.serialize_float32(list(vec)))
+                 for cluster_id, vec in centroids.items()],
             )
-        """)
-        con.executemany(
-            f"INSERT INTO {_SCRATCH_TABLE}(centroid_id, vec) VALUES (?, ?)",
-            [(cluster_id, sqlite_vec.serialize_float32(list(vec)))
-             for cluster_id, vec in centroids.items()],
-        )
 
-        changed = 0
-        new_assignments = {}
-        for chunk_id in ids:
-            row = con.execute(
-                f"SELECT centroid_id FROM {_SCRATCH_TABLE} WHERE vec MATCH ? AND k = 1",
-                (sqlite_vec.serialize_float32(list(vectors[chunk_id])),),
-            ).fetchone()
-            new_assignments[chunk_id] = row[0]
-            if assignments.get(chunk_id) != row[0]:
-                changed += 1
-        assignments = new_assignments
-        print(f"  iteration {iteration + 1}: {changed}/{n} reassigned")
-        if changed < _EARLY_STOP_FRACTION * n:
-            break
+            changed = 0
+            new_assignments = {}
+            with progress.track(f"  iteration {iteration + 1}/{iters}", total=n,
+                                header=False, transient=True, bar_only=True,
+                                parent=overall) as p:
+                for chunk_id in ids:
+                    row = con.execute(
+                        f"SELECT centroid_id FROM {_SCRATCH_TABLE} "
+                        f"WHERE vec MATCH ? AND k = 1",
+                        (sqlite_vec.serialize_float32(list(vectors[chunk_id])),),
+                    ).fetchone()
+                    new_assignments[chunk_id] = row[0]
+                    if assignments.get(chunk_id) != row[0]:
+                        changed += 1
+                    p.advance()
+            assignments = new_assignments
+            overall.advance()
+            print(f"  iteration {iteration + 1}: {changed}/{n} reassigned")
+            if changed < _EARLY_STOP_FRACTION * n:
+                break
 
-        members = {}
-        for chunk_id, cluster_id in assignments.items():
-            members.setdefault(cluster_id, []).append(chunk_id)
-        for cluster_id in centroids:
-            if members.get(cluster_id):  # empty cluster keeps its old centroid
-                centroids[cluster_id] = _mean_vector(vectors, members[cluster_id])
+            members = {}
+            for chunk_id, cluster_id in assignments.items():
+                members.setdefault(cluster_id, []).append(chunk_id)
+            for cluster_id in centroids:
+                if members.get(cluster_id):  # empty cluster: keep old centroid
+                    centroids[cluster_id] = _mean_vector(vectors, members[cluster_id])
 
     con.execute(f"DROP TABLE IF EXISTS {_SCRATCH_TABLE}")
     return assignments, dim, k
@@ -192,7 +206,6 @@ def label_clusters(con, relabel=False, samples=TOPIC_LABEL_SAMPLES):
         return 0
 
     vectors = _load_vectors(con)
-    n_vectors = len(vectors)
     members = {}
     for chunk_id, cluster_id in con.execute(
             "SELECT chunk_id, cluster_id FROM chunk_topics"):
@@ -201,43 +214,55 @@ def label_clusters(con, relabel=False, samples=TOPIC_LABEL_SAMPLES):
     print(f"Labeling {len(cluster_ids)} clusters "
           f"({samples} sample chunks each)...")
     n_done = 0
-    for cluster_id in cluster_ids:
-        member_ids = [m for m in members.get(cluster_id, []) if m in vectors]
-        if not member_ids:
-            continue
-        centroid = _mean_vector(vectors, member_ids)
-        # vec0 KNN needs an explicit k; rank everything, keep the members.
-        ranked = [r[0] for r in con.execute(
-            "SELECT chunk_id FROM chunk_vectors WHERE embedding MATCH ? AND k = ?",
-            (sqlite_vec.serialize_float32(list(centroid)), n_vectors),
-        )]
-        member_set = set(member_ids)
-        sample_ids = [cid for cid in ranked if cid in member_set][:samples]
-        if not sample_ids:
-            # The KNN scan returned none of this cluster's members (it should
-            # rank every vector, but an empty IN () is a syntax error -- never
-            # let a surprise here take the whole label pass down).
-            print(f"  cluster {cluster_id}: no sample chunks ranked, skipped")
-            continue
-        placeholders = ",".join("?" * len(sample_ids))
-        texts = [r[0] for r in con.execute(
-            f"SELECT text FROM chunks WHERE id IN ({placeholders})", sample_ids)]
-        prompt = "\n\n---\n\n".join(t[:_SAMPLE_TEXT_CHARS] for t in texts if t)
+    with progress.track("Labeling clusters", total=len(cluster_ids),
+                        header=False) as p:
+        for cluster_id in cluster_ids:
+            member_ids = [m for m in members.get(cluster_id, []) if m in vectors]
+            if not member_ids:
+                p.advance()
+                continue
+            centroid = _mean_vector(vectors, member_ids)
+            # Rank the cluster's own members by cosine similarity to the
+            # centroid in Python: a vec0 KNN scan caps k at 4096, below the
+            # corpus size. The centroid is unit-length, so only the member
+            # norm needs dividing out.
+            sims = []
+            for cid in member_ids:
+                vec = vectors[cid]
+                norm = sqrt(sum(x * x for x in vec))
+                if norm == 0:
+                    continue
+                dot = sum(c * x for c, x in zip(centroid, vec))
+                sims.append((dot / norm, cid))
+            sims.sort(reverse=True)
+            sample_ids = [cid for _, cid in sims[:samples]]
+            if not sample_ids:
+                # Only possible if every member vector is all-zero; an empty
+                # IN () below is a syntax error, so skip rather than crash.
+                print(f"  cluster {cluster_id}: no sample chunks ranked, skipped")
+                p.advance()
+                continue
+            placeholders = ",".join("?" * len(sample_ids))
+            texts = [r[0] for r in con.execute(
+                f"SELECT text FROM chunks WHERE id IN ({placeholders})", sample_ids)]
+            prompt = "\n\n---\n\n".join(t[:_SAMPLE_TEXT_CHARS] for t in texts if t)
 
-        data = _ask_json([
-            {"role": "system", "content": _LABEL_SYSTEM},
-            {"role": "user", "content": prompt},
-        ])
-        label = data.get("label") if isinstance(data, dict) else None
-        if not isinstance(label, str) or not label.strip():
-            print(f"  cluster {cluster_id}: unusable label response, skipped")
-            continue
-        label = label.strip()[:_LABEL_MAX_CHARS]
-        con.execute("UPDATE topics SET label = ? WHERE cluster_id = ?",
-                    (label, cluster_id))
-        con.commit()
-        n_done += 1
-        print(f"  cluster {cluster_id} ({len(member_ids)} chunks): {label}")
+            data = _ask_json([
+                {"role": "system", "content": _LABEL_SYSTEM},
+                {"role": "user", "content": prompt},
+            ])
+            label = data.get("label") if isinstance(data, dict) else None
+            if not isinstance(label, str) or not label.strip():
+                print(f"  cluster {cluster_id}: unusable label response, skipped")
+                p.advance()
+                continue
+            label = label.strip()[:_LABEL_MAX_CHARS]
+            con.execute("UPDATE topics SET label = ? WHERE cluster_id = ?",
+                        (label, cluster_id))
+            con.commit()
+            n_done += 1
+            print(f"  cluster {cluster_id} ({len(member_ids)} chunks): {label}")
+            p.advance()
     print(f"Labeled {n_done} clusters")
     return n_done
 

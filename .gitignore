@@ -2,6 +2,7 @@
 data/
 source_data/
 imessage_analysis.db
+imessage_analysis.db-journal
 .venv/
 
 __pycache__/

@@ -37,6 +37,7 @@ from pathlib import Path
 import config
 import db
 import ollama
+import progress
 import query_tools
 
 # Patchable by tests, resolved at call time (mirrors query_tools.DB_PATH).
@@ -269,25 +270,35 @@ def compose_report(sections, title, use_llm=False):
     note, extra_md} -- stats None renders the heading plus a one-line skip
     note; a narrative failure keeps the stats block and notes the fallback."""
     parts = [f"# {title}"]
-    for sec in sections:
-        parts.append(f"## {sec['title']}")
-        stats = sec.get("stats")
-        if stats is None:
-            parts.append(f"_Skipped: {sec.get('note') or 'no data'}_")
-            continue
-        if use_llm:
-            try:
-                narrative = narrate_section(sec["title"], stats)
-            except Exception as e:
-                parts.append(f"_Narrative unavailable ({e}); stats only._")
-            else:
-                if narrative:
-                    parts.append(narrative)
-        parts.append(
-            "```json\n" + json.dumps(stats, indent=2, ensure_ascii=False, default=str) + "\n```"
-        )
-        if sec.get("extra_md"):
-            parts.append(sec["extra_md"])
+    # Only the narration pass is slow enough to be worth reporting (one Ollama
+    # call per section); --no-llm assembles in milliseconds. The label stays
+    # generic -- section titles can carry a contact's name, and progress output
+    # is not the place to leak one.
+    with progress.track("Narrating sections", total=len(sections),
+                        enabled=use_llm) as p:
+        for sec in sections:
+            parts.append(f"## {sec['title']}")
+            stats = sec.get("stats")
+            if stats is None:
+                parts.append(f"_Skipped: {sec.get('note') or 'no data'}_")
+                p.advance()
+                continue
+            if use_llm:
+                try:
+                    narrative = narrate_section(sec["title"], stats)
+                except Exception as e:
+                    parts.append(f"_Narrative unavailable ({e}); stats only._")
+                else:
+                    if narrative:
+                        parts.append(narrative)
+            parts.append(
+                "```json\n"
+                + json.dumps(stats, indent=2, ensure_ascii=False, default=str)
+                + "\n```"
+            )
+            if sec.get("extra_md"):
+                parts.append(sec["extra_md"])
+            p.advance()
     return "\n\n".join(parts) + "\n"
 
 
@@ -375,13 +386,18 @@ def build_sections(con, roster, contact_entry=None, year=None,
         })
 
     per_contact, tempo_notes = {}, []
-    for entry in tempo_entries:
-        res, note = _tool("get_response_dynamics", **_entry_scope(entry), **dates)
-        if res is None:
-            tempo_notes.append(f"{entry['name']}: {note}")
-            continue
-        picked = {k: res[k] for k in ("reply_latency", "initiation", "sessions") if k in res}
-        per_contact[entry["name"]] = picked or res
+    # Generic label: the roster's names must not reach stdout here.
+    with progress.track("Analyzing tempo", total=len(tempo_entries)) as p:
+        for entry in tempo_entries:
+            res, note = _tool("get_response_dynamics", **_entry_scope(entry), **dates)
+            if res is None:
+                tempo_notes.append(f"{entry['name']}: {note}")
+                p.advance()
+                continue
+            picked = {k: res[k] for k in ("reply_latency", "initiation", "sessions")
+                      if k in res}
+            per_contact[entry["name"]] = picked or res
+            p.advance()
     sections.append(
         {"title": "Tempo", "stats": {"per_contact": per_contact} if per_contact else None,
          "note": "; ".join(tempo_notes[:2]) or "no contacts in scope"}

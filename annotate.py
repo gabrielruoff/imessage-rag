@@ -14,6 +14,7 @@ import json
 import sqlite3
 
 import ollama
+import progress
 from config import (
     ANNOTATE_COMMIT_EVERY,
     ANNOTATE_MODEL,
@@ -205,29 +206,32 @@ def annotate_chunks(con, model, all_chats=False, top_dyads=ANNOTATE_TOP_DYADS,
 
     n_done = n_skipped = 0
     try:
-        for chunk_id, text in pending:
-            data = _ask_json(
-                [{"role": "system", "content": _ANNOTATE_SYSTEM},
-                 {"role": "user", "content": text}],
-                model,
-            )
-            if data is None:
-                n_skipped += 1
-                print(f"  chunk {chunk_id}: unparseable response, skipped "
-                      f"(retried next run)")
-                continue
-            valence, emotions, depth, events = _validate_annotation(data)
-            _resolve_event_message_ids(con, chunk_id, events)
-            con.execute(
-                "INSERT OR REPLACE INTO chunk_annotations"
-                "(chunk_id, valence, emotions_json, depth, events_json) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (chunk_id, valence, json.dumps(emotions), depth, json.dumps(events)),
-            )
-            n_done += 1
-            if n_done % ANNOTATE_COMMIT_EVERY == 0:
-                con.commit()
-                print(f"  ...{n_done}/{len(pending)}")
+        with progress.track("Annotating chunks", total=len(pending),
+                            header=False) as p:
+            for chunk_id, text in pending:
+                data = _ask_json(
+                    [{"role": "system", "content": _ANNOTATE_SYSTEM},
+                     {"role": "user", "content": text}],
+                    model,
+                )
+                if data is None:
+                    n_skipped += 1
+                    print(f"  chunk {chunk_id}: unparseable response, skipped "
+                          f"(retried next run)")
+                    p.advance()
+                    continue
+                valence, emotions, depth, events = _validate_annotation(data)
+                _resolve_event_message_ids(con, chunk_id, events)
+                con.execute(
+                    "INSERT OR REPLACE INTO chunk_annotations"
+                    "(chunk_id, valence, emotions_json, depth, events_json) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (chunk_id, valence, json.dumps(emotions), depth, json.dumps(events)),
+                )
+                n_done += 1
+                p.advance()
+                if n_done % ANNOTATE_COMMIT_EVERY == 0:
+                    con.commit()
     except KeyboardInterrupt:
         con.commit()
         print(f"\nInterrupted -- committed {n_done} annotations "
@@ -263,35 +267,37 @@ def curate_terms(con, model, limit=None, dry_run=False):
 
     n_done = n_skipped = 0
     try:
-        for chat_id, term in rows:
-            # ESCAPE: a term is tokenizer output so '%'/'_' are vanishingly
-            # unlikely, but an unescaped one would silently match everything.
-            examples = [r[0] for r in con.execute(
-                "SELECT text FROM messages "
-                "WHERE chat_id = ? AND text LIKE '%' || ? || '%' ESCAPE '\\' LIMIT 3",
-                (chat_id, _like_escape(term)),
-            )]
-            user = f'Term: "{term}"\n\nExample messages from this chat:\n' + (
-                "\n".join(f"- {t[:200]}" for t in examples) or "(none found)"
-            )
-            data = _ask_json(
-                [{"role": "system", "content": _TERMS_SYSTEM},
-                 {"role": "user", "content": user}],
-                model,
-            )
-            verdict = data.get("verdict") if isinstance(data, dict) else None
-            if verdict not in TERM_VERDICTS:
-                n_skipped += 1
-                print(f"  term {chat_id}:{term}: invalid verdict {verdict!r}, skipped")
-                continue
-            con.execute(
-                "UPDATE dyad_terms SET llm_verdict = ? WHERE chat_id = ? AND term = ?",
-                (verdict, chat_id, term),
-            )
-            n_done += 1
-            if n_done % ANNOTATE_COMMIT_EVERY == 0:
-                con.commit()
-                print(f"  ...{n_done}/{len(rows)}")
+        with progress.track("Curating terms", total=len(rows), header=False) as p:
+            for chat_id, term in rows:
+                # ESCAPE: a term is tokenizer output so '%'/'_' are vanishingly
+                # unlikely, but an unescaped one would silently match everything.
+                examples = [r[0] for r in con.execute(
+                    "SELECT text FROM messages "
+                    "WHERE chat_id = ? AND text LIKE '%' || ? || '%' ESCAPE '\\' LIMIT 3",
+                    (chat_id, _like_escape(term)),
+                )]
+                user = f'Term: "{term}"\n\nExample messages from this chat:\n' + (
+                    "\n".join(f"- {t[:200]}" for t in examples) or "(none found)"
+                )
+                data = _ask_json(
+                    [{"role": "system", "content": _TERMS_SYSTEM},
+                     {"role": "user", "content": user}],
+                    model,
+                )
+                verdict = data.get("verdict") if isinstance(data, dict) else None
+                if verdict not in TERM_VERDICTS:
+                    n_skipped += 1
+                    print(f"  term {chat_id}:{term}: invalid verdict {verdict!r}, skipped")
+                    p.advance()
+                    continue
+                con.execute(
+                    "UPDATE dyad_terms SET llm_verdict = ? WHERE chat_id = ? AND term = ?",
+                    (verdict, chat_id, term),
+                )
+                n_done += 1
+                p.advance()
+                if n_done % ANNOTATE_COMMIT_EVERY == 0:
+                    con.commit()
     except KeyboardInterrupt:
         con.commit()
         print(f"\nInterrupted -- committed {n_done} verdicts "

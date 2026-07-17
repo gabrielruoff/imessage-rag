@@ -26,9 +26,11 @@ from config import (
     CHUNK_MIN_CHARS,
     CHUNK_OVERLAP_MESSAGES,
     EMBED_BATCH_SIZE,
+    EMBED_COMMIT_EVERY,
     EMBED_MAX_WORKERS,
     EMBED_MODEL,
 )
+import progress
 from db import CONTACT_LABEL_SQL, get_state, iso_to_day, load_vec_extension, set_state
 
 # ---------------------------------------------------------------------------
@@ -131,67 +133,71 @@ def build_chunks(tgt: sqlite3.Connection, gap_minutes=CHUNK_GAP_MINUTES,
     gap = datetime.timedelta(minutes=gap_minutes)
     n_chunks_before = tgt.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
     n_msgs = 0
-    for chat_id in pending_chats:
-        # Rebuild the chat's tail chunk so the pending messages extend it.
-        # The rebuild must re-include the tail's overlap prefix -- messages
-        # carried into it by a size split keep their *first* chunk's id, so
-        # `chunk_id IS NULL` alone would miss them; `id >= first_message_id`
-        # picks up exactly those (they stay stamped to their original chunk
-        # via _flush_chunk's NULL guard).
-        tail = tgt.execute(
-            "SELECT id, first_message_id FROM chunks "
-            "WHERE chat_id = ? ORDER BY id DESC LIMIT 1",
-            (chat_id,)).fetchone()
-        rebuild_cond, rebuild_params = "m.chunk_id IS NULL", []
-        if tail:
-            if has_vec_table:
-                tgt.execute("DELETE FROM chunk_vectors WHERE chunk_id = ?", (tail[0],))
-            tgt.execute("UPDATE messages SET chunk_id = NULL WHERE chunk_id = ?", (tail[0],))
-            tgt.execute("DELETE FROM chunks WHERE id = ?", (tail[0],))
-            rebuild_cond = "(m.chunk_id IS NULL OR m.id >= ?)"
-            rebuild_params = [tail[1]]
+    with progress.track("Building chunks", total=len(pending_chats)) as p:
+        for chat_id in pending_chats:
+            # Rebuild the chat's tail chunk so the pending messages extend it.
+            # The rebuild must re-include the tail's overlap prefix -- messages
+            # carried into it by a size split keep their *first* chunk's id, so
+            # `chunk_id IS NULL` alone would miss them; `id >= first_message_id`
+            # picks up exactly those (they stay stamped to their original chunk
+            # via _flush_chunk's NULL guard).
+            tail = tgt.execute(
+                "SELECT id, first_message_id FROM chunks "
+                "WHERE chat_id = ? ORDER BY id DESC LIMIT 1",
+                (chat_id,)).fetchone()
+            rebuild_cond, rebuild_params = "m.chunk_id IS NULL", []
+            if tail:
+                if has_vec_table:
+                    tgt.execute("DELETE FROM chunk_vectors WHERE chunk_id = ?", (tail[0],))
+                tgt.execute("UPDATE messages SET chunk_id = NULL WHERE chunk_id = ?",
+                            (tail[0],))
+                tgt.execute("DELETE FROM chunks WHERE id = ?", (tail[0],))
+                rebuild_cond = "(m.chunk_id IS NULL OR m.id >= ?)"
+                rebuild_params = [tail[1]]
 
-        rows = tgt.execute(f"""
-            SELECT m.id, m.is_from_me, m.handle_id, m.text, m.date, m.has_attachment
-            FROM messages m
-            WHERE m.chat_id = ? AND {rebuild_cond} AND m.date IS NOT NULL
-              AND {_RENDERABLE}
-            ORDER BY m.date, m.id
-        """, [chat_id] + rebuild_params).fetchall()
-        if not rows:
-            continue
+            rows = tgt.execute(f"""
+                SELECT m.id, m.is_from_me, m.handle_id, m.text, m.date, m.has_attachment
+                FROM messages m
+                WHERE m.chat_id = ? AND {rebuild_cond} AND m.date IS NOT NULL
+                  AND {_RENDERABLE}
+                ORDER BY m.date, m.id
+            """, [chat_id] + rebuild_params).fetchall()
+            if not rows:
+                p.advance()
+                continue
 
-        att_types = {}
-        for msg_id, kind in tgt.execute(f"""
-            SELECT a.message_id, COALESCE(a.mime_type, a.transfer_name, 'file')
-            FROM attachments a JOIN messages m ON m.id = a.message_id
-            WHERE m.chat_id = ? AND {rebuild_cond}
-        """, [chat_id] + rebuild_params):
-            att_types.setdefault(msg_id, []).append(kind)
+            att_types = {}
+            for msg_id, kind in tgt.execute(f"""
+                SELECT a.message_id, COALESCE(a.mime_type, a.transfer_name, 'file')
+                FROM attachments a JOIN messages m ON m.id = a.message_id
+                WHERE m.chat_id = ? AND {rebuild_cond}
+            """, [chat_id] + rebuild_params):
+                att_types.setdefault(msg_id, []).append(kind)
 
-        who = _chat_label(tgt, labels, chat_id)
-        chunk_msgs, cur_len, prev_dt = [], 0, None
-        for msg in rows:
-            line = _render_line(labels, att_types, msg)
-            dt = datetime.datetime.fromisoformat(msg[4])
-            if chunk_msgs and dt - prev_dt > gap:
+            who = _chat_label(tgt, labels, chat_id)
+            chunk_msgs, cur_len, prev_dt = [], 0, None
+            for msg in rows:
+                line = _render_line(labels, att_types, msg)
+                dt = datetime.datetime.fromisoformat(msg[4])
+                if chunk_msgs and dt - prev_dt > gap:
+                    _flush_chunk(tgt, chat_id, who, chunk_msgs)
+                    chunk_msgs, cur_len = [], 0  # session boundary: no overlap carried
+                elif chunk_msgs and cur_len + len(line) + 1 > max_chars:
+                    _flush_chunk(tgt, chat_id, who, chunk_msgs)
+                    chunk_msgs = chunk_msgs[-overlap_messages:] if overlap_messages else []
+                    cur_len = sum(len(li) + 1 for _, li in chunk_msgs)
+                    if cur_len + len(line) + 1 > max_chars:
+                        # Oversized overlap (very long messages): carrying it would
+                        # immediately overflow again and flush a chunk made only of
+                        # already-chunked repeats -- start clean instead.
+                        chunk_msgs, cur_len = [], 0
+                chunk_msgs.append((msg, line))
+                cur_len += len(line) + 1
+                prev_dt = dt
+            if chunk_msgs:
                 _flush_chunk(tgt, chat_id, who, chunk_msgs)
-                chunk_msgs, cur_len = [], 0  # session boundary: no overlap carried
-            elif chunk_msgs and cur_len + len(line) + 1 > max_chars:
-                _flush_chunk(tgt, chat_id, who, chunk_msgs)
-                chunk_msgs = chunk_msgs[-overlap_messages:] if overlap_messages else []
-                cur_len = sum(len(li) + 1 for _, li in chunk_msgs)
-                if cur_len + len(line) + 1 > max_chars:
-                    # Oversized overlap (very long messages): carrying it would
-                    # immediately overflow again and flush a chunk made only of
-                    # already-chunked repeats -- start clean instead.
-                    chunk_msgs, cur_len = [], 0
-            chunk_msgs.append((msg, line))
-            cur_len += len(line) + 1
-            prev_dt = dt
-        if chunk_msgs:
-            _flush_chunk(tgt, chat_id, who, chunk_msgs)
-        n_msgs += len(rows)
+            n_msgs += len(rows)
+            p.advance()
 
     tgt.commit()
     n_built = tgt.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] - n_chunks_before
@@ -254,7 +260,7 @@ def embed_chunks(
     min_chars=CHUNK_MIN_CHARS,
     batch_size=EMBED_BATCH_SIZE,
     max_workers=EMBED_MAX_WORKERS,
-    batch_log_every=200,
+    batch_commit_every=EMBED_COMMIT_EVERY,
 ):
     rows = tgt.execute("""
         SELECT c.id, c.chat_id, c.first_date, c.last_date, c.text
@@ -275,30 +281,35 @@ def embed_chunks(
 
         return batch, ingest.embed_texts([r[4] for r in batch], kind="document")
 
-    n_done, n_err, n_processed, n_logged = 0, 0, 0, 0
+    n_done, n_err, n_processed, n_committed = 0, 0, 0, 0
     pool = ThreadPoolExecutor(max_workers=max_workers)
     try:
-        future_to_batch = {pool.submit(process, batch): batch for batch in batches}
-        for future in as_completed(future_to_batch):
-            batch = future_to_batch[future]
-            try:
-                batch, vecs = future.result()
-            except (http.client.HTTPException, OSError, RuntimeError, json.JSONDecodeError):
-                n_err += len(batch)
-                continue
-            tgt.executemany(
-                "INSERT OR REPLACE INTO chunk_vectors"
-                "(chunk_id, embedding, chat_id, first_day, last_day) VALUES (?, ?, ?, ?, ?)",
-                [(chunk_id, sqlite_vec.serialize_float32(vec), chat_id,
-                  iso_to_day(first_date), iso_to_day(last_date))
-                 for (chunk_id, chat_id, first_date, last_date, _), vec in zip(batch, vecs)],
-            )
-            n_done += len(batch)
-            n_processed += len(batch)
-            if n_processed - n_logged >= batch_log_every:
-                tgt.commit()
-                print(f"  ...{n_processed}/{len(rows)}")
-                n_logged = n_processed
+        with progress.track("Embedding chunks", total=len(rows), header=False) as p:
+            future_to_batch = {pool.submit(process, batch): batch for batch in batches}
+            for future in as_completed(future_to_batch):
+                batch = future_to_batch[future]
+                try:
+                    batch, vecs = future.result()
+                except (http.client.HTTPException, OSError, RuntimeError,
+                        json.JSONDecodeError):
+                    n_err += len(batch)
+                    # A failed batch is still a settled batch: without this the
+                    # bar stalls short of its total and reads as a hang.
+                    p.advance(len(batch))
+                    continue
+                tgt.executemany(
+                    "INSERT OR REPLACE INTO chunk_vectors"
+                    "(chunk_id, embedding, chat_id, first_day, last_day) VALUES (?, ?, ?, ?, ?)",
+                    [(chunk_id, sqlite_vec.serialize_float32(vec), chat_id,
+                      iso_to_day(first_date), iso_to_day(last_date))
+                     for (chunk_id, chat_id, first_date, last_date, _), vec in zip(batch, vecs)],
+                )
+                n_done += len(batch)
+                n_processed += len(batch)
+                p.advance(len(batch))
+                if n_processed - n_committed >= batch_commit_every:
+                    tgt.commit()
+                    n_committed = n_processed
     except KeyboardInterrupt:
         # Don't wait on in-flight worker threads (each blocked on an Ollama
         # HTTP call) -- drop anything not yet started and commit whatever

@@ -15,6 +15,7 @@ import collections
 import json
 import sqlite3
 
+import progress
 from config import DYAD_TERM_MIN_LIFT, DYAD_TERM_MIN_USES, DYAD_TERM_TOP_K
 from function_words import (
     EMOJI_RE,
@@ -63,36 +64,45 @@ def build_person_period_lexicon(tgt: sqlite3.Connection) -> int:
     affected month row for no measurable win."""
     tgt.execute("DELETE FROM person_period_lexicon")
 
+    # Counted up front purely so the pass can report a percentage -- the loop
+    # below streams its cursor and would otherwise have no denominator. Same
+    # WHERE as the stream, so it stays on the same index.
+    n_total = tgt.execute(
+        f"SELECT COUNT(*) FROM messages m WHERE {_QUALIFYING_WHERE}"
+    ).fetchone()[0]
+
     stats = {}
-    for chat_id, handle_id, is_from_me, text, date in tgt.execute(
-        f"SELECT m.chat_id, m.handle_id, m.is_from_me, m.text, m.date "
-        f"FROM messages m WHERE {_QUALIFYING_WHERE}"
-    ):
-        key = (chat_id, None if is_from_me else handle_id, date[:7])
-        s = stats.get(key)
-        if s is None:
-            s = stats[key] = {
-                "n_messages": 0, "n_words": 0, "chars": 0,
-                "fw": [0] * len(_FW_CATEGORIES),
-                "we": 0, "question": 0, "laugh": 0,
-                "emoji": collections.Counter(),
-            }
-        tokens = tokenize(text)
-        s["n_messages"] += 1
-        s["n_words"] += len(tokens)
-        s["chars"] += len(text)
-        fw = s["fw"]
-        for tok in tokens:
-            for i, cat in enumerate(_FW_CATEGORIES):
-                if tok in FUNCTION_WORDS[cat]:
-                    fw[i] += 1
-        if any(tok in WE_WORDS for tok in tokens):
-            s["we"] += 1
-        if "?" in text:
-            s["question"] += 1
-        if LAUGH_RE.search(text):
-            s["laugh"] += 1
-        s["emoji"].update(EMOJI_RE.findall(text))
+    with progress.track("Building lexicon", total=n_total) as p:
+        for chat_id, handle_id, is_from_me, text, date in tgt.execute(
+            f"SELECT m.chat_id, m.handle_id, m.is_from_me, m.text, m.date "
+            f"FROM messages m WHERE {_QUALIFYING_WHERE}"
+        ):
+            key = (chat_id, None if is_from_me else handle_id, date[:7])
+            s = stats.get(key)
+            if s is None:
+                s = stats[key] = {
+                    "n_messages": 0, "n_words": 0, "chars": 0,
+                    "fw": [0] * len(_FW_CATEGORIES),
+                    "we": 0, "question": 0, "laugh": 0,
+                    "emoji": collections.Counter(),
+                }
+            tokens = tokenize(text)
+            s["n_messages"] += 1
+            s["n_words"] += len(tokens)
+            s["chars"] += len(text)
+            fw = s["fw"]
+            for tok in tokens:
+                for i, cat in enumerate(_FW_CATEGORIES):
+                    if tok in FUNCTION_WORDS[cat]:
+                        fw[i] += 1
+            if any(tok in WE_WORDS for tok in tokens):
+                s["we"] += 1
+            if "?" in text:
+                s["question"] += 1
+            if LAUGH_RE.search(text):
+                s["laugh"] += 1
+            s["emoji"].update(EMOJI_RE.findall(text))
+            p.advance()
 
     rows = []
     for (chat_id, handle_id, month), s in stats.items():
@@ -155,25 +165,33 @@ def build_dyad_terms(tgt: sqlite3.Connection, min_uses=None, min_lift=None,
     term_totals = collections.Counter()      # term -> corpus-wide uses
     provenance = {}                          # (chat, term) -> (msg_id, handle-or-None, is_me)
 
+    # Counted up front only to give the streaming pass below a denominator to
+    # report progress against; same WHERE, so it stays on the same index.
+    n_total = tgt.execute(
+        f"SELECT COUNT(*) FROM messages m WHERE {_QUALIFYING_WHERE}"
+    ).fetchone()[0]
+
     # ORDER BY date,id so the first time a (chat, term) pair is seen IS its
     # first occurrence -- provenance falls out of setdefault.
-    for chat_id, handle_id, is_from_me, text, msg_id in tgt.execute(
-        f"SELECT m.chat_id, m.handle_id, m.is_from_me, m.text, m.id "
-        f"FROM messages m WHERE {_QUALIFYING_WHERE} ORDER BY m.date, m.id"
-    ):
-        tokens = tokenize(text)
-        chat_tokens[chat_id] += len(tokens)
-        corpus_tokens.update(tokens)
-        coiner = (msg_id, None if is_from_me else handle_id, 1 if is_from_me else 0)
-        counter = chat_terms[chat_id]
-        # Stopword filtering happens after the pass (the top-N list doesn't
-        # exist yet); the length gate is applied now to bound the counters.
-        terms = [t for t in tokens if len(t) >= 3]
-        terms += [f"{a} {b}" for a, b in zip(tokens, tokens[1:])]
-        for term in terms:
-            counter[term] += 1
-            term_totals[term] += 1
-            provenance.setdefault((chat_id, term), coiner)
+    with progress.track("Scanning messages for terms", total=n_total) as p:
+        for chat_id, handle_id, is_from_me, text, msg_id in tgt.execute(
+            f"SELECT m.chat_id, m.handle_id, m.is_from_me, m.text, m.id "
+            f"FROM messages m WHERE {_QUALIFYING_WHERE} ORDER BY m.date, m.id"
+        ):
+            tokens = tokenize(text)
+            chat_tokens[chat_id] += len(tokens)
+            corpus_tokens.update(tokens)
+            coiner = (msg_id, None if is_from_me else handle_id, 1 if is_from_me else 0)
+            counter = chat_terms[chat_id]
+            # Stopword filtering happens after the pass (the top-N list doesn't
+            # exist yet); the length gate is applied now to bound the counters.
+            terms = [t for t in tokens if len(t) >= 3]
+            terms += [f"{a} {b}" for a, b in zip(tokens, tokens[1:])]
+            for term in terms:
+                counter[term] += 1
+                term_totals[term] += 1
+                provenance.setdefault((chat_id, term), coiner)
+            p.advance()
 
     stop = set(STOPWORDS)
     stop.update(tok for tok, _ in corpus_tokens.most_common(_CORPUS_TOP_N))
