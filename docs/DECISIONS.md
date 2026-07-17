@@ -458,6 +458,101 @@ motivated by specific transcript failures:
   the KV prefix cache) with reduced-context env defaults for fast smoke
   sweeps.
 
+## 2026-07: the analytics layer (six section tools + derived tables)
+
+Replaces the three narrow aggregate tools above (`get_conversation_dynamics`,
+`get_activity_histogram`, `get_top_reacted_messages`) with six that each
+answer a *family* of questions in one call, and adds the derived tables and
+batch-LLM CLIs they read. Rationale for the decisions that aren't obvious
+from the code:
+
+- **Section tools, not more tools.** The eval sweep's failure mode was the
+  model spending its whole iteration budget stitching together narrow calls.
+  Each new tool returns one dict of small pre-aggregated sections
+  (`include=[...]` selects a subset), so "when do we talk / how fast do we
+  reply / who starts it" is one round-trip, not six. Every section is capped
+  (`MAX_LEADERBOARD_ROWS`, `MAX_SERIES_BUCKETS`) with auto-coarsening
+  day→month→year, so a result can't blow the context window — the
+  `TOOL_RESULT_MAX_CHARS` failure mode is designed out rather than truncated.
+- **`sessions` is a table, not a `messages.session_id` column.** Sessions are
+  a *derived* artifact with a tunable gap; a column would make re-tuning
+  `SESSION_GAP_MINUTES` a migration and would put a rebuildable value on the
+  append-only source-derived table. As a separate table it falls under the
+  same carve-out as `chunks` (reset_db deletes it; ingest rebuilds it), and
+  the `sessions_gap_minutes` state key forces a full rebuild if the rule
+  changes, so the table can never mix splitting rules. Rebuild is per-chat
+  and whole: the largest chat takes milliseconds, and it's immune to the
+  tail-surgery subtleties that make incremental chunk rebuilds delicate.
+- **Sessions are one gate stricter than the analytics aggregates.** A session
+  requires text or an attachment; the tools keep every dated real message.
+  ~32 rows of 350k differ. A row with no renderable content can't start or
+  end a conversation, so it must not open a session — but it *is* a message,
+  so it still counts in a message count. The two populations are near-identical
+  by design, not identical; don't assert equality between them.
+- **Local-timezone bucketing happens in Python.** `messages.date` is
+  unlabeled UTC. "Late night" bucketed in UTC is off by hours — the single
+  most wrong-looking number a user could see. SQL can't do the tz conversion
+  without wrapping the column in a function and killing
+  `idx_messages_chat_date`, so rows are filtered in SQL (plain-string date
+  compares) and bucketed in Python. `LOCAL_TZ` is read via the `config`
+  module at call time so tests can pin a zone.
+- **LSM needs a function-word lexicon, so `person_period_lexicon` is
+  precomputed.** Language style matching compares *function-word* rates
+  (pronouns, articles, conjunctions...), which means tokenizing every
+  message. Per-person-per-month rows make that a one-time ingest cost;
+  computing it per query would tokenize the corpus on every call. It's a full
+  rebuild (a few seconds at 350k) — incremental upkeep would need
+  read-modify-write on every affected month row for no measurable win.
+- **`dyad_terms` uses add-one-smoothed lift** — `(uses_in_chat /
+  tokens_in_chat) / ((uses_elsewhere + 1) / tokens_elsewhere)` — so a term
+  used *only* in one chat (the inside jokes we're hunting) gets a finite lift
+  instead of dividing by zero. Candidates exclude the 9 function-word
+  categories plus the corpus's 200 most frequent tokens, computed in the same
+  pass: without that, every chat's "distinctive" list is just "yeah" and the
+  names everyone uses. Measured cost of the accumulation pass on the dev
+  corpus: 13s, 210MB peak, 942k provenance entries — cheap enough that
+  pruning candidates before the lift computation isn't worth the complexity.
+- **`dyad_terms` rebuilds preserve `llm_verdict`.** Stats are recomputed in
+  seconds; a verdict is an overnight LLM pass. Rebuild snapshots the verdicts
+  per `(chat_id, term)` and reattaches them. This is why `annotate.py
+  --terms` gets the same `annotate_model` anti-mixing guard as
+  `chunk_annotations`: both hold expensive, model-specific, rebuild-surviving
+  output.
+- **`wrapped.py`'s silent-contact guard (the the silent-contact case).** A
+  year-in-review that cheerfully resurfaces an ex, or someone who died, is
+  the classic nostalgia-product failure. Contacts who were active (>= 3 of
+  the 6 months before their last message) and then stopped abruptly (silent
+  >= `WRAPPED_SILENT_MONTHS` before corpus end, >=
+  `WRAPPED_SILENT_MIN_MESSAGES` lifetime) are auto-excluded from the featured
+  roster, the roster is *printed for confirmation* before anything is
+  generated, and `--include "Name"` re-admits. The threshold is measured on
+  the same `_REAL_MSG` population the roster ranks on, or a contact could
+  clear it on system rows alone.
+- **`wrapped.py` composes tools deterministically; the LLM only narrates.**
+  Every number is computed by a query tool and passed to the model as JSON
+  with instructions to use only the numbers present. The model never queries
+  and never derives. Sections degrade to a skip note rather than crashing
+  (`_tool` late-binds every tool and swallows missing/error/unavailable), so
+  a report is never lost to one bad section. Note that `get_word_frequency`
+  scopes by *sender* while every other tool scopes to a person's *chats* —
+  under `--contact` its key is named `their_top_words` so the narrator can't
+  mistake one side's vocabulary for shared vocabulary.
+- **Topic k-means pushes assignment into sqlite-vec.** The centroids go in a
+  scratch `vec0` table and each chunk's nearest centroid is a `k = 1` KNN;
+  only the centroid *update* is Python (`array('f')`, no numpy). The
+  `topic_model_k` guard is warn-only, unlike the embedding/annotation guards:
+  a rebuild legitimately *replaces* a differently-parameterized clustering —
+  the fix for a mismatch is the rebuild itself.
+- **Unknown `include` sections raise, never silently drop.** A typo'd section
+  name would otherwise return a plausible-looking partial result the model
+  can't distinguish from the real thing. One shared `_validate_include` in
+  `_shared.py` so all six tools agree.
+
+Hermetic code-level tests for all of the above are in `tests/`.
+End-to-end *response-quality* evaluation (does the model pick the right tool
+and read the result correctly?) is specified but not yet run — see
+[`ANALYTICS_TEST_PLAN.md`](ANALYTICS_TEST_PLAN.md).
+
 ## Linting
 
 `ruff check .` (config in `pyproject.toml`: `line-length = 100`,
@@ -477,10 +572,14 @@ or real `chat.db` needed).
    implements this against `gemma4:26b-a4b-it-qat` via Ollama. Remaining
    option: a Claude-backed reasoning/analysis layer over the same tools
    (keeping embeddings local) if preferred for heavier analysis.
-3. **Enrichment/analysis layer** (sentiment, emotion, topic tagging) —
-   discussed as a future layer (batch-tag messages, store as extra columns
-   on `messages`, aggregate via SQL for trend questions) but intentionally
-   deferred — focus so far has been the storage/retrieval foundation, not
-   the analysis types themselves.
+3. **Enrichment/analysis layer** (sentiment, emotion, topic tagging) — DONE,
+   see "the analytics layer" above. Built one level up from the original
+   sketch: annotations are keyed to *chunks*, not messages, and live in their
+   own `chunk_annotations` / `topics` tables rather than as extra columns on
+   `messages` — same reasoning as embedding chunks instead of messages ("ok"
+   has no sentiment worth storing), and it keeps the append-only source table
+   free of derived, rebuildable values. `annotate.py` and `topics.py` are
+   standalone overnight-scale CLIs, not part of `ingest.py`: they need a
+   reachable Ollama and hours, while ingest must stay runnable offline.
 4. **`.txt` parser** — not built; only needed if `chat.db` access isn't
    available for some future conversation/export.

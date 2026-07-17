@@ -31,6 +31,8 @@ from pathlib import Path
 from chunking import build_chunks, build_vec_table, embed_chunks
 from config import ADDRESS_BOOK_PATH, SNAPSHOT_DB, SOURCE_DB, TARGET_DB
 from db import get_state, load_vec_extension, set_state, strip_reaction_guid_prefix
+from lexicon_build import build_dyad_terms, build_person_period_lexicon
+from sessions import build_sessions
 # embed_texts is otherwise unused here, but it must stay an attribute of
 # this module: chunking.embed_chunks resolves `ingest.embed_texts` at call
 # time, keeping it the one patchable seam (tests stub it here).
@@ -433,6 +435,13 @@ def main():
             # Chunk building is cheap and local -- always runs. Only the
             # Ollama embedding pass is gated by --no-embed.
             build_chunks(tgt)
+
+            # Derived analytics artifacts, all cheap and local: sessions is
+            # incremental like chunks; the lexicon/dyad-term tables are full
+            # rebuilds (a few seconds, and dyad_terms preserves curation).
+            build_sessions(tgt)
+            build_person_period_lexicon(tgt)
+            build_dyad_terms(tgt)
 
             if not args.no_embed:
                 try:

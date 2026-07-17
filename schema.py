@@ -96,6 +96,84 @@ CREATE TABLE IF NOT EXISTS ingest_state (
     value TEXT
 );
 
+-- Derived analytics artifacts (like chunks: rebuildable, reset_db deletes
+-- them, the append-only rule's carve-out applies). sessions/-lexicon/
+-- dyad_terms are built by ingest; chunk_annotations by annotate.py;
+-- topics/chunk_topics by topics.py.
+
+CREATE TABLE IF NOT EXISTS sessions (
+    -- AUTOINCREMENT: rebuilt per chat, ids must never be reused
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER,
+    first_message_id INTEGER,
+    last_message_id INTEGER,
+    first_date TEXT,
+    last_date TEXT,
+    n_messages INTEGER,
+    n_from_me INTEGER,
+    initiator_handle_id INTEGER,     -- NULL = me (paired with initiator_is_me)
+    initiator_is_me INTEGER,
+    ender_handle_id INTEGER,         -- NULL = me
+    ender_is_me INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_chat ON sessions(chat_id, first_date);
+
+CREATE TABLE IF NOT EXISTS person_period_lexicon (
+    chat_id INTEGER,
+    handle_id INTEGER,               -- NULL = me
+    month TEXT,                      -- 'YYYY-MM' (date[:7])
+    n_messages INTEGER,
+    n_words INTEGER,
+    avg_chars REAL,
+    fw_pronoun_rate REAL,
+    fw_ipron_rate REAL,
+    fw_article_rate REAL,
+    fw_conj_rate REAL,
+    fw_prep_rate REAL,
+    fw_aux_rate REAL,
+    fw_adverb_rate REAL,
+    fw_negation_rate REAL,
+    fw_quant_rate REAL,
+    we_count INTEGER,
+    question_count INTEGER,
+    laugh_count INTEGER,
+    emoji_json TEXT,
+    -- NULL handle_id in the PK is fine: the table is full-rebuild only
+    -- (plain INSERTs, never upserts), so PK uniqueness is never relied on.
+    PRIMARY KEY (chat_id, handle_id, month)
+);
+
+CREATE TABLE IF NOT EXISTS dyad_terms (
+    chat_id INTEGER,
+    term TEXT,
+    lift REAL,
+    n_uses INTEGER,
+    first_message_id INTEGER,
+    coined_by_handle_id INTEGER,     -- NULL = me
+    coined_is_me INTEGER,
+    llm_verdict TEXT,                -- NULL until annotate.py --terms curates it
+    PRIMARY KEY (chat_id, term)
+);
+
+CREATE TABLE IF NOT EXISTS chunk_annotations (
+    chunk_id INTEGER PRIMARY KEY,
+    valence REAL,                    -- -1..1
+    emotions_json TEXT,              -- JSON list of GoEmotions labels
+    depth INTEGER,                   -- 1 (logistics) .. 5 (heart-to-heart)
+    events_json TEXT                 -- JSON list of good-news/gratitude events
+);
+
+CREATE TABLE IF NOT EXISTS topics (
+    cluster_id INTEGER PRIMARY KEY,
+    label TEXT,                      -- NULL until the label pass names it
+    n_chunks INTEGER
+);
+CREATE TABLE IF NOT EXISTS chunk_topics (
+    chunk_id INTEGER PRIMARY KEY,
+    cluster_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_chunk_topics_cluster ON chunk_topics(cluster_id);
+
 CREATE INDEX IF NOT EXISTS idx_messages_chat_date ON messages(chat_id, date);
 CREATE INDEX IF NOT EXISTS idx_messages_handle ON messages(handle_id);
 CREATE INDEX IF NOT EXISTS idx_messages_chunk ON messages(chunk_id);

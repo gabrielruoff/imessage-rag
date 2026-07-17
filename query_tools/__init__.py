@@ -19,8 +19,10 @@ results -- never the whole table.
 
 Layout: messages.py (message-level tools), chunks.py (chunk/semantic/hybrid
 tools), directory.py (contact/chat resolution + stats), analytics.py
-(aggregates: dynamics, histograms, reaction leaderboards, participant stats,
-word frequency), _shared.py (connection, caps, scope/date helpers). Every
+(participant stats, word frequency), analytics_time.py (activity patterns,
+response dynamics), analytics_social.py (reaction stats, milestones),
+analytics_language.py (word trends, group dynamics), _shared.py
+(connection, caps, scope/date helpers). Every
 tool is re-exported here, so `import query_tools` stays the only import
 callers need -- add new tools to the right submodule and to __all__ below.
 DB_PATH and embed_texts are module attributes by contract: tests patch them
@@ -31,11 +33,20 @@ from embeddings import embed_texts
 
 from ._shared import DB_PATH, _date_bound_step, _normalize_date_bound
 from .analytics import (
-    get_activity_histogram,
     get_chat_participant_stats,
-    get_conversation_dynamics,
-    get_top_reacted_messages,
     get_word_frequency,
+)
+from .analytics_language import (
+    get_group_dynamics,
+    get_word_trends,
+)
+from .analytics_social import (
+    get_milestones,
+    get_reaction_stats,
+)
+from .analytics_time import (
+    get_activity_patterns,
+    get_response_dynamics,
 )
 from .chunks import (
     find_similar_conversations,
@@ -61,16 +72,19 @@ __all__ = [
     "DB_PATH",
     "embed_texts",
     "find_similar_conversations",
-    "get_activity_histogram",
+    "get_activity_patterns",
     "get_chat_participant_stats",
     "get_chat_summary_stats",
     "get_conversation",
-    "get_conversation_dynamics",
     "get_full_messages",
+    "get_group_dynamics",
     "get_message_context",
     "get_message_reactions",
-    "get_top_reacted_messages",
+    "get_milestones",
+    "get_reaction_stats",
+    "get_response_dynamics",
     "get_word_frequency",
+    "get_word_trends",
     "list_chats",
     "search_contact_by_handle",
     "search_contacts_by_name",

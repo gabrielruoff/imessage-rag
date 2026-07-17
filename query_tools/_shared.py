@@ -49,15 +49,24 @@ MAX_STATS_ROWS = 50      # get_chat_summary_stats group_by_chat=True
 MAX_ID_LIST = 50         # cap on chat_id/handle_id/contact_id/guid list params
 MAX_CONTEXT_MESSAGES = 25   # get_message_context before/after ceiling
 MAX_SCOPE_CHATS = 500       # cap on the person -> chats expansion (chunk + analytics tools)
-MAX_HISTOGRAM_ROWS = 200    # get_activity_histogram bucket rows
-MAX_SILENCES = 20           # get_conversation_dynamics top_silences ceiling
 MAX_WORD_FREQ_TOP = 100     # get_word_frequency `top` ceiling
+MAX_LEADERBOARD_ROWS = 10   # leaderboard sections in the analytics dict tools
+MAX_SERIES_BUCKETS = 120    # time-series sections (auto-coarsen day->month past this)
+MIN_LEADERBOARD_MESSAGES = 50  # min messages for a contact to enter unscoped leaderboards
 MAX_CHUNK_MESSAGES = 200    # get_conversation row ceiling
 HYBRID_POOL = 30            # per-arm candidate depth fed into RRF
 RRF_K = 60                  # standard reciprocal-rank-fusion constant
 
 TEXT_PREVIEW_CHARS = 300    # message rows
 CHUNK_PREVIEW_CHARS = 500   # chunk rows (get_conversation returns the messages)
+
+# Every aggregate counts only real conversation messages: legacy emote rows
+# and system rows (group renames, member joins, ...) must never claim an
+# initiation, break a silence, pad a histogram bucket, or count as a
+# participant's sent message. (Belt and braces -- ingest already splits
+# tapbacks into reactions.) Shared by the analytics tool modules and the
+# sessions pipeline.
+_REAL_MESSAGE_CLAUSES = ("COALESCE(m.is_emote, 0) = 0", "COALESCE(m.item_type, 0) = 0")
 
 
 def _truncate_text_field(rows, limit=TEXT_PREVIEW_CHARS):
@@ -68,6 +77,24 @@ def _truncate_text_field(rows, limit=TEXT_PREVIEW_CHARS):
         if text and len(text) > limit:
             r["text"] = text[:limit] + "…"
     return rows
+
+
+def _validate_include(include, known, tool_name):
+    """Normalize a section-selecting `include` param into a set of section
+    names (None/[] = every section). Unknown names always raise rather than
+    being silently dropped: a typo'd section would otherwise return a
+    plausible-looking partial result the model can't tell from the real
+    thing. Shared by every section-based analytics tool so they agree."""
+    if not include:
+        return set(known)
+    names = set(include) if isinstance(include, (list, tuple)) else {include}
+    unknown = names - set(known)
+    if unknown:
+        raise ValueError(
+            f"{tool_name}: unknown include section(s) {sorted(unknown)!r}: "
+            f"expected any of {', '.join(known)}"
+        )
+    return names
 
 
 def _as_id_list(value):

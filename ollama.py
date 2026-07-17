@@ -21,6 +21,49 @@ class OllamaResponseError(RuntimeError):
     the same request lets the model re-sample."""
 
 
+def chat_once(messages, model=None, format=None, timeout=None):
+    """POST a non-streaming request to the chat endpoint and return the
+    response's `message` dict. format='json' turns on Ollama JSON mode (the
+    batch annotation/labeling path). Raises RuntimeError on an error body."""
+    conn = http.client.HTTPConnection(
+        OLLAMA_HOST, OLLAMA_PORT, timeout=timeout or CHAT_TIMEOUT
+    )
+    body = {
+        "model": model or CHAT_MODEL,
+        "messages": messages,
+        "stream": False,
+    }
+    if format:
+        body["format"] = format
+    if CHAT_THINK is not None:
+        body["think"] = CHAT_THINK
+    try:
+        conn.request(
+            "POST", OLLAMA_CHAT_PATH, body=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        response = conn.getresponse()
+        status, raw = response.status, response.read()
+    finally:
+        conn.close()
+    # Check the status before parsing: a non-200 body is often HTML or empty,
+    # and json.loads would raise JSONDecodeError -- burying the actual cause
+    # (wrong port, model not pulled) under a parse error.
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        snippet = raw[:200].decode("utf-8", "replace").strip()
+        raise RuntimeError(
+            f"Ollama returned unparseable HTTP {status} from {OLLAMA_CHAT_PATH}: "
+            f"{snippet or '(empty body)'}"
+        ) from None
+    if "error" in data:
+        raise RuntimeError(f"Ollama error: {data['error']}")
+    if status != 200:
+        raise RuntimeError(f"Ollama HTTP {status}: {data}")
+    return data.get("message", {})
+
+
 def chat_stream(messages, tools=None, model=None):
     """POST a streaming request to the chat endpoint (OLLAMA_CHAT_PATH) and
     yield each chunk's `message` dict as it arrives. Raises OllamaResponseError

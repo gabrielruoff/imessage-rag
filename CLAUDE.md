@@ -17,6 +17,14 @@ Full design history, schema, rationale, and data forensics:
 - Chat CLI: `.venv/bin/python3 chat.py` (interactive REPL), or
   `chat.py -p "..."` for a one-shot answer (prints only the reply; exit 1 if
   Ollama is unreachable)
+- Annotate chunks (batch LLM, overnight-scale): `.venv/bin/python3 annotate.py
+  [--all | --top-dyads N] [--terms] [--limit N] [--dry-run]` — resumable,
+  commits as it goes, Ctrl-C safe
+- Topic clusters: `.venv/bin/python3 topics.py [--k K] [--relabel]` — k-means
+  over chunk_vectors (assignment in sqlite-vec), then an LLM label pass
+- Wrapped report: `.venv/bin/python3 wrapped.py [--year YYYY] [--contact NAME]
+  [--no-llm] [--yes]` — markdown; previews the featured roster (with
+  silent-contact auto-exclusions) before generating
 - Eval sweep: `eval/fast_eval.sh eval/prompts-smoke.txt [-m model]` — runs a
   prompts file (`id|prompt` lines) through `chat.py -p` sequentially with
   reduced-context env defaults; transcripts land in `eval/results/`. Never
@@ -52,16 +60,20 @@ prefixes (`search_document: ` / `search_query: `) are applied by default and
 the embedding dimension is auto-detected at ingest time, so switching
 embedders is a `.env` change + `reset_db.py` + re-ingest.
 
-Module map: `query_tools/` holds the eighteen retrieval functions the LLM
+Module map: `query_tools/` holds the twenty-one retrieval functions the LLM
 calls — `messages.py` (message-level SQL/FTS search, context expansion, full
 text, reactions), `chunks.py` (chunk-level semantic search, hybrid
 FTS+semantic fused with reciprocal-rank fusion, more-like-this, chunk → its
 messages), `directory.py` (summary stats; name/handle/chat resolution),
-`analytics.py` (single-call aggregates: conversation dynamics, activity
-histograms, reaction leaderboards, per-participant chat stats, word
-frequency — person scope means *that person's chats* for all of these except
-`get_word_frequency`, which scopes by sender),
-`_shared.py` (connection, result caps, date-bound and scope resolution), all
+`analytics.py` (per-participant chat stats; word frequency, which scopes by
+sender), `analytics_time.py` (activity patterns with local-tz Python
+bucketing; response dynamics over messages + the sessions table),
+`analytics_social.py` (reaction stats; milestones), `analytics_language.py`
+(word trends/LSM/distinctive terms from the lexicon tables; group dynamics)
+— person scope means *that person's chats* for all analytics tools except
+`get_word_frequency`,
+`_shared.py` (connection, result caps, date-bound and scope resolution,
+`_REAL_MESSAGE_CLAUSES` excluding emote/system rows from every aggregate), all
 re-exported from `__init__.py` so `import query_tools` is the only import
 callers need (`DB_PATH`/`embed_texts` are patchable package attributes,
 resolved through the package at call time); `tool_schemas.py` their JSON
@@ -73,7 +85,16 @@ ingest (documents) and query_tools (queries) so both sides embed identically;
 `.env.example`); `db.py` shared sqlite helpers (`load_vec_extension`,
 `CONTACT_LABEL_SQL`, `iso_to_day`, `get_state`/`set_state`); `schema.py` the
 analysis-DB DDL + in-place migration (`create_schema`, run and re-exported
-by `ingest.py`).
+by `ingest.py`). Derived-analytics pipelines (all run by `ingest.py` after
+chunking, and re-exported from it): `sessions.py` (gap-split session rows
+with initiator/ender), `lexicon_build.py` (`person_period_lexicon` +
+`dyad_terms`, full rebuilds — dyad_terms preserves `llm_verdict` curation);
+`function_words.py` the bundled open LSM lexicon + tokenize/emoji/laugh
+regexes + GoEmotions labels. Standalone batch CLIs: `annotate.py` (LLM chunk
+annotations + dyad-term curation via `ollama.chat_once` JSON mode),
+`topics.py` (k-means topic clusters + LLM labels), `wrapped.py` (markdown
+report composing the query tools deterministically; LLM only narrates
+computed numbers).
 
 ## Schema (imessage_analysis.db)
 
@@ -100,7 +121,26 @@ chunks(id, chat_id, first_message_id, last_message_id, first_date, last_date,
        n_messages, text)          -- conversation windows; id AUTOINCREMENT so a
                                   -- rebuilt tail chunk never reuses an id
 ingest_state(key, value)          -- last_message_rowid for --since-last, plus
-                                  -- embed_model/embed_dim guarding chunk_vectors
+                                  -- embed_model/embed_dim guarding chunk_vectors,
+                                  -- sessions_max_message_id/sessions_gap_minutes,
+                                  -- annotate_model, topic_model_k
+sessions(id, chat_id, first_message_id, last_message_id, first_date,
+         last_date, n_messages, n_from_me, initiator_handle_id,
+         initiator_is_me, ender_handle_id, ender_is_me)
+                                  -- gap-split conversation sessions (derived,
+                                  -- rebuilt per chat; handle NULL = me)
+person_period_lexicon(chat_id, handle_id, month, ...9 fw_*_rate cols...,
+         we_count, question_count, laugh_count, emoji_json)
+                                  -- per-person-per-month style stats
+                                  -- (derived, full rebuild; handle NULL = me)
+dyad_terms(chat_id, term, lift, n_uses, first_message_id,
+         coined_by_handle_id, coined_is_me, llm_verdict)
+                                  -- chat-distinctive vocabulary; llm_verdict
+                                  -- (annotate.py --terms) survives rebuilds
+chunk_annotations(chunk_id, valence, emotions_json, depth, events_json)
+                                  -- LLM batch annotations (annotate.py)
+topics(cluster_id, label, n_chunks); chunk_topics(chunk_id, cluster_id)
+                                  -- k-means topic clusters (topics.py)
 messages_fts                      -- FTS5 external-content table over messages.text
 chunk_vectors                     -- sqlite-vec vec0 table: chunk_id ->
                                   -- FLOAT[detected dim] distance_metric=cosine,
@@ -132,6 +172,11 @@ chunk_vectors                     -- sqlite-vec vec0 table: chunk_id ->
   mid-conversation steering into it (see `chat.run_turn`). Withholding the
   tool schemas is the only reliable way to stop a tool call — prompting alone
   doesn't.
+- `chunk_annotations` is guarded like `chunk_vectors`: `annotate.py` records
+  `annotate_model` in `ingest_state` and refuses to annotate with a different
+  model while the table is non-empty — switching ANNOTATE_MODEL means
+  emptying `chunk_annotations` first. `topics.py`'s `topic_model_k` guard is
+  warn-only (a rebuild simply replaces the clustering).
 - `chat.db` is live (WAL sidecars): only ever read the snapshot
   (`ingest.snapshot_source`), never the original.
 - Ingestion is append-only by design; `--senders` scopes what a run reads, it

@@ -179,7 +179,7 @@ TOOL_DEFINITIONS = [
                         "(individual attachments -- a message with three photos "
                         "counts three), and reactions_sent_count (reactions SENT "
                         "by whoever matches the filters -- NOT received; for "
-                        "reactions received use get_top_reacted_messages or "
+                        "reactions received use get_reaction_stats or "
                         "get_chat_participant_stats). Scope with chat_id "
                         "(single id or list, aggregates across all of them), or "
                         "with handle_id/contact_id to get totals for one person "
@@ -303,19 +303,17 @@ TOOL_DEFINITIONS = [
         },
     },
     {
-        "name": "get_conversation_dynamics",
-        "description": "Who-texts-first analytics, computed over the WHOLE "
-                        "conversation in one call: per-side message counts, "
-                        "initiation counts (first message after a silence longer "
-                        "than gap_minutes), median/p90 response times per side, "
-                        "double-text counts, and the longest silences with who "
-                        "broke each. THE tool for 'who texts first', 'longest "
-                        "we went without talking', 'do I double-text', 'who "
-                        "carries the conversation'. Requires a scope: chat_id "
-                        "(single or list -- pass every row of a split "
-                        "iMessage/SMS thread), or handle_id/contact_id, which "
-                        "covers that person's 1:1 chats only (group chats need "
-                        "an explicit chat_id).",
+        "name": "get_activity_patterns",
+        "description": "Aggregate WHEN-do-we-text analytics in one call -- use "
+                        "for how-often/busiest/when questions, never by counting "
+                        "search results. Sections: heatmap (7x24 weekday-by-hour, "
+                        "local time), volume_series (per day/month/year, me vs "
+                        "them), late_night (share of messages in the small hours; "
+                        "unscoped adds a top-contacts leaderboard), busiest_days, "
+                        "streaks (longest daily streak and drought). "
+                        "handle_id/contact_id scope to that person's chats (both "
+                        "sides counted); no scope = the whole corpus. Pass "
+                        "include=['heatmap',...] to fetch only some sections.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -324,52 +322,53 @@ TOOL_DEFINITIONS = [
                 "contact_id": _ID_OR_LIST_SCHEMA,
                 "date_from": {"type": "string", "description": _DATE_PARAM_DESC},
                 "date_to": {"type": "string", "description": _DATE_PARAM_DESC},
-                "gap_minutes": {
-                    "type": "number",
-                    "description": "silence (minutes) after which the next message "
-                                   "counts as a new initiation rather than a "
-                                   "response (default 180)",
+                "granularity": {"type": "string", "enum": ["day", "month", "year"],
+                                "default": "month",
+                                "description": "volume_series bucket size"},
+                "include": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "sections to return: heatmap, volume_series, "
+                                   "late_night, busiest_days, streaks (default all)",
                 },
-                "top_silences": {"type": "integer", "default": 5,
-                                 "description": "how many longest silences to return"},
             },
         },
     },
     {
-        "name": "get_activity_histogram",
-        "description": "Message counts bucketed by 'month', 'day', 'dow' "
-                        "(day of week), or 'hour', each split into "
-                        "from_me/from_them -- volume arcs, busiest day, "
-                        "time-of-day patterns, drift over time, in one call. "
-                        "handle_id/contact_id scope to that person's chats "
-                        "(both sides counted); no scope = the whole corpus. "
-                        "Buckets are UTC (hour/dow are not local time). "
-                        "Capped at 200 rows with a truncated flag -- narrow "
-                        "the date range or coarsen the bucket if set.",
+        "name": "get_response_dynamics",
+        "description": "Relationship tempo analytics for ONE conversation or "
+                        "person -- who texts first, reply speeds, ghosting. "
+                        "Sections: reply_latency (median/p90 per side), "
+                        "read_to_reply (unseen vs deliberation time, from read "
+                        "receipts), initiation (who breaks long silences), "
+                        "sessions (count, length, who ends them), ghosted "
+                        "(one-sided sessions), double_text, burstiness. REQUIRES "
+                        "a scope: chat_id (single or list -- pass every row of a "
+                        "split iMessage/SMS thread), or handle_id/contact_id "
+                        "(that person's 1:1 chats; group chats need an explicit "
+                        "chat_id, which adds initiations_by_member).",
         "input_schema": {
             "type": "object",
             "properties": {
                 "chat_id": _ID_OR_LIST_SCHEMA,
                 "handle_id": _ID_OR_LIST_SCHEMA,
                 "contact_id": _ID_OR_LIST_SCHEMA,
-                "bucket": {"type": "string", "enum": ["month", "day", "dow", "hour"],
-                           "default": "month"},
                 "date_from": {"type": "string", "description": _DATE_PARAM_DESC},
                 "date_to": {"type": "string", "description": _DATE_PARAM_DESC},
             },
         },
     },
     {
-        "name": "get_top_reacted_messages",
-        "description": "Messages ranked by tapbacks RECEIVED, most first -- "
-                        "'my most-loved message', 'which of their texts got the "
-                        "most laughs'. reaction_type narrows to one tapback "
-                        "(love, like, dislike, laugh, emphasize, question, "
-                        "custom-emoji, sticker); is_from_me narrows whose "
-                        "messages were reacted to (true = mine). "
-                        "handle_id/contact_id scope to that person's chats. "
-                        "Each row is the message plus reaction_count and a "
-                        "reactions_by_type breakdown.",
+        "name": "get_reaction_stats",
+        "description": "Tapback/reaction analytics in one call -- use for "
+                        "who-reacts-most / most-loved-message / reaction-habit "
+                        "questions. Sections: given and received (totals, "
+                        "per-type, per-100-message rates), reciprocity, "
+                        "time_to_react (median seconds, me vs them), funniest "
+                        "(contacts ranked by laughs per 100 of my messages), "
+                        "hall_of_fame (top most-reacted messages with text). "
+                        "reaction_type narrows to one tapback (name like "
+                        "'laugh'/'love' or raw code). handle_id/contact_id scope "
+                        "to that person's chats; no scope = whole corpus.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -383,13 +382,107 @@ TOOL_DEFINITIONS = [
                     "description": "tapback name (e.g. 'laugh', 'love') or raw "
                                    "Apple type code",
                 },
-                "is_from_me": {
-                    "type": "boolean",
-                    "description": "true = only my messages' received reactions; "
-                                   "false = only other people's",
+                "include": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "sections to return: given, received, "
+                                   "reciprocity, time_to_react, funniest, "
+                                   "hall_of_fame (default all)",
                 },
-                "limit": {"type": "integer", "default": 10},
+                "limit": {"type": "integer", "default": 10,
+                          "description": "hall_of_fame row cap"},
             },
+        },
+    },
+    {
+        "name": "get_word_trends",
+        "description": "Language analytics over time -- use for how-our-words-"
+                        "changed / inside-joke / emoji / style questions, not "
+                        "for plain top-word counts (that's get_word_frequency). "
+                        "Sections: phrase_trend (a phrase's usage per period, me "
+                        "vs them -- requires `phrase`), emoji (top emoji), rates "
+                        "(we/question/laugh per 100 messages), distinctive_terms "
+                        "(this chat's own vocabulary with who coined each term "
+                        "and its first message -- needs a chat/person scope), "
+                        "lsm (language style matching score + trajectory), "
+                        "emotions/valence (from LLM chunk annotations, when "
+                        "available).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "phrase": {"type": "string",
+                           "description": "exact word/phrase for phrase_trend"},
+                "chat_id": _ID_OR_LIST_SCHEMA,
+                "handle_id": _ID_OR_LIST_SCHEMA,
+                "contact_id": _ID_OR_LIST_SCHEMA,
+                "date_from": {"type": "string", "description": _DATE_PARAM_DESC},
+                "date_to": {"type": "string", "description": _DATE_PARAM_DESC},
+                "granularity": {"type": "string", "enum": ["month", "year"],
+                                "default": "year"},
+                "include": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "sections to return: phrase_trend, emoji, "
+                                   "rates, distinctive_terms, lsm, emotions, "
+                                   "valence (default all applicable)",
+                },
+            },
+        },
+    },
+    {
+        "name": "get_milestones",
+        "description": "Milestone lookups in one call -- use for first-message / "
+                        "nth-message / anniversary / longest-silence questions. "
+                        "Sections: firsts (first/last message and each side's "
+                        "first, with text), nth (the nth message when `n` given, "
+                        "else the 1000th/5000th/10000th/... landmarks), "
+                        "anniversaries (scoped: first-contact date and next "
+                        "anniversary; unscoped: contacts with an anniversary in "
+                        "the next 30 days), longest_silence (largest gap + the "
+                        "message that broke it -- needs a scope), "
+                        "earliest_phrase (first use of `phrase`). "
+                        "handle_id/contact_id scope to that person's chats.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "chat_id": _ID_OR_LIST_SCHEMA,
+                "handle_id": _ID_OR_LIST_SCHEMA,
+                "contact_id": _ID_OR_LIST_SCHEMA,
+                "phrase": {"type": "string",
+                           "description": "word/phrase for earliest_phrase"},
+                "n": {"type": "integer",
+                      "description": "return the nth message in scope (1-based)"},
+                "reference_date": {"type": "string",
+                                   "description": "ISO date anchoring the "
+                                                  "unscoped anniversary window "
+                                                  "(default today)"},
+                "limit": {"type": "integer", "default": 10,
+                          "description": "anniversaries row cap"},
+            },
+        },
+    },
+    {
+        "name": "get_group_dynamics",
+        "description": "Structural analytics for a GROUP chat -- who dominates, "
+                        "who lurks, who replies to whom. Sections: members "
+                        "(message/word share), gini (participation inequality + "
+                        "per-year drift), lurkers, igniters (who starts "
+                        "conversations), adjacency (top replier->replied pairs), "
+                        "group_lsm (whose style matches the group). chat_id is "
+                        "REQUIRED and must be a group chat (pass a list to merge "
+                        "a split thread); for 1:1 questions use "
+                        "get_response_dynamics instead.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "chat_id": _ID_OR_LIST_SCHEMA,
+                "date_from": {"type": "string", "description": _DATE_PARAM_DESC},
+                "date_to": {"type": "string", "description": _DATE_PARAM_DESC},
+                "include": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "sections to return: members, gini, lurkers, "
+                                   "igniters, adjacency, group_lsm (default all)",
+                },
+            },
+            "required": ["chat_id"],
         },
     },
     {

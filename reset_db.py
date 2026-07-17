@@ -16,6 +16,12 @@ TABLES = [
     # messages_fts is external-content FTS5 over messages; it's kept in
     # sync by triggers (messages_ai/ad/au) that fire when messages rows
     # change, so it must not be deleted separately/first here.
+    "chunk_topics",
+    "topics",
+    "chunk_annotations",
+    "dyad_terms",
+    "person_period_lexicon",
+    "sessions",
     "chunks",
     "attachments",
     "reactions",

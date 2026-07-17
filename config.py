@@ -68,12 +68,6 @@ EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "64"))  # texts per Ollama 
 # concurrent requests, matches Ollama's default OLLAMA_NUM_PARALLEL
 EMBED_MAX_WORKERS = int(os.getenv("EMBED_MAX_WORKERS", "4"))
 MAX_TOOL_ITERATIONS = int(os.getenv("MAX_TOOL_ITERATIONS", "20"))  # tool round-trips/turn
-# Silence gap (minutes) that ends a conversation for get_conversation_dynamics:
-# a message arriving after a longer gap counts as a new initiation, not a
-# response. Deliberately longer than CHUNK_GAP_MINUTES -- that one bounds
-# embedding sessions, this one defines "who texts first". Overridable per
-# call via the tool's gap_minutes argument.
-DYNAMICS_GAP_MINUTES = int(os.getenv("DYNAMICS_GAP_MINUTES", "180"))
 # Minimum gap (minutes) between two consecutive same-sender messages for the
 # second to count as a double-text rather than a multi-part message.
 DOUBLE_TEXT_MIN_MINUTES = int(os.getenv("DOUBLE_TEXT_MIN_MINUTES", "10"))
@@ -84,6 +78,55 @@ DOUBLE_TEXT_MIN_MINUTES = int(os.getenv("DOUBLE_TEXT_MIN_MINUTES", "10"))
 # oversized tool result must be cut client-side. ~60k chars of dense JSON is
 # ~20k tokens, comfortably inside the 32k window gemma4 runs with.
 TOOL_RESULT_MAX_CHARS = int(os.getenv("TOOL_RESULT_MAX_CHARS", "60000"))
+
+# --- Analytics: sessions & response dynamics ----------------------------------
+# Silence gap (minutes) that closes a session row in the `sessions` table.
+# Distinct from CHUNK_GAP_MINUTES (embedding windows) and deliberately
+# shorter than INITIATION_GAP_HOURS (who-texts-first attribution).
+SESSION_GAP_MINUTES = int(os.getenv("SESSION_GAP_MINUTES", "60"))
+# A session starting after at least this much silence counts as an initiation.
+INITIATION_GAP_HOURS = int(os.getenv("INITIATION_GAP_HOURS", "12"))
+# Max gap (minutes) between a reply and the message before it for the pair to
+# count as an adjacency (who-replies-to-whom) in get_group_dynamics.
+ADJACENCY_MINUTES = int(os.getenv("ADJACENCY_MINUTES", "5"))
+# Local-clock hour window [start, end) counted as "late night" by
+# get_activity_patterns.
+LATE_NIGHT_START_HOUR = int(os.getenv("LATE_NIGHT_START_HOUR", "0"))
+LATE_NIGHT_END_HOUR = int(os.getenv("LATE_NIGHT_END_HOUR", "5"))
+# IANA timezone name for hour/weekday bucketing ('America/New_York'). Empty
+# (the default) uses the system local timezone -- messages.date is stored as
+# unlabeled UTC, and UTC-bucketed "late night" would be off by hours.
+LOCAL_TZ = os.getenv("LOCAL_TZ", "")
+
+# --- Analytics: lexicon & dyad terms --------------------------------------------
+# A term must appear at least this often in a chat, and be at least this many
+# times more frequent there than in the rest of the corpus, to be a candidate
+# "your term" (dyad_terms); top K kept per chat.
+DYAD_TERM_MIN_USES = int(os.getenv("DYAD_TERM_MIN_USES", "5"))
+DYAD_TERM_MIN_LIFT = float(os.getenv("DYAD_TERM_MIN_LIFT", "5.0"))
+DYAD_TERM_TOP_K = int(os.getenv("DYAD_TERM_TOP_K", "50"))
+
+# --- Batch annotation (annotate.py) ----------------------------------------------
+# Empty = use CHAT_MODEL. Recorded in ingest_state; mixing models in one
+# chunk_annotations table is refused (same guard as embeddings).
+ANNOTATE_MODEL = os.getenv("ANNOTATE_MODEL", "") or CHAT_MODEL
+ANNOTATE_TOP_DYADS = int(os.getenv("ANNOTATE_TOP_DYADS", "20"))
+ANNOTATE_COMMIT_EVERY = int(os.getenv("ANNOTATE_COMMIT_EVERY", "50"))
+
+# --- Topic clustering (topics.py) -------------------------------------------------
+TOPIC_K = int(os.getenv("TOPIC_K", "50"))
+TOPIC_KMEANS_ITERS = int(os.getenv("TOPIC_KMEANS_ITERS", "15"))
+TOPIC_LABEL_SAMPLES = int(os.getenv("TOPIC_LABEL_SAMPLES", "5"))
+
+# --- wrapped.py --------------------------------------------------------------------
+WRAPPED_MODEL = os.getenv("WRAPPED_MODEL", "") or CHAT_MODEL
+WRAPPED_TOP_CONTACTS = int(os.getenv("WRAPPED_TOP_CONTACTS", "8"))
+# Auto-exclude contacts who went abruptly silent (>= WRAPPED_SILENT_MONTHS
+# before corpus end, >= WRAPPED_SILENT_MIN_MESSAGES lifetime) from the
+# featured roster -- resurfacing an ex or the estranged uninvited is the
+# classic nostalgia-product failure. --include overrides per name.
+WRAPPED_SILENT_MONTHS = int(os.getenv("WRAPPED_SILENT_MONTHS", "6"))
+WRAPPED_SILENT_MIN_MESSAGES = int(os.getenv("WRAPPED_SILENT_MIN_MESSAGES", "200"))
 
 # --- Conversation chunking ------------------------------------------------------
 # Messages are embedded as conversation chunks, not individually: contiguous

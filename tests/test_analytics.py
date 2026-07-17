@@ -1,13 +1,12 @@
-"""query_tools/analytics.py: conversation dynamics, activity histograms,
-reaction leaderboards, participant stats, and word frequency -- all against a
-hand-scripted fixture DB with known dates, so every aggregate has one right
-answer. Hermetic: temp sqlite file, no Ollama, no real chat.db."""
+"""query_tools/analytics.py: participant stats and word frequency -- all
+against a hand-scripted fixture DB with known dates, so every aggregate has
+one right answer. Hermetic: temp sqlite file, no Ollama, no real chat.db.
+(The time/social/language analytics tools have their own test modules.)"""
 
 import os
 import sqlite3
 import tempfile
 import unittest
-from unittest import mock
 
 import ingest
 import query_tools
@@ -135,116 +134,6 @@ class AnalyticsFixture(unittest.TestCase):
         self._saved_db_path = query_tools.DB_PATH
         query_tools.DB_PATH = self.db_path
         self.addCleanup(setattr, query_tools, "DB_PATH", self._saved_db_path)
-
-
-class ConversationDynamicsTest(AnalyticsFixture):
-    def test_scripted_exchange_counts(self):
-        d = query_tools.get_conversation_dynamics(chat_id=10)
-        self.assertEqual(d["message_count"], 8 + 2)  # incl. emote+system rows
-        self.assertEqual(d["initiations"], {"me": 1, "them": 2})
-        self.assertEqual(d["double_texts"]["them"], 1)
-        self.assertEqual(d["double_texts"]["me"], 0)
-
-    def test_response_medians_per_side(self):
-        d = query_tools.get_conversation_dynamics(chat_id=10)
-        # them: one 60s response; me: 60s and 1800s -> median 930
-        self.assertEqual(d["response_seconds"]["them"]["count"], 1)
-        self.assertEqual(d["response_seconds"]["them"]["median_seconds"], 60)
-        self.assertEqual(d["response_seconds"]["me"]["median_seconds"], 930)
-
-    def test_longest_silence_and_who_broke_it(self):
-        d = query_tools.get_conversation_dynamics(chat_id=10, top_silences=1)
-        top = d["longest_silences"][0]
-        self.assertEqual(top["broken_by"], "them")
-        self.assertEqual(top["to"], "2026-03-03T09:00:00")
-        self.assertAlmostEqual(top["days"], 1.8, places=1)
-
-    def test_gap_minutes_override_flips_initiation_to_response(self):
-        # With a 24h gap, the 14:00 message becomes a response, not an initiation.
-        d = query_tools.get_conversation_dynamics(chat_id=10, gap_minutes=24 * 60)
-        self.assertEqual(d["initiations"], {"me": 0, "them": 2})
-
-    def test_person_scope_covers_only_direct_chats(self):
-        d = query_tools.get_conversation_dynamics(contact_id=5)
-        # Bob's 1:1 chats are 10 and 12; the group chat 11 must be excluded.
-        self.assertEqual(sorted(d["chat_ids"]), [10, 12])
-
-    def test_explicit_chat_id_list_merges_twin_chats(self):
-        d = query_tools.get_conversation_dynamics(chat_id=[10, 12])
-        self.assertEqual(d["message_count"], 12)
-
-    def test_no_scope_raises(self):
-        with self.assertRaises(ValueError):
-            query_tools.get_conversation_dynamics()
-
-    def test_unknown_person_returns_zeroed_result(self):
-        d = query_tools.get_conversation_dynamics(contact_id=999999)
-        self.assertEqual(d["message_count"], 0)
-        self.assertEqual(d["longest_silences"], [])
-
-
-class ActivityHistogramTest(AnalyticsFixture):
-    def test_month_buckets_split_by_sender(self):
-        h = query_tools.get_activity_histogram(contact_id=5, bucket="month")
-        by_bucket = {r["bucket"]: r for r in h["rows"]}
-        # Bob's chats = 10, 11, 12 (histogram includes groups)
-        self.assertEqual(by_bucket["2026-03"]["total"], 10)
-        self.assertEqual(by_bucket["2026-03"]["from_me"], 3)
-        self.assertEqual(by_bucket["2026-03"]["from_them"], 7)
-        self.assertEqual(by_bucket["2026-04"]["total"], 4)
-        self.assertEqual(by_bucket["2026-05"]["total"], 2)
-        self.assertFalse(h["truncated"])
-
-    def test_hour_and_dow_buckets(self):
-        h = query_tools.get_activity_histogram(chat_id=11, bucket="hour")
-        self.assertEqual(h["rows"], [{"bucket": "12", "total": 4,
-                                      "from_me": 1, "from_them": 3}])
-        d = query_tools.get_activity_histogram(chat_id=11, bucket="dow")
-        # 2026-04-01 is a Wednesday
-        self.assertEqual(d["rows"][0]["bucket"], "Wednesday")
-
-    def test_unknown_bucket_raises(self):
-        with self.assertRaises(ValueError):
-            query_tools.get_activity_histogram(bucket="year")
-
-    def test_truncation_flag(self):
-        with mock.patch.object(analytics, "MAX_HISTOGRAM_ROWS", 2):
-            h = query_tools.get_activity_histogram(bucket="day")
-        self.assertTrue(h["truncated"])
-        self.assertEqual(len(h["rows"]), 2)
-        self.assertIn("note", h)
-
-    def test_date_range_filters(self):
-        h = query_tools.get_activity_histogram(
-            bucket="month", date_from="2026-04-01", date_to="2026-04-30"
-        )
-        self.assertEqual([r["bucket"] for r in h["rows"]], ["2026-04"])
-
-
-class TopReactedMessagesTest(AnalyticsFixture):
-    def test_ranking_and_breakdown_exclude_removals_and_strays(self):
-        rows = query_tools.get_top_reacted_messages(chat_id=11)
-        self.assertEqual(rows[0]["guid"], "guid-23")
-        self.assertEqual(rows[0]["reaction_count"], 3)  # not 5: 3003/1000 excluded
-        self.assertEqual(rows[0]["reactions_by_type"], {"laugh": 2, "love": 1})
-
-    def test_reaction_type_by_name_and_code(self):
-        by_name = query_tools.get_top_reacted_messages(chat_id=11, reaction_type="love")
-        self.assertEqual({r["guid"] for r in by_name}, {"guid-23", "guid-21"})
-        by_code = query_tools.get_top_reacted_messages(chat_id=11, reaction_type=2000)
-        self.assertEqual({r["guid"] for r in by_name},
-                         {r["guid"] for r in by_code})
-        with self.assertRaises(ValueError):
-            query_tools.get_top_reacted_messages(reaction_type="applause")
-
-    def test_is_from_me_selects_whose_messages(self):
-        mine = query_tools.get_top_reacted_messages(is_from_me=True)
-        self.assertEqual({r["guid"] for r in mine}, {"guid-21", "guid-2"})
-
-    def test_person_scope_and_empty_scope(self):
-        rows = query_tools.get_top_reacted_messages(contact_id=5)
-        self.assertTrue(rows)  # Bob's chats include the group
-        self.assertEqual(query_tools.get_top_reacted_messages(contact_id=999999), [])
 
 
 class ChatParticipantStatsTest(AnalyticsFixture):

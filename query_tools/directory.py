@@ -205,7 +205,7 @@ def get_chat_summary_stats(chat_id=None, handle_id=None, contact_id=None,
     alike -- is_from_me=True means messages, attachments, and reactions you
     sent. reactions_sent_count counts reactions SENT by whoever matches the
     filters, never reactions received; for reactions *received* use
-    get_top_reacted_messages or get_chat_participant_stats."""
+    get_reaction_stats or get_chat_participant_stats."""
     with contextlib.closing(_connect()) as con:
         chat_ids = _as_id_list(chat_id)
         handle_requested = _scope_requested(handle_id, contact_id)
