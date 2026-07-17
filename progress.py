@@ -178,7 +178,14 @@ def track(description, total=None, log_every=None, header=True,
         columns = [SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
                    MofNCompleteColumn()]
     # console=Console() (file unset) resolves sys.stdout on each write.
-    progress = Progress(*columns, console=Console(), transient=transient)
+    # speed_estimate_period: rich drops samples older than this on every
+    # advance, and estimates the rate from what survives. At its 30s default a
+    # loop whose iterations are slower than that -- one LLM call per topic
+    # label, per annotated chunk -- purges its whole history each step, leaving
+    # one sample, no measurable rate, and a permanent '--:--' ETA. These loops
+    # run for hours; keep an hour of samples.
+    progress = Progress(*columns, console=Console(), transient=transient,
+                        speed_estimate_period=3600)
     # Progress.__exit__ stops the live region and restores the cursor, so a
     # Ctrl-C through here never leaves the terminal in a broken state.
     with progress:
