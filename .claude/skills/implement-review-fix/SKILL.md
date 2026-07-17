@@ -29,6 +29,16 @@ The agent that wrote the code is a poor reviewer of it — it already "knows" wh
    gh pr create --title "<title>" --body "<what changed and why, plus how it was tested>"
    ```
    Capture the PR number/URL from the output — the next phases need it.
+5. Check the PR for merge conflicts against the base branch:
+   ```bash
+   gh pr view <number> --json mergeable,mergeStateStatus
+   ```
+   (`mergeable` may report `UNKNOWN` while GitHub computes it — wait a few seconds and re-check.) If it reports `CONFLICTING`, resolve the conflict:
+   ```bash
+   git fetch origin
+   git merge origin/<base-branch>
+   ```
+   Resolve each conflicted file, preferring changes that preserve both the base branch's intent and this PR's change; then commit the merge and push, and re-check `mergeable`. If a conflict is one you cannot confidently reconcile — the two sides make contradictory changes to the same behavior, or resolving it would require design decisions beyond this task — abort the merge (`git merge --abort`), stop the pipeline, and ask the user how to proceed. Do not guess, and do not continue to the review phase with an unresolved conflict.
 
 If `gh` is not authenticated or push fails, stop and tell the user what's blocking; don't try to work around auth problems.
 
