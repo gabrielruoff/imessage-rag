@@ -1,6 +1,6 @@
 # Approval Plan Format
 
-Present this to the user in chat (not as a file) and stop for approval. Keep it scannable — the user needs to say yes quickly and confidently.
+The plan subagent writes this structure to `REPO_FIX_PLAN.md`; the orchestrator then presents the file's contents in chat and stops for approval. Keep it scannable — the user needs to say yes quickly and confidently.
 
 ```markdown
 ## Implementation plan for <repo>
@@ -49,4 +49,4 @@ I'll run: `<tests>`, `<lint>`, `<typecheck>`, `<import/smoke check>` once all st
 - **Bundle related edits** into one step so verification is meaningful, but keep steps small enough to reason about.
 - **State verification per step** even though the full suite runs only at the end — it tells the user how each change will be checked and gives you a fallback if you need to sanity-check mid-way.
 - **Never hide behavior risk.** Anything that could alter output, API, or side effects goes in the behavior-sensitive list with a recommendation, defaulting to "leave out."
-- End with the explicit approval ask. Presenting the plan ends your turn.
+- End with the explicit approval ask. When the orchestrator presents the plan, that ends its turn — implementation waits for a clear yes.
