@@ -21,10 +21,30 @@ class OllamaResponseError(RuntimeError):
     the same request lets the model re-sample."""
 
 
-def chat_once(messages, model=None, format=None, timeout=None):
+# think= needs three states, so the default can't be None: None already means
+# "omit the flag entirely" (for models that reject a think option), which is
+# distinct from False ("send think: false"). _UNSET is the fourth state --
+# "caller expressed no preference, fall back to CHAT_THINK".
+_UNSET = object()
+
+
+def _apply_think(body, think):
+    """Resolve the think tri-state into the request body, in place."""
+    if think is _UNSET:
+        think = CHAT_THINK
+    if think is not None:
+        body["think"] = think
+
+
+def chat_once(messages, model=None, format=None, timeout=None, think=_UNSET):
     """POST a non-streaming request to the chat endpoint and return the
     response's `message` dict. format='json' turns on Ollama JSON mode (the
-    batch annotation/labeling path). Raises RuntimeError on an error body."""
+    batch annotation/labeling path). Raises RuntimeError on an error body.
+
+    think=False disables a thinking model's hidden reasoning pass for this
+    call only; omitted uses CHAT_THINK. Per-call because the batch pipelines
+    want it off (it is pure latency on a short JSON answer) while interactive
+    chat may want it on."""
     conn = http.client.HTTPConnection(
         OLLAMA_HOST, OLLAMA_PORT, timeout=timeout or CHAT_TIMEOUT
     )
@@ -35,8 +55,7 @@ def chat_once(messages, model=None, format=None, timeout=None):
     }
     if format:
         body["format"] = format
-    if CHAT_THINK is not None:
-        body["think"] = CHAT_THINK
+    _apply_think(body, think)
     try:
         conn.request(
             "POST", OLLAMA_CHAT_PATH, body=json.dumps(body).encode(),
@@ -70,16 +89,19 @@ _JSON_RETRY_NUDGE = (
 )
 
 
-def chat_once_json(messages, model=None, retry_nudge=_JSON_RETRY_NUDGE):
+def chat_once_json(messages, model=None, retry_nudge=_JSON_RETRY_NUDGE,
+                   timeout=None, think=_UNSET):
     """chat_once(format='json') -> parsed dict, retrying once with a
     corrective nudge on a malformed/non-object response; None if the retry
     also fails (the caller skips the row -- batch callers pick it up again on
     their next run). Callers with a task-specific output shape pass their own
-    retry_nudge so the correction names the exact JSON expected."""
+    retry_nudge so the correction names the exact JSON expected.
+    timeout/think forward to chat_once (per-pipeline overrides)."""
     for _ in range(2):
         # chat_once is resolved as a module global at call time (the tests'
         # patch seam).
-        reply = chat_once(messages, model=model, format="json")
+        reply = chat_once(messages, model=model, format="json",
+                          timeout=timeout, think=think)
         content = reply.get("content") or ""
         try:
             data = json.loads(content)
@@ -94,15 +116,17 @@ def chat_once_json(messages, model=None, retry_nudge=_JSON_RETRY_NUDGE):
     return None
 
 
-def chat_stream(messages, tools=None, model=None):
+def chat_stream(messages, tools=None, model=None, timeout=None, think=_UNSET):
     """POST a streaming request to the chat endpoint (OLLAMA_CHAT_PATH) and
     yield each chunk's `message` dict as it arrives. Raises OllamaResponseError
     if the server streams an error chunk.
 
     Pass tools=None to withhold the tool schemas entirely, which is the only
     reliable way to stop the model from calling one. model=None uses
-    CHAT_MODEL from config."""
-    conn = http.client.HTTPConnection(OLLAMA_HOST, OLLAMA_PORT, timeout=CHAT_TIMEOUT)
+    CHAT_MODEL from config; think= behaves as in chat_once."""
+    conn = http.client.HTTPConnection(
+        OLLAMA_HOST, OLLAMA_PORT, timeout=timeout or CHAT_TIMEOUT
+    )
     body = {
         "model": model or CHAT_MODEL,
         "messages": messages,
@@ -110,8 +134,7 @@ def chat_stream(messages, tools=None, model=None):
     }
     if tools:
         body["tools"] = tools
-    if CHAT_THINK is not None:
-        body["think"] = CHAT_THINK
+    _apply_think(body, think)
     payload = json.dumps(body).encode()
     try:
         conn.request(
