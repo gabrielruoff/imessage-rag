@@ -15,8 +15,8 @@ separate, older path — leave them alone.
 Always run from the repo/worktree **root**. Worktrees share the main
 checkout's venv and real DB, so the commands below spell out both paths:
 
-- Python: `<repo-root>/.venv/bin/python3`
-- Real DB: `<repo-root>/imessage_analysis.db`
+- Python: `.venv/bin/python3`
+- Real DB: `imessage_analysis.db`
 
 Commands that need the DB refuse (exit 2) when it is missing or 0 bytes —
 always pass `--db` with the real DB path.
@@ -36,22 +36,22 @@ always pass `--db` with the real DB path.
 
 ```
 # hermetic unit tests for the checkers (fast)
-<repo-root>/.venv/bin/python3 -m unittest tests.test_evalkit_checks
+.venv/bin/python3 -m unittest tests.test_evalkit_checks
 
 # static validation: suites, recipes, roster placeholders, tool-list drift
-<repo-root>/.venv/bin/python3 -m eval.evalkit selfcheck
+.venv/bin/python3 -m eval.evalkit selfcheck
 
 # dry run: print a suite's resolved prompts (real roster names), no Ollama
-<repo-root>/.venv/bin/python3 -m eval.evalkit run --dry-run --suite S1 --run-id demo --db <repo-root>/imessage_analysis.db
+.venv/bin/python3 -m eval.evalkit run --dry-run --suite S1 --run-id demo --db imessage_analysis.db
 ```
 
 ## Smallest end-to-end demo (one case; Ollama must be running)
 
 ```
-<repo-root>/.venv/bin/python3 -m eval.evalkit manifest --db <repo-root>/imessage_analysis.db
-<repo-root>/.venv/bin/python3 -m eval.evalkit run --run-id demo-single --case S1.1 --db <repo-root>/imessage_analysis.db
-<repo-root>/.venv/bin/python3 -m eval.evalkit check --run demo-single
-<repo-root>/.venv/bin/python3 -m eval.evalkit report --run demo-single
+.venv/bin/python3 -m eval.evalkit manifest --db imessage_analysis.db
+.venv/bin/python3 -m eval.evalkit run --run-id demo-single --case S1.1 --db imessage_analysis.db
+.venv/bin/python3 -m eval.evalkit check --run demo-single
+.venv/bin/python3 -m eval.evalkit report --run demo-single
 ```
 
 Then inspect `eval/results/demo-single/S1.1.json` (the full transcript),
@@ -71,27 +71,27 @@ else (`manifest`, `check`, `report`, `p3 check-wrapped`, the samplers without
 
 ```
 # P0 — roster + ground truth (no Ollama; review the printed roster)
-<repo-root>/.venv/bin/python3 -m eval.evalkit manifest --db <repo-root>/imessage_analysis.db
-<repo-root>/.venv/bin/python3 -m eval.evalkit selfcheck
+.venv/bin/python3 -m eval.evalkit manifest --db imessage_analysis.db
+.venv/bin/python3 -m eval.evalkit selfcheck
 
 # P1 — the sweep (ONE agent, Ollama lane)
-<repo-root>/.venv/bin/python3 -m eval.evalkit run --run-id $(date -u +%Y%m%dT%H%M%S)-baseline --all --db <repo-root>/imessage_analysis.db
+.venv/bin/python3 -m eval.evalkit run --run-id $(date -u +%Y%m%dT%H%M%S)-baseline --all --db imessage_analysis.db
 #   useful: --resume  --case S1.1  --suite S1  --model M  --dry-run
 #           --max-iterations N  --tool-result-max-chars N  --case-timeout S
 #   manifest also takes --roster-overrides my.json
 
 # P2a — deterministic checks (parallel-safe)
-<repo-root>/.venv/bin/python3 -m eval.evalkit check --run <run-id>
+.venv/bin/python3 -m eval.evalkit check --run <run-id>
 
 # P2b — grading: spawn ONE grader agent per suite (S1..S9), file I/O only
 # P3 — generator evals (Ollama lane, after/never during the sweep)
-<repo-root>/.venv/bin/python3 -m eval.evalkit p3 wrapped --run <run-id> --db <repo-root>/imessage_analysis.db
-<repo-root>/.venv/bin/python3 -m eval.evalkit p3 check-wrapped --run <run-id>
-<repo-root>/.venv/bin/python3 -m eval.evalkit p3 annotate-sample --run <run-id> --db <repo-root>/imessage_analysis.db   # exits 2 if no annotate run
-<repo-root>/.venv/bin/python3 -m eval.evalkit p3 topics-sample --run <run-id> --db <repo-root>/imessage_analysis.db     # exits 2 if no topics run
+.venv/bin/python3 -m eval.evalkit p3 wrapped --run <run-id> --db imessage_analysis.db
+.venv/bin/python3 -m eval.evalkit p3 check-wrapped --run <run-id>
+.venv/bin/python3 -m eval.evalkit p3 annotate-sample --run <run-id> --db imessage_analysis.db   # exits 2 if no annotate run
+.venv/bin/python3 -m eval.evalkit p3 topics-sample --run <run-id> --db imessage_analysis.db     # exits 2 if no topics run
 
 # P4 — scorecard (+ synthesis agent reads scorecard.md)
-<repo-root>/.venv/bin/python3 -m eval.evalkit report --run <run-id> [--compare <prev-run-id>] [--strict]
+.venv/bin/python3 -m eval.evalkit report --run <run-id> [--compare <prev-run-id>] [--strict]
 ```
 
 ## Grader agents (P2b): what to read, what to write
