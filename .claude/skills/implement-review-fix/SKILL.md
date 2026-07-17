@@ -13,7 +13,18 @@ The agent that wrote the code is a poor reviewer of it — it already "knows" wh
 
 ## Phase 1: Implement
 
-1. Implement the change the user described in their prompt. Follow the repository's existing conventions (style, test layout, commit format). Run the project's tests/linters if they exist and are fast enough to be practical.
+1. Plan before you edit. Sketch the implementation: which files change, what the discrete units of work are, and what depends on what. Follow the repository's existing conventions (style, test layout, commit format). Run the project's tests/linters if they exist and are fast enough to be practical.
+
+   **While writing the plan, look for opportunities to dispatch subagents to work concurrently.** If the plan decomposes into units that don't depend on each other, launch one subagent per unit in a single message (multiple Agent calls in one block) so they run in parallel instead of doing the work serially yourself.
+
+   Decompose on **disjoint file sets with no ordering dependency**. Good candidates: several modules each implementing the same pattern; code vs. docs/tests once the interface is settled; independent research or exploration. Bad candidates — do these inline instead:
+   - one unit's output defines another's interface (the second can't start until the first lands),
+   - two units would edit the same file (concurrent writers conflict),
+   - the unit is small enough that a fresh agent's cold-start cost exceeds the work.
+
+   Each concurrent subagent starts cold, so give it a self-contained prompt: repo path, the exact files it owns, the conventions to follow, and an explicit instruction not to touch files outside its set. When they finish, reconcile the results — read the combined diff and confirm the pieces fit — before moving on.
+
+   Steps 2–4 stay serial: branch, commit, push, and open the PR once, after all the concurrent work has landed.
 2. Create a feature branch if you're on the default branch:
    ```bash
    git checkout -b <short-kebab-description>
@@ -135,5 +146,6 @@ Do not merge the PR — that decision belongs to the user.
 ## Notes
 
 - Keep each phase's context isolation intact even if it feels inefficient. Passing your own opinions to the reviewer or fixer defeats the purpose of the skill.
+- Phase 1's concurrent subagents serve a different purpose than the review/fix ones: throughput, not context isolation. Give them all the context they need to do their piece well — the isolation rule above applies only to the review and fix phases, and is not a reason to avoid fanning out during implementation.
 - If the review finds zero issues, skip Phase 3 and tell the user the PR came back clean.
 - If anything in this pipeline fails partway (push rejected, /review unavailable, subagent errors), report exactly which phase failed and leave the repo in a clean, committed state.
