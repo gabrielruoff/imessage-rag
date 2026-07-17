@@ -232,7 +232,19 @@ def run_turn(messages, show_model_header=True, model=None):
     answer out of whatever was already gathered."""
     seen_calls = set()
     for _ in range(MAX_TOOL_ITERATIONS):
-        message = ollama_chat_stream(messages, show_model_header=show_model_header, model=model)
+        try:
+            message = ollama_chat_stream(
+                messages, show_model_header=show_model_header, model=model
+            )
+        except ollama.OllamaResponseError as e:
+            # Typically the model emitted a tool call Ollama couldn't parse
+            # (e.g. reasoning text leaking into the tool-call channel). The
+            # failed request consumed nothing from `messages`, so re-send it
+            # and let the model re-sample; the retry spends one iteration of
+            # the tool budget, so a persistently failing model still falls
+            # through to the tools-withheld final request below.
+            console.print(f"  [{e}; retrying]", style="dim red")
+            continue
         messages.append(message)
         tool_calls = message.get("tool_calls")
         if not tool_calls:
@@ -328,7 +340,7 @@ def main():
         ]
         try:
             reply = run_turn(messages, show_model_header=False, model=args.model)
-        except (http.client.HTTPException, OSError) as e:
+        except (http.client.HTTPException, OSError, ollama.OllamaResponseError) as e:
             print(f"[error contacting Ollama: {e}]")
             sys.exit(1)
         # A non-empty reply was already streamed live by ollama_chat_stream.
@@ -352,11 +364,14 @@ def main():
             console.print("[dim]conversation cleared[/dim]\n")
             continue
         messages.append({"role": "user", "content": user_input})
+        n_before = len(messages)
         try:
             reply = run_turn(messages, model=args.model)
-        except (http.client.HTTPException, OSError) as e:
+        except (http.client.HTTPException, OSError, ollama.OllamaResponseError) as e:
             print(f"[error contacting Ollama: {e}]")
-            messages.pop()
+            # Drop the failed user turn plus any partial assistant/tool
+            # messages run_turn appended before the error.
+            del messages[n_before - 1:]
             continue
         except KeyboardInterrupt:
             print()

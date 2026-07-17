@@ -2,6 +2,8 @@
 
 Write `REPO_REVIEW.md` using this exact structure. Fill every section with repo-specific, evidence-backed content. Keep prose tight; the report is a working document, not an essay. Every recommendation must be moderate (behavior-preserving) and cite evidence (path:line, counts, tool output).
 
+**Label every finding in sections 3–6 with a severity** from `references/severity-model.md` (Critical / High / Medium / Low / Informational). The fix phase implements everything above Informational, so a missing or wrong label directly changes what gets built — assign deliberately, never leave findings unlabeled.
+
 ```markdown
 # Repo Review: <repo name>
 
@@ -15,6 +17,8 @@ _Generated <date>. Scope: report-only, moderate refactors (restructure + dedupe)
 1. <action> — <impact> / <effort> — <evidence pointer>
 2. ...
 3. ...
+
+**Severity tally:** Critical <n> · High <n> · Medium <n> · Low <n> · Informational <n>
 
 ## 2. Metrics snapshot
 
@@ -33,7 +37,9 @@ _Re-run the commands in the appendix after acting to measure progress._
 
 ## 3. Bloat findings
 
-Grouped by theme, sorted by impact. Each: what, where (path:line), why it matters, moderate fix.
+Grouped by theme, sorted by impact. Each finding leads with its severity, then: what, where (path:line), why it matters, moderate fix. Format each as:
+
+`**[SEVERITY]** <what> — \`<path:line>\` — <why it matters> — Fix: <moderate action>`
 
 ### 3.1 Duplication
 ### 3.2 Dead & speculative code
@@ -43,7 +49,7 @@ Grouped by theme, sorted by impact. Each: what, where (path:line), why it matter
 
 ## 4. Structural assessment
 
-Current layout vs. target. Use a before/after tree sketch. For each move: current → target → the moderate step → payoff. Order low-risk-high-value first.
+Current layout vs. target. Use a before/after tree sketch. For each move: current → target → the moderate step → payoff. Order low-risk-high-value first. Label each proposed change with its severity.
 
 ### 4.1 Proposed structure
 ### 4.2 Files to split (with the specific split)
@@ -51,7 +57,7 @@ Current layout vs. target. Use a before/after tree sketch. For each move: curren
 
 ## 5. Claude Code fitness
 
-The scored checklist (pass / gap per item) from the fitness reference, then the gaps folded into fixes.
+The scored checklist (pass / gap per item) from the fitness reference, then the gaps folded into fixes. Label each gap with its severity.
 
 ### 5.1 Checklist results
 ### 5.2 Proposed CLAUDE.md
@@ -60,14 +66,10 @@ The scored checklist (pass / gap per item) from the fitness reference, then the 
 
 ## 6. Prioritized roadmap
 
-An ordered list the user can execute as discrete, safe PRs. Each row: step, why, risk, rough effort, and how to verify (which test/command). Sequence so each step leaves the repo green.
+An ordered list the user can execute as discrete, safe PRs. Each row: step, severity, why, risk, rough effort, and how to verify (which test/command). Sequence so each step leaves the repo green.
 
-| # | Step | Why | Risk | Effort | Verify with |
-|---|---|---|---|---|---|
-
-## 7. Appendix: commands used
-
-The exact commands run, so results are reproducible and re-measurable.
+| # | Step | Severity | Why | Risk | Effort | Verify with |
+|---|---|---|---|---|---|---|
 ```
 
 ## Filling guidance
@@ -76,4 +78,3 @@ The exact commands run, so results are reproducible and re-measurable.
 - **Preserve behavior.** If a recommendation could change behavior, say so and mark it out-of-scope for this moderate pass.
 - **Make it verifiable.** Every roadmap step names the test or command that confirms it's safe.
 - **Draft, don't dictate.** The `CLAUDE.md` block and proposed tree are drafts for the user to adopt or adjust.
-- After writing the file, tell the user the path and give the top 3 actions in chat — nothing more.

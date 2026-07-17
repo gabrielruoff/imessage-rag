@@ -71,7 +71,9 @@ Ollama chat-streaming HTTP; `embeddings.py` the shared embedding client
 ingest (documents) and query_tools (queries) so both sides embed identically;
 `config.py` all env-driven settings (defaults work with no `.env`; see
 `.env.example`); `db.py` shared sqlite helpers (`load_vec_extension`,
-`CONTACT_LABEL_SQL`, `iso_to_day`, `get_state`/`set_state`).
+`CONTACT_LABEL_SQL`, `iso_to_day`, `get_state`/`set_state`); `schema.py` the
+analysis-DB DDL + in-place migration (`create_schema`, run and re-exported
+by `ingest.py`).
 
 ## Schema (imessage_analysis.db)
 

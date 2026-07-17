@@ -1,6 +1,6 @@
 # Claude Code Fitness
 
-How well an AI coding agent can navigate and safely change the repo. Assess each item in Phase 3, mark pass/gap, and turn every gap into a moderate recommendation. Weight this equally with structural cleanliness.
+How well an AI coding agent can navigate and safely change the repo. Assess each item in step A3, mark pass/gap, and turn every gap into a moderate recommendation. Weight this equally with structural cleanliness.
 
 ## Why this matters
 
