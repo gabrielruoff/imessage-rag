@@ -33,12 +33,32 @@ The agent that wrote the code is a poor reviewer of it — it already "knows" wh
    ```bash
    gh pr view <number> --json mergeable,mergeStateStatus
    ```
-   (`mergeable` may report `UNKNOWN` while GitHub computes it — wait a few seconds and re-check.) If it reports `CONFLICTING`, resolve the conflict:
-   ```bash
-   git fetch origin
-   git merge origin/<base-branch>
+   (`mergeable` may report `UNKNOWN` while GitHub computes it — wait a few seconds and re-check.) If it reports `CONFLICTING`, dispatch a fresh-context subagent with the Task tool to resolve the conflict — like the review and fix phases, give it **only** the handoff below, not your implementation history, so it judges each conflict on what the code says rather than defending your side of it:
+
    ```
-   Resolve each conflicted file, preferring changes that preserve both the base branch's intent and this PR's change; then commit the merge and push, and re-check `mergeable`. If a conflict is one you cannot confidently reconcile — the two sides make contradictory changes to the same behavior, or resolving it would require design decisions beyond this task — abort the merge (`git merge --abort`), stop the pipeline, and ask the user how to proceed. Do not guess, and do not continue to the review phase with an unresolved conflict.
+   You are resolving merge conflicts on a pull request branch. You did not write
+   this code — work only from what you see in the repository.
+
+   Repository: <repo path>
+   Branch: <branch>
+   Base branch: <base-branch>
+   PR: <PR number / URL>
+
+   Run:
+     git fetch origin
+     git merge origin/<base-branch>
+
+   Resolve each conflicted file, preferring resolutions that preserve both the
+   base branch's intent and this PR's change. Then commit the merge and push.
+
+   If a conflict is one you cannot confidently reconcile — the two sides make
+   contradictory changes to the same behavior, or resolving it would require
+   design decisions beyond mechanical merging — run `git merge --abort` and
+   reply describing the conflicting files and why they can't be auto-resolved.
+   Do not guess.
+   ```
+
+   When the subagent finishes, re-check `mergeable`. If the subagent aborted because it couldn't reconcile a conflict, stop the pipeline and ask the user how to proceed. Do not continue to the review phase with an unresolved conflict.
 
 If `gh` is not authenticated or push fails, stop and tell the user what's blocking; don't try to work around auth problems.
 
