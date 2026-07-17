@@ -1,7 +1,7 @@
 # Analytics features — LLM response-quality eval plan
 
 > **Status: mechanized.** This spec is implemented as the evalkit harness
-> (`eval/evalkit/`, suites S1–S8 in `eval/cases/`) — run evals there, per
+> (`eval/evalkit/`, suites S1–S9 in `eval/cases/`) — run evals there, per
 > [`eval/README.md`](../eval/README.md); this document remains the spec and
 > grading rationale.
 
@@ -30,9 +30,9 @@ grading — fans out to **parallel agents**.
 
 | Phase | Agents | Parallel? | Needs Ollama? |
 |---|---|---|---|
-| **P0** Manifest: resolve placeholders + compute ground truth | one agent per suite S1–S8 (or one combined) | **yes** | no |
+| **P0** Manifest: resolve placeholders + compute ground truth | one agent per suite S1–S9 (or one combined) | **yes** | no |
 | **P1** Sweep: run all chat prompts | exactly **one** agent | **no — strictly sequential** | yes |
-| **P2** Grade: score transcripts vs ground truth | one agent per suite S1–S8 | **yes** | no |
+| **P2** Grade: score transcripts vs ground truth | one agent per suite S1–S9 | **yes** | no |
 | **P3** Generator evals: wrapped/annotate/topics output quality | one agent, sequential (generation + LLM-judge share the Ollama lane) | **no** | yes |
 | **P4** Synthesis: scorecard + lever recommendations | one agent | — | no |
 
@@ -164,6 +164,8 @@ answer the question (communication axis).
 | S4.7 | What are the most common words `<TOP2>` sends me? | `get_word_frequency` (sender-scoped, surviving tool) | GT top words |
 | S4.8 | Has the mood of my chats with `<TOP1>` changed over time? | emotions/valence | **gated section probe**: if `chunk_annotations` is empty, GT is `{"available": false}` — the reply must say the analysis isn't available, not invent a mood arc; if populated, valence trajectory must match GT |
 | S4.9 | Have I ever said "`<PHRASE_LO>`"? | phrase_trend or FTS search (both fine) | GT hits (1–5); exact count or the actual messages |
+| S4.10 | What emotions come up most in my chats with `<TOP1>`? | emotions | **gated section probe**, S4.8's sibling: emotions rides the same `chunk_annotations` gate but returns a GoEmotions leaderboard, not a trajectory. Gated → say so; populated → top emotions match GT. Emotions read off message text rather than the annotations = faithfulness 0 |
+| S4.11 | What two-word phrases do I say the most? | `get_word_frequency` (ngram=2, is_from_me) | phrase mode, the half S4.7 misses. GT top phrases + counts, order-tolerant; ngram=1 = routing 0, and an unscoped call answers for the whole corpus (this tool scopes by SENDER) |
 
 ## Suite S5 — Milestones (`get_milestones`)
 
@@ -177,7 +179,7 @@ answer the question (communication axis).
 | S5.6 | What's the last thing `<SPARSE>` sent me? | scoped, firsts (last) | GT last message |
 | S5.7 | How far back does my message history go? | firsts unscoped or `get_db_overview` (both fine) | GT earliest corpus date |
 
-## Suite S6 — Group dynamics (`get_group_dynamics`)
+## Suite S6 — Group dynamics (`get_group_dynamics`, `get_chat_participant_stats`)
 
 | id | prompt | expected call | ground truth & accuracy check |
 |---|---|---|---|
@@ -188,6 +190,7 @@ answer the question (communication axis).
 | S6.5 | Who talks to whom the most inside `<GROUP>`? | adjacency | GT top pair |
 | S6.6 | Whose texting style stands out most in `<GROUP>`? | group_lsm | GT min-LSM member |
 | S6.7 | What are the group dynamics of my chat with `<TOP1>`? | — | **error-path probe**: tool returns an error for non-group chats; model must recover (explain, or pivot to `get_chat_participant_stats` / `get_response_dynamics`), never fabricate group stats for a dyad |
+| S6.8 | Among the people who've sent at least 20 messages in `<GROUP>`, who gets the most reactions per message? | `get_chat_participant_stats`, group-scoped | the one question only this tool answers — `get_group_dynamics` has no reactions-received section and `get_reaction_stats` is scoped to me, so routing to either = routing 0. GT normalizes reactions_received by messages_sent over the members above the prompt's stated ≥ 20-message floor; a raw-total answer = accuracy 0 |
 
 ## Suite S7 — Routing, negative controls, graceful degradation
 
@@ -206,6 +209,8 @@ it is the direct check on the plan's top risk.
 | S7.8 | What's my texting personality? | open-ended: any grounded combination is fine; graded on faithfulness only — every claim must trace to a tool result |
 | S7.9 | lol who do i even text at 3am | casual phrasing still routes to `get_activity_patterns` late_night |
 | S7.10 | Show me the exact messages from my longest streak with `<TOP1>` | analytics → then message retrieval (get_conversation / context); receipts real |
+| S7.11 | Who do I text the most? | `get_chat_summary_stats(group_by_chat=True)` — its rows are bare chat_ids, so naming a person needs `list_chats` after it; a name with no labelling call was invented (faithfulness 0). GT top_contact = `<TOP1>` |
+| S7.12 | How many photos and attachments have `<TOP1>` and I sent each other? | `attachment_count`, the summary-stats field no other case asserts — counts individual attachments (three photos in one message = three), so reporting the message count = accuracy 0 |
 
 ## Suite S8 — Conversational robustness (multi-turn)
 
@@ -218,6 +223,23 @@ a time, in the P1 lane. GT from the manifest.
 | S8.2 | "How fast does `<TOP1>` reply?" → "Is that faster than `<TOP2>`?" | second call re-scoped; comparison uses both GT medians |
 | S8.3 | "What are our inside jokes?" (no prior contact) → user clarifies "`<TOP1>`" | model asks or picks visibly; after clarification, correct scoped call |
 | S8.4 | "When's my anniversary with `<TOP1>`?" → "What did we say that day?" | milestones → retrieval pivot with the GT date carried over |
+
+## Suite S9 — Retrieval & directory plumbing
+
+The five tools no analytics suite reaches. Each is a **second hop** the model
+must take rather than guess at: a handle is not a name, a chat_id is not a
+person, and a search row carries neither its reaction count nor its full
+text. Every case is graded first on whether that second call happened — an
+answer that looks right without it is a lucky guess, not retrieval, and
+faithfulness should fall accordingly.
+
+| id | prompt | expected call | ground truth & accuracy check |
+|---|---|---|---|
+| S9.1 | Who is `<HANDLE>`? | `search_contact_by_handle` | GT owner = `<TOP1>`, plus how many *distinct* phone numbers/emails that contact owns (one identifier filed once per service is one handle, not several). `search_contacts_by_name` is the wrong tool for a raw phone/email = routing 0; naming the person with no resolution call = faithfulness 0 |
+| S9.2 | How many separate one-on-one threads do I have with `<TOP1>`, not counting group chats? | `list_chats`, person-scoped | the person → chat_id bridge plus a filtering test: `list_chats` returns every chat including groups (up to its hard 50-row cap), and only `is_group=0` rows are dyad threads. GT is that filtered count; answering with the full row count = accuracy 0. A split iMessage/SMS pair counts as two — collapsing it to one = accuracy 0 |
+| S9.3 | On `<REACTED_MSG.day>` I sent `<TOP1>` a message starting "…" — did anyone react to it? | any search, then `get_message_reactions` | find-then-inspect: reaction data exists only behind this tool, so no call = any reaction claim is invented (faithfulness 0). GT n_reactions + each tapback name; raw type codes (2000, 2003) in a reply = communication 0 |
+| S9.4 | Around `<LONG_MSG.day>` I sent `<TOP1>` a really long message. What did it say, in full? | any search, then `get_full_messages` | the truncation-recovery contract: search rows cap text at `TEXT_PREVIEW_CHARS` (300), so only this tool returns the rest. GT `text_tail` is sampled from **past** the cap — a reply containing it recovered the full text; a reply that stops near the cap answered from the preview (accuracy 0; faithfulness 0 if it invented an ending) |
+| S9.5 | Find a conversation where `<TOP1>` and I were making plans, then show me other conversations like it. | `search_conversations` → `find_similar_conversations` | the more-like-this chain. No single right answer set: graded on routing + faithfulness. The chunk_id passed to `find_similar_conversations` must appear in an earlier search result (an invented id = faithfulness 0); a second plain search instead of the tool = routing 0 |
 
 ---
 
@@ -317,8 +339,14 @@ fixes by frequency. These map to the implementation plan's risk section.
 | `get_word_trends` / `get_word_frequency` | S4, S8.3 |
 | `get_milestones` | S5, S8.4 |
 | `get_group_dynamics` | S6 |
+| `get_chat_participant_stats` | S6.8, S6.7 (recovery path) |
+| `get_chat_summary_stats` (totals, group_by_chat, attachments) | S7.3, S7.11, S7.12, S1.8 |
+| `list_chats` / `search_contact_by_handle` (directory) | S9.1–S9.2, S7.11 (labelling) |
+| `get_message_reactions` / `get_full_messages` (second-hop retrieval) | S9.3–S9.4 |
+| `search_conversations` / `find_similar_conversations` (semantic) | S9.5, S7.1–S7.2 |
+| `search_contacts_by_name` | S7.6, S9.2 |
 | tool routing at 21 tools / supersession | S7 (all), every suite's routing axis |
 | multi-turn scope handling | S8 |
 | `wrapped.py` | P3.1 |
-| `annotate.py` (+ emotions/valence surfacing) | P3.2, S4.8 |
+| `annotate.py` (+ emotions/valence surfacing) | P3.2, S4.8, S4.10 |
 | `topics.py` | P3.3 |

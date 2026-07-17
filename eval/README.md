@@ -1,11 +1,11 @@
 # evalkit — usage and agent orchestration guide
 
-A regression harness for the analytics tools: it sweeps 61 prompt cases
-across 8 suites (S1 activity patterns, S2 response dynamics, S3 reactions,
+A regression harness for the analytics tools: it sweeps 71 prompt cases
+across 9 suites (S1 activity patterns, S2 response dynamics, S3 reactions,
 S4 words/language, S5 milestones, S6 group dynamics, S7 routing/negative
-controls, S8 multi-turn robustness) through `chat.py`'s tool-calling loop,
-compares replies against SQL-computed ground truth, and aggregates grades
-into a scorecard. Mechanizes [`docs/ANALYTICS_TEST_PLAN.md`](../docs/ANALYTICS_TEST_PLAN.md)
+controls, S8 multi-turn robustness, S9 retrieval/directory plumbing) through
+`chat.py`'s tool-calling loop, compares replies against SQL-computed ground
+truth, and aggregates grades into a scorecard. Mechanizes [`docs/ANALYTICS_TEST_PLAN.md`](../docs/ANALYTICS_TEST_PLAN.md)
 (design: [`docs/EVALKIT_IMPLEMENTATION_PLAN.md`](../docs/EVALKIT_IMPLEMENTATION_PLAN.md)).
 Everything below is copy-pasteable. `fast_eval.sh` / `prompts-smoke.txt` are a
 separate, older path — leave them alone.
@@ -83,7 +83,7 @@ else (`manifest`, `check`, `report`, `p3 check-wrapped`, the samplers without
 # P2a — deterministic checks (parallel-safe)
 <repo-root>/.venv/bin/python3 -m eval.evalkit check --run <run-id>
 
-# P2b — grading: spawn ONE grader agent per suite (S1..S8), file I/O only
+# P2b — grading: spawn ONE grader agent per suite (S1..S9), file I/O only
 # P3 — generator evals (Ollama lane, after/never during the sweep)
 <repo-root>/.venv/bin/python3 -m eval.evalkit p3 wrapped --run <run-id> --db <repo-root>/imessage_analysis.db
 <repo-root>/.venv/bin/python3 -m eval.evalkit p3 check-wrapped --run <run-id>

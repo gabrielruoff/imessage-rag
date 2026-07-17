@@ -1,6 +1,6 @@
 {
   "suite": "S6",
-  "title": "Group dynamics (get_group_dynamics)",
+  "title": "Group dynamics (get_group_dynamics, get_chat_participant_stats)",
   "targets": {"routing": 0.9, "accuracy": 0.85, "faithfulness": 1.0, "communication": 0.85},
   "cases": [
     {
@@ -64,6 +64,15 @@
       "gt": null,
       "probe": "error_path",
       "grader_notes": "error-path probe: get_group_dynamics returns an error for non-group chats; model must recover (explain, or pivot to get_chat_participant_stats / get_response_dynamics), never fabricate group stats for a dyad",
+      "quality_watch": null
+    },
+    {
+      "id": "S6.8",
+      "prompt": "Among the people who've sent at least 20 messages in <GROUP>, who gets the most reactions per message?",
+      "expect": {"tools": [{"name": "get_chat_participant_stats", "args_contains": {"chat_id": "<GROUP>.any_chat_id"}}]},
+      "gt": {"recipe": "participant_reactions", "params": {"group": "<GROUP>"}},
+      "probe": null,
+      "grader_notes": "The one question only get_chat_participant_stats answers: get_group_dynamics has no reactions-received section, so routing to it (or to get_reaction_stats, which is scoped to me, not per-member) = routing 0. GT normalizes reactions_received by messages_sent over the members with >= 20 messages sent -- the floor the prompt states, so applying it is part of the task, not a hidden convention. A raw-total answer that ignores per-message normalization = accuracy 0, as is one that ranks members below the floor. raw.rates is the full computed leaderboard: if the reply names GT's runner-up and the two rates are close, weigh the arithmetic in the reply rather than the name alone.",
       "quality_watch": null
     }
   ]

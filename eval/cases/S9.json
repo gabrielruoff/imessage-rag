@@ -1,0 +1,60 @@
+{
+  "suite": "S9",
+  "title": "Retrieval & directory plumbing (list_chats, search_contact_by_handle, get_message_reactions, get_full_messages, find_similar_conversations)",
+  "targets": {"routing": 0.9, "accuracy": 0.85, "faithfulness": 1.0, "communication": 0.85},
+  "notes": "The five tools no analytics suite reaches. Each is a second hop the model must take rather than guess at: a handle is not a name, a chat_id is not a person, a search row's reaction count and its full text are simply not in the payload. Every case here is graded first on whether the second call happened -- an answer that looks right without it is a lucky guess, not retrieval, and faithfulness should fall.",
+  "cases": [
+    {
+      "id": "S9.1",
+      "prompt": "Who is <HANDLE>?",
+      "expect": {"tools": [{"name": "search_contact_by_handle"}]},
+      "gt": {"recipe": "handle_owner", "params": {"handle": "<HANDLE>"}},
+      "probe": null,
+      "grader_notes": "Handle -> contact resolution. GT owner is TOP1's display name; n_handles is how many DISTINCT phone numbers/emails that contact owns (the tool's other half). The same identifier filed once per service (iMessage/SMS/RCS) is one handle, not several -- the payload can carry more handle rows than identifiers (raw.n_handle_rows), and a reply that counts the identifiers it can see is right. search_contacts_by_name is the wrong tool for a raw phone/email and routing to it = routing 0. Naming the person without any resolution call = faithfulness 0.",
+      "quality_watch": null
+    },
+    {
+      "id": "S9.2",
+      "prompt": "How many separate one-on-one threads do I have with <TOP1>, not counting group chats?",
+      "expect": {"tools": [{"name": "list_chats", "args_contains": {"_scope": "<TOP1>"}}]},
+      "gt": {"recipe": "chats_for_contact", "params": {"scope": "<TOP1>"}},
+      "probe": null,
+      "grader_notes": "The person -> chat_id bridge, plus a filtering test: list_chats(contact_id=...) returns every chat TOP1 is in, groups included, up to its hard 50-row cap (see raw.n_chats_returned), and only the is_group=0 rows are dyad threads. GT n_dyad_chats is that filtered count -- answering with the full row count = accuracy 0. A split iMessage/SMS pair counts as two threads and that split IS the answer; collapsing it to 'one chat' is also accuracy 0. Resolving the name first (search_contacts_by_name) then list_chats with contact_id/handle_id is the intended path; a `query` substring match is acceptable if it returns the same threads.",
+      "quality_watch": null
+    },
+    {
+      "id": "S9.3",
+      "prompt": "On <REACTED_MSG.day> I sent <TOP1> a message starting \"<REACTED_MSG.text_head>\" -- did anyone react to it?",
+      "expect": {"tools": [
+        {"name": "get_message_reactions"}
+      ]},
+      "gt": {"recipe": "message_reactions", "params": {"message": "<REACTED_MSG>"}},
+      "probe": null,
+      "grader_notes": "Find-then-inspect: any search path may locate the message (search_messages_fts/sql/hybrid, get_conversation), but the reaction data exists only behind get_message_reactions -- no such call means any reaction claim is invented (faithfulness 0). GT gives n_reactions (retracted tapbacks excluded -- see raw.removed_reactions) and each tapback name; reporting raw type codes (2000, 2003) instead of names = communication 0. Match the reaction_*_type values SEMANTICALLY, not literally: `custom-emoji` and `sticker` are db.TAPBACK_NAMES category labels, not words any good reply would use -- 'reacted with an emoji' or naming the emoji itself satisfies them.",
+      "quality_watch": null
+    },
+    {
+      "id": "S9.4",
+      "prompt": "Around <LONG_MSG.day> I sent <TOP1> a really long message. What did it say, in full?",
+      "expect": {"tools": [
+        {"name": "get_full_messages"}
+      ]},
+      "gt": {"recipe": "long_message_full", "params": {"message": "<LONG_MSG>"}},
+      "probe": null,
+      "grader_notes": "The truncation-recovery contract: search rows cap text at TEXT_PREVIEW_CHARS (300), so this message arrives cut off and only get_full_messages returns the rest. GT text_tail is sampled from PAST the cap -- if the reply contains it, the model recovered the full text; if the reply ends near the cap or paraphrases past it, it answered from the truncated preview (accuracy 0, and faithfulness 0 if it invented an ending). No get_full_messages call at all = routing 0.",
+      "quality_watch": "A reply that presents the truncated preview as the complete message is the failure this case exists to catch -- check the tail, not the opening."
+    },
+    {
+      "id": "S9.5",
+      "prompt": "Find a conversation where <TOP1> and I were making plans, then show me other conversations like it.",
+      "expect": {"tools": [
+        {"name": "search_conversations", "alternates": ["search_messages_hybrid"], "args_contains": {"_scope": "<TOP1>"}},
+        {"name": "find_similar_conversations"}
+      ]},
+      "gt": null,
+      "probe": "open_ended",
+      "grader_notes": "The more-like-this chain: a chunk search, then find_similar_conversations seeded with a chunk_id from those results. Graded on routing + faithfulness -- there is no single right set of conversations, but the chunk_id passed to find_similar_conversations must appear in an earlier search result (an invented id is faithfulness 0), and every conversation described must trace to a tool result. Answering with a second plain search instead of find_similar_conversations = routing 0.",
+      "quality_watch": null
+    }
+  ]
+}

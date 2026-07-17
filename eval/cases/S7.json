@@ -108,6 +108,24 @@
       "probe": null,
       "grader_notes": "analytics -> then message retrieval (get_conversation / context); receipts real",
       "quality_watch": null
+    },
+    {
+      "id": "S7.11",
+      "prompt": "Who do I text the most?",
+      "expect": {"tools": [{"name": "get_chat_summary_stats", "args_contains": {"group_by_chat": true}}]},
+      "gt": {"recipe": "top_chats_leaderboard", "params": {}},
+      "probe": null,
+      "grader_notes": "The group_by_chat leaderboard path. Its rows are bare chat_ids, so naming a person needs list_chats (or an equivalent label call) after it -- a reply that names a contact with no labelling call in the transcript invented the name (faithfulness 0). GT top_contact is TOP1 -- the #1 1:1 contact -- because the question asks who, not which thread; the leaderboard's own #1 row may be a group chat or one half of a split thread, so a reply naming a group is not automatically right OR wrong: check it against raw.leaderboard and raw.labels and judge whether the reply reconciles thread rows to people. GT top_contact_total is the dyad total, which may exceed the top row's message_count when the thread is split across iMessage/SMS -- either number is acceptable if the reply is consistent about which it cites.",
+      "quality_watch": null
+    },
+    {
+      "id": "S7.12",
+      "prompt": "How many photos and attachments have <TOP1> and I sent each other?",
+      "expect": {"tools": [{"name": "get_chat_summary_stats", "args_contains": {"_scope": "<TOP1>"}}]},
+      "gt": {"recipe": "attachments_pair", "params": {"scope": "<TOP1>"}},
+      "probe": null,
+      "grader_notes": "attachment_count, the summary-stats field no other case asserts. GT attachments_total counts individual attachments (a message with three photos counts three) -- accuracy 0 if the reply reports the message count instead. attachments_from_me is the is_from_me=true split, cited only if the reply breaks it down.",
+      "quality_watch": null
     }
   ]
 }

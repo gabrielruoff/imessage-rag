@@ -41,7 +41,7 @@ Full design history, schema, rationale, and data forensics:
   prefix cache.
 - Analytics eval (evalkit): `.venv/bin/python3 -m eval.evalkit
   <selfcheck|manifest|run|check|report>` — regression harness sweeping the
-  S1–S8 prompt suites (`eval/cases/`) through `chat.run_turn` in-process and
+  S1–S9 prompt suites (`eval/cases/`) through `chat.run_turn` in-process and
   grading replies against SQL-computed ground truth. `selfcheck`/`manifest`
   need no Ollama; `run` does (sequential, one case at a time — the no-parallel
   rule above applies). Usage + agent-orchestration guide: `eval/README.md`.

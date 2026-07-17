@@ -9,6 +9,12 @@ environment before config.py first loads (env-before-import invariant)."""
 
 RECIPES = {}
 
+# Minimum messages sent to make a group member eligible for S6.8's
+# reactions-per-message leaderboard. Keep in sync with S6.8's prompt in
+# eval/cases/S6.json, which states the same floor -- the model can only apply a
+# filter it is told about.
+PARTICIPANT_REACTIONS_MIN_MESSAGES = 20
+
 
 def recipe(name):
     def register(fn):
@@ -487,16 +493,52 @@ def laugh_rates(roster, scope):
     }
 
 
+def _gated_section(r, name):
+    """A get_word_trends section that rides the chunk_annotations gate: returns
+    (section, gated, values-seeded-with-the-gate-flag). An empty table must be
+    reported as unavailable, never narrated, so `gated` is always GT."""
+    section = r[name]
+    gated = isinstance(section, dict) and section.get("available") is False
+    return section, gated, {"gated": _v(gated, "exact")}
+
+
 @recipe("valence_gated")
 def valence_gated(roster, scope):
     qt = _qt()
     r = qt.get_word_trends(include=["valence"], **_scope_kwargs(scope))
-    section = r["valence"]
-    gated = isinstance(section, dict) and section.get("available") is False
-    values = {"gated": _v(gated, "exact")}
+    section, gated, values = _gated_section(r, "valence")
     if not gated:
         for bucket in section["series"]:
             values[f"{bucket['period']}_mean_valence"] = _v(bucket["mean_valence"], "round")
+    return {"values": values, "raw": r}
+
+
+@recipe("emotions_gated")
+def emotions_gated(roster, scope):
+    """emotions rides the same chunk_annotations gate as valence, but has its
+    own shape (a GoEmotions leaderboard, not a trajectory), so it needs its own
+    probe even though the gate is shared."""
+    qt = _qt()
+    r = qt.get_word_trends(include=["emotions"], **_scope_kwargs(scope))
+    section, gated, values = _gated_section(r, "emotions")
+    if not gated:
+        for i, row in enumerate(section["top"][:3], 1):
+            values[f"emotion_{i}"] = _v(row["emotion"], "exact")
+            values[f"emotion_{i}_count"] = _v(row["count"], "exact")
+        values["chunks_annotated"] = _v(section["chunks_annotated"], "exact")
+    return {"values": values, "raw": r}
+
+
+@recipe("phrase_frequency_me")
+def phrase_frequency_me(roster):
+    """get_word_frequency's other half: my own bigrams, corpus-wide. Scoping
+    is by SENDER here (is_from_me), unlike every other analytics tool."""
+    qt = _qt()
+    r = qt.get_word_frequency(is_from_me=1, ngram=2, top=10)
+    values = {}
+    for i, row in enumerate(r["rows"][:3], 1):
+        values[f"top_phrase_{i}"] = _v(row["ngram"], "exact")
+        values[f"top_phrase_{i}_count"] = _v(row["count"], "exact")
     return {"values": values, "raw": r}
 
 
@@ -683,6 +725,84 @@ def group_dynamics(roster, group, section):
     return {"values": values, "raw": r}
 
 
+@recipe("participant_reactions")
+def participant_reactions(roster, group):
+    """get_chat_participant_stats' own leaderboard: reactions RECEIVED per
+    member, normalized by messages sent. get_group_dynamics has no such
+    section, so this is the only tool that answers the question.
+
+    MIN_MESSAGES matches the floor S6.8's prompt states out loud: a hidden
+    threshold would be unguessable, and without one a member with a handful of
+    messages wins on noise."""
+    qt = _qt()
+    rows = qt.get_chat_participant_stats(chat_id=group["chat_ids"])
+    scored = [r for r in rows if r["messages_sent"] >= PARTICIPANT_REACTIONS_MIN_MESSAGES]
+    if not scored:
+        raise ValueError(
+            f"no member of the group has >= {PARTICIPANT_REACTIONS_MIN_MESSAGES} messages"
+        )
+    rates = sorted(
+        (
+            {
+                "participant": r["participant"],
+                "messages_sent": r["messages_sent"],
+                "reactions_received": r["reactions_received"],
+                "rate": r["reactions_received"] / r["messages_sent"],
+            }
+            for r in scored
+        ),
+        key=lambda r: -r["rate"],
+    )
+    top = rates[0]
+    return {
+        "values": {
+            "top_member": _v(top["participant"], "exact"),
+            "top_member_reactions_received": _v(top["reactions_received"], "exact"),
+            "top_member_messages_sent": _v(top["messages_sent"], "exact"),
+        },
+        # rates lets a grader adjudicate a near-miss (the top two can be close)
+        "raw": {"rows": rows, "min_messages": PARTICIPANT_REACTIONS_MIN_MESSAGES, "rates": rates},
+    }
+
+
+@recipe("top_chats_leaderboard")
+def top_chats_leaderboard(roster):
+    """get_chat_summary_stats(group_by_chat=True): the leaderboard path. Its
+    rows are bare chat_ids, so a correct answer also needs list_chats (or an
+    equivalent) to put a name to the winner."""
+    qt = _qt()
+    rows = qt.get_chat_summary_stats(group_by_chat=True, limit=10)
+    labelled = qt.list_chats(chat_id=[r["chat_id"] for r in rows])
+    top1 = roster["TOP1"]
+    dyad = qt.get_chat_summary_stats(**_scope_kwargs(top1))
+    return {
+        # TOP1 is the #1 1:1 contact by definition; the leaderboard's top row
+        # may be a group chat or one half of a split thread, so the dyad total
+        # -- not rows[0]["message_count"] -- is the number to expect.
+        "values": {
+            "top_contact": _v(top1["display_name"], "exact"),
+            "top_contact_total": _v(dyad["message_count"], "exact"),
+        },
+        "raw": {"leaderboard": rows, "labels": labelled, "top_contact_stats": dyad},
+    }
+
+
+@recipe("attachments_pair")
+def attachments_pair(roster, scope):
+    """attachment_count is per individual attachment (a message with three
+    photos counts three) and every filter applies to it alike."""
+    qt = _qt()
+    both = qt.get_chat_summary_stats(**_scope_kwargs(scope))
+    mine = qt.get_chat_summary_stats(is_from_me=True, **_scope_kwargs(scope))
+    return {
+        "values": {
+            "attachments_total": _v(both["attachment_count"], "exact"),
+            "attachments_from_me": _v(mine["attachment_count"], "exact"),
+        },
+        "raw": {"both_sides": both, "from_me": mine},
+    }
+
+
 @recipe("total_messages_pair")
 def total_messages_pair(roster, scope):
     qt = _qt()
@@ -773,4 +893,137 @@ def top_contact_profile(roster):
             "initiation_them": _v(init["them"], "exact"),
         },
         "raw": {"activity": ap, "dynamics": rd},
+    }
+
+
+# --- S9: retrieval & directory plumbing --------------------------------------
+
+
+@recipe("handle_owner")
+def handle_owner(roster, handle):
+    """search_contact_by_handle's contract: a bare phone/email resolves to a
+    named person plus every other handle that person owns."""
+    qt = _qt()
+    r = qt.search_contact_by_handle(handle_identifier=handle)
+    if not r or not r.get("contact"):
+        raise ValueError(f"handle {handle!r} resolves to no contact")
+    top1 = roster["TOP1"]
+    if r["contact"]["id"] != top1["contact_id"]:
+        raise ValueError(
+            f"handle {handle!r} resolves to contact {r['contact']['id']}, not TOP1 "
+            f"({top1['contact_id']}) -- the roster's HANDLE is meant to be TOP1's"
+        )
+    # One identifier can own several handle ROWS -- chat.db files the same phone
+    # number once per service (iMessage/iMessageLite/SMS/RCS). A reply counts the
+    # phone numbers and emails it can see, so GT counts distinct identifiers; the
+    # row count stays in raw as advisory context.
+    identifiers = {r["handle"]["handle_identifier"]} | {
+        h["handle_identifier"] for h in r["other_handles"]
+    }
+    return {
+        "values": {
+            "owner": _v(top1["display_name"], "exact"),
+            "n_handles": _v(len(identifiers), "exact"),
+        },
+        "raw": {**r, "n_handle_rows": 1 + len(r["other_handles"])},
+    }
+
+
+@recipe("chats_for_contact")
+def chats_for_contact(roster, scope):
+    """list_chats as the person -> chat_id bridge. n_chats is the count of
+    1:1 threads (a split iMessage/SMS pair counts twice -- that IS the
+    answer, and a reply that silently merges them loses the distinction)."""
+    from query_tools._shared import MAX_CHATS_LIMIT
+
+    qt = _qt()
+    rows = qt.list_chats(contact_id=scope["contact_id"], limit=MAX_CHATS_LIMIT)
+    if len(rows) >= MAX_CHATS_LIMIT:
+        # The cap is hard (directory.py clamps any limit to it), so a contact in
+        # more chats than this silently loses rows -- including dyad rows. Say so
+        # rather than let the roster cross-check below misreport it as divergence.
+        raise ValueError(
+            f"list_chats hit its {MAX_CHATS_LIMIT}-row cap for this contact -- the dyad "
+            "count may be truncated; S9.2 needs a contact in fewer chats"
+        )
+    # list_chats returns every chat the person is in, groups included; the
+    # dyad threads are the is_group=0 rows. Cross-checked against the roster's
+    # chat_ids so a divergence surfaces here rather than as a graded failure.
+    dyad_rows = [row for row in rows if not row["is_group"]]
+    if {row["id"] for row in dyad_rows} != set(scope["chat_ids"]):
+        raise ValueError(
+            f"list_chats 1:1 rows {[row['id'] for row in dyad_rows]} != roster chat_ids "
+            f"{scope['chat_ids']}"
+        )
+    return {
+        "values": {"n_dyad_chats": _v(len(dyad_rows), "exact")},
+        "raw": {
+            "list_chats": rows,
+            "n_chats_returned": len(rows),
+            "dyad_chat_ids": scope["chat_ids"],
+        },
+    }
+
+
+@recipe("message_reactions")
+def message_reactions(roster, message):
+    """get_message_reactions on a known-reacted message: who reacted and with
+    what. The reactor names and tapback names are the answer -- raw 2000-range
+    type codes leaking into a reply are a communication failure."""
+    qt = _qt()
+    rows = qt.get_message_reactions(message["guid"])
+    # A retracted tapback keeps its row (type >= 3000, rendered 'removed-...').
+    # It is not a reaction anyone can see today, so it must not inflate GT.
+    live = [row for row in rows if not str(row["reaction"]).startswith("removed-")]
+    removed = [row for row in rows if str(row["reaction"]).startswith("removed-")]
+    if not live:
+        raise ValueError(f"message {message['message_id']} has no live reactions")
+    values = {"n_reactions": _v(len(live), "exact")}
+    for i, row in enumerate(live, 1):
+        values[f"reaction_{i}_type"] = _v(row["reaction"], "exact")
+    return {
+        "values": values,
+        "raw": {"message": message, "reactions": rows, "removed_reactions": removed},
+    }
+
+
+@recipe("long_message_full")
+def long_message_full(roster, message):
+    """The truncation-recovery contract: search rows cap text at
+    TEXT_PREVIEW_CHARS, so the tail of this message exists only behind
+    get_full_messages. `text_tail` is past the cap -- a reply containing it
+    proves the model recovered the full text rather than paraphrasing the
+    preview."""
+    from query_tools._shared import TEXT_PREVIEW_CHARS
+
+    text = message["text"]
+    # Whole words from a single line: an arbitrary character slice can straddle a
+    # newline or a run of spaces, and models reflow whitespace when they quote --
+    # a correct reply would then fail an `exact` substring check.
+    window = text[TEXT_PREVIEW_CHARS:TEXT_PREVIEW_CHARS + 120]
+    words = window.split("\n", 1)[0].split()[1:]  # drop the (likely partial) first word
+    tail = ""
+    for word in words:
+        candidate = f"{tail} {word}".strip()
+        if len(candidate) > 60:
+            break
+        tail = candidate
+    if not tail:
+        raise ValueError(
+            f"message {message['message_id']} has no whole-word tail past the "
+            f"{TEXT_PREVIEW_CHARS}-char preview cap"
+        )
+    return {
+        "values": {
+            # text_head is the roster's collapsed form -- the same string the
+            # prompt quotes back, so a reply echoing the prompt matches it.
+            "text_head": _v(message["text_head"], "exact"),
+            "text_tail": _v(tail, "exact"),
+        },
+        "raw": {
+            "message_id": message["message_id"],
+            "length": len(text),
+            "preview_cap": TEXT_PREVIEW_CHARS,
+            "text": text,
+        },
     }

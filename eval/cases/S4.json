@@ -83,6 +83,24 @@
       "probe": null,
       "grader_notes": "GT hits (1-5); exact count or the actual messages",
       "quality_watch": null
+    },
+    {
+      "id": "S4.10",
+      "prompt": "What emotions come up most in my chats with <TOP1>?",
+      "expect": {"tools": [{"name": "get_word_trends", "args_contains": {"_scope": "<TOP1>"}}]},
+      "gt": {"recipe": "emotions_gated", "params": {"scope": "<TOP1>"}},
+      "probe": "gated_section",
+      "grader_notes": "gated section probe (emotions, the sibling of S4.8's valence): if chunk_annotations is empty, GT is {\"gated\": true} and the reply must say the analysis isn't available; if populated, the top emotions must match GT's leaderboard. An emotional read invented from message text rather than the annotations = faithfulness 0. The expectation deliberately does not pin `include`: fetching all sections and reading the emotions one is fine (same leniency as S4.8) -- route on the tool, grade on the emotions content.",
+      "quality_watch": "Emotions are GoEmotions labels counted from LLM annotations, not vibes -- a reply that names emotions when the section returned available:false is a confabulation."
+    },
+    {
+      "id": "S4.11",
+      "prompt": "What two-word phrases do I say the most?",
+      "expect": {"tools": [{"name": "get_word_frequency", "args_contains": {"is_from_me": true, "ngram": 2}}]},
+      "gt": {"recipe": "phrase_frequency_me", "params": {}},
+      "probe": null,
+      "grader_notes": "get_word_frequency's phrase mode -- the half S4.7 doesn't reach. The prompt names the width, so ngram=2 is required (ngram=1 single words = routing 0), as is is_from_me: this tool scopes by SENDER, unlike every other analytics tool, so an unscoped call silently answers for the whole corpus including everyone else's messages. GT top phrases with counts, order-tolerant.",
+      "quality_watch": null
     }
   ]
 }

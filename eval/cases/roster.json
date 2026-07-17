@@ -8,6 +8,9 @@
     "PHRASE_LO": {"kind": "string", "definition": "a phrase with 1-5 lifetime hits"},
     "TERM": {"kind": "string", "definition": "top-lift dyad_terms row for TOP1's chat"},
     "NOBODY": {"kind": "string", "definition": "plausible full name matching no contact"},
-    "YEAR": {"kind": "int", "definition": "most recent full calendar year in the corpus"}
+    "YEAR": {"kind": "int", "definition": "most recent full calendar year in the corpus"},
+    "HANDLE": {"kind": "string", "definition": "a handle_identifier (phone/email) owned by TOP1"},
+    "LONG_MSG": {"kind": "message", "definition": "a message I sent TOP1 longer than TEXT_PREVIEW_CHARS, so a search hit truncates it and only get_full_messages recovers the rest"},
+    "REACTED_MSG": {"kind": "message", "definition": "the message I sent TOP1 carrying the most reactions"}
   }
 }

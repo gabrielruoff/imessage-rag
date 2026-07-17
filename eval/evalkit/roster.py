@@ -1,6 +1,7 @@
 """P0 roster resolution (plan §4.2): resolve_roster() maps the suite files'
-placeholders (TOP1/TOP2/SPARSE/GROUP, YEAR, PHRASE_HI/LO, TERM, NOBODY) to
-the real corpus, printing every auto-pick with its evidence.
+placeholders (TOP1/TOP2/SPARSE/GROUP, YEAR, PHRASE_HI/LO, TERM, NOBODY,
+HANDLE, LONG_MSG, REACTED_MSG) to the real corpus, printing every auto-pick
+with its evidence.
 
 App imports live inside functions -- TARGET_DB must be settable in the
 environment before config.py first loads (env-before-import invariant).
@@ -20,12 +21,11 @@ def _contact_entry(con, contact_id, n_messages):
         "WHERE c.id = ? LIMIT 1",
         (contact_id,),
     ).fetchone()[0]
-    handle_ids = [
-        r[0]
-        for r in con.execute(
-            "SELECT id FROM handles WHERE contact_id = ? ORDER BY id", (contact_id,)
-        )
-    ]
+    handles = con.execute(
+        "SELECT id, handle_identifier FROM handles WHERE contact_id = ? ORDER BY id",
+        (contact_id,),
+    ).fetchall()
+    handle_ids = [r["id"] for r in handles]
     chat_ids = [
         r[0]
         for r in con.execute(
@@ -40,6 +40,7 @@ def _contact_entry(con, contact_id, n_messages):
         "display_name": name,
         "contact_id": contact_id,
         "handle_ids": handle_ids,
+        "handle_identifiers": [r["handle_identifier"] for r in handles],
         "chat_ids": chat_ids,
         "n_messages": n_messages,
     }
@@ -108,6 +109,64 @@ def _pick_phrase_lo(con):
         if 1 <= hits <= 5:
             return phrase
     return None
+
+
+def _message_entry(row, extra=None):
+    """A message placeholder: `text_head` is what a prompt can quote back
+    without becoming a wall of text, `day` what it can date the message by.
+    text_head collapses whitespace and drops attachment placeholders -- it
+    gets substituted into a one-line prompt, where a raw newline would split
+    the quoted excerpt and a U+FFFC would quote an invisible character."""
+    head = " ".join(row["text"].replace("￼", " ").split())[:60]
+    entry = {
+        "display_name": head,
+        "message_id": row["id"],
+        "guid": row["guid"],
+        "chat_id": row["chat_id"],
+        "date": row["date"],
+        "day": row["date"][:10],
+        "text": row["text"],
+        "text_head": head,
+    }
+    entry.update(extra or {})
+    return entry
+
+
+def _pick_long_msg(con, chat_ids):
+    """A message I sent, comfortably longer than query_tools' 300-char
+    TEXT_PREVIEW_CHARS, so any search hit truncates it and the full text is
+    reachable only via get_full_messages."""
+    from query_tools._shared import TEXT_PREVIEW_CHARS
+
+    placeholders = ",".join("?" * len(chat_ids))
+    row = con.execute(
+        f"SELECT m.id, m.guid, m.chat_id, m.date, m.text FROM messages m "
+        f"WHERE m.chat_id IN ({placeholders}) AND m.is_from_me = 1 AND m.date IS NOT NULL "
+        f"  AND length(m.text) > ? AND {_real()} "
+        "ORDER BY length(m.text) DESC LIMIT 1",
+        [*chat_ids, TEXT_PREVIEW_CHARS + 100],
+    ).fetchone()
+    return _message_entry(row, {"length": len(row["text"])}) if row else None
+
+
+def _pick_reacted_msg(con, chat_ids):
+    """The message I sent this contact that drew the most reactions, among
+    those a prompt can actually quote back. Attachment rows carry U+FFFC
+    object-replacement chars instead of words -- stripping them and demanding
+    20 real characters keeps the excerpt meaningful. Retractions (type >= 3000)
+    are excluded: they are rows, not reactions anyone can still see."""
+    placeholders = ",".join("?" * len(chat_ids))
+    row = con.execute(
+        f"SELECT m.id, m.guid, m.chat_id, m.date, m.text, COUNT(r.id) AS n_reactions "
+        f"FROM messages m JOIN reactions r ON r.target_message_guid = m.guid "
+        f"  AND r.associated_message_type < 3000 "
+        f"WHERE m.chat_id IN ({placeholders}) AND m.is_from_me = 1 AND m.date IS NOT NULL "
+        f"  AND m.text IS NOT NULL AND length(trim(replace(m.text, char(65532), ''))) >= 20 "
+        f"  AND {_real()} "
+        "GROUP BY m.id ORDER BY n_reactions DESC, m.id LIMIT 1",
+        chat_ids,
+    ).fetchone()
+    return _message_entry(row, {"n_reactions": row["n_reactions"]}) if row else None
 
 
 def resolve_roster(db_path, overrides=None):
@@ -195,6 +254,11 @@ def resolve_roster(db_path, overrides=None):
                 print(f"  TERM: unavailable ({e})")
         roster["TERM"] = term
 
+        identifiers = roster["TOP1"]["handle_identifiers"]
+        roster["HANDLE"] = identifiers[0] if identifiers else None
+        roster["LONG_MSG"] = _pick_long_msg(con, top1_chats) if top1_chats else None
+        roster["REACTED_MSG"] = _pick_reacted_msg(con, top1_chats) if top1_chats else None
+
     nobody = "Thaddeus Vellingworth"
     matches = qt.search_contacts_by_name(nobody)
     rows = matches["rows"] if isinstance(matches, dict) else matches
@@ -208,8 +272,15 @@ def resolve_roster(db_path, overrides=None):
             f"  {name}: {e['display_name']!r} ({e['n_messages']} messages, "
             f"chat_ids={e['chat_ids']})"
         )
-    for name in ("YEAR", "PHRASE_HI", "PHRASE_LO", "TERM", "NOBODY"):
+    for name in ("YEAR", "PHRASE_HI", "PHRASE_LO", "TERM", "NOBODY", "HANDLE"):
         print(f"  {name}: {roster[name]!r}")
+    for name in ("LONG_MSG", "REACTED_MSG"):
+        e = roster[name]
+        if e is None:
+            print(f"  {name}: unresolved")
+            continue
+        detail = f"{e['length']} chars" if name == "LONG_MSG" else f"{e['n_reactions']} reactions"
+        print(f"  {name}: message {e['message_id']} on {e['day']} ({detail})")
     if overrides:
         for k, v in overrides.items():
             print(f"  override {k}: {v!r}")
