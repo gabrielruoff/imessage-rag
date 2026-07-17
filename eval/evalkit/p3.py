@@ -191,23 +191,26 @@ def cmd_annotate_sample(args):
 
 def _judge_annotations(samples, run_id):
     import ollama
+    import progress  # imports config -- kept lazy (env-before-import invariant)
 
     acquire_ollama_lock(f"p3-annotate-judge-{run_id}")
     try:
-        for sample in samples:
-            prompt = (
-                "You are auditing an automatic conversation annotation.\n\n"
-                f"Conversation chunk:\n{sample['chunk_text']}\n\n"
-                f"Stored annotation: {json.dumps(sample['annotation'])}\n\n"
-                "Reply with JSON only: {\"valence_sign_agree\": true|false, "
-                "\"emotions_agree\": true|false, \"depth_rating\": 0-3, "
-                "\"notes\": \"one sentence\"}"
-            )
-            try:
-                msg = ollama.chat_once([{"role": "user", "content": prompt}], format="json")
-                sample["judgment"] = json.loads(msg.get("content") or "{}")
-            except Exception as e:
-                sample["judgment"] = {"error": str(e)}
+        with progress.track("Judging annotations", total=len(samples), log_every=1) as p:
+            for sample in samples:
+                prompt = (
+                    "You are auditing an automatic conversation annotation.\n\n"
+                    f"Conversation chunk:\n{sample['chunk_text']}\n\n"
+                    f"Stored annotation: {json.dumps(sample['annotation'])}\n\n"
+                    "Reply with JSON only: {\"valence_sign_agree\": true|false, "
+                    "\"emotions_agree\": true|false, \"depth_rating\": 0-3, "
+                    "\"notes\": \"one sentence\"}"
+                )
+                try:
+                    msg = ollama.chat_once([{"role": "user", "content": prompt}], format="json")
+                    sample["judgment"] = json.loads(msg.get("content") or "{}")
+                except Exception as e:
+                    sample["judgment"] = {"error": str(e)}
+                p.advance()
     finally:
         release_ollama_lock()
 
@@ -283,23 +286,26 @@ def cmd_topics_sample(args):
 
 def _judge_topics(samples, run_id):
     import ollama
+    import progress  # imports config -- kept lazy (env-before-import invariant)
 
     acquire_ollama_lock(f"p3-topics-judge-{run_id}")
     try:
-        for sample in samples:
-            excerpts = "\n---\n".join(c["text"] for c in sample["chunks"])
-            prompt = (
-                f"Topic label: {sample['label']!r}\n\n"
-                f"Sampled conversation chunks from this cluster:\n{excerpts}\n\n"
-                "Does the label describe these chunks (and is it 2-5 words)? "
-                "Reply with JSON only: {\"label_fits\": true|false, "
-                "\"notes\": \"one sentence\"}"
-            )
-            try:
-                msg = ollama.chat_once([{"role": "user", "content": prompt}], format="json")
-                sample["judgment"] = json.loads(msg.get("content") or "{}")
-            except Exception as e:
-                sample["judgment"] = {"error": str(e)}
+        with progress.track("Judging topic labels", total=len(samples), log_every=1) as p:
+            for sample in samples:
+                excerpts = "\n---\n".join(c["text"] for c in sample["chunks"])
+                prompt = (
+                    f"Topic label: {sample['label']!r}\n\n"
+                    f"Sampled conversation chunks from this cluster:\n{excerpts}\n\n"
+                    "Does the label describe these chunks (and is it 2-5 words)? "
+                    "Reply with JSON only: {\"label_fits\": true|false, "
+                    "\"notes\": \"one sentence\"}"
+                )
+                try:
+                    msg = ollama.chat_once([{"role": "user", "content": prompt}], format="json")
+                    sample["judgment"] = json.loads(msg.get("content") or "{}")
+                except Exception as e:
+                    sample["judgment"] = {"error": str(e)}
+                p.advance()
     finally:
         release_ollama_lock()
 

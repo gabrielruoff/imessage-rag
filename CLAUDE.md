@@ -135,7 +135,10 @@ modules import): `cases.py` suite loading/validation, `roster.py` roster
 resolution, `recipes.py` SQL ground-truth recipes, `manifest.py`
 corpus-fingerprinted ground truth, `runner.py` the transcript-capturing sweep,
 `checks.py` deterministic grading, `p3.py` LLM-graded checks, `report.py` the
-scorecard.
+scorecard. Its slow loops (`run`, `manifest`'s ground truth, `p3 --judge`)
+reuse `progress.track` — imported function-locally, like every other app
+import here, because `progress` pulls in `config` and `__main__` imports all
+submodules eagerly.
 
 ## Schema (imessage_analysis.db)
 

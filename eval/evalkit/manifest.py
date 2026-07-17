@@ -89,30 +89,38 @@ def _sidecar_path(suite_id):
 
 
 def build_gt(suite_list, roster):
+    import progress  # imports config -- kept lazy (env-before-import invariant)
+
     from . import cases, recipes
 
+    # Cases without a gt spec are skipped below and are not part of the total.
+    n_gt = sum(1 for s in suite_list for c in s["cases"] if c.get("gt"))
     gt = {}
-    for suite in suite_list:
-        for case in suite["cases"]:
-            if not case.get("gt"):
-                continue
-            spec = case["gt"]
-            entry = {"recipe": spec["recipe"], "params_resolved": None, "values": {},
-                     "raw": None, "status": "ok", "error": None}
-            try:
-                fn = recipes.RECIPES[spec["recipe"]]
-                params = {
-                    k: cases.resolve_ref(v, roster) for k, v in spec.get("params", {}).items()
-                }
-                entry["params_resolved"] = params
-                out = fn(roster, **params)
-                entry["values"] = out["values"]
-                entry["raw"] = out.get("raw")
-            except Exception as e:  # recorded, never aborts the build
-                entry["status"] = "error"
-                entry["error"] = f"{type(e).__name__}: {e}"
-                print(f"  GT {case['id']}: ERROR {entry['error']}")
-            gt[case["id"]] = entry
+    # log_every=1: tens of recipes, seconds apiece -- the default stride of 200
+    # would emit no plain-mode line at all for a loop this small.
+    with progress.track("Computing ground truth", total=n_gt, log_every=1) as p:
+        for suite in suite_list:
+            for case in suite["cases"]:
+                if not case.get("gt"):
+                    continue
+                spec = case["gt"]
+                entry = {"recipe": spec["recipe"], "params_resolved": None, "values": {},
+                         "raw": None, "status": "ok", "error": None}
+                try:
+                    fn = recipes.RECIPES[spec["recipe"]]
+                    params = {
+                        k: cases.resolve_ref(v, roster) for k, v in spec.get("params", {}).items()
+                    }
+                    entry["params_resolved"] = params
+                    out = fn(roster, **params)
+                    entry["values"] = out["values"]
+                    entry["raw"] = out.get("raw")
+                except Exception as e:  # recorded, never aborts the build
+                    entry["status"] = "error"
+                    entry["error"] = f"{type(e).__name__}: {e}"
+                    print(f"  GT {case['id']}: ERROR {entry['error']}")
+                gt[case["id"]] = entry
+                p.advance()
     return gt
 
 

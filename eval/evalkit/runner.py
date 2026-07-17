@@ -223,6 +223,7 @@ def cmd_run(args):
 
     import chat
     import ollama
+    import progress  # imports config -- must stay below the env block above
     from rich.console import Console
 
     chat.console = Console(quiet=True)
@@ -247,51 +248,61 @@ def cmd_run(args):
             run_doc["flags"].append("fingerprint_mismatch_forced")
 
         exit_code = 0
-        for case in selected:
-            cid = case["id"]
-            existing = run_dir / f"{cid}.json"
-            explicit = bool(args.case_ids and cid in args.case_ids)
-            if args.resume and not explicit and existing.exists():
-                with open(existing) as f:
-                    if json.load(f).get("status") == "ok":
-                        print(f"{cid}: resume skip (ok)")
-                        continue
-            try:
-                turns = _resolve_turns(case, roster)
-            except KeyError as e:
-                print(f"{cid}: SKIP unresolvable placeholder ({e})")
-                run_doc["cases"][cid] = {"status": "setup_error", "duration_s": 0}
-                write_json_atomic(run_path, run_doc)
-                exit_code = 1
-                continue
-            started = utcnow()
-            t0 = time.monotonic()
-            status = messages = boundaries = reply = None
-            for attempt in (1, 2):
+        # The description stays generic: resolved prompts carry roster names, and
+        # progress output is not the place to leak one.
+        # log_every=1: ~71 cases at minutes apiece, so one plain-mode line per
+        # case is the right cadence -- and the default stride of 200 would emit
+        # none at all for a loop this small (the exact case an operator pipes to
+        # a sweep log).
+        with progress.track("Running cases", total=len(selected), log_every=1) as p:
+            for case in selected:
+                cid = case["id"]
+                existing = run_dir / f"{cid}.json"
+                explicit = bool(args.case_ids and cid in args.case_ids)
+                if args.resume and not explicit and existing.exists():
+                    with open(existing) as f:
+                        if json.load(f).get("status") == "ok":
+                            print(f"{cid}: resume skip (ok)")
+                            p.advance()
+                            continue
                 try:
-                    status, messages, boundaries, reply = _run_case(
-                        chat, state, case, turns, model, args.case_timeout
-                    )
-                    break
-                except (OSError, http.client.HTTPException, ollama.OllamaResponseError) as e:
-                    print(f"{cid}: transport error ({e}), attempt {attempt}")
-                    if attempt == 2:
-                        status, messages, boundaries, reply = "transport_error", [], [], ""
-            duration = round(time.monotonic() - t0, 1)
-            transcript = {
-                "id": cid, "run_id": args.run_id, "status": status,
-                "prompt_resolved": turns[0] if not case.get("turns") else None,
-                "turns_resolved": turns, "model": model, "config": config_snapshot(),
-                "corpus_fingerprint": fp, "started_utc": started, "duration_s": duration,
-                "round_trips": state["rounds"], "turn_boundaries": boundaries,
-                "messages": messages, "final_reply": reply,
-            }
-            _write_transcript(run_dir, cid, transcript)
-            run_doc["cases"][cid] = {"status": status, "duration_s": duration}
-            write_json_atomic(run_path, run_doc)  # crash-resumable
-            print(f"{cid}: {status} ({duration}s, {len(state['rounds'])} round trips)")
-            if status != "ok":
-                exit_code = 1
+                    turns = _resolve_turns(case, roster)
+                except KeyError as e:
+                    print(f"{cid}: SKIP unresolvable placeholder ({e})")
+                    run_doc["cases"][cid] = {"status": "setup_error", "duration_s": 0}
+                    write_json_atomic(run_path, run_doc)
+                    exit_code = 1
+                    p.advance()
+                    continue
+                started = utcnow()
+                t0 = time.monotonic()
+                status = messages = boundaries = reply = None
+                for attempt in (1, 2):
+                    try:
+                        status, messages, boundaries, reply = _run_case(
+                            chat, state, case, turns, model, args.case_timeout
+                        )
+                        break
+                    except (OSError, http.client.HTTPException, ollama.OllamaResponseError) as e:
+                        print(f"{cid}: transport error ({e}), attempt {attempt}")
+                        if attempt == 2:
+                            status, messages, boundaries, reply = "transport_error", [], [], ""
+                duration = round(time.monotonic() - t0, 1)
+                transcript = {
+                    "id": cid, "run_id": args.run_id, "status": status,
+                    "prompt_resolved": turns[0] if not case.get("turns") else None,
+                    "turns_resolved": turns, "model": model, "config": config_snapshot(),
+                    "corpus_fingerprint": fp, "started_utc": started, "duration_s": duration,
+                    "round_trips": state["rounds"], "turn_boundaries": boundaries,
+                    "messages": messages, "final_reply": reply,
+                }
+                _write_transcript(run_dir, cid, transcript)
+                run_doc["cases"][cid] = {"status": status, "duration_s": duration}
+                write_json_atomic(run_path, run_doc)  # crash-resumable
+                print(f"{cid}: {status} ({duration}s, {len(state['rounds'])} round trips)")
+                if status != "ok":
+                    exit_code = 1
+                p.advance()
         return exit_code
     finally:
         release_ollama_lock()

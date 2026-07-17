@@ -1,5 +1,5 @@
 """Progress reporting shared by the CLI jobs (ingest, chunking, sessions,
-lexicon_build, annotate, topics, wrapped).
+lexicon_build, annotate, topics, wrapped, eval/evalkit).
 
 One entry point, `track`, used as a context manager around a long loop:
 

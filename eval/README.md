@@ -21,6 +21,31 @@ checkout's venv and real DB, so the commands below spell out both paths:
 Commands that need the DB refuse (exit 2) when it is missing or 0 bytes —
 always pass `--db` with the real DB path.
 
+## Progress
+
+The slow commands report progress through the same `progress.track` helper the
+pipeline scripts use, so `PROGRESS_STYLE` governs them identically: a live bar
+with an ETA on a terminal, `  ...N/Total (X%)` lines as items complete when
+stdout is piped or redirected (no escape codes in a captured sweep log), and
+nothing at all under `PROGRESS_STYLE=off`. Tracked loops: `run` (per case),
+`manifest` (per ground-truth recipe), and the two `p3 --judge` loops (per
+sample). Per-case status lines still print above the bar.
+
+These loops are tens of items at minutes apiece, so each passes an explicit
+`log_every=1` — the repo-wide `PROGRESS_LOG_EVERY` default (200) is tuned for
+the pipeline's ~350k-row passes and would emit no plain-mode line at all for a
+loop this small. `progress.py`'s `_MAX_PLAIN_LINES` ceiling still caps any loop
+at ~50 lines, so a 71-case sweep logs every second case rather than every one;
+for the same reason the last line can sit one item short of the total (there is
+no final flush on exit) — treat the command's own exit as the completion signal,
+not a `100%` line.
+
+`import progress` is deliberately **function-local** in every evalkit module: it
+pulls in `config`, which reads env at import, and `__main__` imports every
+submodule eagerly — a top-level import would freeze config before `run` applies
+`--max-iterations` / `--tool-result-max-chars` and before `--db` sets
+`TARGET_DB`.
+
 ## The subcommands
 
 | Command | Phase | Ollama? | What it does |
