@@ -1,0 +1,70 @@
+{
+  "suite": "S5",
+  "title": "Milestones (get_milestones)",
+  "targets": {"routing": 0.9, "accuracy": 0.85, "faithfulness": 1.0, "communication": 0.85},
+  "cases": [
+    {
+      "id": "S5.1",
+      "prompt": "When did <TOP1> and I first text, and who texted first?",
+      "expect": {"tools": [{"name": "get_milestones", "args_contains": {"_scope": "<TOP1>"}}]},
+      "gt": {"recipe": "milestone_firsts", "params": {"scope": "<TOP1>"}},
+      "probe": null,
+      "grader_notes": "GT date, direction, first-message text quoted verbatim",
+      "quality_watch": null
+    },
+    {
+      "id": "S5.2",
+      "prompt": "What was the 10,000th message between me and <TOP1>?",
+      "expect": {"tools": [{"name": "get_milestones", "args_contains": {"_scope": "<TOP1>"}}]},
+      "gt": {"recipe": "nth_landmark", "params": {"scope": "<TOP1>"}},
+      "probe": null,
+      "grader_notes": "GT landmark row (skip to 1,000th if the chat is smaller -- GT picks the largest landmark that exists)",
+      "quality_watch": null
+    },
+    {
+      "id": "S5.3",
+      "prompt": "What's the longest <TOP1> and I have gone without talking?",
+      "expect": {"tools": [{"name": "get_milestones", "args_contains": {"_scope": "<TOP1>"}}]},
+      "gt": {"recipe": "longest_silence", "params": {"scope": "<TOP1>"}},
+      "probe": null,
+      "grader_notes": "GT gap duration + dates + reconnection message",
+      "quality_watch": null
+    },
+    {
+      "id": "S5.4",
+      "prompt": "Do I have any texting anniversaries coming up?",
+      "expect": {"tools": [{"name": "get_milestones"}]},
+      "gt": {"recipe": "anniversaries_upcoming", "params": {}},
+      "probe": null,
+      "grader_notes": "GT contacts in the 30-day window; min-100-msg floor respected",
+      "quality_watch": null
+    },
+    {
+      "id": "S5.5",
+      "prompt": "When did I first mention \"<PHRASE_HI>\" to <TOP1>?",
+      "expect": {"tools": [{"name": "get_milestones", "args_contains": {"_scope": "<TOP1>", "phrase": "<PHRASE_HI>"}}]},
+      "gt": {"recipe": "earliest_phrase", "params": {"scope": "<TOP1>", "phrase": "<PHRASE_HI>"}},
+      "probe": null,
+      "grader_notes": "GT first FTS hit (date + text)",
+      "quality_watch": null
+    },
+    {
+      "id": "S5.6",
+      "prompt": "What's the last thing <SPARSE> sent me?",
+      "expect": {"tools": [{"name": "get_milestones", "alternates": ["get_conversation", "search_messages_sql"], "args_contains": {"_scope": "<SPARSE>"}}]},
+      "gt": {"recipe": "last_message_from_them", "params": {"scope": "<SPARSE>"}},
+      "probe": null,
+      "grader_notes": "GT last INBOUND message (their side; date/text) -- milestones firsts.last is the last message regardless of sender, so if the chat ends with my message the model needs a retrieval pivot; an answer quoting my own message as theirs = accuracy 0",
+      "quality_watch": null
+    },
+    {
+      "id": "S5.7",
+      "prompt": "How far back does my message history go?",
+      "expect": {"tools": [{"name": "get_milestones", "alternates": ["get_chat_summary_stats"]}]},
+      "gt": {"recipe": "milestone_firsts", "params": {}},
+      "probe": null,
+      "grader_notes": "GT earliest corpus date",
+      "quality_watch": null
+    }
+  ]
+}

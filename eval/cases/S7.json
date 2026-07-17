@@ -1,0 +1,113 @@
+{
+  "suite": "S7",
+  "title": "Routing, negative controls, graceful degradation",
+  "targets": {"routing": 0.9, "accuracy": 0.85, "faithfulness": 1.0, "communication": 0.85},
+  "notes": "The steering sentence and 21-tool selection are what this suite stresses; it is the direct check on the plan's top risk.",
+  "cases": [
+    {
+      "id": "S7.1",
+      "prompt": "Find messages where <TOP1> and I talked about the beach",
+      "expect": {
+        "tools": [{"name": "search_messages_hybrid", "alternates": ["search_conversations", "search_messages_fts"]}],
+        "banned_tools": ["get_chat_summary_stats", "get_activity_patterns", "get_response_dynamics", "get_reaction_stats", "get_milestones", "get_word_trends", "get_group_dynamics", "get_chat_participant_stats", "get_word_frequency"]
+      },
+      "gt": null,
+      "probe": null,
+      "grader_notes": "FTS/semantic search, no analytics tool in transcript",
+      "quality_watch": null
+    },
+    {
+      "id": "S7.2",
+      "prompt": "What did <TOP1> say about their job interview?",
+      "expect": {"tools": [{"name": "search_messages_hybrid", "alternates": ["search_conversations"]}]},
+      "gt": null,
+      "probe": null,
+      "grader_notes": "retrieval (semantic/hybrid), then grounded quote -- quoted messages must appear in a tool result",
+      "quality_watch": null
+    },
+    {
+      "id": "S7.3",
+      "prompt": "How many messages have <TOP1> and I exchanged in total?",
+      "expect": {
+        "tools": [{"name": "get_chat_summary_stats", "alternates": ["get_milestones", "get_chat_participant_stats"], "args_contains": {"_scope": "<TOP1>"}}],
+        "banned_anywhere": ["get_activity_histogram", "get_conversation_dynamics", "get_top_reacted_messages"]
+      },
+      "gt": {"recipe": "total_messages_pair", "params": {"scope": "<TOP1>"}},
+      "probe": null,
+      "grader_notes": "a count matching GT; must not try removed tools (get_activity_histogram, get_conversation_dynamics, get_top_reacted_messages anywhere in a transcript = routing 0 for the run)",
+      "quality_watch": null
+    },
+    {
+      "id": "S7.4",
+      "prompt": "When am I most active, and does <TOP1> reply faster at night?",
+      "expect": {"tools": [
+        {"name": "get_activity_patterns"},
+        {"name": "get_response_dynamics", "args_contains": {"_scope": "<TOP1>"}}
+      ]},
+      "gt": {"recipe": "activity_and_latency", "params": {"scope": "<TOP1>"}},
+      "probe": null,
+      "grader_notes": "multi-tool: activity + dynamics; both grounded",
+      "quality_watch": null
+    },
+    {
+      "id": "S7.5",
+      "prompt": "Compare my friendships with <TOP1> and <TOP2> -- who do I talk to more, who replies faster?",
+      "expect": {"tools": [
+        {"name": "get_chat_summary_stats", "alternates": ["get_response_dynamics", "get_chat_participant_stats"], "args_contains": {"_scope": "<TOP1>"}},
+        {"name": "get_chat_summary_stats", "alternates": ["get_response_dynamics", "get_chat_participant_stats"], "args_contains": {"_scope": "<TOP2>"}}
+      ]},
+      "gt": {"recipe": "compare_pair", "params": {"a": "<TOP1>", "b": "<TOP2>"}},
+      "probe": null,
+      "grader_notes": ">= 2 scoped calls; per-contact numbers not blended",
+      "quality_watch": null
+    },
+    {
+      "id": "S7.6",
+      "prompt": "What hour does <NOBODY> usually text me?",
+      "expect": {"tools": [{"name": "search_contacts_by_name"}]},
+      "gt": null,
+      "probe": "negative_control",
+      "grader_notes": "contact resolution fails -> says can't find them; no stats invented",
+      "quality_watch": null
+    },
+    {
+      "id": "S7.7",
+      "prompt": "How has my texting with <SPARSE> evolved over the years?",
+      "expect": {"tools": [{"name": "get_activity_patterns", "alternates": ["get_chat_summary_stats", "get_response_dynamics", "get_chat_participant_stats", "get_word_trends"], "args_contains": {"_scope": "<SPARSE>"}}]},
+      "gt": {"recipe": "sparse_history", "params": {"scope": "<SPARSE>"}},
+      "probe": "thin_data",
+      "grader_notes": "tools return thin data -> honest \"not much history\" framing, small numbers cited correctly",
+      "quality_watch": null
+    },
+    {
+      "id": "S7.8",
+      "prompt": "What's my texting personality?",
+      "expect": {"tools": []},
+      "gt": null,
+      "probe": "open_ended",
+      "grader_notes": "open-ended: any grounded combination is fine; graded on faithfulness only -- every claim must trace to a tool result",
+      "quality_watch": null
+    },
+    {
+      "id": "S7.9",
+      "prompt": "lol who do i even text at 3am",
+      "expect": {"tools": [{"name": "get_activity_patterns"}]},
+      "gt": {"recipe": "late_night", "params": {}},
+      "probe": null,
+      "grader_notes": "casual phrasing still routes to get_activity_patterns late_night",
+      "quality_watch": null
+    },
+    {
+      "id": "S7.10",
+      "prompt": "Show me the exact messages from my longest streak with <TOP1>",
+      "expect": {"tools": [
+        {"name": "get_activity_patterns", "args_contains": {"_scope": "<TOP1>"}},
+        {"name": "get_conversation", "alternates": ["get_message_context", "search_messages_sql"]}
+      ]},
+      "gt": {"recipe": "streaks", "params": {"scope": "<TOP1>"}},
+      "probe": null,
+      "grader_notes": "analytics -> then message retrieval (get_conversation / context); receipts real",
+      "quality_watch": null
+    }
+  ]
+}

@@ -1,0 +1,80 @@
+{
+  "suite": "S1",
+  "title": "Activity patterns (get_activity_patterns)",
+  "targets": {"routing": 0.9, "accuracy": 0.85, "faithfulness": 1.0, "communication": 0.85},
+  "notes": "Heatmap answers must be in local time (a UTC argmax differs by 4-5h -- a UTC-shaped answer means LOCAL_TZ isn't reaching the reply). Series answers must not recite all 12 buckets when 2 sentences answer the question (communication axis).",
+  "cases": [
+    {
+      "id": "S1.1",
+      "prompt": "What hour of the day do I text the most?",
+      "expect": {"tools": [{"name": "get_activity_patterns"}]},
+      "gt": {"recipe": "activity_argmax", "params": {"axis": "hour"}},
+      "probe": null,
+      "grader_notes": "argmax hour of heatmap (LOCAL_TZ); reply names that hour",
+      "quality_watch": "Must be the LOCAL_TZ argmax: grade accuracy 0 if the reply matches the UTC argmax (stored in GT raw as utc_top_hour) instead of the local one -- that means LOCAL_TZ isn't reaching the reply."
+    },
+    {
+      "id": "S1.2",
+      "prompt": "What's the busiest day of the week for me and <TOP1>?",
+      "expect": {"tools": [{"name": "get_activity_patterns", "args_contains": {"_scope": "<TOP1>"}}]},
+      "gt": {"recipe": "activity_argmax", "params": {"axis": "weekday", "scope": "<TOP1>"}},
+      "probe": null,
+      "grader_notes": "argmax weekday of scoped heatmap",
+      "quality_watch": null
+    },
+    {
+      "id": "S1.3",
+      "prompt": "How many texts did <TOP1> and I exchange each month of <YEAR>?",
+      "expect": {"tools": [{"name": "get_activity_patterns", "args_contains": {"_scope": "<TOP1>", "granularity": "month", "_date_year": "<YEAR>"}}]},
+      "gt": {"recipe": "volume_series", "params": {"scope": "<TOP1>", "year": "<YEAR>"}},
+      "probe": null,
+      "grader_notes": "volume_series for <YEAR>; spot-check 3 months exactly; sent/received split preserved",
+      "quality_watch": "Must not recite all 12 buckets when 2 sentences answer the question."
+    },
+    {
+      "id": "S1.4",
+      "prompt": "Am I texting more or less this year than last year?",
+      "expect": {"tools": [{"name": "get_activity_patterns", "args_contains": {"granularity": "year"}}]},
+      "gt": {"recipe": "year_compare", "params": {}},
+      "probe": null,
+      "grader_notes": "compare the two year buckets; reply gets the direction right and cites both totals",
+      "quality_watch": null
+    },
+    {
+      "id": "S1.5",
+      "prompt": "How much do I text after midnight, and who's on the other end?",
+      "expect": {"tools": [{"name": "get_activity_patterns"}]},
+      "gt": {"recipe": "late_night", "params": {}},
+      "probe": null,
+      "grader_notes": "late_night share + top_contacts leaderboard; named contact = GT #1",
+      "quality_watch": null
+    },
+    {
+      "id": "S1.6",
+      "prompt": "What's the longest streak of consecutive days <TOP1> and I have talked?",
+      "expect": {"tools": [{"name": "get_activity_patterns", "args_contains": {"_scope": "<TOP1>"}}]},
+      "gt": {"recipe": "streaks", "params": {"scope": "<TOP1>"}},
+      "probe": null,
+      "grader_notes": "streak length + dates match",
+      "quality_watch": null
+    },
+    {
+      "id": "S1.7",
+      "prompt": "What was my single busiest texting day ever?",
+      "expect": {"tools": [{"name": "get_activity_patterns"}]},
+      "gt": {"recipe": "busiest_day", "params": {}},
+      "probe": null,
+      "grader_notes": "GT top day (date + count)",
+      "quality_watch": null
+    },
+    {
+      "id": "S1.8",
+      "prompt": "Did <SPARSE> and I text much in <YEAR>?",
+      "expect": {"tools": [{"name": "get_activity_patterns", "alternates": ["get_chat_summary_stats"], "args_contains": {"_scope": "<SPARSE>", "_date_year": "<YEAR>"}}]},
+      "gt": {"recipe": "message_count", "params": {"scope": "<SPARSE>", "year": "<YEAR>"}},
+      "probe": null,
+      "grader_notes": "small GT count; reply gives the number and honestly frames it as light traffic",
+      "quality_watch": null
+    }
+  ]
+}

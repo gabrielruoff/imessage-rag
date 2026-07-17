@@ -1,3 +1,7 @@
 
 # results of eval/fast_eval.sh runs
 results/
+# evalkit generated artifacts carry real names/messages -- never commit
+analytics_eval_manifest.json
+analytics_eval_manifest.*.json
+prompts-analytics.txt

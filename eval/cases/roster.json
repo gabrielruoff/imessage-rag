@@ -1,0 +1,13 @@
+{
+  "placeholders": {
+    "TOP1": {"kind": "contact", "definition": "#1 1:1 contact by lifetime message count"},
+    "TOP2": {"kind": "contact", "definition": "#2 1:1 contact by lifetime message count"},
+    "SPARSE": {"kind": "contact", "definition": "a real contact with 30-100 lifetime messages"},
+    "GROUP": {"kind": "group_chat", "definition": "busiest group chat with >= 4 participants"},
+    "PHRASE_HI": {"kind": "string", "definition": ">= 200 lifetime FTS hits, usage visibly changed across years"},
+    "PHRASE_LO": {"kind": "string", "definition": "a phrase with 1-5 lifetime hits"},
+    "TERM": {"kind": "string", "definition": "top-lift dyad_terms row for TOP1's chat"},
+    "NOBODY": {"kind": "string", "definition": "plausible full name matching no contact"},
+    "YEAR": {"kind": "int", "definition": "most recent full calendar year in the corpus"}
+  }
+}

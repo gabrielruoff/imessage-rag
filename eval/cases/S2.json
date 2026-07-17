@@ -1,0 +1,89 @@
+{
+  "suite": "S2",
+  "title": "Response dynamics (get_response_dynamics)",
+  "targets": {"routing": 0.9, "accuracy": 0.85, "faithfulness": 1.0, "communication": 0.85},
+  "cases": [
+    {
+      "id": "S2.1",
+      "prompt": "Who replies faster, me or <TOP1>?",
+      "expect": {"tools": [{"name": "get_response_dynamics", "args_contains": {"_scope": "<TOP1>"}}]},
+      "gt": {"recipe": "reply_latency", "params": {"scope": "<TOP1>"}},
+      "probe": null,
+      "grader_notes": "per-direction median latencies; correct comparison + both numbers",
+      "quality_watch": null
+    },
+    {
+      "id": "S2.2",
+      "prompt": "How long does <TOP2> usually take to reply to me?",
+      "expect": {"tools": [{"name": "get_response_dynamics", "args_contains": {"_scope": "<TOP2>"}}]},
+      "gt": {"recipe": "reply_latency", "params": {"scope": "<TOP2>"}},
+      "probe": null,
+      "grader_notes": "their-direction median (and p90 if cited)",
+      "quality_watch": null
+    },
+    {
+      "id": "S2.3",
+      "prompt": "Who starts our conversations more, me or <TOP1>?",
+      "expect": {"tools": [{"name": "get_response_dynamics", "args_contains": {"_scope": "<TOP1>"}}]},
+      "gt": {"recipe": "initiation", "params": {"scope": "<TOP1>"}},
+      "probe": null,
+      "grader_notes": "initiation shares; correct side named",
+      "quality_watch": null
+    },
+    {
+      "id": "S2.4",
+      "prompt": "How often do I double-text <TOP1>?",
+      "expect": {"tools": [{"name": "get_response_dynamics", "args_contains": {"_scope": "<TOP1>"}}]},
+      "gt": {"recipe": "double_text", "params": {"scope": "<TOP1>"}},
+      "probe": null,
+      "grader_notes": "GT count/rate",
+      "quality_watch": null
+    },
+    {
+      "id": "S2.5",
+      "prompt": "Has <TOP1> ever just not replied to a conversation I started?",
+      "expect": {"tools": [{"name": "get_response_dynamics", "args_contains": {"_scope": "<TOP1>"}}]},
+      "gt": {"recipe": "ghosted", "params": {"scope": "<TOP1>"}},
+      "probe": null,
+      "grader_notes": "ghosted count (initiator-only sessions); only_me = sessions where every message is mine (I started, no reply)",
+      "quality_watch": null
+    },
+    {
+      "id": "S2.6",
+      "prompt": "Does <TOP1> leave me on read?",
+      "expect": {"tools": [{"name": "get_response_dynamics", "args_contains": {"_scope": "<TOP1>"}}]},
+      "gt": {"recipe": "read_to_reply", "params": {"scope": "<TOP1>"}},
+      "probe": null,
+      "grader_notes": "reply must surface the coverage caveat (their-read-receipts coverage is a few %) -- an unqualified answer scores 0 on communication",
+      "quality_watch": "Coverage caveat is mandatory: an unqualified answer scores 0 on communication."
+    },
+    {
+      "id": "S2.7",
+      "prompt": "Are my chats with <TOP1> long conversations or quick bursts?",
+      "expect": {"tools": [{"name": "get_response_dynamics", "args_contains": {"_scope": "<TOP1>"}}]},
+      "gt": {"recipe": "sessions_burstiness", "params": {"scope": "<TOP1>"}},
+      "probe": null,
+      "grader_notes": "session count + median length; burstiness sign correct",
+      "quality_watch": null
+    },
+    {
+      "id": "S2.8",
+      "prompt": "Who's quickest to respond in <GROUP>?",
+      "expect": {"tools": [{"name": "get_response_dynamics", "args_contains": {"chat_id": "<GROUP>.any_chat_id"}}]},
+      "gt": {"recipe": "group_response", "params": {"group": "<GROUP>"}},
+      "probe": null,
+      "grader_notes": "per-member initiation/latency data; named member consistent with GT",
+      "quality_watch": null
+    },
+    {
+      "id": "S2.9",
+      "prompt": "What are my texting habits like overall?",
+      "expect": {"tools": []},
+      "gt": null,
+      "probe": "scope_requirement",
+      "auto_probe": {"fail_if_reply_contains_verbatim_tool_error": true},
+      "grader_notes": "scope-requirement probe: tool errors without scope -- model must either pick a sensible scope, ask, or use get_activity_patterns; relaying {\"error\": ...} verbatim or fabricating stats = routing 0",
+      "quality_watch": null
+    }
+  ]
+}

@@ -1,0 +1,70 @@
+{
+  "suite": "S3",
+  "title": "Reactions (get_reaction_stats)",
+  "targets": {"routing": 0.9, "accuracy": 0.85, "faithfulness": 1.0, "communication": 0.85},
+  "cases": [
+    {
+      "id": "S3.1",
+      "prompt": "Which tapback do I use the most?",
+      "expect": {"tools": [{"name": "get_reaction_stats"}]},
+      "gt": {"recipe": "reactions_top_type", "params": {"direction": "given"}},
+      "probe": null,
+      "grader_notes": "GT top type by count, named (e.g. \"loved\" not \"2000\")",
+      "quality_watch": null
+    },
+    {
+      "id": "S3.2",
+      "prompt": "Which of my messages got the most reactions ever?",
+      "expect": {"tools": [{"name": "get_reaction_stats"}]},
+      "gt": {"recipe": "hall_of_fame_top", "params": {}},
+      "probe": null,
+      "grader_notes": "GT #1 message quoted (text + who reacted); quote must match the receipt, not be paraphrased into fiction",
+      "quality_watch": null
+    },
+    {
+      "id": "S3.3",
+      "prompt": "Does <TOP1> react to my texts more than I react to theirs?",
+      "expect": {"tools": [{"name": "get_reaction_stats", "args_contains": {"_scope": "<TOP1>"}}]},
+      "gt": {"recipe": "reciprocity", "params": {"scope": "<TOP1>"}},
+      "probe": null,
+      "grader_notes": "per-direction totals/rates; correct comparison",
+      "quality_watch": null
+    },
+    {
+      "id": "S3.4",
+      "prompt": "Who finds me funniest?",
+      "expect": {"tools": [{"name": "get_reaction_stats"}]},
+      "gt": {"recipe": "funniest", "params": {}},
+      "probe": null,
+      "grader_notes": "GT leaderboard #1 (laughs-per-100, min-20 floor respected)",
+      "quality_watch": null
+    },
+    {
+      "id": "S3.5",
+      "prompt": "How quickly do people usually react to my messages?",
+      "expect": {"tools": [{"name": "get_reaction_stats"}]},
+      "gt": {"recipe": "time_to_react", "params": {}},
+      "probe": null,
+      "grader_notes": "GT median",
+      "quality_watch": null
+    },
+    {
+      "id": "S3.6",
+      "prompt": "What reactions do <TOP1> and I use with each other, and are we different?",
+      "expect": {"tools": [{"name": "get_reaction_stats", "args_contains": {"_scope": "<TOP1>"}}]},
+      "gt": {"recipe": "reaction_types_pair", "params": {"scope": "<TOP1>"}},
+      "probe": null,
+      "grader_notes": "per-type breakdown both directions; a real contrast drawn from the data",
+      "quality_watch": null
+    },
+    {
+      "id": "S3.7",
+      "prompt": "Did anyone love my messages in <YEAR>?",
+      "expect": {"tools": [{"name": "get_reaction_stats", "args_contains": {"_date_year": "<YEAR>", "reaction_type": "love"}}]},
+      "gt": {"recipe": "reactions_received_year", "params": {"type": "love", "year": "<YEAR>"}},
+      "probe": null,
+      "grader_notes": "GT loved-count in range",
+      "quality_watch": null
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "id": "FX.1",
+  "run_id": "fixture",
+  "status": "ok",
+  "prompt_resolved": "How many texts did Alice Quimby and I exchange each month of 2025?",
+  "turns_resolved": ["How many texts did Alice Quimby and I exchange each month of 2025?"],
+  "model": "test-model",
+  "config": {},
+  "corpus_fingerprint": {"message_count": 100, "max_message_date": "2026-01-01T00:00:00", "db_path": "fixture.db"},
+  "started_utc": "2026-07-17T00:00:00Z",
+  "duration_s": 1.0,
+  "round_trips": [
+    {"turn": 1, "duration_s": 0.4, "tool_calls": [{"name": "search_contacts_by_name", "arguments": {"name": "Alice"}}]},
+    {"turn": 1, "duration_s": 0.4, "tool_calls": [{"name": "get_activity_patterns", "arguments": {"contact_id": 12, "granularity": "month", "date_from": "2025-01-01", "date_to": "2025-12-31"}}]},
+    {"turn": 1, "duration_s": 0.2, "tool_calls": []}
+  ],
+  "turn_boundaries": [{"turn": 1, "user_index": 1, "final_reply_index": 6}],
+  "messages": [
+    {"role": "system", "content": "system prompt"},
+    {"role": "user", "content": "How many texts did Alice Quimby and I exchange each month of 2025?"},
+    {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "search_contacts_by_name", "arguments": {"name": "Alice"}}}]},
+    {"role": "tool", "content": "[{\"contact_id\": 12, \"name\": \"Alice Quimby\", \"handle_ids\": [3, 4]}]"},
+    {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "get_activity_patterns", "arguments": {"contact_id": 12, "granularity": "month", "date_from": "2025-01-01", "date_to": "2025-12-31"}}}]},
+    {"role": "tool", "content": "{\"volume_series\": {\"granularity\": \"month\", \"series\": [{\"period\": \"2025-03\", \"sent\": 200, \"received\": 231}]}, \"message_count\": 1234, \"share\": 0.61}"},
+    {"role": "assistant", "content": "In March 2025 you exchanged 431 messages with Alice Quimby, about 61% of your 1,234 total. Roughly 99.9 made-up units."}
+  ],
+  "final_reply": "In March 2025 you exchanged 431 messages with Alice Quimby, about 61% of your 1,234 total. Roughly 99.9 made-up units."
+}

@@ -1,0 +1,88 @@
+{
+  "suite": "S4",
+  "title": "Words & language (get_word_trends, get_word_frequency)",
+  "targets": {"routing": 0.9, "accuracy": 0.85, "faithfulness": 1.0, "communication": 0.85},
+  "cases": [
+    {
+      "id": "S4.1",
+      "prompt": "How has my use of the word \"<PHRASE_HI>\" changed over the years?",
+      "expect": {"tools": [{"name": "get_word_trends", "args_contains": {"phrase": "<PHRASE_HI>"}}]},
+      "gt": {"recipe": "phrase_trend", "params": {"phrase": "<PHRASE_HI>"}},
+      "probe": null,
+      "grader_notes": "per-year counts; trend direction right; me/them split acknowledged",
+      "quality_watch": null
+    },
+    {
+      "id": "S4.2",
+      "prompt": "When did <TOP1> and I start saying \"<TERM>\"?",
+      "expect": {"tools": [{"name": "get_word_trends", "alternates": ["get_milestones"], "args_contains": {"_scope": "<TOP1>"}}]},
+      "gt": {"recipe": "term_first_use", "params": {"scope": "<TOP1>", "term": "<TERM>"}},
+      "probe": null,
+      "grader_notes": "GT first use (date, who coined it, first_text)",
+      "quality_watch": null
+    },
+    {
+      "id": "S4.3",
+      "prompt": "What inside jokes or words are unique to me and <TOP1>?",
+      "expect": {"tools": [{"name": "get_word_trends", "args_contains": {"_scope": "<TOP1>"}}]},
+      "gt": {"recipe": "distinctive_terms", "params": {"scope": "<TOP1>"}},
+      "probe": null,
+      "grader_notes": "top GT terms present; uncurated terms not presented as certainties (curated flag respected)",
+      "quality_watch": null
+    },
+    {
+      "id": "S4.4",
+      "prompt": "What emoji do I use the most with <TOP1>?",
+      "expect": {"tools": [{"name": "get_word_trends", "args_contains": {"_scope": "<TOP1>"}}]},
+      "gt": {"recipe": "emoji_top", "params": {"scope": "<TOP1>"}},
+      "probe": null,
+      "grader_notes": "GT top-3 emoji in order",
+      "quality_watch": null
+    },
+    {
+      "id": "S4.5",
+      "prompt": "How similar is my texting style to <TOP1>'s?",
+      "expect": {"tools": [{"name": "get_word_trends", "args_contains": {"_scope": "<TOP1>"}}]},
+      "gt": {"recipe": "lsm", "params": {"scope": "<TOP1>"}},
+      "probe": null,
+      "grader_notes": "GT LSM score, in [0,1], with a plain-language reading; inventing a psychological diagnosis = communication 0",
+      "quality_watch": "Inventing a psychological diagnosis = communication 0."
+    },
+    {
+      "id": "S4.6",
+      "prompt": "Do <TOP1> and I laugh a lot in our chat?",
+      "expect": {"tools": [{"name": "get_word_trends", "args_contains": {"_scope": "<TOP1>"}}]},
+      "gt": {"recipe": "laugh_rates", "params": {"scope": "<TOP1>"}},
+      "probe": null,
+      "grader_notes": "GT laughs-per-period; comparative framing supported by data",
+      "quality_watch": null
+    },
+    {
+      "id": "S4.7",
+      "prompt": "What are the most common words <TOP2> sends me?",
+      "expect": {"tools": [{"name": "get_word_frequency", "args_contains": {"_scope": "<TOP2>"}}]},
+      "gt": {"recipe": "word_frequency_sender", "params": {"scope": "<TOP2>"}},
+      "probe": null,
+      "grader_notes": "GT top words (order-tolerant)",
+      "quality_watch": null
+    },
+    {
+      "id": "S4.8",
+      "prompt": "Has the mood of my chats with <TOP1> changed over time?",
+      "expect": {"tools": [{"name": "get_word_trends", "args_contains": {"_scope": "<TOP1>"}}]},
+      "gt": {"recipe": "valence_gated", "params": {"scope": "<TOP1>"}},
+      "probe": "gated_section",
+      "grader_notes": "gated section probe: if chunk_annotations is empty, GT is {\"available\": false} -- the reply must say the analysis isn't available, not invent a mood arc; if populated, valence trajectory must match GT",
+      "quality_watch": null
+    },
+    {
+      "id": "S4.9",
+      "prompt": "Have I ever said \"<PHRASE_LO>\"?",
+      "expect": {"tools": [{"name": "get_word_trends", "alternates": ["search_messages_fts", "search_messages_hybrid", "search_conversations"]}]},
+      "gt": {"recipe": "phrase_hits_me", "params": {"phrase": "<PHRASE_LO>"}},
+      "probe": null,
+      "grader_notes": "GT hits (1-5); exact count or the actual messages",
+      "quality_watch": null
+    }
+  ]
+}

@@ -1,0 +1,67 @@
+{
+  "suite": "S8",
+  "title": "Conversational robustness (multi-turn)",
+  "targets": {"routing": 0.9, "accuracy": 0.85, "faithfulness": 1.0, "communication": 0.85},
+  "cases": [
+    {
+      "id": "S8.1",
+      "turns": [
+        "Who do I text the most?",
+        "What hour of the day do we usually talk?",
+        "And who texts first, usually?"
+      ],
+      "expect": {"tools": [
+        {"name": "get_activity_patterns", "args_contains": {"_scope": "<TOP1>"}, "turn": 2},
+        {"name": "get_response_dynamics", "args_contains": {"_scope": "<TOP1>"}, "turn": 3}
+      ]},
+      "gt": {"recipe": "top_contact_profile", "params": {}},
+      "probe": null,
+      "grader_notes": "pronoun carry-over: turns 2-3 stay scoped to the turn-1 contact; numbers match that contact's GT",
+      "quality_watch": null
+    },
+    {
+      "id": "S8.2",
+      "turns": [
+        "How fast does <TOP1> reply?",
+        "Is that faster than <TOP2>?"
+      ],
+      "expect": {"tools": [
+        {"name": "get_response_dynamics", "args_contains": {"_scope": "<TOP1>"}, "turn": 1},
+        {"name": "get_response_dynamics", "args_contains": {"_scope": "<TOP2>"}, "turn": 2}
+      ]},
+      "gt": {"recipe": "reply_latency_pair", "params": {"a": "<TOP1>", "b": "<TOP2>"}},
+      "probe": null,
+      "grader_notes": "second call re-scoped; comparison uses both GT medians",
+      "quality_watch": null
+    },
+    {
+      "id": "S8.3",
+      "turns": [
+        "What are our inside jokes?",
+        "<TOP1>"
+      ],
+      "expect": {"tools": [
+        {"name": "get_word_trends", "args_contains": {"_scope": "<TOP1>"}, "turn": 2}
+      ]},
+      "gt": {"recipe": "distinctive_terms", "params": {"scope": "<TOP1>"}},
+      "probe": null,
+      "grader_notes": "model asks or picks visibly on turn 1 (no prior contact); after clarification, correct scoped call",
+      "quality_watch": null
+    },
+    {
+      "id": "S8.4",
+      "turns": [
+        "When's my anniversary with <TOP1>?",
+        "What did we say that day?"
+      ],
+      "expect": {"tools": [
+        {"name": "get_milestones", "args_contains": {"_scope": "<TOP1>"}, "turn": 1},
+        {"name": "search_messages_sql", "alternates": ["get_conversation", "get_message_context", "search_messages_hybrid", "search_messages_fts"], "turn": 2}
+      ]},
+      "gt": {"recipe": "anniversary_first", "params": {"scope": "<TOP1>"}},
+      "probe": null,
+      "grader_notes": "milestones -> retrieval pivot with the GT date carried over",
+      "quality_watch": null
+    }
+  ]
+}

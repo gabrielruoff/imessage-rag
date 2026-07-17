@@ -1,0 +1,70 @@
+{
+  "suite": "S6",
+  "title": "Group dynamics (get_group_dynamics)",
+  "targets": {"routing": 0.9, "accuracy": 0.85, "faithfulness": 1.0, "communication": 0.85},
+  "cases": [
+    {
+      "id": "S6.1",
+      "prompt": "Who carries <GROUP>?",
+      "expect": {"tools": [{"name": "get_group_dynamics", "args_contains": {"chat_id": "<GROUP>.any_chat_id"}}]},
+      "gt": {"recipe": "group_dynamics", "params": {"group": "<GROUP>", "section": "members"}},
+      "probe": null,
+      "grader_notes": "GT top member by share, with share approximately GT",
+      "quality_watch": null
+    },
+    {
+      "id": "S6.2",
+      "prompt": "Who lurks in <GROUP>?",
+      "expect": {"tools": [{"name": "get_group_dynamics", "args_contains": {"chat_id": "<GROUP>.any_chat_id"}}]},
+      "gt": {"recipe": "group_dynamics", "params": {"group": "<GROUP>", "section": "lurkers"}},
+      "probe": null,
+      "grader_notes": "GT lurker list",
+      "quality_watch": null
+    },
+    {
+      "id": "S6.3",
+      "prompt": "Is <GROUP> dominated by a few people or balanced?",
+      "expect": {"tools": [{"name": "get_group_dynamics", "args_contains": {"chat_id": "<GROUP>.any_chat_id"}}]},
+      "gt": {"recipe": "group_dynamics", "params": {"group": "<GROUP>", "section": "gini"}},
+      "probe": null,
+      "grader_notes": "reading consistent with GT gini (cites the members data, not vibes)",
+      "quality_watch": null
+    },
+    {
+      "id": "S6.4",
+      "prompt": "Who starts the conversations in <GROUP>?",
+      "expect": {"tools": [{"name": "get_group_dynamics", "args_contains": {"chat_id": "<GROUP>.any_chat_id"}}]},
+      "gt": {"recipe": "group_dynamics", "params": {"group": "<GROUP>", "section": "igniters"}},
+      "probe": null,
+      "grader_notes": "GT top igniter",
+      "quality_watch": null
+    },
+    {
+      "id": "S6.5",
+      "prompt": "Who talks to whom the most inside <GROUP>?",
+      "expect": {"tools": [{"name": "get_group_dynamics", "args_contains": {"chat_id": "<GROUP>.any_chat_id"}}]},
+      "gt": {"recipe": "group_dynamics", "params": {"group": "<GROUP>", "section": "adjacency"}},
+      "probe": null,
+      "grader_notes": "GT top pair",
+      "quality_watch": null
+    },
+    {
+      "id": "S6.6",
+      "prompt": "Whose texting style stands out most in <GROUP>?",
+      "expect": {"tools": [{"name": "get_group_dynamics", "args_contains": {"chat_id": "<GROUP>.any_chat_id"}}]},
+      "gt": {"recipe": "group_dynamics", "params": {"group": "<GROUP>", "section": "group_lsm"}},
+      "probe": null,
+      "grader_notes": "GT min-LSM member",
+      "quality_watch": null
+    },
+    {
+      "id": "S6.7",
+      "prompt": "What are the group dynamics of my chat with <TOP1>?",
+      "expect": {"tools": []},
+      "gt": null,
+      "probe": "error_path",
+      "grader_notes": "error-path probe: get_group_dynamics returns an error for non-group chats; model must recover (explain, or pivot to get_chat_participant_stats / get_response_dynamics), never fabricate group stats for a dyad",
+      "quality_watch": null
+    }
+  ]
+}
