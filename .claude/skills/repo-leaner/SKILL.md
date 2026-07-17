@@ -140,17 +140,19 @@ branch), set up its environment, edit in the guide's safe order, keep a running
 changelog, fix obvious breakage as you go, and run the full verification once at
 the end, inside the worktree. Never commit, push, merge, or PR.
 
-Reply with: the worktree path and branch, the verification results (green/red,
-with output), your changelog, and `git diff --stat`. If verification is red or
+Reply with: the worktree path and branch, the base branch and base worktree
+path the new worktree was created from (per the guide's pre-flight detection),
+the verification results (green/red, with output), your changelog, and
+`git diff --stat`. If verification is red or
 you hit one of the guide's stop conditions, report exactly what failed — never
 describe a red run as done.
 ```
 
-**B5 — Relay (orchestrator).** Report the outcome to the user per the implementation guide: green → changelog, `git diff --stat`, worktree path and branch; red → never call it done. Never commit, push, merge, or PR unless the user asks.
+**B5 — Relay (orchestrator).** Report the outcome to the user per the implementation guide: green → changelog, `git diff --stat`, worktree path and branch, and the recorded base branch/base worktree the fix branch forks from; red → never call it done. On green, **offer** to commit, push, and open a PR against the recorded base branch — and only after an explicit yes, from inside the fix worktree, commit the changes, push the branch, and run `gh pr create --base <recorded base branch>`. Never commit, push, merge, or PR without that explicit yes.
 
 ### "Done" for Phase B
 
-The branch holds behavior-preserving fixes for every above-informational finding you committed to, the full verification passes, and the user has a changelog plus reproducible commands. Anything you couldn't safely fix is listed explicitly.
+The branch holds behavior-preserving fixes for every above-informational finding you committed to, the full verification passes, and the user has a changelog plus reproducible commands — including the base branch a PR from the fix branch should target. Anything you couldn't safely fix is listed explicitly.
 
 ---
 
