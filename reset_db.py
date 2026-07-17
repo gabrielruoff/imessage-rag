@@ -8,6 +8,7 @@ touch chat.db / chat_snapshot.db. Run ingest.py afterward to repopulate.
 
 import argparse
 import sqlite3
+import sys
 
 from config import TARGET_DB as DB_PATH
 from db import load_vec_extension
@@ -97,4 +98,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (EOFError, KeyboardInterrupt):
+        print("\nInterrupted, exiting.")
+        sys.exit(130)

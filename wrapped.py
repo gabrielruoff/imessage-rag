@@ -599,4 +599,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except (EOFError, KeyboardInterrupt):
+        print("\nInterrupted, exiting.")
+        sys.exit(130)

@@ -12,6 +12,7 @@ import argparse
 import json
 import random
 import sqlite3
+import sys
 from array import array
 from collections import Counter
 from math import sqrt
@@ -307,4 +308,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nInterrupted, exiting.")
+        sys.exit(130)

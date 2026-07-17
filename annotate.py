@@ -12,6 +12,7 @@ Usage: annotate.py [--all | --top-dyads N] [--terms] [--limit N]
 import argparse
 import json
 import sqlite3
+import sys
 
 import ollama
 import progress
@@ -350,4 +351,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nInterrupted, exiting.")
+        sys.exit(130)
