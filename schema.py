@@ -7,6 +7,8 @@ create_schema at the start of every pipeline run and re-exports it, so
 
 import sqlite3
 
+from db import strip_reaction_guid_prefix
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS chats (
     id INTEGER PRIMARY KEY,
@@ -166,15 +168,17 @@ def create_schema(con: sqlite3.Connection):
     # Reactions used to be stored with chat.db's raw associated_message_guid,
     # which carries a message-part prefix ('p:0/<guid>' -- tapback on part N
     # -- or 'bp:<guid>' for balloon parts) that messages.guid never has, so
-    # reaction -> message joins missed ~99% of rows. Normalize in place;
-    # idempotent, and new rows are stripped at insert time
-    # (ingest.strip_reaction_guid_prefix).
-    con.execute("""
-        UPDATE reactions SET target_message_guid =
-            CASE
-                WHEN target_message_guid LIKE 'bp:%' THEN substr(target_message_guid, 4)
-                ELSE substr(target_message_guid, instr(target_message_guid, '/') + 1)
-            END
-        WHERE target_message_guid LIKE 'p:%/%' OR target_message_guid LIKE 'bp:%'
-    """)
+    # reaction -> message joins missed ~99% of rows. Normalize in place with
+    # the exact function ingest applies at insert time (the SQL LIKEs are
+    # only a loose prefilter; the regex decides). Idempotent: a normalized
+    # guid matches no prefix.
+    prefixed = con.execute(
+        "SELECT id, target_message_guid FROM reactions "
+        "WHERE target_message_guid LIKE 'p:%/%' OR target_message_guid LIKE 'bp:%'"
+    ).fetchall()
+    con.executemany(
+        "UPDATE reactions SET target_message_guid = ? WHERE id = ?",
+        [(stripped, rowid) for rowid, guid in prefixed
+         if (stripped := strip_reaction_guid_prefix(guid)) != guid],
+    )
     con.commit()

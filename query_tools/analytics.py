@@ -33,12 +33,20 @@ from ._shared import (
     _append_id_filters,
     _as_id_list,
     _connect,
+    _envelope,
     _id_filter_clause,
     _normalize_date_bound,
     _resolve_chat_scope,
     _resolve_scope,
     _truncate_text_field,
 )
+
+# Every aggregate here counts only real conversation messages: legacy emote
+# rows and system rows (group renames, member joins, ...) must never claim
+# an initiation, break a silence, pad a histogram bucket, or count as a
+# participant's sent message. (Belt and braces -- ingest already splits
+# tapbacks into reactions.)
+_REAL_MESSAGE_CLAUSES = ("COALESCE(m.is_emote, 0) = 0", "COALESCE(m.item_type, 0) = 0")
 
 
 def _date_clauses(clauses, params, date_from, date_to, column="m.date"):

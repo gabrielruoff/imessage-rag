@@ -4,6 +4,7 @@ the ISO-date -> day-number conversion used by chunk_vectors' metadata
 columns, and the ingest_state key/value accessors."""
 
 import datetime
+import re
 
 import sqlite_vec
 
@@ -23,6 +24,18 @@ CONTACT_LABEL_SQL = (
     "NULLIF(TRIM(COALESCE(c.first_name, '') || ' ' || COALESCE(c.last_name, '')), ''), "
     "h.handle_identifier)"
 )
+
+
+# chat.db's associated_message_guid points at a message *part*
+# ('p:0/<guid>', 'bp:<guid>'); messages.guid is always bare. Reactions are
+# stored with the prefix stripped -- at insert time by ingest, and for old
+# rows by create_schema's migration -- so they join messages.guid. Both
+# sites use this one function so they can never disagree.
+_REACTION_GUID_PREFIX = re.compile(r"^(?:p:\d+/|bp:)")
+
+
+def strip_reaction_guid_prefix(guid):
+    return _REACTION_GUID_PREFIX.sub("", guid) if guid else guid
 
 
 # Apple tapback type codes as stored in reactions.associated_message_type.

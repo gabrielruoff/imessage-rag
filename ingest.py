@@ -23,7 +23,6 @@ Usage:
 import argparse
 import datetime
 import http.client
-import re
 import shutil
 import sqlite3
 import sys
@@ -31,7 +30,7 @@ from pathlib import Path
 
 from chunking import build_chunks, build_vec_table, embed_chunks
 from config import ADDRESS_BOOK_PATH, SNAPSHOT_DB, SOURCE_DB, TARGET_DB
-from db import get_state, load_vec_extension, set_state
+from db import get_state, load_vec_extension, set_state, strip_reaction_guid_prefix
 # embed_texts is otherwise unused here, but it must stay an attribute of
 # this module: chunking.embed_chunks resolves `ingest.embed_texts` at call
 # time, keeping it the one patchable seam (tests stub it here).
@@ -291,16 +290,6 @@ def ingest_handles(src, tgt, contacts, handle_to_contact):
             (rowid, handle_identifier, contact_id, service),
         )
     print(f"Ingested {len(rows)} handles ({matched} matched to a contact)")
-
-
-# chat.db's associated_message_guid points at a message *part*
-# ('p:0/<guid>', 'bp:<guid>'); messages.guid is always bare. Strip the
-# prefix at insert so reactions join to their target message by guid.
-_REACTION_GUID_PREFIX = re.compile(r"^(?:p:\d+/|bp:)")
-
-
-def strip_reaction_guid_prefix(guid):
-    return _REACTION_GUID_PREFIX.sub("", guid) if guid else guid
 
 
 def ingest_messages_and_reactions(src, tgt, since_rowid=0, allowed_chat_ids=None):

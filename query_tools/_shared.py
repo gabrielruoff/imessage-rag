@@ -98,6 +98,19 @@ def _resolve_contact_handle_ids(con, contact_ids):
     return [r[0] for r in rows]
 
 
+def _envelope(rows, total, order):
+    """Result envelope for the row-capped ranking/search tools: makes
+    truncation visible to the model so a capped page is never mistaken for
+    the whole population (see docs/eval_report_2026-07-16.md)."""
+    return {
+        "rows": rows,
+        "total_matching": total,
+        "returned": len(rows),
+        "order": order,
+        "truncated": total > len(rows),
+    }
+
+
 def _id_filter_clause(column, values):
     """Build an `column IN (?,...)` fragment + params for a normalized id
     list, or ("", []) if values is None."""

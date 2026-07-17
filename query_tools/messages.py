@@ -14,23 +14,11 @@ from ._shared import (
     _append_id_filters,
     _as_id_list,
     _connect,
+    _envelope,
     _normalize_date_bound,
     _resolve_scope,
     _truncate_text_field,
 )
-
-
-def _envelope(rows, total, order):
-    """Result envelope for the row-capped search tools: makes truncation
-    visible to the model so a 50-row page is never mistaken for the whole
-    population (see docs/eval_report_2026-07-16.md)."""
-    return {
-        "rows": rows,
-        "total_matching": total,
-        "returned": len(rows),
-        "order": order,
-        "truncated": total > len(rows),
-    }
 
 
 def search_messages_sql(chat_id=None, handle_id=None, contact_id=None, is_from_me=None,
