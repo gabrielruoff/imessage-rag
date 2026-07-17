@@ -33,7 +33,6 @@ from ._shared import (
     _append_id_filters,
     _as_id_list,
     _connect,
-    _envelope,
     _id_filter_clause,
     _normalize_date_bound,
     _resolve_chat_scope,
