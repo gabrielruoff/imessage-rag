@@ -68,6 +68,15 @@ EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "64"))  # texts per Ollama 
 # concurrent requests, matches Ollama's default OLLAMA_NUM_PARALLEL
 EMBED_MAX_WORKERS = int(os.getenv("EMBED_MAX_WORKERS", "4"))
 MAX_TOOL_ITERATIONS = int(os.getenv("MAX_TOOL_ITERATIONS", "20"))  # tool round-trips/turn
+# Silence gap (minutes) that ends a conversation for get_conversation_dynamics:
+# a message arriving after a longer gap counts as a new initiation, not a
+# response. Deliberately longer than CHUNK_GAP_MINUTES -- that one bounds
+# embedding sessions, this one defines "who texts first". Overridable per
+# call via the tool's gap_minutes argument.
+DYNAMICS_GAP_MINUTES = int(os.getenv("DYNAMICS_GAP_MINUTES", "180"))
+# Minimum gap (minutes) between two consecutive same-sender messages for the
+# second to count as a double-text rather than a multi-part message.
+DOUBLE_TEXT_MIN_MINUTES = int(os.getenv("DOUBLE_TEXT_MIN_MINUTES", "10"))
 # Hard cap on one tool result's JSON (chars) before it goes into the chat
 # context. Ollama sizes truncation per whole *message*: any single message
 # larger than the model's context window is silently dropped along with all

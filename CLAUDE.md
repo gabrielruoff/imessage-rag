@@ -17,6 +17,11 @@ Full design history, schema, rationale, and data forensics:
 - Chat CLI: `.venv/bin/python3 chat.py` (interactive REPL), or
   `chat.py -p "..."` for a one-shot answer (prints only the reply; exit 1 if
   Ollama is unreachable)
+- Eval sweep: `eval/fast_eval.sh eval/prompts-smoke.txt [-m model]` — runs a
+  prompts file (`id|prompt` lines) through `chat.py -p` sequentially with
+  reduced-context env defaults; transcripts land in `eval/results/`. Never
+  run eval prompts in parallel — Ollama serializes and it thrashes the KV
+  prefix cache.
 - Test: `.venv/bin/python3 -m unittest discover tests` (hermetic — no Ollama or real `chat.db`).
   NEVER run tests unless your changes touched files in `tests/` or the user
   directly asks — the suite is slow and hangs the terminal. When you do run
@@ -47,11 +52,15 @@ prefixes (`search_document: ` / `search_query: `) are applied by default and
 the embedding dimension is auto-detected at ingest time, so switching
 embedders is a `.env` change + `reset_db.py` + re-ingest.
 
-Module map: `query_tools/` holds the thirteen retrieval functions the LLM
+Module map: `query_tools/` holds the eighteen retrieval functions the LLM
 calls — `messages.py` (message-level SQL/FTS search, context expansion, full
 text, reactions), `chunks.py` (chunk-level semantic search, hybrid
 FTS+semantic fused with reciprocal-rank fusion, more-like-this, chunk → its
 messages), `directory.py` (summary stats; name/handle/chat resolution),
+`analytics.py` (single-call aggregates: conversation dynamics, activity
+histograms, reaction leaderboards, per-participant chat stats, word
+frequency — person scope means *that person's chats* for all of these except
+`get_word_frequency`, which scopes by sender),
 `_shared.py` (connection, result caps, date-bound and scope resolution), all
 re-exported from `__init__.py` so `import query_tools` is the only import
 callers need (`DB_PATH`/`embed_texts` are patchable package attributes,
@@ -79,6 +88,11 @@ messages(id, guid, chat_id, handle_id, is_from_me, text, decode_failed,
                                   -- dateless/system rows, or chunking pending)
 reactions(id, target_message_guid, chat_id, handle_id, is_from_me,
           associated_message_type, date)
+                                  -- target_message_guid is normalized: the
+                                  -- 'p:N/' / 'bp:' part prefix chat.db puts on
+                                  -- associated_message_guid is stripped at
+                                  -- ingest (and by an idempotent migration in
+                                  -- create_schema) so it joins messages.guid
 attachments(id, message_id, filename, mime_type, transfer_name)
 chunks(id, chat_id, first_message_id, last_message_id, first_date, last_date,
        n_messages, text)          -- conversation windows; id AUTOINCREMENT so a
@@ -94,7 +108,9 @@ chunk_vectors                     -- sqlite-vec vec0 table: chunk_id ->
 ## Gotchas (load-bearing)
 
 - `messages.date` strings are unlabeled UTC ISO; compare as plain strings and
-  never wrap the column in SQL date functions (kills `idx_messages_chat_date`).
+  never wrap the column in SQL date functions inside WHERE (kills
+  `idx_messages_chat_date`); `substr`/`strftime` bucket expressions are fine
+  in SELECT/GROUP BY over already-filtered rows (see `analytics.py`).
   Date bounds go through `query_tools._normalize_date_bound` (half-open upper
   bound, tz-aware input converted to UTC). Chunk date filters and the
   `first_day`/`last_day` metadata writer must both use `db.iso_to_day`.
@@ -129,7 +145,9 @@ chunk_vectors                     -- sqlite-vec vec0 table: chunk_id ->
 - Tool functions: id params accept a scalar or a list (`_as_id_list`); message
   `text` is truncated to `TEXT_PREVIEW_CHARS` (chunk previews to
   `CHUNK_PREVIEW_CHARS`), recoverable via `get_full_messages` /
-  `get_conversation`.
+  `get_conversation`. `search_messages_sql`/`search_messages_fts` return an
+  envelope (`rows`/`total_matching`/`returned`/`order`/`truncated`), not a
+  bare list, so the model can tell a capped sample from the population.
 - New tool = function in the right `query_tools/` module (re-export it from
   `__init__.py`) + schema in `tool_schemas.py` (same `name` as the function —
   `chat.py` derives its dispatch table from that) + a one-line entry in

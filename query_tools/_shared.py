@@ -48,7 +48,10 @@ MAX_CHATS_LIMIT = 50     # list_chats
 MAX_STATS_ROWS = 50      # get_chat_summary_stats group_by_chat=True
 MAX_ID_LIST = 50         # cap on chat_id/handle_id/contact_id/guid list params
 MAX_CONTEXT_MESSAGES = 25   # get_message_context before/after ceiling
-MAX_SCOPE_CHATS = 500       # cap on the person -> chats expansion for chunk search
+MAX_SCOPE_CHATS = 500       # cap on the person -> chats expansion (chunk + analytics tools)
+MAX_HISTOGRAM_ROWS = 200    # get_activity_histogram bucket rows
+MAX_SILENCES = 20           # get_conversation_dynamics top_silences ceiling
+MAX_WORD_FREQ_TOP = 100     # get_word_frequency `top` ceiling
 MAX_CHUNK_MESSAGES = 200    # get_conversation row ceiling
 HYBRID_POOL = 30            # per-arm candidate depth fed into RRF
 RRF_K = 60                  # standard reciprocal-rank-fusion constant
@@ -174,6 +177,39 @@ def _resolve_handle_filter(con, handle_id, contact_id):
     if contact_ids:
         handle_ids = list(handle_ids) + _resolve_contact_handle_ids(con, contact_ids)
     return handle_ids[:MAX_ID_LIST] or None
+
+
+def _resolve_chat_scope(con, chat_id, handle_id, contact_id):
+    """Resolve scope params into (chat_ids, empty) for chat-level tools.
+    Chunks and aggregate analytics cover whole chats, so handle_id/contact_id
+    scope to the chats that person participates in (an exact
+    chat_participants join); when chat and person params are both given, the
+    scopes intersect, matching the AND semantics of the message-level tools.
+    `empty` mirrors _resolve_scope: True when a scope was requested but
+    matched nothing."""
+    # chat_ids needs no emptiness check: a chat_id never resolves through a
+    # lookup, so a requested chat scope is always non-empty after
+    # normalization (and an explicit [] normalizes to "no filter").
+    chat_ids = _as_id_list(chat_id)
+    handle_requested = _scope_requested(handle_id, contact_id)
+    if handle_requested:
+        handle_ids = _resolve_handle_filter(con, handle_id, contact_id)
+        if not handle_ids:
+            return None, True
+        placeholders = ",".join("?" * len(handle_ids))
+        # ORDER BY makes the MAX_SCOPE_CHATS truncation deterministic
+        person_chats = [r[0] for r in con.execute(
+            f"SELECT DISTINCT chat_id FROM chat_participants "
+            f"WHERE handle_id IN ({placeholders}) ORDER BY chat_id", handle_ids,
+        ).fetchall()][:MAX_SCOPE_CHATS]
+        if chat_ids:
+            person_set = set(person_chats)
+            chat_ids = [c for c in chat_ids if c in person_set]
+        else:
+            chat_ids = person_chats
+        if not chat_ids:
+            return None, True
+    return chat_ids, False
 
 
 def _resolve_scope(con, chat_id, handle_id, contact_id):

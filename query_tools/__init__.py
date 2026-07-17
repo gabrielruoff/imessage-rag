@@ -18,17 +18,25 @@ Each returns a small list of dicts, meant to be fed back to the LLM as tool
 results -- never the whole table.
 
 Layout: messages.py (message-level tools), chunks.py (chunk/semantic/hybrid
-tools), directory.py (contact/chat resolution + stats), _shared.py (connection,
-caps, scope/date helpers). Every tool is re-exported here, so `import
-query_tools` stays the only import callers need -- add new tools to the right
-submodule and to __all__ below. DB_PATH and embed_texts are module attributes
-by contract: tests patch them on this package, and the internals resolve both
-through it at call time.
+tools), directory.py (contact/chat resolution + stats), analytics.py
+(aggregates: dynamics, histograms, reaction leaderboards, participant stats,
+word frequency), _shared.py (connection, caps, scope/date helpers). Every
+tool is re-exported here, so `import query_tools` stays the only import
+callers need -- add new tools to the right submodule and to __all__ below.
+DB_PATH and embed_texts are module attributes by contract: tests patch them
+on this package, and the internals resolve both through it at call time.
 """
 
 from embeddings import embed_texts
 
 from ._shared import DB_PATH, _date_bound_step, _normalize_date_bound
+from .analytics import (
+    get_activity_histogram,
+    get_chat_participant_stats,
+    get_conversation_dynamics,
+    get_top_reacted_messages,
+    get_word_frequency,
+)
 from .chunks import (
     find_similar_conversations,
     get_conversation,
@@ -53,11 +61,16 @@ __all__ = [
     "DB_PATH",
     "embed_texts",
     "find_similar_conversations",
+    "get_activity_histogram",
+    "get_chat_participant_stats",
     "get_chat_summary_stats",
     "get_conversation",
+    "get_conversation_dynamics",
     "get_full_messages",
     "get_message_context",
     "get_message_reactions",
+    "get_top_reacted_messages",
+    "get_word_frequency",
     "list_chats",
     "search_contact_by_handle",
     "search_contacts_by_name",

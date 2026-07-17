@@ -25,6 +25,32 @@ CONTACT_LABEL_SQL = (
 )
 
 
+# Apple tapback type codes as stored in reactions.associated_message_type.
+# 2000-2007 are tapbacks being added; 3000-3007 remove the corresponding
+# tapback. Other codes (2, 3, 1000, ...) are non-tapback associated messages;
+# counting queries filter to BETWEEN 2000 AND 2999 so removals and strays
+# never inflate reaction counts.
+TAPBACK_NAMES = {
+    2000: "love",
+    2001: "like",
+    2002: "dislike",
+    2003: "laugh",
+    2004: "emphasize",
+    2005: "question",
+    2006: "custom-emoji",
+    2007: "sticker",
+}
+
+
+def tapback_name(code):
+    """Human-readable name for a reactions.associated_message_type code."""
+    if code in TAPBACK_NAMES:
+        return TAPBACK_NAMES[code]
+    if code is not None and 3000 <= code <= 3007 and code - 1000 in TAPBACK_NAMES:
+        return "removed-" + TAPBACK_NAMES[code - 1000]
+    return f"unknown-{code}"
+
+
 def get_state(con, key, default=None):
     """Read one ingest_state value (last_message_rowid, embed_model, ...)."""
     row = con.execute("SELECT value FROM ingest_state WHERE key = ?", (key,)).fetchone()

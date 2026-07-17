@@ -32,7 +32,10 @@ TOOL_DEFINITIONS = [
                         "(get it from search_contacts_by_name). chat_id and "
                         "handle_id each accept a single id or a list of ids. Long "
                         "message text is truncated -- use get_full_messages(ids) "
-                        "for the complete content of specific messages.",
+                        "for the complete content of specific messages. Returns "
+                        "{rows, total_matching, returned, order, truncated}: rows "
+                        "holds only the newest `limit` matches -- when truncated "
+                        "is true it is a SAMPLE, never the whole population.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -53,7 +56,10 @@ TOOL_DEFINITIONS = [
                         "id or list each; contact_id covers every handle that "
                         "person owns). Long message text is truncated -- use "
                         "get_full_messages(ids) for the complete content of "
-                        "specific messages.",
+                        "specific messages. Returns {rows, total_matching, "
+                        "returned, order, truncated}: rows holds only the `limit` "
+                        "best-ranked hits -- when truncated is true it is a "
+                        "SAMPLE of the matches, not all of them.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -171,7 +177,10 @@ TOOL_DEFINITIONS = [
         "name": "get_chat_summary_stats",
         "description": "Get message counts, date range, attachment_count "
                         "(individual attachments -- a message with three photos "
-                        "counts three), and reaction_count. Scope with chat_id "
+                        "counts three), and reactions_sent_count (reactions SENT "
+                        "by whoever matches the filters -- NOT received; for "
+                        "reactions received use get_top_reacted_messages or "
+                        "get_chat_participant_stats). Scope with chat_id "
                         "(single id or list, aggregates across all of them), or "
                         "with handle_id/contact_id to get totals for one person "
                         "across every chat/handle they use (e.g. 'how many "
@@ -260,7 +269,9 @@ TOOL_DEFINITIONS = [
         "name": "get_message_reactions",
         "description": "List the reactions/tapbacks on one or more messages and "
                         "who reacted. Pass the `guid` (or a list of guids) from "
-                        "message search results.",
+                        "message search results. Each row carries a readable "
+                        "`reaction` name (love/like/laugh/...) beside the raw "
+                        "type code.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -289,6 +300,144 @@ TOOL_DEFINITIONS = [
                 },
             },
             "required": ["ids"],
+        },
+    },
+    {
+        "name": "get_conversation_dynamics",
+        "description": "Who-texts-first analytics, computed over the WHOLE "
+                        "conversation in one call: per-side message counts, "
+                        "initiation counts (first message after a silence longer "
+                        "than gap_minutes), median/p90 response times per side, "
+                        "double-text counts, and the longest silences with who "
+                        "broke each. THE tool for 'who texts first', 'longest "
+                        "we went without talking', 'do I double-text', 'who "
+                        "carries the conversation'. Requires a scope: chat_id "
+                        "(single or list -- pass every row of a split "
+                        "iMessage/SMS thread), or handle_id/contact_id, which "
+                        "covers that person's 1:1 chats only (group chats need "
+                        "an explicit chat_id).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "chat_id": _ID_OR_LIST_SCHEMA,
+                "handle_id": _ID_OR_LIST_SCHEMA,
+                "contact_id": _ID_OR_LIST_SCHEMA,
+                "date_from": {"type": "string", "description": _DATE_PARAM_DESC},
+                "date_to": {"type": "string", "description": _DATE_PARAM_DESC},
+                "gap_minutes": {
+                    "type": "number",
+                    "description": "silence (minutes) after which the next message "
+                                   "counts as a new initiation rather than a "
+                                   "response (default 180)",
+                },
+                "top_silences": {"type": "integer", "default": 5,
+                                 "description": "how many longest silences to return"},
+            },
+        },
+    },
+    {
+        "name": "get_activity_histogram",
+        "description": "Message counts bucketed by 'month', 'day', 'dow' "
+                        "(day of week), or 'hour', each split into "
+                        "from_me/from_them -- volume arcs, busiest day, "
+                        "time-of-day patterns, drift over time, in one call. "
+                        "handle_id/contact_id scope to that person's chats "
+                        "(both sides counted); no scope = the whole corpus. "
+                        "Buckets are UTC (hour/dow are not local time). "
+                        "Capped at 200 rows with a truncated flag -- narrow "
+                        "the date range or coarsen the bucket if set.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "chat_id": _ID_OR_LIST_SCHEMA,
+                "handle_id": _ID_OR_LIST_SCHEMA,
+                "contact_id": _ID_OR_LIST_SCHEMA,
+                "bucket": {"type": "string", "enum": ["month", "day", "dow", "hour"],
+                           "default": "month"},
+                "date_from": {"type": "string", "description": _DATE_PARAM_DESC},
+                "date_to": {"type": "string", "description": _DATE_PARAM_DESC},
+            },
+        },
+    },
+    {
+        "name": "get_top_reacted_messages",
+        "description": "Messages ranked by tapbacks RECEIVED, most first -- "
+                        "'my most-loved message', 'which of their texts got the "
+                        "most laughs'. reaction_type narrows to one tapback "
+                        "(love, like, dislike, laugh, emphasize, question, "
+                        "custom-emoji, sticker); is_from_me narrows whose "
+                        "messages were reacted to (true = mine). "
+                        "handle_id/contact_id scope to that person's chats. "
+                        "Each row is the message plus reaction_count and a "
+                        "reactions_by_type breakdown.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "chat_id": _ID_OR_LIST_SCHEMA,
+                "handle_id": _ID_OR_LIST_SCHEMA,
+                "contact_id": _ID_OR_LIST_SCHEMA,
+                "date_from": {"type": "string", "description": _DATE_PARAM_DESC},
+                "date_to": {"type": "string", "description": _DATE_PARAM_DESC},
+                "reaction_type": {
+                    "type": ["string", "integer"],
+                    "description": "tapback name (e.g. 'laugh', 'love') or raw "
+                                   "Apple type code",
+                },
+                "is_from_me": {
+                    "type": "boolean",
+                    "description": "true = only my messages' received reactions; "
+                                   "false = only other people's",
+                },
+                "limit": {"type": "integer", "default": 10},
+            },
+        },
+    },
+    {
+        "name": "get_chat_participant_stats",
+        "description": "Per-member stats for a chat: one row per participant "
+                        "(including 'Me' and silent members) with messages_sent, "
+                        "first/last message dates, reactions_given, and "
+                        "reactions_received broken down by tapback type -- "
+                        "group-chat rankings like 'who talks most' or 'who gets "
+                        "the most laughs per message' in one call. chat_id is "
+                        "required; pass a list to merge a split iMessage/SMS "
+                        "thread into one table.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "chat_id": _ID_OR_LIST_SCHEMA,
+                "date_from": {"type": "string", "description": _DATE_PARAM_DESC},
+                "date_to": {"type": "string", "description": _DATE_PARAM_DESC},
+            },
+            "required": ["chat_id"],
+        },
+    },
+    {
+        "name": "get_word_frequency",
+        "description": "Most frequent words (ngram=1) or phrases (ngram=2-3) "
+                        "with real counts -- 'what words do I overuse', catch "
+                        "phrases, inside-joke frequency. Unlike the other "
+                        "analytics tools this scopes by SENDER: "
+                        "handle_id/contact_id means messages that person sent; "
+                        "is_from_me=true means messages I sent (combine with "
+                        "nothing else for 'my' corpus-wide habits). Common "
+                        "English stopwords are excluded unless "
+                        "include_stopwords=true.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "chat_id": _ID_OR_LIST_SCHEMA,
+                "handle_id": _ID_OR_LIST_SCHEMA,
+                "contact_id": _ID_OR_LIST_SCHEMA,
+                "is_from_me": {"type": "boolean"},
+                "date_from": {"type": "string", "description": _DATE_PARAM_DESC},
+                "date_to": {"type": "string", "description": _DATE_PARAM_DESC},
+                "ngram": {"type": "integer", "default": 1,
+                          "description": "1 = single words, 2-3 = phrases"},
+                "top": {"type": "integer", "default": 25},
+                "min_count": {"type": "integer", "default": 2},
+                "include_stopwords": {"type": "boolean", "default": False},
+            },
         },
     },
 ]
