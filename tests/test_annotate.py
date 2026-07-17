@@ -12,7 +12,7 @@ from unittest import mock
 import annotate
 import ollama
 import schema
-from config import ANNOTATE_MODEL
+from config import ANNOTATE_MODEL, ANNOTATE_TERMS_MAX_FAILURES
 from db import get_state, load_vec_extension, set_state
 
 
@@ -178,14 +178,179 @@ class TestCurateTerms(AnnotateFixture):
             (term,)).fetchone()[0]
 
     def test_verdicts_validated_and_persisted(self):
-        # terms processed in ORDER BY chat_id, term: blorbo then zippy
-        replies = [_reply({"verdict": "inside_joke"}),
-                   _reply({"verdict": "hilarious"})]     # not in the enum
+        # Both terms share a chat, so one batched request covers them, keyed
+        # by position in ORDER BY chat_id, term: blorbo=0, zippy=1. zippy's
+        # verdict is not in the enum, so it falls back to a single-term
+        # request -- which returns another bogus verdict and is skipped.
+        replies = [_reply({"0": "inside_joke", "1": "hilarious"}),
+                   _reply({"verdict": "hilarious"})]
         with mock.patch.object(ollama, "chat_once", side_effect=replies) as fake:
             annotate.main(["--terms"])
         self.assertEqual(fake.call_count, 2)
         self.assertEqual(self.verdict("blorbo"), "inside_joke")
         self.assertIsNone(self.verdict("zippy"))         # invalid verdict skipped
+
+    def test_terms_batched_into_one_request(self):
+        # The point of batching: two pending terms, one LLM request.
+        with mock.patch.object(
+                ollama, "chat_once",
+                return_value=_reply({"0": "inside_joke", "1": "noise"})) as fake:
+            annotate.main(["--terms"])
+        self.assertEqual(fake.call_count, 1)
+        self.assertEqual(self.verdict("blorbo"), "inside_joke")
+        self.assertEqual(self.verdict("zippy"), "noise")
+
+    def test_terms_batch_never_spans_chats(self):
+        # A batch shares one system prompt saying "in one text-message chat",
+        # so terms from different chats must not ride in the same request.
+        self.con.execute(
+            "INSERT INTO dyad_terms(chat_id, term, lift, n_uses, "
+            "first_message_id, coined_by_handle_id, coined_is_me, llm_verdict) "
+            "VALUES (2, 'wug', 10.0, 5, 1, NULL, 1, NULL)")
+        self.con.commit()
+        with mock.patch.object(
+                ollama, "chat_once",
+                return_value=_reply({"0": "noise", "1": "noise"})) as fake:
+            annotate.main(["--terms"])
+        # chat 1 (blorbo, zippy) batched; chat 2 (wug) is its own singleton.
+        self.assertEqual(fake.call_count, 2)
+        # ...and the split is by chat, not just two requests of any shape:
+        # each call's user message carries only its own chat's terms.
+        prompts = [call[0][0][-1]["content"] for call in fake.call_args_list]
+        self.assertIn("blorbo", prompts[0])
+        self.assertIn("zippy", prompts[0])
+        self.assertNotIn("wug", prompts[0])
+        self.assertIn("wug", prompts[1])
+        self.assertNotIn("blorbo", prompts[1])
+
+    def test_retry_failed_dry_run_leaves_parking_intact(self):
+        # --dry-run must not unpark: the preview would spend the very state
+        # it is previewing, and the next bare run would re-attempt the terms
+        # at full price -- the loop curate_failures exists to close.
+        self.con.execute(
+            "UPDATE dyad_terms SET curate_failures = ? WHERE term = 'blorbo'",
+            (ANNOTATE_TERMS_MAX_FAILURES,))
+        self.con.commit()
+        with mock.patch.object(ollama, "chat_once") as fake:
+            annotate.main(["--terms", "--retry-failed", "--dry-run"])
+        fake.assert_not_called()
+        (failures,) = self.con.execute(
+            "SELECT curate_failures FROM dyad_terms WHERE term = 'blorbo'"
+        ).fetchone()
+        self.assertEqual(failures, ANNOTATE_TERMS_MAX_FAILURES)
+
+    def test_retry_failed_dry_run_previews_the_unparked_scope(self):
+        # The preview must show what the real run would curate -- which
+        # includes the parked terms it would have unparked.
+        self.con.execute(
+            "UPDATE dyad_terms SET curate_failures = ? WHERE term = 'blorbo'",
+            (ANNOTATE_TERMS_MAX_FAILURES,))
+        self.con.commit()
+        with mock.patch.object(ollama, "chat_once"):
+            with mock.patch("builtins.print") as out:
+                annotate.main(["--terms", "--retry-failed", "--dry-run"])
+        printed = "\n".join(str(c[0][0]) for c in out.call_args_list if c[0])
+        self.assertIn("1:blorbo", printed)
+        self.assertIn("2 dyad terms pending", printed)
+
+    def test_run_that_never_succeeds_aborts_without_parking(self):
+        # A model answering nothing is a config failure, not N bad terms:
+        # without this, one gpt-oss/think=false mismatch parks the corpus.
+        terms = [(f"term{i}",) for i in range(annotate._TERMS_ABORT_AFTER + 5)]
+        self.con.executemany(
+            "INSERT INTO dyad_terms(chat_id, term, lift, n_uses, "
+            "first_message_id, coined_by_handle_id, coined_is_me, llm_verdict) "
+            "VALUES (1, ?, 10.0, 5, 1, NULL, 1, NULL)", terms)
+        self.con.commit()
+        with mock.patch.object(ollama, "chat_once",
+                               return_value=_reply({"verdict": "nonsense"})):
+            with self.assertRaises(SystemExit):
+                annotate.main(["--terms"])
+        # Rolled back: nothing parked, so a fixed config just reruns.
+        (charged,) = self.con.execute(
+            "SELECT COUNT(*) FROM dyad_terms WHERE curate_failures > 0").fetchone()
+        self.assertEqual(charged, 0)
+
+    def test_abandoned_terms_are_not_charged_a_failure(self):
+        # A batch that comes back unusable falls back to one request per term;
+        # once _GROUP_GIVEUP of those have failed in a row the rest of the
+        # group is left alone -- never asked, so never charged.
+        terms = [(f"term{i}",) for i in range(annotate._GROUP_GIVEUP + 5)]
+        self.con.executemany(
+            "INSERT INTO dyad_terms(chat_id, term, lift, n_uses, "
+            "first_message_id, coined_by_handle_id, coined_is_me, llm_verdict) "
+            "VALUES (1, ?, 10.0, 5, 1, NULL, 1, NULL)", terms)
+        self.con.commit()
+        with mock.patch.object(ollama, "chat_once",
+                               return_value=_reply({"verdict": "nonsense"})):
+            annotate.main(["--terms"])
+        # Exactly _GROUP_GIVEUP terms got their own request and failed; the
+        # rest were abandoned at 0 and stay pending for the next run.
+        (charged,) = self.con.execute(
+            "SELECT COUNT(*) FROM dyad_terms WHERE curate_failures > 0").fetchone()
+        self.assertEqual(charged, annotate._GROUP_GIVEUP)
+
+    def test_terms_think_defaults_off_and_ignores_quality(self):
+        # Reasoning about a one-word verdict cost ~11x for an identical
+        # answer, so --terms sends think=False rather than a --quality tier's.
+        with mock.patch.object(
+                ollama, "chat_once",
+                return_value=_reply({"0": "noise", "1": "noise"})) as fake:
+            annotate.main(["--terms"])
+        self.assertIs(fake.call_args.kwargs["think"], False)
+
+    def test_terms_think_omit_reaches_the_flagless_state(self):
+        # None ("omit the flag") is a distinct state from False ("send
+        # think: false") and is the right setting for some models, so the env
+        # var needs a spelling for it -- otherwise 'none' would forward the
+        # literal string "none" to Ollama.
+        with mock.patch.object(annotate, "ANNOTATE_TERMS_THINK", "omit"):
+            with mock.patch.object(
+                    ollama, "chat_once",
+                    return_value=_reply({"0": "noise", "1": "noise"})) as fake:
+                annotate.main(["--terms"])
+        self.assertIsNone(fake.call_args.kwargs["think"])
+
+    def test_quality_rejected_with_terms(self):
+        # --quality is a chunk tier; silently accepting it here is what let
+        # its `think` leak into term curation and cost ~11x per term.
+        with mock.patch.object(ollama, "chat_once") as fake:
+            with self.assertRaises(SystemExit):
+                annotate.main(["--terms", "--quality", "max"])
+        fake.assert_not_called()
+
+    def test_failed_terms_are_parked_after_max_failures(self):
+        # An unparseable reply burns two requests (chat_once_json retries
+        # once); without a failure counter the same term would do that on
+        # every future run forever.
+        with mock.patch.object(ollama, "chat_once",
+                               return_value=_reply("not json at all")):
+            for _ in range(ANNOTATE_TERMS_MAX_FAILURES):
+                annotate.main(["--terms"])
+        (failures,) = self.con.execute(
+            "SELECT curate_failures FROM dyad_terms WHERE term = 'blorbo'"
+        ).fetchone()
+        self.assertEqual(failures, ANNOTATE_TERMS_MAX_FAILURES)
+        # Parked now: a further run must not call the model at all.
+        with mock.patch.object(ollama, "chat_once") as fake:
+            annotate.main(["--terms"])
+        fake.assert_not_called()
+
+    def test_retry_failed_unparks_terms(self):
+        self.con.execute(
+            "UPDATE dyad_terms SET curate_failures = ? WHERE term = 'blorbo'",
+            (ANNOTATE_TERMS_MAX_FAILURES,))
+        self.con.execute("UPDATE dyad_terms SET llm_verdict = 'noise' "
+                         "WHERE term = 'zippy'")
+        self.con.commit()
+        with mock.patch.object(ollama, "chat_once",
+                               return_value=_reply({"verdict": "nickname"})):
+            annotate.main(["--terms", "--retry-failed"])
+        self.assertEqual(self.verdict("blorbo"), "nickname")
+        (failures,) = self.con.execute(
+            "SELECT curate_failures FROM dyad_terms WHERE term = 'blorbo'"
+        ).fetchone()
+        self.assertEqual(failures, 0)
 
     def test_terms_resumable_skips_curated(self):
         self.con.execute(

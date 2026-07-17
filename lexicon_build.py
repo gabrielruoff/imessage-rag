@@ -145,16 +145,18 @@ def build_dyad_terms(tgt: sqlite3.Connection, min_uses=None, min_lift=None,
     coined_by_handle_id [NULL = me] / coined_is_me) is tracked in the pass.
 
     Full rebuild preserving curation: existing llm_verdict values are
-    snapshotted per (chat_id, term) and reattached to recomputed rows."""
+    snapshotted per (chat_id, term) and reattached to recomputed rows, as is
+    curate_failures -- a term that already burned N curation attempts must not
+    look freshly eligible again just because the lexicon was rebuilt."""
     min_uses = DYAD_TERM_MIN_USES if min_uses is None else int(min_uses)
     min_lift = DYAD_TERM_MIN_LIFT if min_lift is None else float(min_lift)
     top_k = DYAD_TERM_TOP_K if top_k is None else int(top_k)
 
-    verdicts = {
-        (chat_id, term): verdict
-        for chat_id, term, verdict in tgt.execute(
-            "SELECT chat_id, term, llm_verdict FROM dyad_terms "
-            "WHERE llm_verdict IS NOT NULL"
+    curation = {
+        (chat_id, term): (verdict, failures)
+        for chat_id, term, verdict, failures in tgt.execute(
+            "SELECT chat_id, term, llm_verdict, curate_failures FROM dyad_terms "
+            "WHERE llm_verdict IS NOT NULL OR curate_failures > 0"
         )
     }
     tgt.execute("DELETE FROM dyad_terms")
@@ -226,13 +228,14 @@ def build_dyad_terms(tgt: sqlite3.Connection, min_uses=None, min_lift=None,
         kept.sort(key=lambda t: (-t[1], t[0]))
         for term, lift, n_uses in kept[:top_k]:
             msg_id, coined_by, coined_is_me = provenance[(chat_id, term)]
+            verdict, failures = curation.get((chat_id, term), (None, 0))
             rows.append((chat_id, term, lift, n_uses, msg_id, coined_by,
-                         coined_is_me, verdicts.get((chat_id, term))))
+                         coined_is_me, verdict, failures))
 
     tgt.executemany(
         "INSERT INTO dyad_terms(chat_id, term, lift, n_uses, first_message_id, "
-        "coined_by_handle_id, coined_is_me, llm_verdict) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "coined_by_handle_id, coined_is_me, llm_verdict, curate_failures) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         rows,
     )
     tgt.commit()

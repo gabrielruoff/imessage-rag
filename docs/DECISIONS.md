@@ -583,8 +583,11 @@ overrides. `max` is the original behavior. Implementation notes:
 - Ollama's `think` accepts effort strings (`low`/`medium`/`high`) on gpt-oss
   and booleans on toggle models (qwen3). gpt-oss **silently returns empty
   content for `think: false`** — every annotation would be "skipped", so the
-  presets use `"low"`, never `false`. gemma4 tolerates `"low"`; models that
-  reject `think` outright drop it for the rest of the run (warned once).
+  presets use `"low"`, never `false`. gemma4 *accepts* `"low"` without
+  erroring — but accepting is not honoring, and the term-curation entry below
+  is what that cost: gemma4 has no effort levels, so `"low"` is merely truthy
+  there and buys a full reasoning pass. Models that reject `think` outright
+  drop it for the rest of the run (warned once).
 - Batched replies are keyed by chunk id (`{"<id>": {...}}`); any id the
   reply misses or mangles falls back to a single-chunk request, so batching
   can't lose rows — worst case it costs one extra request.
@@ -652,6 +655,83 @@ across concurrent sequences, so weight reads only partially amortize. RAM
 cost ~0.6 GB; Ollama scales total context so each slot keeps the full 32k
 window. Against a serial server the extra workers just queue (CHAT_TIMEOUT
 covers the wait), which is why 4 is a safe default.
+
+## 2026-07-17: term curation was ~11x slow on a borrowed `think`
+
+`annotate.py --terms` was projected at **8.6 days** for 2,635 pending terms.
+Profiling found none of it was ours: the per-term `LIKE '%term%'` prompt scan
+— which the code's own comment called "the expensive bit" — measures **2ms**
+at 350k messages (it rides `idx_messages_chat_date`). All of it was one
+request, and the request was slow for a reason that had nothing to do with
+terms.
+
+`main()` resolved `--quality` *before* dispatching on `--terms`, so term
+curation inherited the chunk presets' `think`. Default quality is `distilled`
+→ `think="low"`. gemma4 has no effort levels, so `"low"` is just truthy to it
+and it runs a full reasoning pass — to answer a four-way classification whose
+output is one word. One term, one prompt, one model, **identical verdict**
+every time:
+
+| `think` | wall |
+|---|---|
+| `"low"` (what shipped) | 282.6s |
+| omitted | 52.0s |
+| `false` | 26.2s |
+
+The 282 seconds of hidden reasoning open by re-reading the three-line prompt
+back to the model. So term curation is now its own pipeline, not a `--quality`
+tier: it owns `ANNOTATE_TERMS_THINK` (default `false`), `--quality` with
+`--terms` is a hard error, and `ANNOTATE_THINK` deliberately does not reach it
+— one pipeline's `think` silently steering another is the whole bug.
+
+Batching then amortizes the rest, and terms batch far better than chunks do:
+the prompt is ~150 chars and the answer is one enum, so
+`ANNOTATE_TERMS_BATCH_SIZE=25` fits easily. A batch never spans chats (the
+system prompt says "in one text-message chat"; mixing chats would make the
+examples contradict it), and replies are keyed by position — positions can't
+collide or need escaping the way term text could. As with chunk batching, any
+entry the reply misses or mangles falls back to a single-term request, so
+batching cannot lose rows.
+
+Measured end-to-end on the real corpus: **25 terms in 29.5s, one request, 0
+skipped** (verdicts spread across all four classes). The same 25 terms cost
+~2 hours before. Full corpus: ~8.6 days → **under an hour**.
+
+Two smaller things the profile exposed:
+
+- Failures were unbounded and free to repeat. `chat_once_json` retries once,
+  so a term that can't be parsed burns *two* full requests — and since a skip
+  left `llm_verdict` NULL, which is also the "never attempted" state, every
+  future run paid again, forever. `dyad_terms.curate_failures` now counts
+  failures, parks a term at `ANNOTATE_TERMS_MAX_FAILURES`, and survives
+  lexicon rebuilds (a rebuild resetting it to 0 would restore the loop).
+  `--retry-failed` unparks.
+
+  Parking is sticky state, so it is deliberately hard to spend (all of this
+  came out of the PR review). Only a term's *own* dedicated request can
+  charge it a failure: a batch miss always falls back to one before counting,
+  and a group whose fallbacks keep failing is abandoned unattempted rather
+  than fanned out into ~50 doomed requests behind a single worker slot. A run
+  in which nothing at all succeeds aborts at 20 failures and rolls them back
+  — that is a misconfiguration, not 2,635 independent bad terms. And
+  `--retry-failed --dry-run` previews the unpark instead of performing it: a
+  preview that spends the state it previews is worse than a stray write,
+  since the next bare run then re-attempts those terms at full price. The
+  misconfiguration all of this guards against is near at hand rather than
+  hypothetical: gpt-oss answers `think=false` with empty content and
+  `--terms` defaults to `false`, so a gpt-oss `CHAT_MODEL` (what this repo's
+  own `.env` sets) would otherwise park the whole corpus in three runs.
+  `ollama.chat_once_json` therefore also detects that empty reply directly
+  and degrades the run to no reasoning control — the same move it already
+  made for models that reject `think` outright, driven off the reply instead
+  of an error, because gpt-oss doesn't error.
+- `make ollama-start` was a no-op against an already-running server (`brew
+  services start`), so the `launchctl setenv OLLAMA_NUM_PARALLEL=4` above it
+  never reached the process — leaving the worst case, an `ANNOTATE_WORKERS=4`
+  pool queueing against a server with no parallel slots, looking configured
+  while buying nothing. It now `restart`s. Ollama exposes no way to read
+  `NUM_PARALLEL` back, so there is nothing to assert afterwards; making the
+  restart unconditional is the only fix.
 
 ## Linting
 

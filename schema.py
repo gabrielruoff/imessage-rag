@@ -152,6 +152,13 @@ CREATE TABLE IF NOT EXISTS dyad_terms (
     coined_by_handle_id INTEGER,     -- NULL = me
     coined_is_me INTEGER,
     llm_verdict TEXT,                -- NULL until annotate.py --terms curates it
+    curate_failures INTEGER NOT NULL DEFAULT 0,
+                                     -- failed curation attempts. At
+                                     -- ANNOTATE_TERMS_MAX_FAILURES the term is
+                                     -- parked: llm_verdict stays NULL but runs
+                                     -- stop retrying it (--retry-failed
+                                     -- unparks). Preserved across rebuilds
+                                     -- alongside llm_verdict.
     PRIMARY KEY (chat_id, term)
 );
 
@@ -245,6 +252,14 @@ def create_schema(con: sqlite3.Connection):
     ann_cols = {row[1] for row in con.execute("PRAGMA table_info(chunk_annotations)")}
     if ann_cols and "source" not in ann_cols:
         con.execute("ALTER TABLE chunk_annotations ADD COLUMN source TEXT DEFAULT 'llm'")
+
+    # Pre-parking dyad_terms: add the failure counter. The DEFAULT stamps
+    # existing rows 0, which is correct -- an uncurated row predating the
+    # column has no recorded failures, so it stays eligible.
+    term_cols = {row[1] for row in con.execute("PRAGMA table_info(dyad_terms)")}
+    if term_cols and "curate_failures" not in term_cols:
+        con.execute("ALTER TABLE dyad_terms "
+                    "ADD COLUMN curate_failures INTEGER NOT NULL DEFAULT 0")
 
     # The update trigger used to fire on ANY messages update; drop it so
     # FTS_SCHEMA recreates it scoped to UPDATE OF text (see comment there).

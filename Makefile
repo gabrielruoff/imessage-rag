@@ -65,12 +65,19 @@ install:
 
 # OLLAMA_NUM_PARALLEL=4: parallel request slots, feeding annotate.py's
 # ANNOTATE_WORKERS pool (~2x on LLM annotation passes, measured 2026-07-17;
-# RAM cost negligible, each slot keeps the full context window). Takes
-# effect on service (re)start.
+# RAM cost negligible, each slot keeps the full context window).
+#
+# `restart`, not `start`: the launchctl vars above are only read by ollama at
+# process start, and `brew services start` is a NO-OP against an already-
+# running service. That combination silently produced the worst case -- a
+# server with no parallel slots and an ANNOTATE_WORKERS=4 pool queueing
+# against it, looking configured while buying nothing. Ollama exposes no way
+# to read NUM_PARALLEL back, so there is nothing to assert afterwards; the
+# only fix is to make the restart unconditional.
 ollama-start:
 	launchctl setenv OLLAMA_KEEP_ALIVE 24h
 	launchctl setenv OLLAMA_NUM_PARALLEL 4
-	brew services start ollama
+	brew services restart ollama
 
 ollama-stop:
 	brew services stop ollama

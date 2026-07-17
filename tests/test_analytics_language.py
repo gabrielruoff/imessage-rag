@@ -306,6 +306,20 @@ class DyadTermsTest(LanguageFixture):
             "SELECT COUNT(*) AS n FROM dyad_terms WHERE llm_verdict IS NOT NULL")
         self.assertEqual(others[0]["n"], 1)
 
+    def test_curate_failures_preserved_across_rebuild(self):
+        # A term that already burned its curation attempts must not look
+        # freshly eligible again just because the lexicon was rebuilt.
+        self._build_dyads()
+        self._execute("UPDATE dyad_terms SET curate_failures = 3 "
+                      "WHERE chat_id = 10 AND term = 'blorptastic'")
+        self._build_dyads()  # full rebuild
+        (row,) = self._rows("SELECT curate_failures FROM dyad_terms "
+                            "WHERE chat_id = 10 AND term = 'blorptastic'")
+        self.assertEqual(row["curate_failures"], 3)
+        (rest,) = self._rows("SELECT COUNT(*) AS n FROM dyad_terms "
+                             "WHERE curate_failures > 0")
+        self.assertEqual(rest["n"], 1)
+
 
 class WordTrendsTest(LanguageFixture):
     def test_phrase_trend_split_by_period_and_side(self):

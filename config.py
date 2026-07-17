@@ -151,10 +151,19 @@ ANNOTATE_QUALITY = (os.getenv("ANNOTATE_QUALITY", "") or "distilled").strip().lo
 # Fine-grained preset overrides (empty/0 = use the preset's value).
 # ANNOTATE_THINK becomes Ollama's `think`: 'low'/'medium'/'high' for
 # reasoning-effort models (gpt-oss), 'true'/'false' for toggle models
-# (qwen3). gpt-oss silently returns EMPTY output for think=false -- use the
-# effort levels there.
+# (qwen3), or 'omit'/'none' to send no flag at all -- the third state, which
+# is distinct from false and which empty cannot express here (empty means
+# "the preset's value"). gpt-oss silently returns EMPTY output for
+# think=false -- use the effort levels there; ollama.chat_once_json notices
+# that empty reply once and drops reasoning control for the rest of the run
+# rather than failing every row.
 ANNOTATE_THINK = os.getenv("ANNOTATE_THINK", "").strip().lower()
 ANNOTATE_BATCH_SIZE = int(os.getenv("ANNOTATE_BATCH_SIZE") or "0")
+# Unset = inherit CHAT_TIMEOUT. Worth setting independently: an annotation is
+# one short JSON answer, but a thinking model can spend minutes on it, and a
+# timeout raises out of the pass rather than skipping the row.
+_annotate_timeout = os.getenv("ANNOTATE_TIMEOUT", "").strip()
+ANNOTATE_TIMEOUT = int(_annotate_timeout) if _annotate_timeout else CHAT_TIMEOUT
 # Concurrent LLM requests for the annotate/terms/seed passes. >1 only pays
 # off when the Ollama server itself runs parallel slots (OLLAMA_NUM_PARALLEL
 # -- `make ollama-start` sets 4); against a serial server extra workers just
@@ -166,6 +175,32 @@ ANNOTATE_WORKERS = int(os.getenv("ANNOTATE_WORKERS", "4"))
 # nearest seed neighbours that vote for each classified chunk.
 ANNOTATE_SEED_TARGET = int(os.getenv("ANNOTATE_SEED_TARGET", "450"))
 ANNOTATE_KNN_K = int(os.getenv("ANNOTATE_KNN_K", "10"))
+
+# --- Dyad-term curation (annotate.py --terms) -------------------------------
+# Terms are their own pipeline, NOT a --quality tier: classifying one term is
+# a four-way choice answered in one word, so a reasoning pass is pure latency.
+# Measured 2026-07-17, gemma4:26b-a4b-it-qat, same term, same verdict every
+# time: think='low' 282.6s, think unset 52.0s, think=false 26.2s. --quality's
+# think used to leak in here and cost ~11x for an identical answer, so --terms
+# now has its own default (false, below) instead of inheriting a chunk preset.
+# Empty = false; 'omit'/'none' reaches the unset row of that table (52.0s).
+# Set to 'low' on gpt-oss, which returns EMPTY output for think=false (see
+# ANNOTATE_THINK above -- that empty reply is detected once and the run
+# continues without reasoning control, so the mismatch costs a warning, not a
+# failure counter on every term); ANNOTATE_THINK does NOT apply here.
+ANNOTATE_TERMS_THINK = os.getenv("ANNOTATE_TERMS_THINK", "").strip().lower()
+# Terms classified per request. Each term's prompt is ~150 chars and its
+# answer is one enum, so batching costs almost nothing and cuts the request
+# count ~25x; a batch never spans chats (the prompt is chat-scoped).
+ANNOTATE_TERMS_BATCH_SIZE = int(os.getenv("ANNOTATE_TERMS_BATCH_SIZE") or "25")
+# A term whose curation keeps failing is parked after this many failed
+# attempts (dyad_terms.curate_failures) rather than being retried -- at full
+# price, the retry nudge doubling it -- by every future run forever. Only a
+# term's own dedicated request can charge it a failure, and a run in which
+# nothing at all succeeds aborts without recording any: parking is for bad
+# terms, and a bad config must not be able to spend it on the whole corpus.
+# `annotate.py --terms --retry-failed` unparks them.
+ANNOTATE_TERMS_MAX_FAILURES = int(os.getenv("ANNOTATE_TERMS_MAX_FAILURES") or "3")
 
 # --- Topic clustering (topics.py) -------------------------------------------------
 # Empty = use CHAT_MODEL (same convention as ANNOTATE_MODEL/WRAPPED_MODEL).

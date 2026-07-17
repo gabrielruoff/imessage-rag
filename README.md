@@ -93,15 +93,27 @@ topics back to back in the right order (and stays sequential even under
     in for the chats that matter.
 - `--terms` instead curates `dyad_terms` verdicts, which is what gives
   `get_word_trends` its inside-joke section. It's a mode switch, so a bare run
-  never touches terms — this is the second run you need.
+  never touches terms — this is the second run you need. It is *not* a
+  `--quality` tier and won't accept one: classifying a term is a four-way
+  choice answered in one word, so it batches `ANNOTATE_TERMS_BATCH_SIZE` terms
+  per request and skips the reasoning pass (`ANNOTATE_TERMS_THINK`, default
+  false — on gemma4 that was 282.6s vs 26.2s per term for the same verdict).
+  A term whose curation keeps failing is parked after
+  `ANNOTATE_TERMS_MAX_FAILURES` attempts rather than retried by every later
+  run; `--retry-failed` gives those terms another chance, and each run names
+  the terms it parked. A run in which the model answers *nothing* aborts
+  without recording any failures — that's a misconfiguration, not a corpus of
+  bad terms, and it shouldn't be able to park everything.
 
 (`make annotate-all` passes `--all`, which only changes anything if you've set
 an LLM quality tier — under the default `distilled` both targets already cover
 the whole corpus.)
 
 `--dry-run` prints the pending scope and exits without calling Ollama or
-writing, which is worth doing before an LLM-tier `--all` to see how many
-chunks you're signing up for. `--limit N` caps a single run. `annotate.py`
+writing anything, which is worth doing before an LLM-tier `--all` to see how
+many chunks you're signing up for. It previews `--retry-failed` too: the
+scope it prints is what the real run would curate, but the unparking itself
+is held back. `--limit N` caps a single run. `annotate.py`
 records its model and refuses to mix models into a non-empty
 `chunk_annotations` table (distilled rows count — they inherit the seed
 model's bias), so changing `ANNOTATE_MODEL` means emptying that table first.

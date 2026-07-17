@@ -91,8 +91,10 @@ _JSON_RETRY_NUDGE = (
 )
 
 
-# Flipped when the model rejects the `think` option so a run degrades to
-# no reasoning control once instead of erroring on every request.
+# Flipped when the model can't take the `think` value we send -- either it
+# rejects the option outright (an error body) or it accepts think=false and
+# answers with EMPTY content (gpt-oss's signature). Either way the run
+# degrades to no reasoning control once instead of failing every request.
 _think_unsupported = False
 
 
@@ -104,8 +106,9 @@ def chat_once_json(messages, model=None, retry_nudge=_JSON_RETRY_NUDGE,
     their next run). Callers with a task-specific output shape pass their own
     retry_nudge so the correction names the exact JSON expected.
     timeout/think forward to chat_once (per-pipeline overrides); models that
-    reject an explicit `think` value degrade to no reasoning control for the
-    rest of the process instead of erroring on every request."""
+    can't take the `think` value we send -- by rejecting it, or by answering
+    think=false with empty content -- degrade to no reasoning control for the
+    rest of the process instead of failing every request."""
     global _think_unsupported
     for _ in range(2):
         send_think = None if _think_unsupported else think
@@ -123,6 +126,17 @@ def chat_once_json(messages, model=None, retry_nudge=_JSON_RETRY_NUDGE,
             reply = chat_once(messages, model=model, format="json",
                               timeout=timeout, think=None)
         content = reply.get("content") or ""
+        if not content.strip() and send_think is False:
+            # gpt-oss doesn't reject think=false, it honours it and returns
+            # EMPTY content -- so the branch above never fires and every
+            # caller would instead record a per-row failure for what is one
+            # config mismatch. Same degrade, detected from the reply.
+            _think_unsupported = True
+            print("  model returned empty output for think=false; "
+                  "continuing without reasoning control")
+            reply = chat_once(messages, model=model, format="json",
+                              timeout=timeout, think=None)
+            content = reply.get("content") or ""
         try:
             data = json.loads(content)
         except json.JSONDecodeError:

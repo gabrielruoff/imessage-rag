@@ -20,7 +20,7 @@ Full design history, schema, rationale, and data forensics:
   Ollama is unreachable)
 - Annotate chunks: `make annotate` (chunks + `--terms`) / `make annotate-all`
   (`--all` + `--terms`), or `.venv/bin/python3 annotate.py [--all |
-  --top-dyads N] [--terms] [--limit N] [--quality distilled|fast|balanced|max]
+  --top-dyads N] [--limit N] [--quality distilled|fast|balanced|max]
   [--upgrade-distilled] [--dry-run]` — resumable, commits as it goes, Ctrl-C
   safe. Default quality `distilled`: LLM-labels a random ~`ANNOTATE_SEED_TARGET`
   seed sample, then kNN-classifies the whole corpus from `chunk_vectors`
@@ -29,7 +29,18 @@ Full design history, schema, rationale, and data forensics:
   scope to top `ANNOTATE_TOP_DYADS` chats bare, honor `--all`, and with
   `--upgrade-distilled` re-annotate kNN rows in scope (how events get filled
   for chats that matter). LLM passes fan out over `ANNOTATE_WORKERS`; `--terms`
-  is a mode switch, not an addition. See docs/DECISIONS.md for measurements.
+  is a mode switch, not an addition — it's the separate pipeline below, and
+  rejects `--quality`/`--upgrade-distilled`. See docs/DECISIONS.md for
+  measurements.
+- Curate dyad terms: `.venv/bin/python3 annotate.py --terms [--limit N]
+  [--retry-failed] [--dry-run]` — a separate pipeline, NOT a `--quality` tier
+  (passing `--quality` with `--terms` is an error, and `ANNOTATE_THINK` does
+  not reach it). It batches `ANNOTATE_TERMS_BATCH_SIZE` terms per request
+  (never spanning chats) and runs `ANNOTATE_TERMS_THINK`, default false:
+  reasoning about a one-word verdict measured ~11x latency for an identical
+  answer (gemma4: 282.6s vs 26.2s per term). A term that fails
+  `ANNOTATE_TERMS_MAX_FAILURES` times is parked in `dyad_terms.curate_failures`
+  rather than retried by every later run; `--retry-failed` unparks it.
 - Topic clusters: `make topics`, or `.venv/bin/python3 topics.py [--k K]
   [--relabel] [--model M]` — k-means over chunk_vectors (assignment in
   sqlite-vec), then an LLM label pass
@@ -87,7 +98,13 @@ Each LLM pipeline picks its own generation model: `CHAT_MODEL` (chat.py, plus
 `--model`), `ANNOTATE_MODEL` (annotate.py, `--model`), `TOPIC_MODEL`
 (topics.py, `--model`), `WRAPPED_MODEL` (wrapped.py). Empty = inherit
 `CHAT_MODEL`, so the defaults are a single knob until you need otherwise; the
-same inherit-from-chat rule covers `*_THINK` and `*_TIMEOUT`. `EMBED_MODEL` is
+same inherit-from-chat rule covers `*_THINK` and `*_TIMEOUT` — except the
+annotate `think` vars, which carve themselves out: empty `ANNOTATE_THINK`
+means the `--quality` preset's value, and empty `ANNOTATE_TERMS_THINK` means
+`false` (a term verdict is one word; reasoning about it is ~11x latency for
+the same answer). Because empty is spoken for in both, they alone take
+`omit`/`none` to reach the flagless third state that the other `*_THINK` vars
+get from being unset. `EMBED_MODEL` is
 deliberately NOT per-pipeline — query-side and document-side embeddings must
 come from one model or retrieval silently degrades (see the gotcha below), and
 ingest runs no generation model at all.
@@ -186,9 +203,14 @@ person_period_lexicon(chat_id, handle_id, month, ...9 fw_*_rate cols...,
                                   -- per-person-per-month style stats
                                   -- (derived, full rebuild; handle NULL = me)
 dyad_terms(chat_id, term, lift, n_uses, first_message_id,
-         coined_by_handle_id, coined_is_me, llm_verdict)
+         coined_by_handle_id, coined_is_me, llm_verdict, curate_failures)
                                   -- chat-distinctive vocabulary; llm_verdict
-                                  -- (annotate.py --terms) survives rebuilds
+                                  -- (annotate.py --terms) survives rebuilds,
+                                  -- as does curate_failures: at
+                                  -- ANNOTATE_TERMS_MAX_FAILURES the term is
+                                  -- parked (never retried until
+                                  -- --retry-failed), so a rebuild must not
+                                  -- reset the count to 0
 chunk_annotations(chunk_id, valence, emotions_json, depth, events_json,
          source)                  -- batch annotations (annotate.py); source
                                   -- 'llm' or 'distilled' (kNN, empty events)
@@ -243,6 +265,12 @@ chunk_vectors                     -- sqlite-vec vec0 table: chunk_id ->
   same as `False` (send `think: false`), so never default the param to `None`.
   On a thinking model the flag dominates everything else: qwen3:4b labels a
   topic in 3.2s with `think=false` vs 85s with it on — slower than a 30B.
+  Corollary: an effort level is not a portable dial. `think='low'` is an
+  effort level only to models that have them (gpt-oss); to gemma4 it is just
+  truthy, so it buys a *full* reasoning pass — 282.6s vs 26.2s per dyad term,
+  same verdict. Never route one pipeline's `think` into another's: `--terms`
+  inherited the `--quality` presets' and paid ~11x for nothing, which is why
+  term curation now owns `ANNOTATE_TERMS_THINK` and rejects `--quality`.
 - `TOPIC_LABEL_SAMPLES` defaults to 30 for a non-obvious reason: label samples
   are ranked by similarity to the cluster centroid, and a big cluster's most
   *central* chunks are its shortest ("ok", "yeah"). At 5 samples the whole
