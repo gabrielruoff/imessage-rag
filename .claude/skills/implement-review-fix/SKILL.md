@@ -44,11 +44,22 @@ You are reviewing a pull request with no prior context — judge it purely on wh
 Repository: <repo path>
 PR: <PR number / URL>
 
-Invoke the /review skill on this PR. Then write your complete findings to
-<workspace>/review-findings.md, structured as:
+Invoke the /review skill on this PR.
+
+Then, separately from /review, check whether the PR keeps the repository's
+documentation honest. Read README.md (and CLAUDE.md, plus any docs/ page the
+diff makes stale) and compare them against the diff: commands, flags, env vars,
+setup steps, schema, module maps, and feature lists that the change adds,
+renames, removes, or alters must be reflected there. A stale README is a real
+finding — report it as an issue with the specific file, section, and the exact
+wording that is now wrong. If the docs are already accurate, say so explicitly
+in your summary rather than staying silent.
+
+Then write your complete findings to <workspace>/review-findings.md, structured as:
 
 ## Summary
 ## Issues (each with severity: blocker / important / minor / nit, file, line, and a concrete description)
+## Documentation (README/CLAUDE.md/docs accuracy: either the specific stale passages, or an explicit "docs are up to date")
 ## Suggestions (optional improvements, clearly separated from issues)
 
 Be specific enough that another engineer could fix each issue without asking questions.
@@ -72,6 +83,8 @@ Review findings: read <workspace>/review-findings.md
 For each issue:
 - Fix all blocker and important issues.
 - Fix minor issues and nits when the fix is safe and local.
+- Treat the Documentation section as work, not commentary: update README.md (and
+  CLAUDE.md / docs/) so they match what the PR actually does.
 - If you disagree with a finding or it would require a large design change, do NOT
   silently skip it — note it in your summary with your reasoning.
 
