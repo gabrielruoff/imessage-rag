@@ -1,5 +1,5 @@
 .PHONY: reset-db ollama-start ollama-stop install lint \
-        ingest annotate annotate-all topics pipeline
+        ingest annotate annotate-all topics pipeline eval eval-dry
 
 # --- Pipelines (all need Ollama up: make ollama-start) -----------------------
 # These share one SQLite file and one serialized Ollama instance, so they must
@@ -30,6 +30,28 @@ pipeline:
 	$(MAKE) ingest
 	$(MAKE) annotate
 	$(MAKE) topics
+
+# --- Analytics eval (evalkit) ------------------------------------------------
+# EVAL_RUN_ID names the results dir under eval/results/; override to re-check or
+# re-report an existing run: `make eval EVAL_RUN_ID=20260717T120000-baseline`.
+EVALKIT := .venv/bin/python3 -m eval.evalkit
+EVAL_RUN_ID ?= $(shell date -u +%Y%m%dT%H%M%S)-baseline
+
+# Full P0->P4 sweep. Needs Ollama (make ollama-start). Recipe lines, not
+# prerequisites: `run` holds the Ollama lane lock and the phases are ordered.
+eval:
+	$(EVALKIT) selfcheck
+	$(EVALKIT) manifest
+	$(EVALKIT) run --run-id $(EVAL_RUN_ID) --all
+	$(EVALKIT) check --run $(EVAL_RUN_ID)
+	$(EVALKIT) report --run $(EVAL_RUN_ID)
+
+# Everything the eval can do without Ollama: static validation, ground truth,
+# and the resolved prompts the sweep would send.
+eval-dry:
+	$(EVALKIT) selfcheck
+	$(EVALKIT) manifest
+	$(EVALKIT) run --dry-run --all --run-id $(EVAL_RUN_ID)
 
 reset-db:
 	.venv/bin/python3 reset_db.py -f
