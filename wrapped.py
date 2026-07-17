@@ -30,7 +30,6 @@ import contextlib
 import datetime
 import json
 import re
-import sqlite3
 import sys
 from pathlib import Path
 
@@ -60,10 +59,7 @@ _NARRATIVE_SYSTEM = (
 
 
 def _connect():
-    con = sqlite3.connect(DB_PATH)  # module attribute, patchable by tests
-    db.load_vec_extension(con)
-    con.row_factory = sqlite3.Row
-    return con
+    return db.connect(DB_PATH)  # DB_PATH: module attribute, patchable by tests
 
 
 def _tool(name, /, **kwargs):
@@ -347,44 +343,26 @@ def _top_group_chats(con, year, limit=3):
     ).fetchall()
 
 
-def build_sections(con, roster, contact_entry=None, year=None,
-                   exclude_chat_ids=(), exclude_ranges=()):
-    """Build the ordered list of report sections. roster drives the default
-    multi-contact report; contact_entry switches to the single-relationship
-    deep-dive (people/groups sections are dropped -- they describe the whole
-    corpus). The exclusions are forwarded to the prior-year roster so
-    previous_rank is computed on the same basis as the current ranks."""
-    dates = {}
-    if year is not None:
-        dates = {"date_from": f"{year:04d}-01-01", "date_to": f"{year:04d}-12-31"}
-    scope = _entry_scope(contact_entry) if contact_entry else {}
-    tempo_entries = [contact_entry] if contact_entry else roster
-    sections = []
-
-    # Year in Numbers + (later) Late Nights share one get_activity_patterns call.
-    patterns, patterns_note = _tool("get_activity_patterns", **scope, **dates)
+def _sec_year_in_numbers(patterns, patterns_note):
+    """Built from the get_activity_patterns result shared with
+    _sec_late_nights (one tool call serves both sections)."""
     if patterns is None:
-        sections.append({"title": "Year in Numbers", "stats": None, "note": patterns_note})
-    else:
-        series = patterns.get("volume_series") or []
-        if isinstance(series, dict):  # real tool wraps rows in {granularity, rows}
-            series = series.get("rows") or []
-        sections.append({
-            "title": "Year in Numbers",
-            "stats": {
-                "messages_sent": _sum_series(series, "sent"),
-                "messages_received": _sum_series(series, "received"),
-                "late_night": patterns.get("late_night"),
-                "volume_series": series,
-            },
-        })
+        return {"title": "Year in Numbers", "stats": None, "note": patterns_note}
+    series = patterns.get("volume_series") or []
+    if isinstance(series, dict):  # real tool wraps rows in {granularity, rows}
+        series = series.get("rows") or []
+    return {
+        "title": "Year in Numbers",
+        "stats": {
+            "messages_sent": _sum_series(series, "sent"),
+            "messages_received": _sum_series(series, "received"),
+            "late_night": patterns.get("late_night"),
+            "volume_series": series,
+        },
+    }
 
-    if contact_entry is None:
-        sections.append({
-            "title": "Your People",
-            "stats": _your_people_stats(con, roster, year, exclude_chat_ids, exclude_ranges),
-        })
 
+def _sec_tempo(tempo_entries, dates):
     per_contact, tempo_notes = {}, []
     # Generic label: the roster's names must not reach stdout here.
     with progress.track("Analyzing tempo", total=len(tempo_entries)) as p:
@@ -398,40 +376,46 @@ def build_sections(con, roster, contact_entry=None, year=None,
                       if k in res}
             per_contact[entry["name"]] = picked or res
             p.advance()
-    sections.append(
-        {"title": "Tempo", "stats": {"per_contact": per_contact} if per_contact else None,
-         "note": "; ".join(tempo_notes[:2]) or "no contacts in scope"}
-    )
+    return {"title": "Tempo",
+            "stats": {"per_contact": per_contact} if per_contact else None,
+            "note": "; ".join(tempo_notes[:2]) or "no contacts in scope"}
 
+
+def _sec_reactions(scope, dates):
     reactions, note = _tool("get_reaction_stats", **scope, **dates)
     if reactions is None:
-        sections.append({"title": "Reactions", "stats": None, "note": note})
-    else:
-        keys = ("given", "received", "reciprocity", "funniest", "hall_of_fame")
-        picked = {k: reactions[k] for k in keys if k in reactions}
-        sections.append({"title": "Reactions", "stats": picked or reactions})
+        return {"title": "Reactions", "stats": None, "note": note}
+    keys = ("given", "received", "reciprocity", "funniest", "hall_of_fame")
+    picked = {k: reactions[k] for k in keys if k in reactions}
+    return {"title": "Reactions", "stats": picked or reactions}
 
+
+def _sec_late_nights(patterns, patterns_note):
+    """Second consumer of the shared get_activity_patterns result."""
     if patterns is None:
-        sections.append({"title": "Late Nights, Streaks & the Heatmap",
-                         "stats": None, "note": patterns_note})
-    else:
-        art = render_heatmap_ascii(patterns.get("heatmap"))
-        sections.append({
-            "title": "Late Nights, Streaks & the Heatmap",
-            "stats": {"late_night": patterns.get("late_night"),
-                      "streaks": patterns.get("streaks"),
-                      "busiest_days": patterns.get("busiest_days")},
-            "extra_md": f"```\n{art}\n```" if art else None,
-        })
+        return {"title": "Late Nights, Streaks & the Heatmap",
+                "stats": None, "note": patterns_note}
+    art = render_heatmap_ascii(patterns.get("heatmap"))
+    return {
+        "title": "Late Nights, Streaks & the Heatmap",
+        "stats": {"late_night": patterns.get("late_night"),
+                  "streaks": patterns.get("streaks"),
+                  "busiest_days": patterns.get("busiest_days")},
+        "extra_md": f"```\n{art}\n```" if art else None,
+    }
 
+
+def _sec_milestones(scope, year):
     # get_milestones takes no date bounds by contract; reference_date anchors
     # the anniversary window to the report year's end when a year is given.
     milestone_kwargs = dict(scope)
     if year is not None:
         milestone_kwargs["reference_date"] = f"{year:04d}-12-31"
     milestones, note = _tool("get_milestones", **milestone_kwargs)
-    sections.append({"title": "Milestones & Anniversaries", "stats": milestones, "note": note})
+    return {"title": "Milestones & Anniversaries", "stats": milestones, "note": note}
 
+
+def _sec_words(scope, dates, contact_entry):
     # get_word_frequency is the one analytics tool that scopes by SENDER, not
     # by that person's chats: under a --contact scope it returns only THEIR
     # words, while every other key here covers both sides. Naming the key for
@@ -446,36 +430,70 @@ def build_sections(con, roster, contact_entry=None, year=None,
         for k in ("distinctive_terms", "emoji", "rates"):
             if k in trends:
                 words[k] = trends[k]
-    sections.append(
-        {"title": "Words & Inside Jokes", "stats": words or None,
-         "note": "; ".join(n for n in (note_f, note_t) if n)}
-    )
+    return {"title": "Words & Inside Jokes", "stats": words or None,
+            "note": "; ".join(n for n in (note_f, note_t) if n)}
 
-    if contact_entry is None:
-        groups, group_notes = {}, []
-        for row in _top_group_chats(con, year):
-            res, note = _tool("get_group_dynamics", chat_id=row["chat_id"], **dates)
-            if res is None:
-                group_notes.append(f"{row['label']}: {note}")
-            else:
-                groups[row["label"]] = res
-        sections.append(
-            {"title": "Groups", "stats": groups or None,
-             "note": "; ".join(group_notes[:2]) or "no group chats in scope"}
-        )
 
-    # Phase-3 section: only when the batch-LLM artifacts exist at all.
+def _sec_groups(con, year, dates):
+    groups, group_notes = {}, []
+    for row in _top_group_chats(con, year):
+        res, note = _tool("get_group_dynamics", chat_id=row["chat_id"], **dates)
+        if res is None:
+            group_notes.append(f"{row['label']}: {note}")
+        else:
+            groups[row["label"]] = res
+    return {"title": "Groups", "stats": groups or None,
+            "note": "; ".join(group_notes[:2]) or "no group chats in scope"}
+
+
+def _sec_eras(con, scope, dates):
+    """Phase-3 section: None (section omitted) unless the batch-LLM
+    artifacts exist at all."""
     n_annotated = con.execute("SELECT COUNT(*) FROM chunk_annotations").fetchone()[0]
     n_topics = con.execute("SELECT COUNT(*) FROM topics").fetchone()[0]
-    if n_annotated or n_topics:
-        arc, note = _tool(
-            "get_word_trends", include=["emotions", "valence"], **scope, **dates
-        )
-        stats = None
-        if arc is not None:
-            stats = {k: arc[k] for k in ("emotions", "valence") if k in arc} or None
-        sections.append({"title": "Eras & Emotional Arc", "stats": stats, "note": note})
+    if not (n_annotated or n_topics):
+        return None
+    arc, note = _tool(
+        "get_word_trends", include=["emotions", "valence"], **scope, **dates
+    )
+    stats = None
+    if arc is not None:
+        stats = {k: arc[k] for k in ("emotions", "valence") if k in arc} or None
+    return {"title": "Eras & Emotional Arc", "stats": stats, "note": note}
 
+
+def build_sections(con, roster, contact_entry=None, year=None,
+                   exclude_chat_ids=(), exclude_ranges=()):
+    """Build the ordered list of report sections. roster drives the default
+    multi-contact report; contact_entry switches to the single-relationship
+    deep-dive (people/groups sections are dropped -- they describe the whole
+    corpus). The exclusions are forwarded to the prior-year roster so
+    previous_rank is computed on the same basis as the current ranks."""
+    dates = {}
+    if year is not None:
+        dates = {"date_from": f"{year:04d}-01-01", "date_to": f"{year:04d}-12-31"}
+    scope = _entry_scope(contact_entry) if contact_entry else {}
+    tempo_entries = [contact_entry] if contact_entry else roster
+
+    # Year in Numbers + (later) Late Nights share one get_activity_patterns call.
+    patterns, patterns_note = _tool("get_activity_patterns", **scope, **dates)
+
+    sections = [_sec_year_in_numbers(patterns, patterns_note)]
+    if contact_entry is None:
+        sections.append({
+            "title": "Your People",
+            "stats": _your_people_stats(con, roster, year, exclude_chat_ids, exclude_ranges),
+        })
+    sections.append(_sec_tempo(tempo_entries, dates))
+    sections.append(_sec_reactions(scope, dates))
+    sections.append(_sec_late_nights(patterns, patterns_note))
+    sections.append(_sec_milestones(scope, year))
+    sections.append(_sec_words(scope, dates, contact_entry))
+    if contact_entry is None:
+        sections.append(_sec_groups(con, year, dates))
+    eras = _sec_eras(con, scope, dates)
+    if eras is not None:
+        sections.append(eras)
     return sections
 
 

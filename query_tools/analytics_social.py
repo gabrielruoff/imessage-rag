@@ -31,8 +31,8 @@ from ._shared import (
     _REAL_MESSAGE_CLAUSES,
     _append_id_filters,
     _connect,
+    _date_clauses,
     _id_filter_clause,
-    _normalize_date_bound,
     _resolve_chat_scope,
     _truncate_text_field,
     _validate_include,
@@ -53,17 +53,6 @@ _LANDMARK_ORDINALS = (1000, 5000, 10000, 25000, 50000)
 
 _REACTION_SECTIONS = ("given", "received", "reciprocity", "time_to_react",
                       "funniest", "hall_of_fame")
-
-
-def _date_clauses(clauses, params, date_from, date_to, column="m.date"):
-    """Append normalized date-range clauses (plain-string compares -- never
-    wrap the column in SQL date functions, that kills idx_messages_chat_date)."""
-    if date_from is not None:
-        clauses.append(f"{column} >= ?")
-        params.append(_normalize_date_bound(date_from))
-    if date_to is not None:
-        clauses.append(f"{column} < ?")
-        params.append(_normalize_date_bound(date_to, upper=True))
 
 
 def _resolve_reaction_type(reaction_type):

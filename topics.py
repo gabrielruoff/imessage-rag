@@ -8,11 +8,9 @@ Usage: topics.py [--k K] [--relabel]
   clustering, then labels clusters WHERE label IS NULL).
 """
 
-import argparse
-import json
-import random
-import sqlite3
 import sys
+import argparse
+import random
 from array import array
 from collections import Counter
 from math import sqrt
@@ -22,7 +20,7 @@ import sqlite_vec
 import ollama
 import progress
 from config import TARGET_DB, TOPIC_K, TOPIC_KMEANS_ITERS, TOPIC_LABEL_SAMPLES
-from db import get_state, load_vec_extension, set_state
+from db import connect, get_state, set_state
 
 # Module attribute so tests can patch it; _connect() reads it at call time.
 DB_PATH = TARGET_DB
@@ -43,29 +41,7 @@ _RETRY_NUDGE = (
 
 
 def _connect():
-    con = sqlite3.connect(DB_PATH)
-    load_vec_extension(con)
-    return con
-
-
-def _ask_json(messages, model=None):
-    """chat_once(format='json') -> parsed dict; one corrective retry on a
-    malformed/non-object response, then None (caller skips)."""
-    for _ in range(2):
-        # Resolved through the ollama module at call time (patch seam).
-        reply = ollama.chat_once(messages, model=model, format="json")
-        content = reply.get("content") or ""
-        try:
-            data = json.loads(content)
-        except json.JSONDecodeError:
-            data = None
-        if isinstance(data, dict):
-            return data
-        messages = messages + [
-            {"role": "assistant", "content": content},
-            {"role": "user", "content": _RETRY_NUDGE},
-        ]
-    return None
+    return connect(DB_PATH, rows=False)
 
 
 def _load_vectors(con):
@@ -248,10 +224,10 @@ def label_clusters(con, relabel=False, samples=TOPIC_LABEL_SAMPLES):
                 f"SELECT text FROM chunks WHERE id IN ({placeholders})", sample_ids)]
             prompt = "\n\n---\n\n".join(t[:_SAMPLE_TEXT_CHARS] for t in texts if t)
 
-            data = _ask_json([
+            data = ollama.chat_once_json([
                 {"role": "system", "content": _LABEL_SYSTEM},
                 {"role": "user", "content": prompt},
-            ])
+            ], retry_nudge=_RETRY_NUDGE)
             label = data.get("label") if isinstance(data, dict) else None
             if not isinstance(label, str) or not label.strip():
                 print(f"  cluster {cluster_id}: unusable label response, skipped")

@@ -5,6 +5,7 @@ columns, and the ingest_state key/value accessors."""
 
 import datetime
 import re
+import sqlite3
 
 import sqlite_vec
 
@@ -13,6 +14,19 @@ def load_vec_extension(con):
     con.enable_load_extension(True)
     sqlite_vec.load(con)
     con.enable_load_extension(False)
+
+
+def connect(path, vec=True, rows=True):
+    """Open the analysis DB the one shared way. Callers keep the path in a
+    module-level attribute (their test patch seam) and pass it in; vec/rows
+    opt out of the sqlite-vec extension and sqlite3.Row for the callers that
+    don't use them."""
+    con = sqlite3.connect(path)
+    if vec:
+        load_vec_extension(con)
+    if rows:
+        con.row_factory = sqlite3.Row
+    return con
 
 
 # Human-readable label for a contact/handle: nickname > "First Last" > raw

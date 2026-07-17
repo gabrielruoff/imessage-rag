@@ -1,5 +1,9 @@
 # evalkit — implementation plan
 
+> **Status: implemented.** The framework this plan specifies now exists in
+> `eval/evalkit/` — the code is authoritative and this document is kept as
+> design rationale. For how to run it, see [`eval/README.md`](../eval/README.md).
+
 Companion to [`ANALYTICS_TEST_PLAN.md`](ANALYTICS_TEST_PLAN.md) (the eval
 spec this framework mechanizes). This document is self-contained: an
 implementing agent should be able to build the framework from it plus the

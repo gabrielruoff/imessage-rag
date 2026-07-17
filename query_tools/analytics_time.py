@@ -41,7 +41,7 @@ from ._shared import (
     _append_id_filters,
     _as_id_list,
     _connect,
-    _normalize_date_bound,
+    _date_clauses,
     _REAL_MESSAGE_CLAUSES,
     _resolve_chat_scope,
     _scope_requested,
@@ -52,17 +52,6 @@ _WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
                   "Saturday", "Sunday"]  # datetime.weekday() order
 _GRANULARITIES = ("day", "month", "year")
 _ACTIVITY_SECTIONS = ("heatmap", "volume_series", "late_night", "busiest_days", "streaks")
-
-
-def _date_clauses(clauses, params, date_from, date_to, column="m.date"):
-    """Append normalized date-range clauses (plain-string compares -- never
-    wrap the column in SQL date functions, that kills idx_messages_chat_date)."""
-    if date_from is not None:
-        clauses.append(f"{column} >= ?")
-        params.append(_normalize_date_bound(date_from))
-    if date_to is not None:
-        clauses.append(f"{column} < ?")
-        params.append(_normalize_date_bound(date_to, upper=True))
 
 
 def _local_tz():
@@ -318,80 +307,65 @@ def _zero_response_sections():
     }
 
 
-def get_response_dynamics(chat_id=None, handle_id=None, contact_id=None,
-                          date_from=None, date_to=None):
-    """How the conversation moves, for one scope (required -- chat_id, or
-    handle_id/contact_id covering that person's 1:1 chats): `reply_latency`
-    (median/p90 seconds per side; only gaps shorter than INITIATION_GAP_HOURS
-    count as replies), `read_to_reply` (for my replies to read inbound
-    messages: unseen = read - arrival, deliberation = reply - read; with
-    honest per-direction date_read coverage counts), `initiation` (messages
-    arriving after >= INITIATION_GAP_HOURS of silence, first message
-    included), `sessions` (from the sessions table: count, median size and
-    duration, ended_by_me_share), `ghosted` (fully one-sided sessions per
-    side), `double_text` (same-sender follow-ups after >=
-    DOUBLE_TEXT_MIN_MINUTES), and `burstiness` (Goh-Barabasi B over
-    inter-message gaps, -1 regular .. +1 bursty). An explicit group chat_id
-    adds `initiations_by_member` (session-starter leaderboard)."""
-    if not _scope_requested(chat_id, handle_id, contact_id):
-        return {"error": "get_response_dynamics needs a scope: chat_id, "
-                         "handle_id, or contact_id"}
-    init_gap = INITIATION_GAP_HOURS * 3600.0
-    double_gap = DOUBLE_TEXT_MIN_MINUTES * 60.0
+def _response_rows(con, chat_ids, date_from, date_to):
+    """(id, is_from_me, date, date_read) for every real message in scope,
+    date-ordered -- the single pass _scan_message_flow consumes."""
+    clauses, params = ["m.date IS NOT NULL", *_REAL_MESSAGE_CLAUSES], []
+    _append_id_filters(clauses, params, chat_ids, None)
+    _date_clauses(clauses, params, date_from, date_to)
+    return con.execute(
+        f"SELECT m.id, m.is_from_me, m.date, m.date_read FROM messages m "
+        f"WHERE {' AND '.join(clauses)} ORDER BY m.date, m.id",
+        params,
+    ).fetchall()
 
-    with contextlib.closing(_connect()) as con:
-        chat_ids, empty = _resolve_chat_scope(con, chat_id, handle_id, contact_id)
-        if not empty and chat_ids and _as_id_list(chat_id) is None:
-            # Person scope without an explicit chat_id: 1:1 chats only.
-            chat_ids = _restrict_to_direct_chats(con, chat_ids)
-            empty = not chat_ids
-        result = {"chat_ids": chat_ids, "initiation_gap_hours": INITIATION_GAP_HOURS}
-        if empty:
-            result.update(_zero_response_sections())
-            return result
 
-        clauses, params = ["m.date IS NOT NULL", *_REAL_MESSAGE_CLAUSES], []
-        _append_id_filters(clauses, params, chat_ids, None)
-        _date_clauses(clauses, params, date_from, date_to)
-        rows = con.execute(
-            f"SELECT m.id, m.is_from_me, m.date, m.date_read FROM messages m "
-            f"WHERE {' AND '.join(clauses)} ORDER BY m.date, m.id",
-            params,
-        ).fetchall()
+def _response_sessions(con, chat_ids, date_from, date_to):
+    """Session rows for the same scope; a session is in-range when it
+    *started* inside the date window (plain-string compares)."""
+    sess_clauses = [f"s.chat_id IN ({','.join('?' * len(chat_ids))})"]
+    sess_params = list(chat_ids)
+    _date_clauses(sess_clauses, sess_params, date_from, date_to, column="s.first_date")
+    return con.execute(
+        "SELECT s.chat_id, s.n_messages, s.n_from_me, s.first_date, s.last_date, "
+        "s.ender_is_me, s.initiator_is_me, s.initiator_handle_id "
+        f"FROM sessions s WHERE {' AND '.join(sess_clauses)}",
+        sess_params,
+    ).fetchall()
 
-        # Session rows for the same scope; a session is in-range when it
-        # *started* inside the date window (plain-string compares).
-        sess_clauses = [f"s.chat_id IN ({','.join('?' * len(chat_ids))})"]
-        sess_params = list(chat_ids)
-        _date_clauses(sess_clauses, sess_params, date_from, date_to, column="s.first_date")
-        sess = con.execute(
-            "SELECT s.chat_id, s.n_messages, s.n_from_me, s.first_date, s.last_date, "
-            "s.ender_is_me, s.initiator_is_me, s.initiator_handle_id "
-            f"FROM sessions s WHERE {' AND '.join(sess_clauses)}",
-            sess_params,
-        ).fetchall()
 
-        group_ids = set()
-        if _as_id_list(chat_id) is not None:
-            placeholders = ",".join("?" * len(chat_ids))
-            group_ids = {r[0] for r in con.execute(
-                f"SELECT id FROM chats WHERE id IN ({placeholders}) AND is_group = 1",
-                chat_ids,
-            ).fetchall()}
-        labels = {}
-        if group_ids:
-            handle_ids = sorted({r["initiator_handle_id"] for r in sess
-                                 if r["chat_id"] in group_ids
-                                 and r["initiator_handle_id"] is not None})
-            if handle_ids:
-                placeholders = ",".join("?" * len(handle_ids))
-                labels = dict(con.execute(
-                    f"SELECT h.id, {CONTACT_LABEL_SQL} FROM handles h "
-                    f"LEFT JOIN contacts c ON c.id = h.contact_id "
-                    f"WHERE h.id IN ({placeholders})",
-                    handle_ids,
-                ).fetchall())
+def _group_chat_ids(con, chat_ids):
+    """The subset of chat_ids that are group chats."""
+    placeholders = ",".join("?" * len(chat_ids))
+    return {r[0] for r in con.execute(
+        f"SELECT id FROM chats WHERE id IN ({placeholders}) AND is_group = 1",
+        chat_ids,
+    ).fetchall()}
 
+
+def _initiator_labels(con, sess, group_ids):
+    """Contact labels for the group sessions' initiator handles."""
+    handle_ids = sorted({r["initiator_handle_id"] for r in sess
+                         if r["chat_id"] in group_ids
+                         and r["initiator_handle_id"] is not None})
+    if not handle_ids:
+        return {}
+    placeholders = ",".join("?" * len(handle_ids))
+    return dict(con.execute(
+        f"SELECT h.id, {CONTACT_LABEL_SQL} FROM handles h "
+        f"LEFT JOIN contacts c ON c.id = h.contact_id "
+        f"WHERE h.id IN ({placeholders})",
+        handle_ids,
+    ).fetchall())
+
+
+def _scan_message_flow(rows, init_gap, double_gap):
+    """One date-ordered pass over the message rows, accumulating every
+    per-message section at once (the sections share prev-message state, so
+    they can't be computed independently): side counts, initiations,
+    per-side reply latencies, read-to-reply splits with date_read coverage,
+    double-texts, and the raw inter-message gaps burstiness is computed
+    from."""
     counts = {"me": 0, "them": 0}
     initiations = {"me": 0, "them": 0}
     double_texts = {"me": 0, "them": 0}
@@ -433,20 +407,37 @@ def get_response_dynamics(chat_id=None, handle_id=None, contact_id=None,
                 double_texts[side] += 1
         prev_dt, prev_side, prev_read = cur, side, date_read
 
-    burstiness = None
-    if len(gaps) >= 2:
-        mu = statistics.fmean(gaps)
-        sigma = statistics.pstdev(gaps)
-        if sigma + mu > 0:
-            burstiness = round((sigma - mu) / (sigma + mu), 4)
+    return {
+        "counts": counts,
+        "initiations": initiations,
+        "double_texts": double_texts,
+        "latency": latency,
+        "unseen": unseen,
+        "deliberation": deliberation,
+        "coverage": coverage,
+        "gaps": gaps,
+    }
 
+
+def _burstiness(gaps):
+    """Goh-Barabasi B over inter-message gaps (-1 regular .. +1 bursty)."""
+    if len(gaps) < 2:
+        return None
+    mu = statistics.fmean(gaps)
+    sigma = statistics.pstdev(gaps)
+    if sigma + mu > 0:
+        return round((sigma - mu) / (sigma + mu), 4)
+    return None
+
+
+def _sessions_section(sess):
     n_sess = len(sess)
     durations = [
         (datetime.datetime.fromisoformat(r["last_date"])
          - datetime.datetime.fromisoformat(r["first_date"])).total_seconds()
         for r in sess
     ]
-    sessions_section = {
+    return {
         "count": n_sess,
         "median_messages": statistics.median([r["n_messages"] for r in sess])
         if n_sess else None,
@@ -455,44 +446,100 @@ def get_response_dynamics(chat_id=None, handle_id=None, contact_id=None,
         "ended_by_me_share": round(sum(r["ender_is_me"] for r in sess) / n_sess, 4)
         if n_sess else None,
     }
-    ghosted = {
+
+
+def _ghosted_section(sess):
+    return {
         "only_me": sum(1 for r in sess
                        if r["n_messages"] > 0 and r["n_from_me"] == r["n_messages"]),
         "only_them": sum(1 for r in sess if r["n_messages"] > 0 and r["n_from_me"] == 0),
     }
 
+
+def _read_to_reply_section(unseen, deliberation, coverage):
+    return {
+        "pairs": len(unseen),
+        "median_unseen_seconds": round(statistics.median(unseen), 1)
+        if unseen else None,
+        "median_deliberation_seconds": round(statistics.median(deliberation), 1)
+        if deliberation else None,
+        "coverage": coverage,
+    }
+
+
+def _initiations_by_member(sess, group_ids, labels):
+    """Session-starter leaderboard over the group chats in scope."""
+    counter = collections.Counter()
+    for r in sess:
+        if r["chat_id"] not in group_ids:
+            continue
+        if r["initiator_is_me"]:
+            counter["Me"] += 1
+        else:
+            hid = r["initiator_handle_id"]
+            counter[labels.get(hid, f"handle:{hid}")] += 1
+    return [
+        {"member": member, "sessions_initiated": n}
+        for member, n in sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))
+    ][:MAX_LEADERBOARD_ROWS]
+
+
+def get_response_dynamics(chat_id=None, handle_id=None, contact_id=None,
+                          date_from=None, date_to=None):
+    """How the conversation moves, for one scope (required -- chat_id, or
+    handle_id/contact_id covering that person's 1:1 chats): `reply_latency`
+    (median/p90 seconds per side; only gaps shorter than INITIATION_GAP_HOURS
+    count as replies), `read_to_reply` (for my replies to read inbound
+    messages: unseen = read - arrival, deliberation = reply - read; with
+    honest per-direction date_read coverage counts), `initiation` (messages
+    arriving after >= INITIATION_GAP_HOURS of silence, first message
+    included), `sessions` (from the sessions table: count, median size and
+    duration, ended_by_me_share), `ghosted` (fully one-sided sessions per
+    side), `double_text` (same-sender follow-ups after >=
+    DOUBLE_TEXT_MIN_MINUTES), and `burstiness` (Goh-Barabasi B over
+    inter-message gaps, -1 regular .. +1 bursty). An explicit group chat_id
+    adds `initiations_by_member` (session-starter leaderboard)."""
+    if not _scope_requested(chat_id, handle_id, contact_id):
+        return {"error": "get_response_dynamics needs a scope: chat_id, "
+                         "handle_id, or contact_id"}
+    init_gap = INITIATION_GAP_HOURS * 3600.0
+    double_gap = DOUBLE_TEXT_MIN_MINUTES * 60.0
+
+    with contextlib.closing(_connect()) as con:
+        chat_ids, empty = _resolve_chat_scope(con, chat_id, handle_id, contact_id)
+        if not empty and chat_ids and _as_id_list(chat_id) is None:
+            # Person scope without an explicit chat_id: 1:1 chats only.
+            chat_ids = _restrict_to_direct_chats(con, chat_ids)
+            empty = not chat_ids
+        result = {"chat_ids": chat_ids, "initiation_gap_hours": INITIATION_GAP_HOURS}
+        if empty:
+            result.update(_zero_response_sections())
+            return result
+
+        rows = _response_rows(con, chat_ids, date_from, date_to)
+        sess = _response_sessions(con, chat_ids, date_from, date_to)
+        # initiations_by_member is offered only for an explicit group chat_id.
+        group_ids = set()
+        if _as_id_list(chat_id) is not None:
+            group_ids = _group_chat_ids(con, chat_ids)
+        labels = _initiator_labels(con, sess, group_ids)
+
+    flow = _scan_message_flow(rows, init_gap, double_gap)
+
     result.update(
         message_count=len(rows),
-        from_me=counts["me"],
-        from_them=counts["them"],
-        reply_latency={s: _latency_stats(latency[s]) for s in ("me", "them")},
-        read_to_reply={
-            "pairs": len(unseen),
-            "median_unseen_seconds": round(statistics.median(unseen), 1)
-            if unseen else None,
-            "median_deliberation_seconds": round(statistics.median(deliberation), 1)
-            if deliberation else None,
-            "coverage": coverage,
-        },
-        initiation=initiations,
-        sessions=sessions_section,
-        ghosted=ghosted,
-        double_text=double_texts,
-        burstiness=burstiness,
+        from_me=flow["counts"]["me"],
+        from_them=flow["counts"]["them"],
+        reply_latency={s: _latency_stats(flow["latency"][s]) for s in ("me", "them")},
+        read_to_reply=_read_to_reply_section(
+            flow["unseen"], flow["deliberation"], flow["coverage"]),
+        initiation=flow["initiations"],
+        sessions=_sessions_section(sess),
+        ghosted=_ghosted_section(sess),
+        double_text=flow["double_texts"],
+        burstiness=_burstiness(flow["gaps"]),
     )
 
     if group_ids:
-        counter = collections.Counter()
-        for r in sess:
-            if r["chat_id"] not in group_ids:
-                continue
-            if r["initiator_is_me"]:
-                counter["Me"] += 1
-            else:
-                hid = r["initiator_handle_id"]
-                counter[labels.get(hid, f"handle:{hid}")] += 1
-        result["initiations_by_member"] = [
-            {"member": member, "sessions_initiated": n}
-            for member, n in sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))
-        ][:MAX_LEADERBOARD_ROWS]
+        result["initiations_by_member"] = _initiations_by_member(sess, group_ids, labels)
     return result

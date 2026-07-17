@@ -26,21 +26,10 @@ from ._shared import (
     _append_id_filters,
     _as_id_list,
     _connect,
+    _date_clauses,
     _id_filter_clause,
-    _normalize_date_bound,
     _resolve_scope,
 )
-
-
-def _date_clauses(clauses, params, date_from, date_to, column="m.date"):
-    """Append normalized date-range clauses (plain-string compares -- never
-    wrap the column in SQL date functions, that kills idx_messages_chat_date)."""
-    if date_from is not None:
-        clauses.append(f"{column} >= ?")
-        params.append(_normalize_date_bound(date_from))
-    if date_to is not None:
-        clauses.append(f"{column} < ?")
-        params.append(_normalize_date_bound(date_to, upper=True))
 
 
 def get_chat_participant_stats(chat_id, date_from=None, date_to=None):

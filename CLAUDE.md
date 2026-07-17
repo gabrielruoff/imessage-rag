@@ -39,6 +39,13 @@ Full design history, schema, rationale, and data forensics:
   reduced-context env defaults; transcripts land in `eval/results/`. Never
   run eval prompts in parallel — Ollama serializes and it thrashes the KV
   prefix cache.
+- Analytics eval (evalkit): `.venv/bin/python3 -m eval.evalkit
+  <selfcheck|manifest|run|check|report>` — regression harness sweeping the
+  S1–S8 prompt suites (`eval/cases/`) through `chat.run_turn` in-process and
+  grading replies against SQL-computed ground truth. `selfcheck`/`manifest`
+  need no Ollama; `run` does (sequential, one case at a time — the no-parallel
+  rule above applies). Usage + agent-orchestration guide: `eval/README.md`.
+  `fast_eval.sh` is the separate, older smoke path — leave it as-is.
 - Test: `.venv/bin/python3 -m unittest discover tests` (hermetic — no Ollama or real `chat.db`).
   NEVER run tests unless your changes touched files in `tests/` or the user
   directly asks — the suite is slow and hangs the terminal. When you do run
@@ -103,10 +110,16 @@ with initiator/ender), `lexicon_build.py` (`person_period_lexicon` +
 `dyad_terms`, full rebuilds — dyad_terms preserves `llm_verdict` curation);
 `function_words.py` the bundled open LSM lexicon + tokenize/emoji/laugh
 regexes + GoEmotions labels. Standalone batch CLIs: `annotate.py` (LLM chunk
-annotations + dyad-term curation via `ollama.chat_once` JSON mode),
+annotations + dyad-term curation via `ollama.chat_once_json`),
 `topics.py` (k-means topic clusters + LLM labels), `wrapped.py` (markdown
 report composing the query tools deterministically; LLM only narrates
-computed numbers).
+computed numbers). `eval/evalkit/` is the analytics eval harness (stdlib-only;
+imports the app in-process, lazily — env overrides must be set before app
+modules import): `cases.py` suite loading/validation, `roster.py` roster
+resolution, `recipes.py` SQL ground-truth recipes, `manifest.py`
+corpus-fingerprinted ground truth, `runner.py` the transcript-capturing sweep,
+`checks.py` deterministic grading, `p3.py` LLM-graded checks, `report.py` the
+scorecard.
 
 ## Schema (imessage_analysis.db)
 

@@ -11,9 +11,7 @@ Usage: annotate.py [--all | --top-dyads N] [--terms] [--limit N]
 
 import argparse
 import json
-import sqlite3
 import sys
-
 import ollama
 import progress
 from config import (
@@ -22,7 +20,7 @@ from config import (
     ANNOTATE_TOP_DYADS,
     TARGET_DB,
 )
-from db import get_state, load_vec_extension, set_state
+from db import connect, get_state, set_state
 from function_words import EMOTION_LABELS
 
 # Module attribute so tests can patch it; _connect() reads it at call time.
@@ -57,16 +55,8 @@ people; "nickname" = a name they call a person, pet, or place; "ordinary" = a
 normal word that just happens to be frequent; "noise" = a typo, artifact, or
 meaningless fragment."""
 
-_RETRY_NUDGE = (
-    "Respond with only the JSON object described in the instructions -- "
-    "no prose, no code fences, nothing else."
-)
-
-
 def _connect():
-    con = sqlite3.connect(DB_PATH)
-    load_vec_extension(con)
-    return con
+    return connect(DB_PATH, rows=False)
 
 
 def _like_escape(value):
@@ -74,27 +64,6 @@ def _like_escape(value):
     return (value.replace("\\", "\\\\")
                  .replace("%", "\\%")
                  .replace("_", "\\_"))
-
-
-def _ask_json(messages, model):
-    """chat_once(format='json') -> parsed dict, retrying once with a
-    corrective nudge on a malformed/non-object response; None if the retry
-    also fails (caller skips -- the row is retried on the next run)."""
-    for _ in range(2):
-        # Resolved through the ollama module at call time (patch seam).
-        reply = ollama.chat_once(messages, model=model, format="json")
-        content = reply.get("content") or ""
-        try:
-            data = json.loads(content)
-        except json.JSONDecodeError:
-            data = None
-        if isinstance(data, dict):
-            return data
-        messages = messages + [
-            {"role": "assistant", "content": content},
-            {"role": "user", "content": _RETRY_NUDGE},
-        ]
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -210,10 +179,10 @@ def annotate_chunks(con, model, all_chats=False, top_dyads=ANNOTATE_TOP_DYADS,
         with progress.track("Annotating chunks", total=len(pending),
                             header=False) as p:
             for chunk_id, text in pending:
-                data = _ask_json(
+                data = ollama.chat_once_json(
                     [{"role": "system", "content": _ANNOTATE_SYSTEM},
                      {"role": "user", "content": text}],
-                    model,
+                    model=model,
                 )
                 if data is None:
                     n_skipped += 1
@@ -280,10 +249,10 @@ def curate_terms(con, model, limit=None, dry_run=False):
                 user = f'Term: "{term}"\n\nExample messages from this chat:\n' + (
                     "\n".join(f"- {t[:200]}" for t in examples) or "(none found)"
                 )
-                data = _ask_json(
+                data = ollama.chat_once_json(
                     [{"role": "system", "content": _TERMS_SYSTEM},
                      {"role": "user", "content": user}],
-                    model,
+                    model=model,
                 )
                 verdict = data.get("verdict") if isinstance(data, dict) else None
                 if verdict not in TERM_VERDICTS:

@@ -3,10 +3,9 @@ result-size ceilings, id-list/scope normalization, date-bound parsing, and
 the message SELECT fragments every message-returning tool shares."""
 
 import datetime
-import sqlite3
 
 from config import TARGET_DB
-from db import CONTACT_LABEL_SQL, load_vec_extension
+from db import CONTACT_LABEL_SQL, connect
 
 DB_PATH = str(TARGET_DB)
 
@@ -17,10 +16,7 @@ def _connect():
     # cycle-safe because _connect only runs after the package is initialized.
     import query_tools
 
-    con = sqlite3.connect(query_tools.DB_PATH)
-    load_vec_extension(con)
-    con.row_factory = sqlite3.Row
-    return con
+    return connect(query_tools.DB_PATH)
 
 
 # Resolve a message's sender: "Me" when is_from_me, else the contact label
@@ -155,6 +151,17 @@ def _append_id_filters(clauses, params, chat_ids, handle_ids, prefix="m."):
         if clause:
             clauses.append(clause)
             params.extend(cparams)
+
+
+def _date_clauses(clauses, params, date_from, date_to, column="m.date"):
+    """Append normalized date-range clauses (plain-string compares -- never
+    wrap the column in SQL date functions, that kills idx_messages_chat_date)."""
+    if date_from is not None:
+        clauses.append(f"{column} >= ?")
+        params.append(_normalize_date_bound(date_from))
+    if date_to is not None:
+        clauses.append(f"{column} < ?")
+        params.append(_normalize_date_bound(date_to, upper=True))
 
 
 def _date_bound_step(value):

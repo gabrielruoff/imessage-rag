@@ -64,6 +64,36 @@ def chat_once(messages, model=None, format=None, timeout=None):
     return data.get("message", {})
 
 
+_JSON_RETRY_NUDGE = (
+    "Respond with only the JSON object described in the instructions -- "
+    "no prose, no code fences, nothing else."
+)
+
+
+def chat_once_json(messages, model=None, retry_nudge=_JSON_RETRY_NUDGE):
+    """chat_once(format='json') -> parsed dict, retrying once with a
+    corrective nudge on a malformed/non-object response; None if the retry
+    also fails (the caller skips the row -- batch callers pick it up again on
+    their next run). Callers with a task-specific output shape pass their own
+    retry_nudge so the correction names the exact JSON expected."""
+    for _ in range(2):
+        # chat_once is resolved as a module global at call time (the tests'
+        # patch seam).
+        reply = chat_once(messages, model=model, format="json")
+        content = reply.get("content") or ""
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, dict):
+            return data
+        messages = messages + [
+            {"role": "assistant", "content": content},
+            {"role": "user", "content": retry_nudge},
+        ]
+    return None
+
+
 def chat_stream(messages, tools=None, model=None):
     """POST a streaming request to the chat endpoint (OLLAMA_CHAT_PATH) and
     yield each chunk's `message` dict as it arrives. Raises OllamaResponseError

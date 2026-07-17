@@ -122,7 +122,8 @@ def cmd_manifest(args):
 
     db_path = resolve_db_path(args.db)
 
-    from . import cases, recipes
+    from . import cases
+    from .roster import resolve_roster
 
     overrides = None
     if args.roster_overrides:
@@ -134,7 +135,7 @@ def cmd_manifest(args):
         print(f"roster loaded from {MANIFEST_PATH.name} (partial rebuild)")
     else:
         print("resolving roster:")
-        roster = recipes.resolve_roster(db_path, overrides)
+        roster = resolve_roster(db_path, overrides)
 
     fp = fingerprint(db_path)
     suite_list = cases.load_suites(suites=args.suites)

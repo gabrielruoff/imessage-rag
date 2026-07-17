@@ -1,6 +1,11 @@
 # Analytics features — LLM response-quality eval plan
 
-Not yet run. Design rationale for the features under test lives in
+> **Status: mechanized.** This spec is implemented as the evalkit harness
+> (`eval/evalkit/`, suites S1–S8 in `eval/cases/`) — run evals there, per
+> [`eval/README.md`](../eval/README.md); this document remains the spec and
+> grading rationale.
+
+Design rationale for the features under test lives in
 [`DECISIONS.md`](DECISIONS.md) ("the analytics layer"); this document is the
 forward plan for evaluating them.
 
