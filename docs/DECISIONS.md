@@ -417,6 +417,47 @@ vector extension), and `rich==13.9.4` (used by `chat.py` to stream/render
 the model's markdown replies in the terminal); `requirements-dev.txt` pins
 `ruff==0.15.21` (linting, see below); everything else is stdlib.
 
+## 2026-07-16: aggregate tools + loop fixes (eval-driven)
+
+A 20-prompt eval sweep ([`eval_report_2026-07-16.md`](eval_report_2026-07-16.md))
+showed narrative/retrieval prompts working and quantitative/superlative
+prompts failing (empty replies, confident wrong numbers from 50-row samples,
+a whole 20-iteration budget spent approximating a histogram). Changes, all
+motivated by specific transcript failures:
+
+- **`query_tools/analytics.py`** — five single-call aggregate tools:
+  `get_conversation_dynamics` (initiations, response-time median/p90,
+  longest silences + who broke them, double-texts; person scope = their 1:1
+  chats), `get_activity_histogram` (month/day/dow/hour buckets, UTC,
+  from_me/from_them split), `get_top_reacted_messages` (tapbacks *received*,
+  filterable by type), `get_chat_participant_stats` (per-member rows incl.
+  'Me' and silent members; identities merged in Python because from-me rows
+  carry `handle_id=0` and contacts own duplicate handles),
+  `get_word_frequency` (n-gram counts with stopword filtering; sender
+  scope, unlike the other four which scope to a person's chats).
+- **Reaction guid normalization** — `reactions.target_message_guid` was
+  stored raw from chat.db's `associated_message_guid`, which carries a
+  message-part prefix (`p:N/`, `bp:`) that `messages.guid` never has; only
+  well under 1% of reactions joined to their target. Ingest now strips the
+  prefix and `create_schema` runs an idempotent in-place `UPDATE` for
+  existing DBs. This bug silently zeroed `get_message_reactions` lookups.
+- **Result envelopes** — `search_messages_sql`/`search_messages_fts` return
+  `{rows, total_matching, returned, order, truncated}` so a capped page can
+  never be mistaken for the population (the eval's "longest silence = 39
+  days" failure, computed from the newest 50 of 4,000 rows).
+- **`reactions_sent_count` rename** — `get_chat_summary_stats.reaction_count`
+  counted reactions *sent by* the scope; the model read it as "received" and
+  inverted a group-chat ranking. The name now says what it counts.
+- **chat.py loop robustness** — a reply with neither content nor tool calls
+  (4/20 eval runs) now falls through to the existing tools-withheld
+  final-turn request instead of returning an empty answer; exact-duplicate
+  tool calls are short-circuited with a "reuse the earlier result" note
+  (one eval run repeated an identical call ten times).
+- **`eval/fast_eval.sh`** — single-stream prompt-sweep runner (Ollama
+  serializes requests; parallel eval batches only add queueing and thrash
+  the KV prefix cache) with reduced-context env defaults for fast smoke
+  sweeps.
+
 ## Linting
 
 `ruff check .` (config in `pyproject.toml`: `line-length = 100`,

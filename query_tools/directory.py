@@ -160,7 +160,7 @@ def list_chats(query=None, chat_id=None, handle_id=None, contact_id=None, limit=
 
 
 _ZERO_STATS = {"message_count": 0, "first_message": None, "last_message": None,
-               "from_me": 0, "from_them": 0, "attachment_count": 0, "reaction_count": 0}
+               "from_me": 0, "from_them": 0, "attachment_count": 0, "reactions_sent_count": 0}
 
 
 def _stats_filters(prefix, chat_ids, handle_ids, is_from_me, date_from, date_to):
@@ -201,9 +201,11 @@ def get_chat_summary_stats(chat_id=None, handle_id=None, contact_id=None,
     `limit` chats by message_count (an unlimited dump of every chat would
     overflow the chat model's context window). Each row also includes
     attachment_count (individual attachments, so a message with three photos
-    counts three) and reaction_count. Every filter applies to all three counts
+    counts three) and reactions_sent_count. Every filter applies to all three counts
     alike -- is_from_me=True means messages, attachments, and reactions you
-    sent."""
+    sent. reactions_sent_count counts reactions SENT by whoever matches the
+    filters, never reactions received; for reactions *received* use
+    get_top_reacted_messages or get_chat_participant_stats."""
     with contextlib.closing(_connect()) as con:
         chat_ids = _as_id_list(chat_id)
         handle_requested = _scope_requested(handle_id, contact_id)
@@ -250,7 +252,7 @@ def get_chat_summary_stats(chat_id=None, handle_id=None, contact_id=None,
                 )
                 SELECT t.*,
                     ({att_sql}) AS attachment_count,
-                    ({reaction_sql}) AS reaction_count
+                    ({reaction_sql}) AS reactions_sent_count
                 FROM top_chats t
                 ORDER BY t.message_count DESC
             """, params + [max(1, min(limit, MAX_STATS_ROWS))]
@@ -273,7 +275,7 @@ def get_chat_summary_stats(chat_id=None, handle_id=None, contact_id=None,
                 SUM(CASE WHEN is_from_me = 1 THEN 1 ELSE 0 END) AS from_me,
                 SUM(CASE WHEN is_from_me = 0 THEN 1 ELSE 0 END) AS from_them,
                 ({att_sql}) AS attachment_count,
-                (SELECT COUNT(*) FROM reactions r WHERE {reaction_where}) AS reaction_count
+                (SELECT COUNT(*) FROM reactions r WHERE {reaction_where}) AS reactions_sent_count
             FROM messages WHERE {where}
         """, att_params + reaction_params + params).fetchone()
     return dict(row)

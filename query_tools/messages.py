@@ -4,7 +4,7 @@ full-text recovery for truncated results."""
 
 import contextlib
 
-from db import CONTACT_LABEL_SQL
+from db import CONTACT_LABEL_SQL, tapback_name
 
 from ._shared import (
     MAX_CONTEXT_MESSAGES,
@@ -20,6 +20,19 @@ from ._shared import (
 )
 
 
+def _envelope(rows, total, order):
+    """Result envelope for the row-capped search tools: makes truncation
+    visible to the model so a 50-row page is never mistaken for the whole
+    population (see docs/eval_report_2026-07-16.md)."""
+    return {
+        "rows": rows,
+        "total_matching": total,
+        "returned": len(rows),
+        "order": order,
+        "truncated": total > len(rows),
+    }
+
+
 def search_messages_sql(chat_id=None, handle_id=None, contact_id=None, is_from_me=None,
                          date_from=None, date_to=None, limit=50):
     """Structured filter search -- no text matching, just facets. chat_id and
@@ -31,13 +44,17 @@ def search_messages_sql(chat_id=None, handle_id=None, contact_id=None, is_from_m
     not just a day. date_to covers the whole unit named, so date_to='2026-01-01'
     includes all of Jan 1. Message dates are stored in UTC; a bound carrying an
     offset ('2026-01-01T13:00:00-05:00', '...Z') is converted to UTC for you,
-    and a bound without one is taken as already-UTC."""
+    and a bound without one is taken as already-UTC.
+
+    Returns an envelope, not a bare list: rows carries the newest
+    `limit` matching messages, total_matching the full match count -- when
+    truncated is true, rows is only a sample of the population."""
     limit = max(1, min(limit, MAX_MESSAGE_LIMIT))
 
     with contextlib.closing(_connect()) as con:
         chat_ids, handle_ids, empty = _resolve_scope(con, chat_id, handle_id, contact_id)
         if empty:
-            return []
+            return _envelope([], 0, "newest-first")
 
         clauses, params = [], []
         _append_id_filters(clauses, params, chat_ids, handle_ids)
@@ -52,6 +69,9 @@ def search_messages_sql(chat_id=None, handle_id=None, contact_id=None, is_from_m
             params.append(_normalize_date_bound(date_to, upper=True))
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        total = con.execute(
+            f"SELECT COUNT(*) FROM messages m {where}", params
+        ).fetchone()[0]
         sql = f"""
             SELECT {_MSG_COLS}
             FROM messages m
@@ -60,37 +80,47 @@ def search_messages_sql(chat_id=None, handle_id=None, contact_id=None, is_from_m
             ORDER BY m.date DESC
             LIMIT ?
         """
-        params.append(limit)
-        rows = con.execute(sql, params).fetchall()
-    return _truncate_text_field([dict(r) for r in rows])
+        rows = con.execute(sql, params + [limit]).fetchall()
+    return _envelope(_truncate_text_field([dict(r) for r in rows]), total, "newest-first")
 
 
 def search_messages_fts(query: str, chat_id=None, handle_id=None, contact_id=None, limit=50):
     """Keyword/phrase search via FTS5 (supports FTS5 query syntax:
     'foo AND bar', '"exact phrase"', 'foo NOT bar', etc.). chat_id/handle_id
     accept a single id or a list; contact_id (single or list) scopes to a
-    person across every handle they own."""
+    person across every handle they own.
+
+    Returns an envelope, not a bare list: rows carries the `limit`
+    best-ranked hits, total_matching the full match count -- when truncated
+    is true, rows is only a sample of the matches."""
     limit = max(1, min(limit, MAX_MESSAGE_LIMIT))
     with contextlib.closing(_connect()) as con:
         chat_ids, handle_ids, empty = _resolve_scope(con, chat_id, handle_id, contact_id)
         if empty:
-            return []
+            return _envelope([], 0, "best-match-first")
 
         clauses, params = ["messages_fts MATCH ?"], [query]
         _append_id_filters(clauses, params, chat_ids, handle_ids)
+        where = " AND ".join(clauses)
 
+        total = con.execute(
+            f"SELECT COUNT(*) FROM messages_fts f JOIN messages m ON m.id = f.rowid "
+            f"WHERE {where}",
+            params,
+        ).fetchone()[0]
         sql = f"""
             SELECT {_MSG_COLS}
             FROM messages_fts f
             JOIN messages m ON m.id = f.rowid
             {_MSG_JOIN}
-            WHERE {' AND '.join(clauses)}
+            WHERE {where}
             ORDER BY rank
             LIMIT ?
         """
-        params.append(limit)
-        rows = con.execute(sql, params).fetchall()
-    return _truncate_text_field([dict(r) for r in rows])
+        rows = con.execute(sql, params + [limit]).fetchall()
+    return _envelope(
+        _truncate_text_field([dict(r) for r in rows]), total, "best-match-first"
+    )
 
 
 def get_message_context(message_id: int, before=10, after=10):
@@ -154,7 +184,11 @@ def get_message_reactions(target_message_guid):
             """,
             guids,
         ).fetchall()
-    return [dict(r) for r in rows]
+    results = [dict(r) for r in rows]
+    for r in results:
+        # Human-readable tapback name next to the raw Apple type code.
+        r["reaction"] = tapback_name(r["associated_message_type"])
+    return results
 
 
 def get_full_messages(ids):

@@ -14,17 +14,14 @@ from ._shared import (
     CHUNK_PREVIEW_CHARS,
     HYBRID_POOL,
     MAX_CHUNK_MESSAGES,
-    MAX_SCOPE_CHATS,
     MAX_VEC_K,
     RRF_K,
     _MSG_COLS,
     _MSG_JOIN,
-    _as_id_list,
     _connect,
     _id_filter_clause,
     _normalize_date_bound,
-    _resolve_handle_filter,
-    _scope_requested,
+    _resolve_chat_scope,
     _truncate_text_field,
 )
 
@@ -56,38 +53,6 @@ _CHUNK_SELECT = (
     "ck.first_date, ck.last_date, ck.n_messages, "
     "ck.first_message_id, ck.last_message_id"
 )
-
-
-def _resolve_chat_scope(con, chat_id, handle_id, contact_id):
-    """Resolve scope params into (chat_ids, empty) for chunk-level search.
-    Chunks belong to whole chats, so handle_id/contact_id scope to the chats
-    that person participates in (an exact chat_participants join); when chat
-    and person params are both given, the scopes intersect, matching the AND
-    semantics of the message-level tools. `empty` mirrors _resolve_scope:
-    True when a scope was requested but matched nothing."""
-    # chat_ids needs no emptiness check: a chat_id never resolves through a
-    # lookup, so a requested chat scope is always non-empty after
-    # normalization (and an explicit [] normalizes to "no filter").
-    chat_ids = _as_id_list(chat_id)
-    handle_requested = _scope_requested(handle_id, contact_id)
-    if handle_requested:
-        handle_ids = _resolve_handle_filter(con, handle_id, contact_id)
-        if not handle_ids:
-            return None, True
-        placeholders = ",".join("?" * len(handle_ids))
-        # ORDER BY makes the MAX_SCOPE_CHATS truncation deterministic
-        person_chats = [r[0] for r in con.execute(
-            f"SELECT DISTINCT chat_id FROM chat_participants "
-            f"WHERE handle_id IN ({placeholders}) ORDER BY chat_id", handle_ids,
-        ).fetchall()][:MAX_SCOPE_CHATS]
-        if chat_ids:
-            person_set = set(person_chats)
-            chat_ids = [c for c in chat_ids if c in person_set]
-        else:
-            chat_ids = person_chats
-        if not chat_ids:
-            return None, True
-    return chat_ids, False
 
 
 def _day_bounds(date_from, date_to):

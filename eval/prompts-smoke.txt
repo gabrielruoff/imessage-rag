@@ -1,0 +1,8 @@
+# One prompt per new aggregate tool, each a regression for an eval-sweep
+# failure (docs/eval_report_2026-07-16.md). Format: id|prompt
+smoke-dynamics|Who usually texts first, me or Alice, and what's the longest we've ever gone without talking?
+smoke-histogram|What hour of the day am I most active, and how has my monthly message volume with Bob Carter changed over time?
+smoke-top-reacted|Which of my messages got the most laugh reactions in 2025?
+smoke-participants|In the Weekend Crew group chat, who sends the most messages and who gets reacted to the most?
+smoke-word-freq|What words do I overuse in my texts? Rank them by count.
+smoke-superlative|What's the longest silence between me and Dana Whitfield, and who broke it?

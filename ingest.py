@@ -23,6 +23,7 @@ Usage:
 import argparse
 import datetime
 import http.client
+import re
 import shutil
 import sqlite3
 import sys
@@ -292,6 +293,16 @@ def ingest_handles(src, tgt, contacts, handle_to_contact):
     print(f"Ingested {len(rows)} handles ({matched} matched to a contact)")
 
 
+# chat.db's associated_message_guid points at a message *part*
+# ('p:0/<guid>', 'bp:<guid>'); messages.guid is always bare. Strip the
+# prefix at insert so reactions join to their target message by guid.
+_REACTION_GUID_PREFIX = re.compile(r"^(?:p:\d+/|bp:)")
+
+
+def strip_reaction_guid_prefix(guid):
+    return _REACTION_GUID_PREFIX.sub("", guid) if guid else guid
+
+
 def ingest_messages_and_reactions(src, tgt, since_rowid=0, allowed_chat_ids=None):
     params = [since_rowid]
     chat_filter = _chat_id_filter_sql("cmj.chat_id", allowed_chat_ids, params)
@@ -329,8 +340,8 @@ def ingest_messages_and_reactions(src, tgt, since_rowid=0, allowed_chat_ids=None
                 "INSERT OR REPLACE INTO reactions"
                 "(id, target_message_guid, chat_id, handle_id, is_from_me, "
                 " associated_message_type, date) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (rowid, assoc_guid, chat_id, handle_id, is_from_me,
-                 assoc_type, apple_ns_to_iso(date)),
+                (rowid, strip_reaction_guid_prefix(assoc_guid), chat_id, handle_id,
+                 is_from_me, assoc_type, apple_ns_to_iso(date)),
             )
             n_react += 1
         else:

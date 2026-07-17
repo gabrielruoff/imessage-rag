@@ -119,6 +119,114 @@ class RunTurnFallbackTest(unittest.TestCase):
         self.assertEqual(reply, "the final answer")
 
 
+class EmptyReplyRetryTest(RunTurnFallbackTest):
+    """A reply with neither content nor tool calls (the model stalling out)
+    must trigger the same tools-withheld final request as budget exhaustion,
+    not be returned as an empty answer."""
+
+    def _fake_stream(self, messages, tools=chat.OLLAMA_TOOLS, show_model_header=True, model=None):
+        self.calls.append({"messages": copy.deepcopy(messages), "tools": tools, "model": model})
+        if tools is None:
+            return dict(FINAL_REPLY)
+        # First budgeted iteration: an empty, tool-call-free stall.
+        return {"role": "assistant", "content": ""}
+
+    def test_empty_reply_falls_through_to_final_request(self):
+        reply = chat.run_turn([{"role": "system", "content": chat.SYSTEM_PROMPT}])
+        self.assertEqual(reply, "the final answer")
+        # One stalled iteration + the final request -- the budget (2) is NOT
+        # exhausted first.
+        self.assertEqual(len(self.calls), 2)
+        self.assertIsNone(self.calls[-1]["tools"])
+        self.assertIn(chat.FINAL_TURN_NOTE, self.calls[-1]["messages"][0]["content"])
+
+    def test_empty_assistant_message_is_dropped_from_the_conversation(self):
+        messages = [{"role": "system", "content": chat.SYSTEM_PROMPT}]
+        chat.run_turn(messages)
+        empties = [m for m in messages
+                   if m["role"] == "assistant" and not m.get("content")]
+        self.assertEqual(empties, [])
+        self.assertEqual(messages[-1]["content"], "the final answer")
+
+    # The inherited fallback tests exercise the empty-reply path too (the
+    # stub returns an empty reply on every budgeted iteration but the first
+    # one already breaks out), except the ones premised on exhausting the
+    # budget -- re-pin their expected call counts.
+    def test_fallback_withholds_tools_from_the_final_request(self):
+        chat.run_turn([{"role": "system", "content": chat.SYSTEM_PROMPT}])
+        self.assertEqual(len(self.calls), 2)  # 1 stalled iteration + 1 final
+        self.assertIsNone(self.calls[-1]["tools"])
+
+    def test_model_override_reaches_every_request(self):
+        chat.run_turn([{"role": "system", "content": chat.SYSTEM_PROMPT}], model="other-model")
+        self.assertEqual(len(self.calls), 2)
+        for call in self.calls:
+            self.assertEqual(call["model"], "other-model")
+
+
+class DedupGuardTest(unittest.TestCase):
+    """An exact repeat of a (tool, args) call within one turn must not
+    re-execute the tool -- it burns an iteration for zero new information."""
+
+    def setUp(self):
+        self._saved_iterations = chat.MAX_TOOL_ITERATIONS
+        chat.MAX_TOOL_ITERATIONS = 4
+        self.addCleanup(setattr, chat, "MAX_TOOL_ITERATIONS", self._saved_iterations)
+
+        self._saved_console = chat.console
+        chat.console = Console(file=io.StringIO())
+        self.addCleanup(setattr, chat, "console", self._saved_console)
+
+        self.executions = []
+
+        def counting_tool(**kwargs):
+            self.executions.append(kwargs)
+            return [{"id": 1}]
+
+        chat.TOOL_FUNCTIONS["counting_tool"] = counting_tool
+        self.addCleanup(chat.TOOL_FUNCTIONS.pop, "counting_tool", None)
+
+        self._saved_stream = chat.ollama_chat_stream
+        self.addCleanup(setattr, chat, "ollama_chat_stream", self._saved_stream)
+
+    def _run_with_scripted_calls(self, arg_script):
+        """Each entry in arg_script becomes one iteration's tool call; then
+        the stub answers."""
+        script = list(arg_script)
+
+        def fake_stream(messages, tools=chat.OLLAMA_TOOLS, show_model_header=True, model=None):
+            if script:
+                args = script.pop(0)
+                return {
+                    "role": "assistant", "content": "",
+                    "tool_calls": [{"function": {"name": "counting_tool",
+                                                 "arguments": args}}],
+                }
+            return dict(FINAL_REPLY)
+
+        chat.ollama_chat_stream = fake_stream
+        messages = [{"role": "system", "content": chat.SYSTEM_PROMPT}]
+        reply = chat.run_turn(messages)
+        return reply, messages
+
+    def test_identical_repeat_is_not_reexecuted(self):
+        reply, messages = self._run_with_scripted_calls([{"a": 1}, {"a": 1}])
+        self.assertEqual(reply, "the final answer")
+        self.assertEqual(len(self.executions), 1)
+        duplicate_notes = [m for m in messages if m["role"] == "tool"
+                           and "duplicate_call" in m["content"]]
+        self.assertEqual(len(duplicate_notes), 1)
+        self.assertIn("counting_tool", duplicate_notes[0]["content"])
+
+    def test_different_arguments_still_execute(self):
+        self._run_with_scripted_calls([{"a": 1}, {"a": 2}])
+        self.assertEqual(len(self.executions), 2)
+
+    def test_key_is_stable_under_dict_ordering(self):
+        self._run_with_scripted_calls([{"a": 1, "b": 2}, {"b": 2, "a": 1}])
+        self.assertEqual(len(self.executions), 1)
+
+
 class CapToolResultTest(unittest.TestCase):
     """Whatever the shape or size of a tool result, _cap_tool_result must hand
     Ollama valid JSON no larger than TOOL_RESULT_MAX_CHARS -- an oversized
@@ -158,6 +266,22 @@ class CapToolResultTest(unittest.TestCase):
         capped = json.loads(self.cap([{"text": "z" * 2000}]))
         self.assertIs(capped["truncated"], True)
         self.assertIn("partial_json", capped)
+        self.assertLessEqual(len(json.dumps(capped)), 500)
+
+    def test_oversized_envelope_is_cut_at_whole_rows(self):
+        envelope = {
+            "rows": [{"id": i, "text": "x" * 40} for i in range(50)],
+            "total_matching": 900, "returned": 50,
+            "order": "newest-first", "truncated": False,
+        }
+        capped = json.loads(self.cap(envelope))
+        self.assertIs(capped["truncated"], True)
+        self.assertEqual(capped["rows_total"], 50)
+        # kept rows are whole and the envelope context survives the cut
+        self.assertEqual(capped["rows"], envelope["rows"][: capped["rows_returned"]])
+        self.assertEqual(capped["total_matching"], 900)
+        self.assertEqual(capped["order"], "newest-first")
+        self.assertEqual(capped["returned"], capped["rows_returned"])
         self.assertLessEqual(len(json.dumps(capped)), 500)
 
 

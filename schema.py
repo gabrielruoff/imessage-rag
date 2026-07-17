@@ -162,4 +162,19 @@ def create_schema(con: sqlite3.Connection):
 
     con.executescript(SCHEMA)
     con.executescript(FTS_SCHEMA)
+
+    # Reactions used to be stored with chat.db's raw associated_message_guid,
+    # which carries a message-part prefix ('p:0/<guid>' -- tapback on part N
+    # -- or 'bp:<guid>' for balloon parts) that messages.guid never has, so
+    # reaction -> message joins missed ~99% of rows. Normalize in place;
+    # idempotent, and new rows are stripped at insert time
+    # (ingest.strip_reaction_guid_prefix).
+    con.execute("""
+        UPDATE reactions SET target_message_guid =
+            CASE
+                WHEN target_message_guid LIKE 'bp:%' THEN substr(target_message_guid, 4)
+                ELSE substr(target_message_guid, instr(target_message_guid, '/') + 1)
+            END
+        WHERE target_message_guid LIKE 'p:%/%' OR target_message_guid LIKE 'bp:%'
+    """)
     con.commit()
