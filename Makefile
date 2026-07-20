@@ -1,4 +1,4 @@
-.PHONY: reset-db ollama-start ollama-stop install lint \
+.PHONY: reset-db ollama-start ollama-stop install install-ollama lint \
         ingest annotate annotate-all topics pipeline eval eval-dry
 
 # --- Pipelines (all need Ollama up: make ollama-start) -----------------------
@@ -59,9 +59,51 @@ reset-db:
 lint:
 	.venv/bin/ruff check .
 
+# PYTHON defaults to Homebrew's interpreter because python.org builds ship a
+# SQLite compiled without loadable-extension support, which sqlite-vec needs.
+# Override for Intel Macs (/usr/local/bin/python3) or any other prefix:
+#   make install PYTHON=/usr/local/bin/python3
+PYTHON ?= /opt/homebrew/bin/python3
+
 install:
-	test -d .venv || /opt/homebrew/bin/python3 -m venv .venv
+	@test -x "$(PYTHON)" || { \
+	  echo "error: no interpreter at $(PYTHON)"; \
+	  echo "  Install Homebrew Python (brew install python@3.13), or re-run as:"; \
+	  echo "    make install PYTHON=/path/to/python3"; \
+	  exit 1; }
+	test -d .venv || "$(PYTHON)" -m venv .venv
+	@.venv/bin/python3 -c "import sqlite3, tempfile, os; \
+	  p = os.path.join(tempfile.mkdtemp(), 'probe.db'); \
+	  c = sqlite3.connect(p); \
+	  c.enable_load_extension(True)" 2>/dev/null || { \
+	  echo "error: $(PYTHON) was built without SQLite loadable-extension support."; \
+	  echo "  sqlite-vec cannot work with it. Use Homebrew Python:"; \
+	  echo "    brew install python@3.13 && rm -rf .venv && make install"; \
+	  exit 1; }
 	.venv/bin/pip install -r requirements.txt -r requirements-dev.txt
+
+# Ollama setup: the binary, the service, and every model config.py names.
+# Deliberately NOT part of `make install` -- that target is fast, offline and
+# needed for lint/tests/`ingest --no-embed`, none of which touch Ollama, while
+# this one pulls ~15GB and installs a background service.
+#
+# brew, not `curl ollama.com/install.sh | sh`: on macOS that script installs
+# /Applications/Ollama.app, which `ollama-start`'s `brew services` cannot
+# manage (and which auto-starts at login, contending for port 11434).
+#
+# Models come from config.py rather than being spelled here, so a .env that
+# repoints CHAT_MODEL/ANNOTATE_MODEL/etc. pulls what it actually uses -- hence
+# the .venv dependency. `ollama pull` needs a reachable server, so ollama-start
+# runs first; pull is a no-op for an already-present model, making re-runs
+# cheap. The model list is computed inside the recipe, not in a `$(shell ...)`
+# variable: a top-level one would shell out to Python on every `make lint` too.
+install-ollama:
+	@command -v ollama >/dev/null || brew install ollama
+	@test -d .venv || { echo "error: no .venv -- run 'make install' first (config.py names the models)"; exit 1; }
+	$(MAKE) ollama-start
+	@for m in $$(.venv/bin/python3 -c 'import config; print(" ".join(sorted({config.EMBED_MODEL, config.CHAT_MODEL, config.ANNOTATE_MODEL, config.TOPIC_MODEL, config.WRAPPED_MODEL})))'); do \
+	  echo ">>> ollama pull $$m"; ollama pull "$$m" || exit 1; \
+	done
 
 # OLLAMA_NUM_PARALLEL=4: parallel request slots, feeding annotate.py's
 # ANNOTATE_WORKERS pool (~2x on LLM annotation passes, measured 2026-07-17;
