@@ -4,7 +4,7 @@
 # so an installed copy would put imessage_analysis.db and source_data/ inside
 # site-packages. This is a clone-and-run project; use `make install`.
 [project]
-name = "textmessagething"
+name = "imessage-rag"
 version = "0.1.0"
 description = "Query your iMessage history with a local LLM"
 readme = "README.md"

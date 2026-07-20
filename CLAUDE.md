@@ -1,4 +1,4 @@
-# textmessagething
+# imessage-rag
 
 Makes iMessage history queryable by a local LLM: ingest macOS `chat.db` into a
 normalized SQLite store (`imessage_analysis.db`) with FTS5 keyword search and

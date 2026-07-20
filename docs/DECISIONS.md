@@ -1,4 +1,4 @@
-# textmessagething — design decisions & full reference
+# imessage-rag — design decisions & full reference
 
 Full design history, rationale, data forensics, and per-file reference.
 The always-loaded agent orientation lives in the repo-root `CLAUDE.md`;
