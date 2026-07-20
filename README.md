@@ -1,4 +1,4 @@
-# textmessagething
+# imessage-rag
 
 Makes iMessage history queryable and analyzable by an LLM. Ingests the
 macOS Messages `chat.db` into a normalized SQLite store
