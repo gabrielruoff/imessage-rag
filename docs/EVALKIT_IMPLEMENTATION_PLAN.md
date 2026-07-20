@@ -43,7 +43,7 @@ stdlib-only (no new dependencies).
   `TOOL_RESULT_MAX_CHARS` in `os.environ` **before importing**
   `config`/`chat`/`query_tools`. Therefore every evalkit module imports app
   modules **lazily inside functions**, never at module top level.
-- **Real DB** (~222 MB) exists only in the main checkout
+- **Real DB** (hundreds of MB) exists only in the main checkout
   `<repo-root>/imessage_analysis.db`.
   The worktree copy is a **0-byte stub** — the runner must refuse to start
   (exit 2, with an explicit fix hint) when the resolved DB is missing or
@@ -279,17 +279,17 @@ default is all sections).
 
 ```json
 {
-  "created_utc": "2026-07-17T01:00:00Z",
-  "corpus_fingerprint": {"message_count": 350123, "max_message_date": "2026-07-14T03:12:09",
+  "created_utc": "<iso8601>",
+  "corpus_fingerprint": {"message_count": <int>, "max_message_date": "<iso8601>",
                           "db_path": "/abs/path/imessage_analysis.db"},
   "roster": {
-    "TOP1": {"display_name": "…", "contact_id": 12, "handle_ids": [3, 4], "chat_ids": [7, 8]},
+    "TOP1": {"display_name": "…", "contact_id": <int>, "handle_ids": [<int>…], "chat_ids": [<int>…]},
     "TOP2": {…}, "SPARSE": {…},
-    "GROUP": {"display_name": "…", "chat_ids": [9, 10], "n_participants": 6},
-    "PHRASE_HI": "…", "PHRASE_LO": "…", "TERM": "…", "NOBODY": "…", "YEAR": 2025
+    "GROUP": {"display_name": "…", "chat_ids": [<int>…], "n_participants": <int>},
+    "PHRASE_HI": "…", "PHRASE_LO": "…", "TERM": "…", "NOBODY": "…", "YEAR": <int>
   },
   "gt": {"S1.1": {"recipe": "activity_argmax", "params_resolved": {…},
-                   "values": {"top_hour": {"value": 22, "tol": "exact"}},
+                   "values": {"top_hour": {"value": <int>, "tol": "exact"}},
                    "raw": {…}, "status": "ok|error", "error": null}, …}
 }
 ```
@@ -333,7 +333,7 @@ reply). `run.json` in the run dir:
     "called": ["search_contacts_by_name", "get_activity_patterns"],
     "banned_called": [], "banned_anywhere_hits": []},
   "numeric": {"advisory": true,
-    "values": {"march_total": {"expected": 431, "tol": "exact",
+    "values": {"march_total": {"expected": 400, "tol": "exact",
                 "found_in_reply": true, "found_in_tool_results": true}},
     "missing_from_reply": ["sent_received_split"]},
   "probe": {"type": null, "auto": "pass|fail|manual", "detail": "…"},
@@ -352,7 +352,7 @@ fuzzy) — they never auto-fail a case.
 {
   "id": "S1.3", "run_id": "…", "suite": "S1", "grader": "agent:S1",
   "axes": {"routing": 1, "accuracy": 0, "faithfulness": 1, "communication": 1},
-  "evidence": [{"axis": "accuracy", "note": "reply says March=412, GT=431", "ref": "messages[7]"}],
+  "evidence": [{"axis": "accuracy", "note": "reply says March=385, GT=400", "ref": "messages[7]"}],
   "levers": ["shape"],
   "blocked": false, "blocked_reason": null, "notes": "…"
 }
@@ -623,7 +623,7 @@ Notation: `AP = get_activity_patterns`, `RD = get_response_dynamics`,
 | S8.4 | turns×2; MS `_scope:<TOP1>` turn 1; retrieval tool turn 2 | `anniversary_first(scope=<TOP1>)` → first_contact date (exact) |
 
 S1.1's `quality_watch` (and the suite-level note) must carry the local-time
-warning: a UTC-shaped argmax differs by 4–5h — grade accuracy 0 if the reply
+warning: a UTC-shaped argmax is offset by the local UTC offset — grade accuracy 0 if the reply
 matches the UTC argmax instead of the LOCAL_TZ one (store both in GT raw).
 
 ---

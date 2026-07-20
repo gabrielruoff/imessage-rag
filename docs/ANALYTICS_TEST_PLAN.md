@@ -121,7 +121,7 @@ statistic is a release blocker for that feature.
 | S1.8 | Did `<SPARSE>` and I text much in `<YEAR>`? | scoped + date-bounded | small GT count; reply gives the number and honestly frames it as light traffic |
 
 **Quality watch:** heatmap answers must be in local time (S1.1 vs a UTC
-argmax differs by 4–5 h — a UTC-shaped answer means LOCAL_TZ isn't reaching
+argmax is offset by the local UTC offset — a UTC-shaped answer means LOCAL_TZ isn't reaching
 the reply). Series answers must not recite all 12 buckets when 2 sentences
 answer the question (communication axis).
 

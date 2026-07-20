@@ -15,10 +15,10 @@ targeted retrieval.
 
 ## Data sources
 
-- `source_data/chat.db` — the real macOS Messages database (found already
-  present in this project folder, ~500MB, ~382k messages across ~1.1k chats /
-  ~1.9k handles). This is the primary/preferred source — richer and more
-  reliable than parsed `.txt` exports.
+- `source_data/chat.db` — the live macOS Messages database (project-local
+  path, on the order of 500MB / ~380k messages across ~1.1k chats and ~1.9k
+  handles on the dev corpus). This is the primary/preferred source — richer
+  and more reliable than parsed `.txt` exports.
 - `source_data/address_book.abcddb` (optional, project-local path) — a copy
   of macOS's Contacts store (normally at `~/Library/Application
   Support/AddressBook/Sources/*/AddressBook-v22.abcddb`). `chat.db`'s
@@ -82,8 +82,8 @@ targeted retrieval.
 
 ## Key technical findings
 
-- **`message.text` is NULL for ~99% of rows** (~379.5k of ~382k in this
-  data). The actual text lives in the `attributedBody` BLOB as an
+- **`message.text` is NULL for ~99% of rows** (all but ~2.5k rows on the dev
+  corpus). The actual text lives in the `attributedBody` BLOB as an
   `NSAttributedString`/`NSKeyedArchiver` typedstream — there's no native
   Python decoder for this.
 - **Decoder used: the `streamtyped` byte-pattern approach** from
@@ -126,7 +126,7 @@ targeted retrieval.
   `message`) + `chat_handle_join` (chat participants, for group threads) +
   `message_attachment_join` + `attachment`.
 - **Reactions/tapbacks are stored as rows in the `message` table**
-  (`associated_message_type != 0`, ~32k of them here) pointing at a target
+  (`associated_message_type != 0`, ~32k of them on the dev corpus) pointing at a target
   message via `associated_message_guid` — these are not real messages and
   are split into their own `reactions` table during ingestion rather than
   mixed into the message stream.
@@ -286,12 +286,12 @@ targeted retrieval.
   `ingest.py` afterward to repopulate. Invoked as `make reset-db`
   (`.venv/bin/python3 reset_db.py -f`).
 - **`imessage_analysis.db`** — output of a full ingestion run against the
-  real `chat.db` in this repo (135MB), with a **partial** embedding run
-  present: `message_vectors` holds ~3.5k vectors so far out of ~350k
-  messages (full embedding still pending). Verified: ~350k messages +
-  ~32k reactions = ~382k (matches `chat.db`'s `message` count exactly),
-  ~1.1k chats, ~1.9k handles, ~14.9k attachments, ~260 contacts. FTS5 and
-  `sqlite-vec` mechanics both confirmed working with real test queries.
+  local `chat.db` (~135MB), with a **partial** embedding run present:
+  `message_vectors` held ~3.5k vectors out of ~350k messages (full embedding
+  still pending). Verified on the dev corpus: non-reaction messages +
+  reactions summed exactly to `chat.db`'s `message` count, and chat, handle,
+  attachment, and contact totals all reconciled. FTS5 and `sqlite-vec`
+  mechanics both confirmed working with real test queries.
 - **`data/*.txt`** — sample `.txt` exports, not
   currently used by the pipeline (see Data sources above).
 - **`tests/`** — stdlib `unittest` smoke tests (no Ollama / real `chat.db`
@@ -359,7 +359,7 @@ mid-conversation or trailing `{"role": "system", ...}` reminder never reaches th
 model (verified — the model's `thinking` field showed it had never seen the text).
 To steer the model mid-turn, fold the text into the first system message instead,
 as `chat.py::run_turn` does with `FINAL_TURN_NOTE`. This is model-specific:
-`qwen3:30b-a3b` (what a local `.env` currently sets `CHAT_MODEL` to) *does* render a
+`qwen3:30b-a3b` (one alternative `CHAT_MODEL`) *does* render a
 trailing system message — but folding into the first system message is correct for
 both, so `run_turn` does that unconditionally rather than branching on model.
 Related, and true of both models: prompting alone does not reliably stop a tool call
@@ -371,7 +371,7 @@ deliberately renders only `content`.
 window.** Ollama (0.32.0) fits a request by keeping the first system message
 plus the longest *suffix of whole messages* that fits in the model's context
 window. A single tool result bigger than the window (observed: an unlimited
-`get_chat_summary_stats(group_by_chat=True)` dump, 555 rows / ~114KB ≈ 35k
+`get_chat_summary_stats(group_by_chat=True)` dump, ~550 rows / ~114KB ≈ 35k
 tokens vs the 32k window) means no suffix fits, so the model receives *only
 the system prompt* — no user question, no data — and confabulates a question
 from the system prompt's example text (verified by probing: a marker planted
@@ -437,14 +437,15 @@ motivated by specific transcript failures:
   scope, unlike the other four which scope to a person's chats).
 - **Reaction guid normalization** — `reactions.target_message_guid` was
   stored raw from chat.db's `associated_message_guid`, which carries a
-  message-part prefix (`p:N/`, `bp:`) that `messages.guid` never has; only
-  well under 1% of reactions joined to their target. Ingest now strips the
+  message-part prefix (`p:N/`, `bp:`) that `messages.guid` never has; well
+  under 1% of reactions joined to their target. Ingest now strips the
   prefix and `create_schema` runs an idempotent in-place `UPDATE` for
   existing DBs. This bug silently zeroed `get_message_reactions` lookups.
 - **Result envelopes** — `search_messages_sql`/`search_messages_fts` return
   `{rows, total_matching, returned, order, truncated}` so a capped page can
-  never be mistaken for the population (the eval's "longest silence = 39
-  days" failure, computed from the newest 50 of 4,000 rows).
+  never be mistaken for the population (the eval's longest-silence failure,
+  where a confident gap was computed from just the newest 50 rows of a
+  multi-thousand-row thread).
 - **`reactions_sent_count` rename** — `get_chat_summary_stats.reaction_count`
   counted reactions *sent by* the scope; the model read it as "received" and
   inverted a group-chat ranking. The name now says what it counts.
@@ -791,8 +792,8 @@ Two smaller things the profile exposed:
   since the next bare run then re-attempts those terms at full price. The
   misconfiguration all of this guards against is near at hand rather than
   hypothetical: gpt-oss answers `think=false` with empty content and
-  `--terms` defaults to `false`, so a gpt-oss `CHAT_MODEL` (what this repo's
-  own `.env` sets) would otherwise park the whole corpus in three runs.
+  `--terms` defaults to `false`, so a gpt-oss `CHAT_MODEL` would otherwise
+  park the whole corpus in three runs.
   `ollama.chat_once_json` therefore also detects that empty reply directly
   and degrades the run to no reasoning control — the same move it already
   made for models that reject `think` outright, driven off the reply instead
@@ -818,8 +819,8 @@ or real `chat.db` needed).
 1. **Finish embeddings**: a partial run exists (~3.5k vectors in
    `message_vectors`), so this is started but not complete. To fill in the
    rest: `ollama pull gemma4:26b-a4b-it-qat`, then `python3 ingest.py --since-last`
-   on a machine where Ollama is actually reachable, until all ~350k
-   messages are embedded.
+   on a machine where Ollama is actually reachable, until every message is
+   embedded.
 2. **Wire `TOOL_DEFINITIONS` into a tool-calling loop** — DONE: `chat.py`
    implements this against `gemma4:26b-a4b-it-qat` via Ollama. Remaining
    option: a Claude-backed reasoning/analysis layer over the same tools

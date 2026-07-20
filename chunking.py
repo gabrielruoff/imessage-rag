@@ -322,3 +322,21 @@ def embed_chunks(
     pool.shutdown(wait=True)
     tgt.commit()
     print(f"Embedded {n_done} chunks ({n_err} errors)")
+
+    # Per-batch errors are swallowed above so one bad batch can't abandon the
+    # rest, but that leaves the total-failure case exiting 0 with a database
+    # the caller believes is complete -- semantic search then returns nothing,
+    # forever, with no error to go looking for. Ollama dying mid-run is the
+    # way this happens, so no preflight can catch it; only this can.
+    if n_err:
+        if n_done == 0:
+            raise SystemExit(
+                f"error: every embedding batch failed ({n_err} chunks) -- is Ollama running?\n"
+                f"  Nothing was embedded, so semantic search would return nothing.\n"
+                f"  Check with 'make doctor'; start Ollama with 'make ollama-start',\n"
+                f"  then re-run -- embedding resumes from where it stopped."
+            )
+        print(
+            f"warning: {n_err} chunks failed to embed and have no vector. Semantic\n"
+            f"  search is incomplete until you re-run ingest (it retries only those)."
+        )

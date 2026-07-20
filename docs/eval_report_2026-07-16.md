@@ -1,15 +1,15 @@
 # Eval report: analysis-prompt sweep, 2026-07-16
 
 20 prompts from [`analysis_prompts.md`](analysis_prompts.md) (2–3 per category,
-placeholders filled with real contacts) run through `chat.py -p` against
+placeholders filled in) run through `chat.py -p` against
 gemma4:26b-a4b-it-qat with a corpus of roughly 380k messages. Raw transcripts
 (prompt, tool-call trace, streamed reply, duration) were captured per run;
-key evidence is quoted inline below.
+findings are summarized inline below.
 
-**Contact names, chat names, and message content in this report are
-pseudonymized** — the sweep ran against a private corpus. Names (Alice, Bob,
-Dana, Casey, Erin), the "Weekend Crew" group, and row ids are stand-ins; the
-behavior, counts, and timings are the real measurements.
+**This report describes tool and model behavior only.** The sweep ran against
+a private corpus; contact names, chat names, message content, and row ids
+have been removed rather than pseudonymized, and per-conversation statistics
+are omitted. Call counts, durations, and verdicts are the real measurements.
 
 ## Executive summary
 
@@ -47,26 +47,26 @@ are retrieval-and-read questions.
 The **hybrid-search → `get_conversation` → synthesize** pattern is the
 success story. Representative runs:
 
-- **p07 fight-forensics** (6 calls, 514s): hybrid search with emotion
-  keywords scoped to the contact → expanded two chunks → delivered an
-  accurate beat-by-beat of a specific argument with exact quotes and
-  timestamps, including who escalated at which message. This is the "killer
-  feature" category, and it works.
+- **p07 conflict-forensics** (6 calls, 514s): hybrid search with emotion
+  keywords scoped to the contact → expanded two chunks → reconstructed a
+  multi-turn exchange in correct order, with accurate timestamps and correct
+  speaker attribution throughout. This is the "killer feature" category, and
+  it works.
 - **p19 hard-conversation coaching** (2 calls, 311s): one
-  `search_conversations` call → a nuanced, actionable answer built on real
-  patterns from past fights (it identified a recurring de-escalation pattern
-  and what tended to follow it). Best answer of the sweep.
-- **p18 birthday draft** (4 calls): retrieved genuine inside jokes and
-  produced three usable drafts.
+  `search_conversations` call → a specific, grounded answer that cited
+  retrieved messages rather than generic advice, and generalized across
+  several retrieved threads instead of one. Best answer of the sweep.
+- **p18 drafting-with-callbacks** (4 calls): retrieval surfaced
+  chat-distinctive vocabulary, and the drafts used it correctly.
 - **p13 laughed-about-2024** (1 call, 47s): date-scoped hybrid search,
   correct and charming answer, and — once the GPU was uncontended and the KV
   cache warm — *fast*. The happy path is 1–3 tool calls and under a minute.
 
 The system prompt's resolve-contact-first guidance is followed reliably
 (`search_contacts_by_name` → scoped search in nearly every run), and in p11
-the model correctly passed **both** chat_ids for the "Weekend Crew" chat,
-which exists as two rows (iMessage + SMS continuation) — it merged them
-without being told.
+the model correctly passed **both** chat_ids for a group thread that exists
+as two rows (iMessage + SMS continuation) — it merged them without being
+told.
 
 ## Failure modes
 
@@ -92,13 +92,14 @@ That converts 4 hard failures into honest partial answers.
 a larger population**. The model repeatedly treated the visible window as
 the whole history:
 
-- **p06 longest-silence**: answered with a 39-day gap derived from the
-  last 50 messages of a multi-thousand-message, multi-year thread. Plausible-sounding,
-  almost certainly wrong, stated with full confidence. This is worse than
-  the empty replies — nothing signals the user to distrust it.
-- **p01 texting-style / p04 carries-conversation**: style and relationship
-  dynamics generalized from the most recent 50 rows. p04 characterized an
-  entire relationship's dynamic from a single recent exchange.
+- **p06 longest-silence**: answered with a specific gap in days derived from
+  the last 50 messages of a multi-thousand-message, multi-year thread.
+  Plausible-sounding, almost certainly wrong, stated with full confidence.
+  This is worse than the empty replies — nothing signals the user to
+  distrust it.
+- **p01 texting-style / p04 carries-conversation**: both generalized from the
+  most recent 50 rows. p04 extrapolated a long-run characterization from a
+  single recent exchange.
 - **p09 first-vs-recent-month**: date-bounded queries still return the
   *last* 50 rows of each window, so "first month" is actually "the tail of
   the first month."
@@ -119,8 +120,8 @@ instance of it:
   a row, then approximated "volume by month" with 6 coarse year/quarter
   stats calls (1756s total). It also misread the stats it did get (claimed
   every message in a period came from one side — a misreading of the
-  `from_me`/`from_them` fields) and its ratio math is wrong (it called a
-  968-vs-1,902 split "roughly one-third").
+  `from_me`/`from_them` fields) and its ratio math is wrong (it described a
+  roughly one-third/two-thirds split as "roughly one-third").
 - **p12 comedic-hit-rate / p17 most-loved / p16 Wrapped**: there is no tool
   that ranks messages by reactions received, and `get_chat_summary_stats`'s
   `reaction_count` counts reactions *sent by* the scoped person. p17 probed
@@ -156,16 +157,16 @@ instance of it:
 
 ## Issues discovered outside the model's behavior
 
-- **Split chats across services**: the "Weekend Crew" thread is two chat
+- **Split chats across services**: a group thread in the corpus is two chat
   rows — an iMessage chat that stops at a service switch, and an SMS chat
   that continues from it. The model merged them this time, but any
   single-chat_id scoping silently drops the recent half. Worth either
   merging at ingest, exposing a "sibling chats" hint in `list_chats`, or a
   system-prompt note.
-- **`handle_id=0` sentinel**: from-me messages carry `handle_id=0` (many
-  rows; 34 received rows too), which joins to no `handles` row. Query-side
-  code handles it via `is_from_me`, but any future per-handle join needs to
-  know. NULL would be cleaner.
+- **`handle_id=0` sentinel**: from-me messages carry `handle_id=0` (and a
+  handful of received rows do too), which joins to no `handles` row.
+  Query-side code handles it via `is_from_me`, but any future per-handle
+  join needs to know. NULL would be cleaner.
 - **Duplicate handle rows**: one contact's phone number appeared as 4
   separate `handles` rows all linked to the same `contacts` row.
   Contact-scoped queries are fine; handle-scoped stats could silently split.
@@ -242,7 +243,7 @@ aggregate, not missing sentiment.
 | p07 | conflict beat-by-beat | 6 | 514 | pass |
 | p08 | who apologizes first | 2 | 254 | partial — 10 chunks as "historically", hedged OK |
 | p09 | first vs recent month, 1:1 | 6 | 283 | pass (50-row slices per window) |
-| p10 | engagement drop-off over time | 7 | 650 | pass — good buckets; didn't attribute who withdrew |
+| p10 | engagement drop-off over time | 7 | 650 | pass — good buckets; didn't attribute which side |
 | p11 | group main character | 8 | 843 | partial — reactions semantics inverted; merged split chat correctly |
 | p12 | comedic hit rate | 7 | 700 | empty reply |
 | p13 | laughed about in 2024 | 1 | 47 | pass |

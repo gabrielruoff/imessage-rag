@@ -37,6 +37,8 @@ Keep it that way if you contribute back.
 
 - **macOS.** The ingest path reads Apple's Messages and Contacts databases;
   there is no equivalent on Linux or Windows.
+- **[Homebrew](https://brew.sh).** Ollama is installed and supervised as a
+  brew service, and the default interpreter below is Homebrew's.
 - **Homebrew Python.** `make install` builds the venv from
   `/opt/homebrew/bin/python3`. python.org builds ship a SQLite without
   loadable-extension support, which `sqlite-vec` requires. Override with
@@ -44,7 +46,9 @@ Keep it that way if you contribute back.
   Macs: `/usr/local/bin/python3`).
 - **Full Disk Access.** Reading `~/Library/Messages/chat.db` requires
   granting your terminal (or IDE) Full Disk Access in System Settings →
-  Privacy & Security → Full Disk Access, then restarting it.
+  Privacy & Security → Full Disk Access, then restarting it. `make doctor`
+  reports whether the grant is actually live, and `make source-data` prints
+  these instructions if it isn't.
 - **[Ollama](https://ollama.com)** with the models pulled — `make
   install-ollama` does both (Homebrew install, then pulls every model
   `config.py` names, so it follows your `.env`). By default that is
@@ -56,32 +60,53 @@ Keep it that way if you contribute back.
 ## Quickstart
 
 ```sh
+make bootstrap        # everything below, in order — then `make chat`
+```
+
+Or one step at a time:
+
+```sh
 make install          # creates .venv, installs pinned deps
 make install-ollama   # installs Ollama, starts it, pulls the models config.py names
+make source-data      # copies chat.db + Contacts in (needs Full Disk Access)
 make ingest           # snapshot chat.db -> imessage_analysis.db, chunk, embed
-python3 chat.py                 # interactive CLI chat over your iMessage history
-python3 chat.py -p "who did I text most in June?"   # one-shot: answer one prompt and exit
+make chat             # interactive CLI chat over your iMessage history
+make chat ARGS='-p "who did I text most in June?"'   # one-shot: answer and exit
 ```
+
+`make` on its own lists every target. `make doctor` checks the whole setup —
+venv, Ollama, models, source data, ingested DB — and names whatever is
+missing, which is the fastest way to diagnose anything below.
 
 `ingest.py` reads `source_data/chat.db` (not the live database), so copy
 yours in first — along with your AddressBook, if you want contact names
-instead of raw phone numbers:
+instead of raw phone numbers. `make source-data` does both, refuses to
+overwrite an existing copy, and if macOS blocks the read it tells you it's
+Full Disk Access instead of failing with a bare `Operation not permitted`.
+
+If you'd rather copy by hand, bring the `-wal`/`-shm` sidecars along:
 
 ```sh
 mkdir -p source_data
-cp ~/Library/Messages/chat.db source_data/chat.db
+cp ~/Library/Messages/chat.db     source_data/chat.db
+cp ~/Library/Messages/chat.db-wal source_data/chat.db-wal   # or you lose every
+cp ~/Library/Messages/chat.db-shm source_data/chat.db-shm   # unflushed message
 cp ~/Library/Application\ Support/AddressBook/Sources/*/AddressBook-v22.abcddb \
    source_data/address_book.abcddb    # optional: contact names
 ```
 
+Messages keeps `chat.db` in WAL mode while it runs, so your most recent
+messages may live only in those sidecars until ingest checkpoints them —
+copying `chat.db` alone silently drops them.
+
 Both paths are overridable via `SOURCE_DB` / `ADDRESS_BOOK_PATH` in `.env`
 if you'd rather point at the originals. Either way ingest works on a
-snapshot copy — the live `chat.db` is never opened directly, since Messages
-keeps it in WAL mode while running. `source_data/` is gitignored.
+snapshot copy — the live `chat.db` is never opened directly.
+`source_data/` is gitignored.
 
 `make ingest` needs Ollama up for the embedding step; run
-`python3 ingest.py --no-embed` instead to skip it and get a searchable DB
-without semantic search.
+`make ingest INGEST_ARGS=--no-embed` instead to skip it and get a searchable
+DB without semantic search.
 
 ## Analytics
 
@@ -102,7 +127,7 @@ Scoping by a person means *that person's chats*. Each tool returns several
 sections in one call, so prefer them over counting search results.
 
 ```
-> when do I text Sarah, and who texts first?
+> when do I text Alice, and who texts first?
 > what emoji did we start using in 2025 that we never used before?
 > who lurks in the family group chat?
 ```
@@ -192,8 +217,9 @@ Sections reveal and bars grow as you scroll (static under reduced-motion or
 with JS off). Open it in a browser; print to PDF to keep a copy.
 
 ```sh
+make wrapped ARGS='--year 2025'                      # or drive it through make
 .venv/bin/python3 wrapped.py --year 2025             # previews the featured roster, then generates
-.venv/bin/python3 wrapped.py --contact "Sarah"       # single-relationship deep dive
+.venv/bin/python3 wrapped.py --contact "Alice"       # single-relationship deep dive
 .venv/bin/python3 wrapped.py --year 2025 --no-llm    # stats only, no narratives
 ```
 
@@ -217,7 +243,11 @@ line style, `PROGRESS_STYLE=off` silences progress entirely.
 ## Other commands
 
 ```sh
+make                  # list every target
+make doctor           # check venv, Ollama, models, source data, ingested DB
 make lint             # ruff check .
-python -m unittest discover tests   # test suite, no Ollama/chat.db needed
-make reset-db          # wipe imessage_analysis.db's data, keep schema
+make test             # test suite, no Ollama/chat.db needed
+make check            # everything CI enforces: lint + tests + compile check
+make env              # create .env from .env.example (optional — all defaults work)
+make reset-db         # wipe imessage_analysis.db's data, keep schema
 ```

@@ -110,6 +110,20 @@ def snapshot_source(source: Path, dest: Path):
     standalone snapshot, then checkpoint its WAL into the main file. The
     rest of the pipeline only ever reads from this copy, never the original
     (which may still be written to by Messages.app)."""
+    # Checked before the copy loop, because that loop reads a missing path as
+    # "delete the stale destination sidecar" -- right for -wal/-shm, silently
+    # wrong for the main file. Without this, sqlite3.connect(dest) below
+    # CREATES an empty snapshot, we print a success line for a database with
+    # no messages in it, and the run dies four stages later in ingest_chats
+    # with "no such table: chat" -- an error naming neither this file nor
+    # source_data/.
+    if not source.exists():
+        raise SystemExit(
+            f"error: no source database at {source}\n"
+            f"  Copy your Messages database in with:  make source-data\n"
+            f"  (or point SOURCE_DB at an existing copy -- see .env.example)"
+        )
+
     for suffix in ("", "-wal", "-shm"):
         src_path = source.with_name(source.name + suffix)
         dest_path = dest.with_name(dest.name + suffix)

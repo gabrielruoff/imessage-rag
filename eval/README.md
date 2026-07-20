@@ -130,7 +130,7 @@ auto verdict; numeric/faithfulness blocks are advisory), and the manifest's
 {
   "id": "S1.3", "run_id": "…", "suite": "S1", "grader": "agent:S1",
   "axes": {"routing": 1, "accuracy": 0, "faithfulness": 1, "communication": 1},
-  "evidence": [{"axis": "accuracy", "note": "reply says March=412, GT=431", "ref": "messages[7]"}],
+  "evidence": [{"axis": "accuracy", "note": "reply says March=385, GT=400", "ref": "messages[7]"}],
   "levers": ["shape"],
   "blocked": false, "blocked_reason": null, "notes": "…"
 }
