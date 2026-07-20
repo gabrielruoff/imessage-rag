@@ -145,6 +145,11 @@ def ollama_chat_stream(messages, tools=OLLAMA_TOOLS, show_model_header=True, mod
     content = ""
     tool_calls = None
     live = None
+    # Live is a terminal-only construct: on a non-terminal console (a file, as
+    # the eval sweep's --log-file uses, or a redirected `chat.py -p`) it emits
+    # only the first wrapped line of the final frame. There, accumulate silently
+    # and render the whole reply once after the stream (below).
+    use_live = console.is_terminal
     try:
         for msg in ollama.chat_stream(messages, tools, model=model):
             role = msg.get("role", role)
@@ -152,16 +157,22 @@ def ollama_chat_stream(messages, tools=OLLAMA_TOOLS, show_model_header=True, mod
                 tool_calls = msg["tool_calls"]
             piece = msg.get("content", "")
             if piece:
-                if live is None:
-                    if show_model_header:
-                        console.print(f"[bold]{model}>[/bold]")
-                    live = Live(Markdown(""), console=console, refresh_per_second=12)
-                    live.start()
                 content += piece
-                live.update(Markdown(content))
+                if use_live:
+                    if live is None:
+                        if show_model_header:
+                            console.print(f"[bold]{model}>[/bold]")
+                        live = Live(Markdown(""), console=console, refresh_per_second=12)
+                        live.start()
+                    live.update(Markdown(content))
     finally:
         if live is not None:
             live.stop()
+    if content and not use_live:
+        # One faithful, untruncated render for the file/pipe consumer.
+        if show_model_header:
+            console.print(f"[bold]{model}>[/bold]")
+        console.print(Markdown(content))
 
     result = {"role": role, "content": content}
     if tool_calls:
@@ -252,7 +263,7 @@ def run_turn(messages, show_model_header=True, model=None):
             # and let the model re-sample; the retry spends one iteration of
             # the tool budget, so a persistently failing model still falls
             # through to the tools-withheld final request below.
-            console.print(f"  [{e}; retrying]", style="dim red")
+            console.print(f"  [{e}; retrying]", style="dim red", markup=False)
             continue
         messages.append(message)
         tool_calls = message.get("tool_calls")
@@ -296,10 +307,15 @@ def run_turn(messages, show_model_header=True, model=None):
             else:
                 count = "ok"
             result_json = _cap_tool_result(result, json.dumps(result))
+            # markup=False: the literal "[tool call]" label and any brackets in
+            # the tool arguments must print verbatim -- rich's markup parser
+            # would otherwise silently eat "[tool call]" and mangle bracketed
+            # args. style still applies.
             console.print(
                 f"  [tool call] {name}({args}) -> {count}"
                 f" (~{_estimate_tokens(result_json)} tokens)",
                 style="dim cyan",
+                markup=False,
             )
             messages.append({"role": "tool", "content": result_json})
 

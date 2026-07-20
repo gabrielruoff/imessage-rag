@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 
 from . import LOCK_PATH, RESULTS_DIR
 from .manifest import (
@@ -144,6 +145,10 @@ def _run_case(chat_mod, state, case, turns, model, case_timeout):
             state["turn"] = i
             messages.append({"role": "user", "content": turn})
             user_index = len(messages) - 1
+            # Prompt header in the log stream (no-op on a quiet console).
+            # markup=False: the literal [turn N] and the prompt's own brackets
+            # must survive rich's markup parser verbatim.
+            chat_mod.console.print(f"\n[turn {i}] you> {turn}", markup=False)
             reply = chat_mod.run_turn(messages, show_model_header=False, model=model)
             turn_boundaries.append(
                 {"turn": i, "user_index": user_index, "final_reply_index": len(messages) - 1}
@@ -226,14 +231,26 @@ def cmd_run(args):
     import progress  # imports config -- must stay below the env block above
     from rich.console import Console
 
-    chat.console = Console(quiet=True)
     state = _install_recorder(chat)
     model = args.model or config_snapshot()["CHAT_MODEL"]
 
     run_dir = RESULTS_DIR / args.run_id
+    logfile = None
     acquire_ollama_lock(args.run_id)
     try:
         run_dir.mkdir(parents=True, exist_ok=True)
+        # --log-file streams every prompt/tool call/reply -- chat.py's own
+        # console output -- to a file while the progress bar keeps the terminal
+        # (progress.py draws through its own stdout Console). Without the flag,
+        # chat's console stays quiet: the default, unchanged sweep behavior.
+        # append mode + line buffering so --resume extends the log and `tail -f`
+        # sees each line as it lands.
+        if args.log_file is not None:
+            log_path = Path(args.log_file) if args.log_file else run_dir / "run.log"
+            logfile = open(log_path, "a", buffering=1)
+            chat.console = Console(file=logfile, width=120, soft_wrap=True)
+        else:
+            chat.console = Console(quiet=True)
         run_path = run_dir / "run.json"
         if run_path.exists():
             with open(run_path) as f:
@@ -274,6 +291,8 @@ def cmd_run(args):
                     exit_code = 1
                     p.advance()
                     continue
+                # Frame each case in the log stream (no-op on a quiet console).
+                chat.console.rule(cid)
                 started = utcnow()
                 t0 = time.monotonic()
                 status = messages = boundaries = reply = None
@@ -300,12 +319,15 @@ def cmd_run(args):
                 run_doc["cases"][cid] = {"status": status, "duration_s": duration}
                 write_json_atomic(run_path, run_doc)  # crash-resumable
                 print(f"{cid}: {status} ({duration}s, {len(state['rounds'])} round trips)")
+                chat.console.print(f"{cid}: {status} ({duration}s)")
                 if status != "ok":
                     exit_code = 1
                 p.advance()
         return exit_code
     finally:
         release_ollama_lock()
+        if logfile is not None:
+            logfile.close()
 
 
 def add_parser(subparsers):
@@ -325,4 +347,10 @@ def add_parser(subparsers):
     )
     p.add_argument("--case-timeout", type=float, default=1200, metavar="S")
     p.add_argument("--label", default=None)
+    p.add_argument(
+        "--log-file", nargs="?", const="", default=None, metavar="PATH",
+        help="stream every prompt/tool call/reply to a log file while the "
+             "progress bar keeps the terminal; bare flag logs to "
+             "<run-dir>/run.log. Omit to log nothing (default).",
+    )
     p.set_defaults(func=cmd_run)

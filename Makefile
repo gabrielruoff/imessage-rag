@@ -353,7 +353,7 @@ install:  ## Create .venv and install pinned deps
 	  echo "  sqlite-vec cannot work with it. Use Homebrew Python:"; \
 	  echo "    brew install python@3.13 && rm -rf .venv && make install"; \
 	  exit 1; }
-	.venv/bin/pip install -r requirements.txt -r requirements-dev.txt
+	.venv/bin/python -m pip install -r requirements.txt -r requirements-dev.txt
 
 # Ollama setup: the binary, the service, and every model config.py names.
 # Deliberately NOT part of `make install` -- that target is fast, offline and

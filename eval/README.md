@@ -31,6 +31,14 @@ nothing at all under `PROGRESS_STYLE=off`. Tracked loops: `run` (per case),
 `manifest` (per ground-truth recipe), and the two `p3 --judge` loops (per
 sample). Per-case status lines still print above the bar.
 
+Pass `--log-file` to `run` to also stream the full per-case detail — each
+resolved prompt, every `[tool call] …` line, and the model's reply (chat.py's
+own console output) — to a log file while the progress bar keeps the terminal.
+Bare `--log-file` writes `eval/results/<run-id>/run.log`; `--log-file PATH`
+picks the location. Append mode, so `--resume` extends it and `tail -f` follows
+the sweep live. Omit the flag and nothing is logged (the default) — the
+per-case `<id>.json`/`.txt` transcripts remain the authoritative artifacts.
+
 These loops are tens of items at minutes apiece, so each passes an explicit
 `log_every=1` — the repo-wide `PROGRESS_LOG_EVERY` default (200) is tuned for
 the pipeline's ~350k-row passes and would emit no plain-mode line at all for a
