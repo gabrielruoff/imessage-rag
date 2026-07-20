@@ -1,31 +1,29 @@
 name: CI
 
-on:
-  push:
-    paths:
-      - "**.py"
-      - "requirements*.txt"
-      - "pyproject.toml"
-      - ".github/workflows/ci.yml"
-  pull_request:
-    paths:
-      - "**.py"
-      - "requirements*.txt"
-      - "pyproject.toml"
-      - ".github/workflows/ci.yml"
+# No `paths:` filter on purpose: with one, a docs-only or Makefile-only PR
+# runs zero jobs, and a required status check that never runs blocks the PR
+# instead of passing it. The whole suite is hermetic and takes ~1 minute.
+on: [push, pull_request]
 
 jobs:
   compile-check:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.13 is the supported floor (requires-python); 3.14 is what the
+        # Makefile's Homebrew Python currently resolves to locally.
+        python-version: ["3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: ${{ matrix.python-version }}
       - run: pip install -r requirements.txt
       - run: python -m compileall -q .
 
   lint:
+    # Single version: ruff's rules don't vary with the interpreter running it.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -37,10 +35,17 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
-      - run: pip install -r requirements.txt
+          python-version: ${{ matrix.python-version }}
+      # Dev deps too: the suite is stdlib-only today, but installing just
+      # requirements.txt means a test that imports a dev-only tool would fail
+      # here for a reason that looks nothing like the cause.
+      - run: pip install -r requirements.txt -r requirements-dev.txt
       - run: python -m unittest discover tests

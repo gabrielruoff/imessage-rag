@@ -1,3 +1,22 @@
+# Project metadata + tool config. Deliberately NOT a packaging manifest:
+# there is no [build-system], and `pip install .` is not a supported flow.
+# config.py anchors every DB path to its own directory (Path(__file__).parent),
+# so an installed copy would put imessage_analysis.db and source_data/ inside
+# site-packages. This is a clone-and-run project; use `make install`.
+[project]
+name = "textmessagething"
+version = "0.1.0"
+description = "Query your iMessage history with a local LLM"
+readme = "README.md"
+requires-python = ">=3.13"
+# Keep in sync with requirements.txt, which is what `make install` actually
+# installs from (these are duplicated, not derived -- no build backend here).
+dependencies = [
+    "python-dotenv==1.2.2",
+    "sqlite-vec==0.1.9",
+    "rich==13.9.4",
+]
+
 [tool.ruff]
 line-length = 100
 
