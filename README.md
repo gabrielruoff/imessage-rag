@@ -251,3 +251,10 @@ make check            # everything CI enforces: lint + tests + compile check
 make env              # create .env from .env.example (optional — all defaults work)
 make reset-db         # wipe imessage_analysis.db's data, keep schema
 ```
+
+## License
+
+Copyright (c) 2026 Gabriel Ruoff. All rights reserved. This project is
+proprietary: no license is granted to copy, redistribute, modify, or use it.
+Viewing the source (e.g. in this repository) does not grant any of those
+rights. See [`LICENSE`](LICENSE) for the full terms.

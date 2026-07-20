@@ -1,0 +1,30 @@
+Copyright (c) 2026 Gabriel Ruoff. All rights reserved.
+
+This software and its associated source code, documentation, and other files
+(the "Software") are the exclusive property of Gabriel Ruoff (the "Owner").
+
+No license, express or implied, is granted to any person or entity. In
+particular, and without limiting the foregoing, you are NOT permitted to:
+
+  1. copy, reproduce, or store the Software, except for a transient copy
+     strictly necessary to view it where the Owner has made it available;
+  2. redistribute, publish, sublicense, sell, rent, lease, or otherwise
+     transfer the Software or any portion of it to any third party, in
+     original or modified form;
+  3. modify, adapt, translate, or create derivative works based on the
+     Software;
+  4. use the Software for any commercial or non-commercial purpose; or
+  5. remove or alter this notice.
+
+Viewing the Software (for example, in a public source-code repository) does
+not grant any of the rights above. Any use not expressly authorized in a
+separate written agreement signed by the Owner is prohibited and reserved.
+
+To request permission for any use, contact the Owner.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+OWNER BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN
+ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

@@ -8,6 +8,8 @@ name = "imessage-rag"
 version = "0.1.0"
 description = "Query your iMessage history with a local LLM"
 readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Gabriel Ruoff", email = "geruoff@gmail.com" }]
 requires-python = ">=3.13"
 # Keep in sync with requirements.txt, which is what `make install` actually
 # installs from (these are duplicated, not derived -- no build backend here).
