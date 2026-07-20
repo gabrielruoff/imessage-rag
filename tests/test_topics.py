@@ -65,7 +65,7 @@ class TopicsFixture(unittest.TestCase):
 
     def seed_vectors(self):
         for chunk_id, vec in VECTORS.items():
-            topic = "ski trip" if chunk_id in CLUSTER_A_IDS else "thai dinner"
+            topic = "potluck" if chunk_id in CLUSTER_A_IDS else "trivia night"
             self.con.execute(
                 "INSERT INTO chunks(id, chat_id, first_message_id, last_message_id, "
                 "first_date, last_date, n_messages, text) "
@@ -94,8 +94,8 @@ class TopicsFixture(unittest.TestCase):
 class TestClustering(TopicsFixture):
     def test_kmeans_groups_persist_and_state(self):
         self.seed_vectors()
-        replies = [_reply({"label": "Ski Trip Planning"}),
-                   _reply({"label": "Dinner Plans"})]
+        replies = [_reply({"label": "Potluck Planning"}),
+                   _reply({"label": "Trivia Plans"})]
         with mock.patch.object(ollama, "chat_once", side_effect=replies):
             topics.main(["--k", "2"])
 
@@ -111,7 +111,7 @@ class TestClustering(TopicsFixture):
         self.assertEqual(len(rows), 2)
         self.assertEqual({r[2] for r in rows}, {3})          # n_chunks = 3 each
         self.assertEqual({r[1] for r in rows},
-                         {"Ski Trip Planning", "Dinner Plans"})
+                         {"Potluck Planning", "Trivia Plans"})
         self.assertEqual(get_state(self.con, "topic_model_k"),
                          "nomic-embed-text:4:2")
         # scratch centroid table cleaned up
@@ -147,30 +147,30 @@ class TestLabelPass(TopicsFixture):
     def test_labels_persisted_and_truncated(self):
         long_label = "An Extremely Verbose Topic Label That Runs On And On Well Past Sixty"
         self.run_clustered([_reply({"label": long_label}),
-                            _reply({"label": "  Dinner Plans  "})])
+                            _reply({"label": "  Trivia Plans  "})])
         labels = {r[1] for r in self.topic_rows()}
-        self.assertIn("Dinner Plans", labels)              # stripped
+        self.assertIn("Trivia Plans", labels)              # stripped
         self.assertTrue(any(len(label) == 60 for label in labels))
 
     def test_malformed_label_retries_then_skips_and_resumes(self):
         # One cluster's label response is garbage twice -> retried once,
         # then skipped (stays NULL); the other labels fine.
         bad = {"role": "assistant", "content": "not json {"}
-        fake = self.run_clustered([bad, bad, _reply({"label": "Dinner Plans"})])
+        fake = self.run_clustered([bad, bad, _reply({"label": "Trivia Plans"})])
         self.assertEqual(fake.call_count, 3)
         labels = [r[1] for r in self.topic_rows()]
         self.assertIn(None, labels)
-        self.assertIn("Dinner Plans", labels)
+        self.assertIn("Trivia Plans", labels)
         # the default label pass is resumable: only the NULL cluster is sent
         con = sqlite3.connect(self.db_path)
         self.addCleanup(con.close)
         load_vec_extension(con)
         with mock.patch.object(ollama, "chat_once",
-                               return_value=_reply({"label": "Ski Trip"})) as fake2:
+                               return_value=_reply({"label": "Potluck"})) as fake2:
             topics.label_clusters(con)
         self.assertEqual(fake2.call_count, 1)
         self.assertEqual(sorted(r[1] for r in self.topic_rows()),
-                         ["Dinner Plans", "Ski Trip"])
+                         ["Potluck", "Trivia Plans"])
 
     def test_relabel_renames_all_clusters_without_reclustering(self):
         self.run_clustered([_reply({"label": "Old A"}), _reply({"label": "Old B"})])

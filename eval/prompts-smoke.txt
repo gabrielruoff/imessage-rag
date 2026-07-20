@@ -1,5 +1,9 @@
 # One prompt per new aggregate tool, each a regression for an eval-sweep
 # failure (docs/eval_report_2026-07-16.md). Format: id|prompt
+#
+# The names below are placeholders. Substitute contacts and a group chat
+# that actually exist in your own analysis DB before running the sweep --
+# these prompts are only meaningful against a corpus that contains them.
 smoke-dynamics|Who usually texts first, me or Alice, and what's the longest we've ever gone without talking?
 smoke-histogram|What hour of the day am I most active, and how has my monthly message volume with Bob Carter changed over time?
 smoke-top-reacted|Which of my messages got the most laugh reactions in 2025?

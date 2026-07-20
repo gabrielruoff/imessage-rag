@@ -292,7 +292,7 @@ targeted retrieval.
   ~32k reactions = ~382k (matches `chat.db`'s `message` count exactly),
   ~1.1k chats, ~1.9k handles, ~14.9k attachments, ~260 contacts. FTS5 and
   `sqlite-vec` mechanics both confirmed working with real test queries.
-- **`data/<sender>.txt`, `data/orphaned.txt`** — sample `.txt` exports, not
+- **`data/*.txt`** — sample `.txt` exports, not
   currently used by the pipeline (see Data sources above).
 - **`tests/`** — stdlib `unittest` smoke tests (no Ollama / real `chat.db`
   needed; all against temp SQLite). `test_migration_and_ingest.py` covers the
@@ -518,7 +518,7 @@ from the code:
   --terms` gets the same `annotate_model` anti-mixing guard as
   `chunk_annotations`: both hold expensive, model-specific, rebuild-surviving
   output.
-- **`wrapped.py`'s silent-contact guard (the the silent-contact case).** A
+- **`wrapped.py`'s silent-contact guard.** A
   year-in-review that cheerfully resurfaces an ex, or someone who died, is
   the classic nostalgia-product failure. Contacts who were active (>= 3 of
   the 6 months before their last message) and then stopped abruptly (silent
@@ -555,7 +555,7 @@ from the code:
   is a lie.
 - **Wrapped stats are reshaped for readers before rendering or narration.**
   Raw tool results leak plumbing a keepsake must not show: ISO timestamps,
-  `start_hour: 0` for midnight, `chat<19-digit-id>` as a group's name,
+  `start_hour: 0` for midnight, a raw `chat<19-digit-id>` GUID as a group's name,
   error strings ("longest_silence needs a chat or person scope") rendered as
   content, and nested dicts crammed into table cells. Each `_sec_*` builder
   now reshapes its tool's result — drops unavailable sub-results, flattens
@@ -566,7 +566,7 @@ from the code:
   Crucially, the **narrator is fed `wrapped_html.humanized(stats)`** — the
   same display-formatted copy the reader sees, hidden keys stripped — so the
   model can only quote values in the reader's format; narrating the raw JSON
-  is how "between 0 and 5", "chat with ID 952", and re-derived percentages
+  is how "between 0 and 5", "chat with ID <n>", and re-derived percentages
   got into prose. Sections also carry a `caption` (a one-line methodology
   note rendered under the narrative, e.g. that milestones span the full
   history) and a `hint` (unrendered context for the narrator naming the one

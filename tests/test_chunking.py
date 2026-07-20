@@ -26,7 +26,7 @@ class ChunkFixture(unittest.TestCase):
 
     Fixture people: contact 1 "Alice Smith" (handle 1), contact 2 nickname
     "Bobby" (handle 2). Chat 1 is a direct chat with Alice; chat 2 is a group
-    ("Ski Trip") with Alice and Bob.
+    ("Potluck") with Alice and Bob.
     """
 
     def setUp(self):
@@ -52,7 +52,7 @@ class ChunkFixture(unittest.TestCase):
         self.con.executemany(
             "INSERT INTO chats(id, chat_identifier, display_name, is_group, service) "
             "VALUES (?, ?, ?, ?, ?)",
-            [(1, "chat1", None, 0, "iMessage"), (2, "chat2", "Ski Trip", 1, "iMessage")],
+            [(1, "chat1", None, 0, "iMessage"), (2, "chat2", "Potluck", 1, "iMessage")],
         )
         self.con.executemany(
             "INSERT INTO chat_participants(chat_id, handle_id) VALUES (?, ?)",
@@ -85,7 +85,7 @@ class ChunkFixture(unittest.TestCase):
 
 class TestBuildChunks(ChunkFixture):
     def test_gap_split_header_and_labels(self):
-        self.add_msg(1, 1, 1, 0, "Are we still planning the ski trip?", "2026-01-01T10:00:00")
+        self.add_msg(1, 1, 1, 0, "Are we still planning the potluck?", "2026-01-01T10:00:00")
         self.add_msg(2, 1, None, 1, "Yes, Presidents Day weekend", "2026-01-01T10:01:00")
         self.add_msg(3, 1, 1, 0, "Perfect, I'll look at cabins", "2026-01-01T10:03:00")
         # > 60 min gap: session boundary
@@ -99,7 +99,7 @@ class TestBuildChunks(ChunkFixture):
         self.assertEqual(second[3], 1)
         self.assertEqual((first[1], first[2]), (1, 3))
         self.assertTrue(first[4].startswith("Conversation with Alice Smith on 2026-01-01:"))
-        self.assertIn("Alice Smith: Are we still planning the ski trip?", first[4])
+        self.assertIn("Alice Smith: Are we still planning the potluck?", first[4])
         self.assertIn("Me: Yes, Presidents Day weekend", first[4])
         self.assertEqual({self.chunk_of(m) for m in (1, 2, 3)}, {first[0]})
         self.assertEqual(self.chunk_of(4), second[0])
@@ -108,7 +108,7 @@ class TestBuildChunks(ChunkFixture):
         self.add_msg(10, 2, 2, 0, "Who's bringing snacks", "2026-02-01T09:00:00")
         ingest.build_chunks(self.con)
         (chunk,) = self.chunks(2)
-        self.assertTrue(chunk[4].startswith("Conversation with Ski Trip on 2026-02-01:"))
+        self.assertTrue(chunk[4].startswith("Conversation with Potluck on 2026-02-01:"))
         self.assertIn("Bobby: Who's bringing snacks", chunk[4])  # nickname wins
 
     def test_size_split_carries_overlap(self):
@@ -218,7 +218,7 @@ class TestBuildChunks(ChunkFixture):
         ).fetchone()[0], 0)
 
     def test_embed_chunks_writes_vectors_with_metadata(self):
-        self.add_msg(60, 1, 1, 0, "let's plan the ski trip", "2026-01-01T10:00:00")
+        self.add_msg(60, 1, 1, 0, "let's plan the potluck", "2026-01-01T10:00:00")
         self.add_msg(61, 2, 2, 0, "snacks are handled", "2026-02-01T09:00:00")
         ingest.build_chunks(self.con)
         ingest.build_vec_table(self.con, 4)
@@ -241,16 +241,16 @@ class TestBuildChunks(ChunkFixture):
 
 
 class TestChunkQueryTools(ChunkFixture):
-    """Three chunks with hand-planted vectors: A (chat 1, ski, Jan), B (chat 1,
-    dinner, Jan), C (chat 2 group, ski, Feb). Query vector equals A's."""
+    """Three chunks with hand-planted vectors: A (chat 1, potluck, Jan), B (chat 1,
+    dinner, Jan), C (chat 2 group, potluck, Feb). Query vector equals A's."""
 
     def setUp(self):
         super().setUp()
-        self.add_msg(1, 1, 1, 0, "thinking about the ski trip", "2026-01-01T10:00:00")
-        self.add_msg(2, 1, None, 1, "same, I want to ski powder", "2026-01-01T10:01:00")
-        self.add_msg(3, 1, 1, 0, "dinner tonight at the thai place?", "2026-01-01T19:00:00")
+        self.add_msg(1, 1, 1, 0, "thinking about the potluck", "2026-01-01T10:00:00")
+        self.add_msg(2, 1, None, 1, "same, I want to bring dessert", "2026-01-01T10:01:00")
+        self.add_msg(3, 1, 1, 0, "dinner tonight at the new place?", "2026-01-01T19:00:00")
         self.add_msg(4, 1, None, 1, "yes see you at 7", "2026-01-01T19:02:00")
-        self.add_msg(5, 2, 2, 0, "ski house is booked", "2026-02-01T09:00:00")
+        self.add_msg(5, 2, 2, 0, "the venue is booked", "2026-02-01T09:00:00")
         ingest.build_chunks(self.con)
 
         rows = self.con.execute(
@@ -277,29 +277,29 @@ class TestChunkQueryTools(ChunkFixture):
         self.addCleanup(patcher.stop)
 
     def test_search_conversations_ranks_and_labels(self):
-        rows = query_tools.search_conversations("ski plans", k=3)
+        rows = query_tools.search_conversations("potluck plans", k=3)
         self.assertEqual([r["chunk_id"] for r in rows],
                          [self.chunk_a, self.chunk_c, self.chunk_b])
         self.assertEqual(rows[0]["participants"], "Alice Smith")
-        self.assertEqual(rows[1]["participants"], "Ski Trip")  # display_name wins
+        self.assertEqual(rows[1]["participants"], "Potluck")  # display_name wins
         self.assertIn("first_message_id", rows[0])
         self.assertTrue(rows[0]["text"].startswith("Conversation with"))
 
     def test_search_conversations_scope_and_date_filters(self):
         # Bob (contact 2) only participates in chat 2
-        rows = query_tools.search_conversations("ski", k=3, contact_id=2)
+        rows = query_tools.search_conversations("potluck", k=3, contact_id=2)
         self.assertEqual([r["chunk_id"] for r in rows], [self.chunk_c])
         # only chat 1 has January chunks
-        rows = query_tools.search_conversations("ski", k=3, date_from="2026-01-01",
+        rows = query_tools.search_conversations("potluck", k=3, date_from="2026-01-01",
                                                 date_to="2026-01-31")
         self.assertEqual({r["chunk_id"] for r in rows}, {self.chunk_a, self.chunk_b})
         # scope that matches nothing returns [] rather than over-matching
-        self.assertEqual(query_tools.search_conversations("ski", contact_id=999), [])
+        self.assertEqual(query_tools.search_conversations("potluck", contact_id=999), [])
 
     def test_search_conversations_empty_scope_lists_mean_no_filter(self):
         # LLMs pass [] for an omitted param -- it must behave as unscoped,
         # not as a scope that matched nothing.
-        rows = query_tools.search_conversations("ski plans", k=3, chat_id=[], handle_id=[])
+        rows = query_tools.search_conversations("potluck plans", k=3, chat_id=[], handle_id=[])
         self.assertEqual([r["chunk_id"] for r in rows],
                          [self.chunk_a, self.chunk_c, self.chunk_b])
 
@@ -324,11 +324,11 @@ class TestChunkQueryTools(ChunkFixture):
         self.assertEqual(query_tools.get_message_context(99999), [])
 
     def test_hybrid_fuses_keyword_and_semantic(self):
-        rows = query_tools.search_messages_hybrid("ski", k=3)
+        rows = query_tools.search_messages_hybrid("potluck", k=3)
         self.assertEqual(rows[0]["chunk_id"], self.chunk_a)  # top of both arms
         self.assertEqual(rows[0]["matched_by"], ["semantic", "keyword"])
         by_id = {r["chunk_id"]: r for r in rows}
-        self.assertEqual(by_id[self.chunk_b]["matched_by"], ["semantic"])  # no 'ski' text
+        self.assertEqual(by_id[self.chunk_b]["matched_by"], ["semantic"])  # no 'potluck' text
         self.assertIn("rrf_score", rows[0])
         self.assertEqual(
             [r["rrf_score"] for r in rows],

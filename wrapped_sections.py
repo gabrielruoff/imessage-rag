@@ -529,10 +529,10 @@ def _inside_jokes_all(con, roster, exclude_chat_ids=(), excluded_names=frozenset
     Scope matters here: dyad_terms is corpus-wide, so without a roster
     restriction this would resurface curated terms from chats the silent-
     contact guard (or --exclude) deliberately dropped -- and from bank/alert
-    threads ('apr' from a credit union). 1:1 chats must belong to a
-    featured roster member; group chats pass (they're not what the guard
+    threads (a bank's shorthand for a savings balance). 1:1 chats must belong
+    to a featured roster member; group chats pass (they're not what the guard
     protects, and their labels are group names). excluded_names drops terms
-    that ARE an excluded person's name ('Alice' coined in someone else's
+    that ARE an excluded person's name ('alice' coined in someone else's
     chat) -- a nickname card for the excluded defeats the exclusion."""
     clauses = ["d.llm_verdict IN ('inside_joke', 'nickname')", "d.n_uses >= ?"]
     params = [min_uses]
@@ -691,7 +691,7 @@ def _sec_words(con, scope, dates, contact_entry, roster, exclude_chat_ids=(),
 
 def _group_label(row, members):
     """A group chat's display name, else the other members' names -- never
-    the raw chat_identifier ('chat<19-digit-id>')."""
+    the raw chat_identifier (an opaque 'chat<19-digit-id>' string)."""
     if row["display_name"]:
         return row["display_name"]
     names = [m.get("member") for m in members

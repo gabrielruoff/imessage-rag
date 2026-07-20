@@ -325,7 +325,7 @@ class TestMainFlow(WrappedTestCase):
         seed_contact(self.con, 1, "Alice")
         seed_handle(self.con, 1, "+15550001", 1)
         seed_chat(self.con, 1, "c1")
-        seed_chat(self.con, 2, "group1", is_group=1, display_name="The Gang")
+        seed_chat(self.con, 2, "group1", is_group=1, display_name="The Committee")
         seed_msgs(self.con, 1, 1, [f"2025-05-{d:02d}T12:00:00" for d in range(1, 6)])
         seed_msgs(self.con, 2, 1, ["2025-05-10T12:00:00", "2025-05-11T12:00:00"])
         self.con.commit()
@@ -363,7 +363,7 @@ class TestMainFlow(WrappedTestCase):
         self.assertIn('class="cloud"', page)
         self.assertIn("zamboni", page)
         self.assertIn("<h2>Groups</h2>", page)
-        self.assertIn("The Gang", page)
+        self.assertIn("The Committee", page)
         # chunk_annotations/topics empty -> Eras omitted silently.
         self.assertNotIn("Eras &amp; Emotional Arc", page)
         # The whole point of the HTML report: no JSON reaches the page.

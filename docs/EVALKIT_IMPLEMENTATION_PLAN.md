@@ -285,7 +285,7 @@ default is all sections).
   "roster": {
     "TOP1": {"display_name": "…", "contact_id": 12, "handle_ids": [3, 4], "chat_ids": [7, 8]},
     "TOP2": {…}, "SPARSE": {…},
-    "GROUP": {"display_name": "…", "chat_ids": [<int>…], "n_participants": <int>},
+    "GROUP": {"display_name": "…", "chat_ids": [9, 10], "n_participants": 6},
     "PHRASE_HI": "…", "PHRASE_LO": "…", "TERM": "…", "NOBODY": "…", "YEAR": 2025
   },
   "gt": {"S1.1": {"recipe": "activity_argmax", "params_resolved": {…},

@@ -5,7 +5,7 @@ loop): roster ranking and scoping run as direct SQL against the analysis DB,
 each feature section calls one analytics tool, and (unless --no-llm) a short
 LLM narrative is written per section from the computed stats alone.
 
-Safety-first flow (the the silent-contact guard): before generating anything, the
+Safety-first flow (the silent-contact guard): before generating anything, the
 would-be-featured roster is printed, abruptly-silent contacts are
 auto-excluded (resurfacing an ex or the estranged uninvited is the classic
 nostalgia-product failure), and the run aborts unless confirmed (--yes skips
@@ -437,7 +437,7 @@ def _business_chat_ids(con):
 
 def _excluded_name_set(con, contact_ids, entries, name_specs):
     """Lowercase names identifying excluded persons -- used to keep a term
-    named after them ('Alice' coined in someone else's chat) out of the joke
+    named after them ('alice' coined in someone else's chat) out of the joke
     cards, and them out of the prior-year ranks. Covers the raw --exclude
     specs, each excluded contact's first name / nickname / full label, and
     the dropped roster entries' display labels. Bare first names mean

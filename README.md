@@ -11,22 +11,77 @@ See [`docs/DECISIONS.md`](docs/DECISIONS.md) for full architecture, rationale,
 schema, and known environment quirks ([`CLAUDE.md`](CLAUDE.md) is the short
 agent-facing orientation).
 
+## Privacy first — read this before running anything
+
+This tool reads your entire iMessage history: every message you have ever
+sent or received, and every message anyone has ever sent *you*.
+
+- **The other people in your threads never consented to this analysis.**
+  Treat the corpus, the derived DB, and anything you generate from it as
+  their private data as much as yours.
+- **Everything stays local.** The only network calls go to your own Ollama
+  instance on `localhost`. No message content is sent to any hosted API.
+- **`imessage_analysis.db` is unencrypted** and contains full message text.
+  It is gitignored — keep it that way, and don't sync it to cloud storage.
+- **Generated Wrapped reports quote real messages verbatim**, including
+  names and inside jokes. `wrapped_*.html` is gitignored for that reason.
+  Think hard before sharing one.
+- **Don't commit eval artifacts.** `eval/results/` and
+  `eval/analytics_eval_manifest*.json` embed real names and message text
+  and are gitignored.
+
+Everything in this repo — docs, tests, eval cases — uses placeholder names.
+Keep it that way if you contribute back.
+
+## Prerequisites
+
+- **macOS.** The ingest path reads Apple's Messages and Contacts databases;
+  there is no equivalent on Linux or Windows.
+- **Homebrew Python.** `make install` builds the venv from
+  `/opt/homebrew/bin/python3`. python.org builds ship a SQLite without
+  loadable-extension support, which `sqlite-vec` requires. Override with
+  `make install PYTHON=/path/to/python3` if yours lives elsewhere (Intel
+  Macs: `/usr/local/bin/python3`).
+- **Full Disk Access.** Reading `~/Library/Messages/chat.db` requires
+  granting your terminal (or IDE) Full Disk Access in System Settings →
+  Privacy & Security → Full Disk Access, then restarting it.
+- **[Ollama](https://ollama.com)** with the models pulled — `make
+  install-ollama` does both (Homebrew install, then pulls every model
+  `config.py` names, so it follows your `.env`). By default that is
+  `nomic-embed-text` for embeddings and `gemma4:26b-a4b-it-qat` for
+  chat/annotation. The chat model is a 26B MoE; expect roughly 20 GB of free
+  RAM and seconds-to-minutes per answer. Point `CHAT_MODEL` at something
+  smaller if that's too heavy — see [`.env.example`](.env.example).
+
 ## Quickstart
 
 ```sh
-make install          # creates .venv (Homebrew Python required — see CLAUDE.md), installs deps
+make install          # creates .venv, installs pinned deps
+make install-ollama   # installs Ollama, starts it, pulls the models config.py names
 make ingest           # snapshot chat.db -> imessage_analysis.db, chunk, embed
 python3 chat.py                 # interactive CLI chat over your iMessage history
 python3 chat.py -p "who did I text most in June?"   # one-shot: answer one prompt and exit
 ```
 
+`ingest.py` reads `source_data/chat.db` (not the live database), so copy
+yours in first — along with your AddressBook, if you want contact names
+instead of raw phone numbers:
+
+```sh
+mkdir -p source_data
+cp ~/Library/Messages/chat.db source_data/chat.db
+cp ~/Library/Application\ Support/AddressBook/Sources/*/AddressBook-v22.abcddb \
+   source_data/address_book.abcddb    # optional: contact names
+```
+
+Both paths are overridable via `SOURCE_DB` / `ADDRESS_BOOK_PATH` in `.env`
+if you'd rather point at the originals. Either way ingest works on a
+snapshot copy — the live `chat.db` is never opened directly, since Messages
+keeps it in WAL mode while running. `source_data/` is gitignored.
+
 `make ingest` needs Ollama up for the embedding step; run
 `python3 ingest.py --no-embed` instead to skip it and get a searchable DB
 without semantic search.
-
-Requires a local `chat.db` (already present under `source_data/` for this
-project) and, for embeddings/chat, Ollama (`make ollama-start`) running
-`nomic-embed-text` (embeddings) and `gemma4:26b-a4b-it-qat` (chat).
 
 ## Analytics
 

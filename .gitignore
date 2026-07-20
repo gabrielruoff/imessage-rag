@@ -3,12 +3,19 @@ data/
 source_data/
 imessage_analysis.db
 imessage_analysis.db-journal
+imessage_analysis.db-wal
+imessage_analysis.db-shm
 .venv/
 
 __pycache__/
+*.pyc
 .env
+.ruff_cache/
 
-**.DS_STORE
+.DS_Store
+# local agent settings -- machine-specific, never shared
+.claude/settings.local.json
+
 # repo-leaner audit artifacts (local working files, never committed)
 REPO_REVIEW.md
 REPO_FIX_PLAN.md

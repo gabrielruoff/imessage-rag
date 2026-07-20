@@ -6,6 +6,11 @@ gemma4:26b-a4b-it-qat with a corpus of roughly 380k messages. Raw transcripts
 (prompt, tool-call trace, streamed reply, duration) were captured per run;
 key evidence is quoted inline below.
 
+**Contact names, chat names, and message content in this report are
+pseudonymized** — the sweep ran against a private corpus. Names (Alice, Bob,
+Dana, Casey, Erin), the "Weekend Crew" group, and row ids are stand-ins; the
+behavior, counts, and timings are the real measurements.
+
 ## Executive summary
 
 **The qualitative/narrative half of the prompt library works today; the
@@ -51,18 +56,17 @@ success story. Representative runs:
   `search_conversations` call → a nuanced, actionable answer built on real
   patterns from past fights (it identified a recurring de-escalation pattern
   and what tended to follow it). Best answer of the sweep.
-- **p18 birthday draft** (4 calls): retrieved genuine inside jokes
-  ("[inside joke]", "[inside joke]", [inside joke]) and produced three
-  usable drafts.
+- **p18 birthday draft** (4 calls): retrieved genuine inside jokes and
+  produced three usable drafts.
 - **p13 laughed-about-2024** (1 call, 47s): date-scoped hybrid search,
   correct and charming answer, and — once the GPU was uncontended and the KV
   cache warm — *fast*. The happy path is 1–3 tool calls and under a minute.
 
 The system prompt's resolve-contact-first guidance is followed reliably
 (`search_contacts_by_name` → scoped search in nearly every run), and in p11
-the model correctly passed **both** chat_ids for the
-group thread, which exists as two rows (iMessage + SMS
-continuation) — it merged them without being told.
+the model correctly passed **both** chat_ids for the "Weekend Crew" chat,
+which exists as two rows (iMessage + SMS continuation) — it merged them
+without being told.
 
 ## Failure modes
 
@@ -88,14 +92,13 @@ That converts 4 hard failures into honest partial answers.
 a larger population**. The model repeatedly treated the visible window as
 the whole history:
 
-- **p06 longest-silence**: answered with a specific gap in days from the
+- **p06 longest-silence**: answered with a 39-day gap derived from the
   last 50 messages of a multi-thousand-message, multi-year thread. Plausible-sounding,
   almost certainly wrong, stated with full confidence. This is worse than
   the empty replies — nothing signals the user to distrust it.
 - **p01 texting-style / p04 carries-conversation**: style and relationship
   dynamics generalized from the most recent 50 rows. p04 characterized an
-  entire relationship's dynamic from a single recent exchange (it named
-  one side as the one who lets threads die, from a single exchange).
+  entire relationship's dynamic from a single recent exchange.
 - **p09 first-vs-recent-month**: date-bounded queries still return the
   *last* 50 rows of each window, so "first month" is actually "the tail of
   the first month."
@@ -112,12 +115,12 @@ The doc's feasibility section predicted this; the transcripts confirm every
 instance of it:
 
 - **p05 relationship-arc** burned the *entire 20-iteration budget*, including
-  **ten identical `search_messages_sql(contact_id=[83], limit=1)` calls** in
+  **ten identical `search_messages_sql(contact_id=[...], limit=1)` calls** in
   a row, then approximated "volume by month" with 6 coarse year/quarter
-  stats calls (1756s total). It also misread the stats it did get ("all
-  3,228 messages in this period were from him" — a misreading of the
-  `from_me`/`from_them` fields) and its ratio math is wrong (it described a
-  roughly one-third/two-thirds split as "roughly one-third").
+  stats calls (1756s total). It also misread the stats it did get (claimed
+  every message in a period came from one side — a misreading of the
+  `from_me`/`from_them` fields) and its ratio math is wrong (it called a
+  968-vs-1,902 split "roughly one-third").
 - **p12 comedic-hit-rate / p17 most-loved / p16 Wrapped**: there is no tool
   that ranks messages by reactions received, and `get_chat_summary_stats`'s
   `reaction_count` counts reactions *sent by* the scoped person. p17 probed
@@ -145,32 +148,34 @@ instance of it:
 - **Duplicate identical calls**: p05's ten `limit=1` calls, p12 and p16 each
   repeated a call verbatim. A dispatch-level dedup guard (return the cached
   result with a note "identical call already made") would reclaim iterations.
-- **Wasted probe calls**: p04 guessed chunk_ids (0, 43, 57) without
-  searching, and ran FTS with query `'?'` — three near-empty results.
-- **Silent disambiguation**: a `search_contacts_by_name` call on a common first name returned 3
-  matches; the model picked one without noting the ambiguity (p14).
+- **Wasted probe calls**: p04 guessed chunk_ids without searching, and ran
+  FTS with query `'?'` — three near-empty results.
+- **Silent disambiguation**: a `search_contacts_by_name` call on a common
+  first name returned 3 matches; the model picked one without noting the
+  ambiguity (p14).
 
 ## Issues discovered outside the model's behavior
 
-- **Split chats across services**: a group thread is one chat row (iMessage,
-  through 2026-01) + a second row (SMS, 2026-01→present). The model merged them
-  this time, but any single-chat_id scoping silently drops the recent half.
-  Worth either merging at ingest, exposing a "sibling chats" hint in
-  `list_chats`, or a system-prompt note.
+- **Split chats across services**: the "Weekend Crew" thread is two chat
+  rows — an iMessage chat that stops at a service switch, and an SMS chat
+  that continues from it. The model merged them this time, but any
+  single-chat_id scoping silently drops the recent half. Worth either
+  merging at ingest, exposing a "sibling chats" hint in `list_chats`, or a
+  system-prompt note.
 - **`handle_id=0` sentinel**: from-me messages carry `handle_id=0` (many
   rows; 34 received rows too), which joins to no `handles` row. Query-side
   code handles it via `is_from_me`, but any future per-handle join needs to
   know. NULL would be cleaner.
-- **Duplicate handle rows**: one contact's phone number appears as 4 handle rows
-  all linked to the same contact row. Contact-scoped queries
-  are fine; handle-scoped stats could silently split.
+- **Duplicate handle rows**: one contact's phone number appeared as 4
+  separate `handles` rows all linked to the same `contacts` row.
+  Contact-scoped queries are fine; handle-scoped stats could silently split.
 - **`reaction_count` naming**: as noted above, it means "reactions sent by
   the scope," which the model (reasonably) misreads. Rename or document in
   the schema description (e.g. `reactions_sent_count`).
 - **Reaction target guids never joined** (found post-report while
   implementing the fixes): ingest stored `associated_message_guid` raw, so
   99.6% of reactions carried a `p:N/` or `bp:` part prefix that
-  `messages.guid` lacks — `get_message_reactions` silently returned nothing
+  `messages.guid` lacked — `get_message_reactions` silently returned nothing
   for nearly every message. Fixed at ingest + idempotent migration.
 
 ## Performance findings
@@ -231,7 +236,7 @@ aggregate, not missing sentiment.
 | p01 | texting style | 1 | 135 | pass (recent-50 sample, undisclosed) |
 | p02 | overused words | 4 | 437 | partial — no frequency evidence, seeded query |
 | p03 | unhinged time of day | 2 | 268 | fail — literal keyword as metric |
-| p04 | who carries conversation, 1:1 | 9 | 873 | partial — one fight generalized; 3 wasted probes |
+| p04 | who carries conversation, 1:1 | 9 | 873 | partial — one exchange generalized; 3 wasted probes |
 | p05 | arc by month, 1:1 | 20 | 1756 | partial — 10 dup calls, yearly not monthly, misread stats |
 | p06 | longest silence, 1:1 | 3 | 388 | fail — confident wrong number from last-50 window |
 | p07 | conflict beat-by-beat | 6 | 514 | pass |
