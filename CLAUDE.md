@@ -13,6 +13,12 @@ Full design history, schema, rationale, and data forensics:
 
 - Install: `make install` (needs Homebrew Python — python.org builds lack the
   sqlite loadable-extension support sqlite-vec requires)
+- Install Ollama + models: `make install-ollama` (brew install — NOT
+  `curl ollama.com/install.sh`, which drops a `/Applications/Ollama.app` that
+  `make ollama-start`'s `brew services` cannot manage — then `ollama-start`,
+  then pulls every model `config.py` names, so it honors `.env`). Kept out of
+  `make install` on purpose: that target is fast and offline, this one pulls
+  ~15GB and installs a background service.
 - Ingest: `make ingest`, or `.venv/bin/python3 ingest.py [--no-embed]
   [--since-last] [--senders=...]`
 - Chat CLI: `.venv/bin/python3 chat.py` (interactive REPL), or
