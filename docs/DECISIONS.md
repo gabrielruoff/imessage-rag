@@ -537,6 +537,78 @@ from the code:
   scopes by *sender* while every other tool scopes to a person's *chats* —
   under `--contact` its key is named `their_top_words` so the narrator can't
   mistake one side's vocabulary for shared vocabulary.
+- **The Wrapped report renders HTML structurally, not from a schema.** It was
+  markdown with a `json` fence per section: correct, unreadable, and a keepsake
+  nobody would open twice. `wrapped_html.render_value` dispatches on the
+  *shape* of a stats value (scalar → tile, list-of-dicts → table, period series
+  → bar chart, dict-of-dicts → nested blocks), so a new analytics tool renders
+  without touching the renderer — the alternative, a per-section template, puts
+  every tool one schema change away from a broken report. Two rules earn their
+  keep: a lone *list* under one key is a container and is unwrapped (its key
+  would repeat the parent heading), while a lone *dict* is not — there the key
+  is data (a group chat's name), and unwrapping silently deletes it. And the
+  heatmap shades by **quantile band, not linearly against the peak**: hourly
+  message counts are heavily skewed, so one 3am outlier sets the peak and flattens
+  every other cell onto the same mid step, hiding the daily rhythm the heatmap
+  exists to show. Exact counts stay in each cell's hover title, and the caption
+  says the shading is relative — a non-linear scale that doesn't announce itself
+  is a lie.
+- **Wrapped stats are reshaped for readers before rendering or narration.**
+  Raw tool results leak plumbing a keepsake must not show: ISO timestamps,
+  `start_hour: 0` for midnight, `chat<19-digit-id>` as a group's name,
+  error strings ("longest_silence needs a chat or person scope") rendered as
+  content, and nested dicts crammed into table cells. Each `_sec_*` builder
+  now reshapes its tool's result — drops unavailable sub-results, flattens
+  nested rows (Tempo is one comparable row per contact, not a wall of nested
+  blocks), names group chats by their members, and renames jargon keys — and
+  `wrapped_html` formats values by key (`*_seconds` → "27 min", ISO dates →
+  "Feb 3, 2025", `share` floats → percent, hour grids → "12 AM").
+  Crucially, the **narrator is fed `wrapped_html.humanized(stats)`** — the
+  same display-formatted copy the reader sees, hidden keys stripped — so the
+  model can only quote values in the reader's format; narrating the raw JSON
+  is how "between 0 and 5", "chat with ID 952", and re-derived percentages
+  got into prose. Sections also carry a `caption` (a one-line methodology
+  note rendered under the narrative, e.g. that milestones span the full
+  history) and a `hint` (unrendered context for the narrator naming the one
+  or two facts worth telling — and clarifying units the model got wrong in
+  testing, like 'started' counting conversations, not messages).
+- **The Wrapped report is visual-first; tables are the fallback, not the
+  format.** A keepsake that reads as a series of tables gets opened once.
+  Each section renders through purpose-built visuals in `wrapped_html`
+  (horizontal bar lists, opposed me/them split bars — square-root scaled so
+  12-second and 39-minute reply medians share one picture, with exact values
+  in the labels — a 100% stacked who-talks share bar, a word cloud, joke
+  cards, and the hall of fame as iMessage-style bubbles with tapback pills);
+  every chart keeps a `<details>` table view as the accessibility fallback,
+  and the categorical slots 3–4 added for the share bar were validated with
+  the data-viz palette checker in both modes. Because visuals live in
+  `extra_html`, sections carry the full shaped data in `narrate_stats` so
+  the LLM narrator still sees what the reader sees. The page gained inline
+  JS (scroll-reveal, bars growing in, count-up tiles) — a deliberate trade
+  approved against the old "no scripts" claim: the promise that matters is
+  **no network**, and the JS degrades to a fully static page under
+  `prefers-reduced-motion`, JS-off, and print. Two content calls from the
+  same pass: "top words" filters through `function_words.COMMON_WORDS`
+  (~500 everyday-English words) because a top-words list led by "ok/yeah"
+  describes texting, not the person; and Milestones & Anniversaries plus the
+  per-100 style table were cut as the sections readers skipped. Inside jokes
+  are real now: the all-contacts report pulls the LLM-curated
+  `inside_joke`/`nickname` verdicts straight from `dyad_terms` (first-use
+  message as the hover), labeling 1:1 chats by the partner's contact name —
+  **restricted to the featured roster's chats** (plus groups): dyad_terms is
+  corpus-wide, so an unrestricted scan resurfaces terms from chats the
+  silent-contact guard or `--exclude` deliberately dropped, and from
+  bank/alert threads. The report's design system is the subject's own: iOS
+  grouped-list surfaces and separators, `ui-rounded` display type, the real
+  send-blue on bubbles only (chart series stay on the validated palette),
+  a hero that renders the year's total as one sent message with its
+  reactions as a tapback ("Delivered"), and a received-bubble sign-off.
+  Three sections come from previously unused data: Ghosts & Double Texts
+  (the `ghosted`/`double_text` fields the tempo call already fetched), The
+  Marathon (top `sessions` rows by `n_messages`), and the Eras arc — a
+  per-month tone strip (diverging blue↔gray↔red, buckets tuned to where
+  corpus valence actually lives, ±0.02/±0.08) labeled with each month's
+  leading emotion from `chunk_annotations.emotions_json`.
 - **Topic k-means pushes assignment into sqlite-vec.** The centroids go in a
   scratch `vec0` table and each chunk's nearest centroid is a `k = 1` KNN;
   only the centroid *update* is Python (`array('f')`, no numpy). The

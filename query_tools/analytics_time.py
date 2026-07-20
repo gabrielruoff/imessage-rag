@@ -39,9 +39,11 @@ from ._shared import (
     MAX_SERIES_BUCKETS,
     MIN_LEADERBOARD_MESSAGES,
     _append_id_filters,
+    _as_exclusion_list,
     _as_id_list,
     _connect,
     _date_clauses,
+    _exclude_id_filters,
     _REAL_MESSAGE_CLAUSES,
     _resolve_chat_scope,
     _scope_requested,
@@ -124,11 +126,12 @@ def _volume_section(series, granularity):
     return section
 
 
-def _activity_rows(con, chat_ids, date_from, date_to):
+def _activity_rows(con, chat_ids, date_from, date_to, exclude_chat_ids=None):
     """(date, is_from_me, chat_id) for every real message in scope,
     date-ordered -- the single pass _scan_activity consumes."""
     clauses, params = ["m.date IS NOT NULL", *_REAL_MESSAGE_CLAUSES], []
     _append_id_filters(clauses, params, chat_ids, None)
+    _exclude_id_filters(clauses, params, exclude_chat_ids)
     _date_clauses(clauses, params, date_from, date_to)
     return con.execute(
         f"SELECT m.date, m.is_from_me, m.chat_id FROM messages m "
@@ -272,7 +275,7 @@ def _streaks_section(day_counts, drought):
 
 def get_activity_patterns(chat_id=None, handle_id=None, contact_id=None,
                           date_from=None, date_to=None, granularity="month",
-                          include=None):
+                          include=None, exclude_chat_id=None):
     """When-do-we-talk analytics, bucketed in the local timezone: `heatmap`
     (7x24 weekday-by-hour message counts), `volume_series` (per-period
     sent/received at granularity 'day'|'month'|'year'; a day series past
@@ -282,18 +285,22 @@ def get_activity_patterns(chat_id=None, handle_id=None, contact_id=None,
     (top 10 local dates), `streaks` (longest run of consecutive active days
     and the longest drought). Messages only, reactions excluded.
     include=["heatmap", ...] selects a subset of sections; no scope
-    aggregates the whole corpus."""
+    aggregates the whole corpus. exclude_chat_id (scalar or list; not in the
+    LLM schema -- wrapped.py's carve-out) drops those chats from the scope
+    without turning an unscoped call into a scoped one."""
     if granularity not in _GRANULARITIES:
         raise ValueError(f"unknown granularity {granularity!r}: expected one of "
                          f"{', '.join(_GRANULARITIES)}")
     sections = _validate_include(include, _ACTIVITY_SECTIONS, "get_activity_patterns")
     unscoped = not _scope_requested(chat_id, handle_id, contact_id)
+    exclude_chat_ids = _as_exclusion_list(exclude_chat_id)
     tz = _local_tz()
     want_leaderboard = unscoped and "late_night" in sections
 
     with contextlib.closing(_connect()) as con:
         chat_ids, empty = _resolve_chat_scope(con, chat_id, handle_id, contact_id)
-        rows = [] if empty else _activity_rows(con, chat_ids, date_from, date_to)
+        rows = [] if empty else _activity_rows(con, chat_ids, date_from, date_to,
+                                               exclude_chat_ids)
         contact_by_chat = _late_night_contact_map(con) if want_leaderboard else {}
 
     scan = _scan_activity(rows, tz, granularity, contact_by_chat, want_leaderboard)

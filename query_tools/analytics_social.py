@@ -30,8 +30,10 @@ from ._shared import (
     _MSG_JOIN,
     _REAL_MESSAGE_CLAUSES,
     _append_id_filters,
+    _as_exclusion_list,
     _connect,
     _date_clauses,
+    _exclude_id_filters,
     _id_filter_clause,
     _resolve_chat_scope,
     _truncate_text_field,
@@ -83,7 +85,8 @@ def _receipt(row):
     return _truncate_text_field([dict(row)])[0] if row else None
 
 
-def _reaction_clauses(chat_ids, date_from, date_to, type_code):
+def _reaction_clauses(chat_ids, date_from, date_to, type_code,
+                      exclude_chat_ids=None):
     """Shared WHERE tail for reaction-counting queries: tapback-adds only, on
     a real target message, optional single type, chat scope on the target
     message, and date bounds on the *reaction* date (a reaction is an event of
@@ -97,15 +100,17 @@ def _reaction_clauses(chat_ids, date_from, date_to, type_code):
         clauses.append("r.associated_message_type = ?")
         params.append(type_code)
     _append_id_filters(clauses, params, chat_ids, None)
+    _exclude_id_filters(clauses, params, exclude_chat_ids)
     _date_clauses(clauses, params, date_from, date_to, column="r.date")
     return clauses, params
 
 
-def _message_counts(con, chat_ids, date_from, date_to):
+def _message_counts(con, chat_ids, date_from, date_to, exclude_chat_ids=None):
     """(sent, received) real-message counts in scope -- the rate denominators."""
     clauses = ["m.date IS NOT NULL", *_REAL_MESSAGE_CLAUSES]
     params = []
     _append_id_filters(clauses, params, chat_ids, None)
+    _exclude_id_filters(clauses, params, exclude_chat_ids)
     _date_clauses(clauses, params, date_from, date_to)
     total, sent = con.execute(
         f"SELECT COUNT(*), COALESCE(SUM(m.is_from_me), 0) "
@@ -116,10 +121,12 @@ def _message_counts(con, chat_ids, date_from, date_to):
 
 
 def _direction_stats(con, chat_ids, date_from, date_to, type_code,
-                     direction_clause, denominator, rate_key):
+                     direction_clause, denominator, rate_key,
+                     exclude_chat_ids=None):
     """Total + per-type counts for one direction of reactions, with a
     per-100-messages rate against the given denominator."""
-    clauses, params = _reaction_clauses(chat_ids, date_from, date_to, type_code)
+    clauses, params = _reaction_clauses(chat_ids, date_from, date_to, type_code,
+                                        exclude_chat_ids)
     clauses.append(direction_clause)
     by_type = collections.Counter()
     for code, count in con.execute(
@@ -142,10 +149,11 @@ def _zero_direction(rate_key):
     return {"total": 0, "by_type": {}, rate_key: None}
 
 
-def _time_to_react(con, chat_ids, date_from, date_to):
+def _time_to_react(con, chat_ids, date_from, date_to, exclude_chat_ids=None):
     """Median seconds from message to reaction, split by who reacted --
     medians computed in Python (never SQL date math in predicates)."""
-    clauses, params = _reaction_clauses(chat_ids, date_from, date_to, None)
+    clauses, params = _reaction_clauses(chat_ids, date_from, date_to, None,
+                                        exclude_chat_ids)
     clauses += ["m.date IS NOT NULL", "r.date IS NOT NULL"]
     samples = {"me_reacting": [], "them_reacting": []}
     for m_date, r_date, from_me in con.execute(
@@ -169,10 +177,11 @@ def _time_to_react(con, chat_ids, date_from, date_to):
     }
 
 
-def _funniest(con, chat_ids, date_from, date_to):
+def _funniest(con, chat_ids, date_from, date_to, exclude_chat_ids=None):
     """Contacts ranked by laugh-tapbacks per 100 of MY messages in their
     chats (min _FUNNIEST_MIN_REACTIONS reactions on my messages to enter)."""
-    clauses, params = _reaction_clauses(chat_ids, date_from, date_to, None)
+    clauses, params = _reaction_clauses(chat_ids, date_from, date_to, None,
+                                        exclude_chat_ids)
     clauses += ["m.is_from_me = 1", "r.is_from_me = 0"]
     reactors = {}
     for row in con.execute(
@@ -221,6 +230,7 @@ def _funniest(con, chat_ids, date_from, date_to):
     clauses = ["m.date IS NOT NULL", "m.is_from_me = 1", *_REAL_MESSAGE_CLAUSES]
     params = []
     _append_id_filters(clauses, params, chat_ids, None)
+    _exclude_id_filters(clauses, params, exclude_chat_ids)
     _date_clauses(clauses, params, date_from, date_to)
     my_msgs_by_chat = dict(con.execute(
         f"SELECT m.chat_id, COUNT(*) FROM messages m "
@@ -254,7 +264,8 @@ def _funniest(con, chat_ids, date_from, date_to):
     return rows[:MAX_LEADERBOARD_ROWS]
 
 
-def _hall_of_fame(con, chat_ids, date_from, date_to, type_code, limit):
+def _hall_of_fame(con, chat_ids, date_from, date_to, type_code, limit,
+                  exclude_chat_ids=None):
     """Top-`limit` most-reacted messages with receipts and a per-type
     breakdown. Date bounds apply to the *message* date here (the question is
     'best message of that period'), unlike the reaction-event sections."""
@@ -264,6 +275,7 @@ def _hall_of_fame(con, chat_ids, date_from, date_to, type_code, limit):
         clauses.append("r.associated_message_type = ?")
         params.append(type_code)
     _append_id_filters(clauses, params, chat_ids, None)
+    _exclude_id_filters(clauses, params, exclude_chat_ids)
     _date_clauses(clauses, params, date_from, date_to)
     rows = con.execute(
         f"""
@@ -303,7 +315,7 @@ def _hall_of_fame(con, chat_ids, date_from, date_to, type_code, limit):
 
 def get_reaction_stats(chat_id=None, handle_id=None, contact_id=None,
                        date_from=None, date_to=None, include=None,
-                       reaction_type=None, limit=10):
+                       reaction_type=None, limit=10, exclude_chat_id=None):
     """Tapback statistics in one call: `given` (reactions I sent: total,
     per-type, rate per 100 messages received), `received` (reactions on my
     messages: total, per-type, rate per 100 messages sent), `reciprocity`
@@ -314,10 +326,13 @@ def get_reaction_stats(chat_id=None, handle_id=None, contact_id=None,
     include selects sections (default all); reaction_type (name like
     'laugh'/'love' or raw code) narrows given/received/hall_of_fame;
     handle_id/contact_id scope to that person's chats; date bounds apply to
-    the reaction date (message date for hall_of_fame)."""
+    the reaction date (message date for hall_of_fame). exclude_chat_id
+    (scalar or list; not in the LLM schema -- wrapped.py's carve-out) drops
+    those chats from every section."""
     sections = _validate_include(include, _REACTION_SECTIONS, "get_reaction_stats")
     limit = max(1, min(int(limit), MAX_MESSAGE_LIMIT))
     type_code = None if reaction_type is None else _resolve_reaction_type(reaction_type)
+    exclude_chat_ids = _as_exclusion_list(exclude_chat_id)
 
     with contextlib.closing(_connect()) as con:
         chat_ids, empty = _resolve_chat_scope(con, chat_id, handle_id, contact_id)
@@ -340,13 +355,14 @@ def get_reaction_stats(chat_id=None, handle_id=None, contact_id=None,
 
         given = received = None
         if sections & {"given", "received", "reciprocity"}:
-            sent_msgs, received_msgs = _message_counts(con, chat_ids, date_from, date_to)
+            sent_msgs, received_msgs = _message_counts(con, chat_ids, date_from,
+                                                       date_to, exclude_chat_ids)
             given = _direction_stats(con, chat_ids, date_from, date_to, type_code,
                                      "r.is_from_me = 1", received_msgs,
-                                     "per_100_received_messages")
+                                     "per_100_received_messages", exclude_chat_ids)
             received = _direction_stats(con, chat_ids, date_from, date_to, type_code,
                                         "m.is_from_me = 1", sent_msgs,
-                                        "per_100_sent_messages")
+                                        "per_100_sent_messages", exclude_chat_ids)
         if "given" in sections:
             result["given"] = given
         if "received" in sections:
@@ -357,12 +373,14 @@ def get_reaction_stats(chat_id=None, handle_id=None, contact_id=None,
             result["reciprocity"] = {"given": given["total"],
                                      "received": received["total"], "ratio": ratio}
         if "time_to_react" in sections:
-            result["time_to_react"] = _time_to_react(con, chat_ids, date_from, date_to)
+            result["time_to_react"] = _time_to_react(con, chat_ids, date_from,
+                                                     date_to, exclude_chat_ids)
         if "funniest" in sections:
-            result["funniest"] = _funniest(con, chat_ids, date_from, date_to)
+            result["funniest"] = _funniest(con, chat_ids, date_from, date_to,
+                                           exclude_chat_ids)
         if "hall_of_fame" in sections:
             result["hall_of_fame"] = _hall_of_fame(con, chat_ids, date_from, date_to,
-                                                   type_code, limit)
+                                                   type_code, limit, exclude_chat_ids)
     return result
 
 

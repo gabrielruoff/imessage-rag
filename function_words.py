@@ -110,6 +110,64 @@ LAUGH_RE = re.compile(
 
 WE_WORDS = frozenset("we us our ours ourselves we're we've we'll we'd lets let's".split())
 
+# High-frequency conversational English beyond the function words above:
+# generic verbs, generic nouns, fillers, and texting affirmations. Used by
+# the Wrapped report to filter "top words" down to vocabulary that is
+# actually characteristic of the corpus ("ok"/"yeah"/"going" tell a reader
+# nothing). Deliberately conservative -- pet names, profanity, and oddball
+# words stay interesting and are NOT listed here.
+COMMON_WORDS = STOPWORDS | frozenset("""
+    get gets got gotten getting go goes going gone went come comes coming
+    came want wants wanted wanting know knows knew knowing known think
+    thinks thought thinking need needs needed needing make makes made
+    making take takes took taken taking see sees saw seen seeing look
+    looks looked looking say says said saying tell tells told telling talk
+    talks talked talking call calls called calling text texts texted
+    texting let lets letting try tries tried trying use uses used using
+    work works worked working give gives gave given giving find finds
+    found finding feel feels felt feeling put puts putting keep keeps kept
+    keeping start starts started starting stop stops stopped stopping
+    leave leaves leaving stay stays stayed staying wait waits waited
+    waiting watch watches watched watching eat eats ate eaten eating sleep
+    sleeps slept sleeping buy buys bought buying pay pays paid paying run
+    runs ran running drive drives drove driving walk walks walked walking
+    help helps helped helping ask asks asked asking send sends sent
+    sending bring brings brought bringing meet meets met meeting hear
+    hears heard hearing remember remembers remembered forget forgets
+    forgot forgotten guess guessed hope hopes hoped hoping wish wishes
+    wished mean means meant seem seems seemed happen happens happened
+    happening turn turns turned move moves moved live lives lived living
+    show shows showed shown read reads reading write writes wrote written
+    love loves loved like likes liked want check checks checked checking
+    play plays played playing end ends ended ending change changes changed
+    talk done doing did does
+    time times day days night nights week weeks weekend weekends month
+    months year years today tomorrow tonight yesterday morning afternoon
+    evening minute minutes min mins hour hours second seconds moment
+    moments while thing things stuff people person guy guys man men woman
+    women kid kids friend friends home house place places way ways lot
+    lots bit bits point points part parts side sides name names phone
+    school word words idea ideas plan plans money food dinner lunch
+    breakfast car game games life world door room rooms
+
+    good great nice bad better best worse worst fine well okay ok kk
+    right wrong sure new old big small little long short early late soon
+    ready busy tired happy sad easy hard fun funny cool awesome cute crazy
+    weird real true whole last next first same different able
+    yeah yea yes yep yup yuppp no nah nope not hey hi hello bye oh ah um
+    uh hmm hm mm mhm wow omg oof welp huh eh damn dang gosh geez jeez
+    lol lols lmao lmaoo lmfao haha hahah hahaha hehe rofl
+    btw idk idc imo imho tbh fyi rn asap af ffs stg ngl fr frfr ong bc cuz
+    pls plz please thanks thank thanks thx ty tysm np yw sorry sry oops
+    my bad man bro bruh dude dawg fam yall y'all
+    that'll there's here's what's who's how's when's where's why's
+    should've would've could've must've i'ma imma lemme gimme dunno
+    kinda gonna gotta wanna sorta oughta
+    one two three four five six seven eight nine ten
+    back why where when how still only ever also sound sounds
+    http https www com org net
+""".split())
+
 # GoEmotions taxonomy (Demszky et al. 2020), minus 'neutral' -- the label
 # set annotate.py's output is validated against.
 EMOTION_LABELS = (

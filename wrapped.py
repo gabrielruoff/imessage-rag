@@ -1,4 +1,4 @@
-"""Year-in-review ("Wrapped") markdown report generator.
+"""Year-in-review ("Wrapped") HTML report generator.
 
 Composes a report from deterministic, direct query_tools calls (no LLM tool
 loop): roster ranking and scoping run as direct SQL against the analysis DB,
@@ -16,8 +16,13 @@ Usage:
                [--include NAME ...] [--out PATH] [--no-llm] [--yes]
 
 --exclude SPEC: an integer excludes that chat_id, 'A..B' (ISO dates) drops
-that date range from scope, anything else is a contact name (resolved via
-search_contacts_by_name).
+that date range from roster ranking, anything else is a contact name
+(resolved via search_contacts_by_name). Excluding a person -- by name or via
+the silent-contact guard -- removes them from the roster AND drops their 1:1
+chats from every section (totals, marathons, leaderboards, jokes, tone...).
+Group chats they belong to stay in the report and may still name them, and
+free-text mentions of them inside other people's kept messages are not
+scrubbed.
 
 Every tool is resolved as a query_tools.<name> attribute at call time, so a
 tool that is not integrated yet (AttributeError) or that returns an error /
@@ -37,6 +42,7 @@ import db
 import ollama
 import progress
 import query_tools
+import wrapped_html
 import wrapped_sections
 
 # Patchable by tests, resolved at call time (mirrors query_tools.DB_PATH).
@@ -46,15 +52,24 @@ DB_PATH = str(config.TARGET_DB)
 # analytics tools -- see query_tools._shared._REAL_MESSAGE_CLAUSES).
 _REAL_MSG = "COALESCE(m.is_emote, 0) = 0 AND COALESCE(m.item_type, 0) = 0"
 
-_DENSITY_CHARS = " .:-=+*#%@"
-_WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
-
 _NARRATIVE_SYSTEM = (
-    "You write short narrative blurbs for sections of a personal year-in-review "
-    "messaging report. Write 2-4 sentences from the stats JSON you are given. "
-    "Rules: use ONLY numbers that appear in the input -- never invent, derive, or "
-    "round differently; be descriptive, never evaluative -- no judgments about "
-    "relationship health, no advice; no headings or bullet lists, plain prose only."
+    "You write the short blurb that opens each section of a personal year-in-review "
+    "texting report (think Spotify Wrapped, for iMessage). You get one section's "
+    "stats as JSON; the reader sees the same numbers in tables right below your "
+    "blurb.\n"
+    "Rules:\n"
+    "- Write 2-3 sentences of plain, warm, second-person prose ('you'). No "
+    "headings, bullets, or emoji.\n"
+    "- Pick only the two or three most interesting facts; never walk through every "
+    "row or restate a whole table.\n"
+    "- Quote numbers, percentages, durations, and dates EXACTLY as they appear in "
+    "the JSON -- they are pre-formatted for display; never invent, recompute, "
+    "combine, or re-round anything.\n"
+    "- Reply times and conversation lengths are MEDIANS: say 'typically' or "
+    "'usually', never 'average' or 'on average'.\n"
+    "- Descriptive, never evaluative: no judgments about relationship health, no "
+    "advice.\n"
+    "- Never mention JSON, stats, data, sections, or this report's machinery."
 )
 
 
@@ -127,7 +142,8 @@ def build_roster(con, year=None, exclude_chat_ids=(), exclude_ranges=(), limit=N
     by handle. Returns [{contact_id, handle_id, name, n_messages}] ranked."""
     if limit is None:
         limit = config.WRAPPED_TOP_CONTACTS
-    clauses = ["m.date IS NOT NULL", "m.is_from_me = 0", _REAL_MSG]
+    clauses = ["m.date IS NOT NULL", "m.is_from_me = 0", _REAL_MSG,
+               "h.handle_identifier NOT LIKE 'urn:biz:%'"]
     params = []
     if year is not None:
         clauses += ["m.date >= ?", "m.date < ?"]
@@ -214,47 +230,26 @@ def silent_exclusions(con, roster, min_messages=None, silent_months=None):
     return kept, excluded
 
 
-def render_heatmap_ascii(heatmap):
-    """Render a 7x24 weekday-major count grid as ASCII art using
-    ' .:-=+*#%@' density characters. Accepts the raw grid or a dict wrapping
-    it; returns None when no grid is recognizable."""
-    grid = heatmap
-    if isinstance(heatmap, dict):
-        grid = next(
-            (heatmap[k] for k in ("grid", "counts", "cells", "heatmap") if k in heatmap),
-            None,
-        )
-    if not grid:
-        return None
-    try:
-        peak = max(v for row in grid for v in row)
-    except (TypeError, ValueError):
-        return None
-    header = [" "] * 24
-    for hour in (0, 6, 12, 18):
-        for i, ch in enumerate(str(hour)):
-            header[hour + i] = ch
-    lines = ["     " + "".join(header)]
-    top = len(_DENSITY_CHARS) - 1
-    for day, row in zip(_WEEKDAYS, grid):
-        cells = []
-        for v in row:
-            if not peak or not v:
-                cells.append(_DENSITY_CHARS[0])
-            else:
-                cells.append(_DENSITY_CHARS[max(1, round(v / peak * top))])
-        lines.append(f"{day}  " + "".join(cells))
-    return "\n".join(lines)
-
-
-def narrate_section(title, stats):
-    """One 2-4 sentence LLM narrative for a section's stats dict. Raises on
-    LLM failure -- the caller falls back to stats-only."""
-    payload = json.dumps(stats, ensure_ascii=False, default=str)
+def narrate_section(title, stats, hint=None, report_title=""):
+    """One short LLM narrative for a section's stats dict. The narrator gets
+    the humanized copy of the stats -- hidden keys stripped, every value
+    formatted exactly as the page renders it -- so it can only quote numbers
+    in the form the reader sees -- plus the report title, so an all-time
+    report isn't narrated as "this year". Raises on LLM failure -- the
+    caller falls back to stats-only."""
+    payload = json.dumps(wrapped_html.humanized(stats), ensure_ascii=False, default=str)
+    content = ""
+    if report_title:
+        content += (f"Report: {report_title} (match your wording to this scope -- "
+                    "never say 'this year' unless the report covers one year)\n")
+    content += f"Section: {title}\n"
+    if hint:
+        content += f"What this section shows: {hint}\n"
+    content += f"Stats JSON:\n{payload}"
     reply = ollama.chat_once(
         [
             {"role": "system", "content": _NARRATIVE_SYSTEM},
-            {"role": "user", "content": f"Section: {title}\nStats JSON:\n{payload}"},
+            {"role": "user", "content": content},
         ],
         model=config.WRAPPED_MODEL,
         timeout=config.WRAPPED_TIMEOUT,
@@ -263,11 +258,17 @@ def narrate_section(title, stats):
     return (reply.get("content") or "").strip() or None
 
 
-def compose_report(sections, title, use_llm=False):
-    """Assemble the markdown report. Each section dict: {title, stats,
-    note, extra_md} -- stats None renders the heading plus a one-line skip
-    note; a narrative failure keeps the stats block and notes the fallback."""
-    parts = [f"# {title}"]
+def compose_report(sections, title, subtitle="", use_llm=False):
+    """Assemble the HTML report. Each section dict: {title, stats, note,
+    caption, hint, narrate_stats, extra_html}. A section renders visuals
+    from extra_html plus any residual stats (tiles/tables via wrapped_html);
+    it is skipped with a note only when it has neither. narrate_stats, when
+    present, is the full shaped data the narrator sees -- sections that move
+    their rows into visuals keep narrating the complete picture. A narrative
+    failure keeps the rendered content and notes the fallback; caption is a
+    one-line methodology note under the narrative; no JSON reaches the
+    page."""
+    cards = []
     # Only the narration pass is slow enough to be worth reporting (one Ollama
     # call per section); --no-llm assembles in milliseconds. The label stays
     # generic -- section titles can carry a contact's name, and progress output
@@ -275,29 +276,74 @@ def compose_report(sections, title, use_llm=False):
     with progress.track("Narrating sections", total=len(sections),
                         enabled=use_llm) as p:
         for sec in sections:
-            parts.append(f"## {sec['title']}")
+            parts = [f"<h2>{wrapped_html.esc(sec['title'])}</h2>"]
             stats = sec.get("stats")
-            if stats is None:
-                parts.append(f"_Skipped: {sec.get('note') or 'no data'}_")
-                p.advance()
-                continue
-            if use_llm:
-                try:
-                    narrative = narrate_section(sec["title"], stats)
-                except Exception as e:
-                    parts.append(f"_Narrative unavailable ({e}); stats only._")
-                else:
-                    if narrative:
-                        parts.append(narrative)
-            parts.append(
-                "```json\n"
-                + json.dumps(stats, indent=2, ensure_ascii=False, default=str)
-                + "\n```"
-            )
-            if sec.get("extra_md"):
-                parts.append(sec["extra_md"])
+            extra = sec.get("extra_html")
+            if stats is None and not extra:
+                note = sec.get("note") or "no data"
+                parts.append(f'<p class="note">Skipped: {wrapped_html.esc(note)}</p>')
+            else:
+                narrate_stats = sec.get("narrate_stats") or stats
+                if use_llm and narrate_stats:
+                    try:
+                        narrative = narrate_section(sec["title"], narrate_stats,
+                                                    sec.get("hint"), title)
+                    except Exception as e:
+                        parts.append(
+                            '<p class="note">Narrative unavailable '
+                            f"({wrapped_html.esc(e)}); stats only.</p>"
+                        )
+                    else:
+                        if narrative:
+                            parts.append(
+                                f'<p class="narrative">{wrapped_html.esc(narrative)}</p>'
+                            )
+                if sec.get("caption"):
+                    parts.append(
+                        f'<p class="note">{wrapped_html.esc(sec["caption"])}</p>'
+                    )
+                if stats:
+                    parts.append(wrapped_html.render_value(stats))
+                if extra:
+                    parts.append(extra)
+            cards.append('<section class="card">' + "".join(parts) + "</section>")
             p.advance()
-    return "\n\n".join(parts) + "\n"
+    cards.append(_outro_card(title))
+    footer = "Generated locally from your message history. Nothing left this machine."
+    hero = _hero(sections, subtitle)
+    return wrapped_html.render_page(title, subtitle, "\n".join(cards), footer,
+                                    hero=hero)
+
+
+def _outro_card(title):
+    """The closing beat: the report signs off as one received message --
+    bookending the hero, which opened as a sent one."""
+    year = re.search(r"\b(\d{4})\b", title)
+    text = f"that’s a wrap on {year.group(1)} 💙" if year else "that’s a wrap 💙"
+    return (
+        '<section class="card outro"><div class="bubbles">'
+        '<figure class="msg inc"><div class="bubble">'
+        f"{wrapped_html.esc(text)}</div></figure></div></section>"
+    )
+
+
+def _hero(sections, subtitle):
+    """The opener bubble: total messages in scope (from Year in Numbers) with
+    reactions received as its tapback. Empty when the totals are missing --
+    render_page then falls back to the plain subtitle."""
+    totals = reactions = None
+    for sec in sections:
+        stats = sec.get("narrate_stats") or sec.get("stats")
+        if not isinstance(stats, dict):
+            continue
+        if totals is None and stats.get("messages_sent") is not None:
+            totals = (stats.get("messages_sent") or 0) + (stats.get("messages_received") or 0)
+        if reactions is None and stats.get("reactions_received"):
+            reactions = stats["reactions_received"]
+    if not totals:
+        return ""
+    caption = subtitle.replace("Generated", "Delivered") or subtitle
+    return wrapped_html.render_hero(totals, caption, reactions)
 
 
 def _resolve_contact(name):
@@ -345,6 +391,74 @@ def _resolve_name_exclusions(names):
     return contact_ids, lowered
 
 
+def _person_direct_chat_ids(con, contact_ids, handle_ids):
+    """1:1 (non-group) chat ids the given contacts/handles participate in --
+    what excluding a person carves out of every section. Group chats stay:
+    they are shared history with everyone else in them (same call
+    _inside_jokes_all makes)."""
+    who = []
+    params = []
+    if contact_ids:
+        who.append(f"h.contact_id IN ({','.join('?' * len(contact_ids))})")
+        params += sorted(contact_ids)
+    if handle_ids:
+        who.append(f"h.id IN ({','.join('?' * len(handle_ids))})")
+        params += sorted(handle_ids)
+    if not who:
+        return set()
+    return {r[0] for r in con.execute(
+        f"""
+        SELECT DISTINCT cp.chat_id
+        FROM chat_participants cp
+        JOIN handles h ON h.id = cp.handle_id
+        JOIN chats ch ON ch.id = cp.chat_id AND ch.is_group = 0
+        WHERE {" OR ".join(who)}
+        """,
+        params,
+    )}
+
+
+def _business_chat_ids(con):
+    """Chat ids with a business (urn:biz:) participant. build_roster keeps
+    business handles off the roster, but corpus-wide sections don't go through
+    the roster -- their chats must be carved out via exclude_chat_ids or the
+    raw urn:biz identifier surfaces as a 'contact' (e.g. the night-owls
+    leaderboard). No is_group guard: a business in a chat makes the whole chat
+    business traffic."""
+    return {r[0] for r in con.execute(
+        """
+        SELECT DISTINCT cp.chat_id
+        FROM chat_participants cp
+        JOIN handles h ON h.id = cp.handle_id
+        WHERE h.handle_identifier LIKE 'urn:biz:%'
+        """
+    )}
+
+
+def _excluded_name_set(con, contact_ids, entries, name_specs):
+    """Lowercase names identifying excluded persons -- used to keep a term
+    named after them ('Alice' coined in someone else's chat) out of the joke
+    cards, and them out of the prior-year ranks. Covers the raw --exclude
+    specs, each excluded contact's first name / nickname / full label, and
+    the dropped roster entries' display labels. Bare first names mean
+    collisions over-drop (excluding one Alice hides every Alice from the word
+    cloud, joke cards, and prior ranks) -- deliberate: for a privacy guard,
+    over-exclusion is the right failure direction."""
+    names = {s.lower() for s in name_specs}
+    names |= {e["name"].lower() for e in entries if e.get("name")}
+    if contact_ids:
+        placeholders = ",".join("?" * len(contact_ids))
+        for first, last, nick in con.execute(
+            f"SELECT first_name, last_name, nickname FROM contacts "
+            f"WHERE id IN ({placeholders})", sorted(contact_ids),
+        ):
+            for name in (first, nick, " ".join(p for p in (first, last) if p)):
+                if name:
+                    names.add(name.lower())
+    names.discard("")
+    return names
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--year", type=int, help="scope the report to one calendar year")
@@ -353,13 +467,24 @@ def main(argv=None):
                         help="chat_id, ISO date range A..B, or contact name to exclude")
     parser.add_argument("--include", action="append", default=[], metavar="NAME",
                         help="re-admit an auto-excluded contact by name")
-    parser.add_argument("--out", help="output path (default wrapped_<scope>.md)")
+    parser.add_argument("--out", help="output path (default wrapped_<scope>.html)")
     parser.add_argument("--no-llm", action="store_true", help="stats-only, no narratives")
     parser.add_argument("--yes", action="store_true", help="skip the roster confirmation prompt")
     args = parser.parse_args(argv)
 
     with contextlib.closing(_connect()) as con:
-        exclude_chats, exclude_ranges = [], []
+        exclude_chats, exclude_ranges, exclude_names = [], [], []
+        for spec in args.exclude:
+            kind, value = parse_exclude_spec(spec)
+            if kind == "chat":
+                exclude_chats.append(value)
+            elif kind == "range":
+                exclude_ranges.append(value)
+            else:
+                exclude_names.append(value)
+        drop_ids, drop_names = _resolve_name_exclusions(exclude_names)
+        excluded_entries = []  # roster entries dropped by name or silence
+
         if args.contact:
             contact = _resolve_contact(args.contact)
             if contact is None:
@@ -369,24 +494,17 @@ def main(argv=None):
             print(f"Featured: {entry['name']} (contact_id {contact['id']})")
             roster, contact_entry, scope_slug = [entry], entry, _slug(entry["name"])
         else:
-            exclude_names = []
-            for spec in args.exclude:
-                kind, value = parse_exclude_spec(spec)
-                if kind == "chat":
-                    exclude_chats.append(value)
-                elif kind == "range":
-                    exclude_ranges.append(value)
-                else:
-                    exclude_names.append(value)
             roster = build_roster(con, args.year, exclude_chats, exclude_ranges)
-            drop_ids, drop_names = _resolve_name_exclusions(exclude_names)
-            roster = [e for e in roster
-                      if e["contact_id"] not in drop_ids and e["name"].lower() not in drop_names]
+            dropped = [e for e in roster
+                       if e["contact_id"] in drop_ids or e["name"].lower() in drop_names]
+            roster = [e for e in roster if e not in dropped]
             kept, silenced = silent_exclusions(con, roster)
             include_lower = {n.lower() for n in args.include}
             readmitted = {_entry_key(e) for e in silenced if e["name"].lower() in include_lower}
             keep_keys = {_entry_key(e) for e in kept} | readmitted
             featured = [e for e in roster if _entry_key(e) in keep_keys]
+            excluded_entries = dropped + [e for e in silenced
+                                          if _entry_key(e) not in readmitted]
 
             print("Featured roster:")
             for i, e in enumerate(featured, 1):
@@ -398,6 +516,29 @@ def main(argv=None):
                       f'pass --include "{e["name"]}" to feature them')
             roster, contact_entry, scope_slug = featured, None, "all"
 
+        # An excluded person's data must not leak back in through the
+        # corpus-wide sections: expand every excluded person (named or
+        # silence-guarded) into their 1:1 chats and carve those out of
+        # everything. Group chats stay -- shared history.
+        excl_contact_ids = set(drop_ids)
+        excl_handle_ids = set()
+        for e in excluded_entries:
+            if e.get("contact_id") is not None:
+                excl_contact_ids.add(e["contact_id"])
+            elif e.get("handle_id") is not None:
+                excl_handle_ids.add(e["handle_id"])
+        person_chats = _person_direct_chat_ids(con, excl_contact_ids, excl_handle_ids)
+        if person_chats:
+            print(f"(also excluding {len(person_chats)} direct chat(s) of "
+                  "excluded contacts from every section)")
+        biz_chats = _business_chat_ids(con)
+        if biz_chats:
+            print(f"(also excluding {len(biz_chats)} business chat(s) -- "
+                  "urn:biz handles -- from every section)")
+        exclude_chats = sorted(set(exclude_chats) | person_chats | biz_chats)
+        excluded_names = _excluded_name_set(con, excl_contact_ids,
+                                            excluded_entries, drop_names)
+
         if not args.yes:
             answer = input("Proceed? [y/N] ").strip().lower()
             if answer not in ("y", "yes"):
@@ -406,15 +547,18 @@ def main(argv=None):
 
         sections = wrapped_sections.build_sections(con, roster, contact_entry,
                                                    args.year, exclude_chats,
-                                                   exclude_ranges)
+                                                   exclude_ranges, excluded_names)
 
     year_label = str(args.year) if args.year else "All Time"
     title = f"Wrapped — {year_label}"
     if contact_entry is not None:
         title += f" — {contact_entry['name']}"
-    report = compose_report(sections, title, use_llm=not args.no_llm)
+    today = datetime.date.today()
+    subtitle = f"Generated {today:%B} {today.day}, {today.year}"
+    report = compose_report(sections, title, subtitle, use_llm=not args.no_llm)
 
-    out = Path(args.out) if args.out else Path(f"wrapped_{args.year or 'all'}_{scope_slug}.md")
+    out = (Path(args.out) if args.out
+           else Path(f"wrapped_{args.year or 'all'}_{scope_slug}.html"))
     out.write_text(report, encoding="utf-8")
     print(str(out))
     return 0

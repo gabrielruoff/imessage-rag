@@ -24,9 +24,11 @@ from ._shared import (
     MAX_WORD_FREQ_TOP,
     _REAL_MESSAGE_CLAUSES,
     _append_id_filters,
+    _as_exclusion_list,
     _as_id_list,
     _connect,
     _date_clauses,
+    _exclude_id_filters,
     _id_filter_clause,
     _participant_roster,
     _resolve_scope,
@@ -162,7 +164,7 @@ def _tokenize(text):
 
 def get_word_frequency(chat_id=None, handle_id=None, contact_id=None, is_from_me=None,
                        date_from=None, date_to=None, ngram=1, top=25, min_count=2,
-                       include_stopwords=False):
+                       include_stopwords=False, exclude_chat_id=None):
     """Most frequent words (ngram=1) or phrases (ngram=2..3) in message text,
     with counts. Unlike the other analytics tools this scopes by SENDER:
     handle_id/contact_id means messages that person sent, is_from_me=true
@@ -170,7 +172,8 @@ def get_word_frequency(chat_id=None, handle_id=None, contact_id=None, is_from_me
     is_from_me=true with no other scope. Common English stopwords are
     excluded unless include_stopwords=true (phrases are dropped only when
     every word is a stopword). Scans every matching message -- corpus-wide
-    calls take a few seconds."""
+    calls take a few seconds. exclude_chat_id (scalar or list; not in the
+    LLM schema -- wrapped.py's carve-out) drops those chats from the scan."""
     ngram = max(1, min(int(ngram), 3))
     top = max(1, min(int(top), MAX_WORD_FREQ_TOP))
 
@@ -183,6 +186,7 @@ def get_word_frequency(chat_id=None, handle_id=None, contact_id=None, is_from_me
         clauses = ["m.text IS NOT NULL", "m.text != ''", *_REAL_MESSAGE_CLAUSES]
         params = []
         _append_id_filters(clauses, params, chat_ids, handle_ids)
+        _exclude_id_filters(clauses, params, _as_exclusion_list(exclude_chat_id))
         if is_from_me is not None:
             clauses.append("m.is_from_me = ?")
             params.append(int(is_from_me))

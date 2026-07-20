@@ -4,6 +4,7 @@ tools are integrated), and mocked ollama.chat_once -- no Ollama, no real DB."""
 
 import io
 import os
+import re
 import sqlite3
 import tempfile
 import unittest
@@ -16,6 +17,7 @@ import ollama
 import query_tools
 import schema
 import wrapped
+import wrapped_html
 
 # The six new tools plus the existing ones wrapped.py composes; every test
 # that drives main() patches all of these so no real query path runs.
@@ -56,7 +58,7 @@ _DEFAULT_RESULTS = {
     "get_word_trends": {"distinctive_terms": [{"term": "blorbo"}], "emoji": [], "rates": {}},
     "get_milestones": {"firsts": {"first": {"id": 1}}},
     "get_group_dynamics": {"members": [{"name": "A", "share": 0.5}]},
-    "get_word_frequency": [{"word": "hello", "count": 4}],
+    "get_word_frequency": [{"word": "zamboni", "count": 4}],
     "search_contacts_by_name": [],
 }
 
@@ -150,7 +152,7 @@ class WrappedTestCase(unittest.TestCase):
             code = wrapped.main(argv)
         return code, out.getvalue()
 
-    def out_path(self, name="report.md"):
+    def out_path(self, name="report.html"):
         return os.path.join(tempfile.gettempdir(), f"wrapped-test-{os.getpid()}-{name}")
 
 
@@ -253,15 +255,69 @@ class TestParseExcludeSpec(unittest.TestCase):
 
 class TestHeatmap(unittest.TestCase):
     def test_render(self):
-        art = wrapped.render_heatmap_ascii(_HEATMAP)
-        lines = art.splitlines()
-        self.assertEqual(len(lines), 8)  # header + 7 weekdays
-        self.assertIn("@", lines[3])  # Wednesday peak at max density
-        self.assertNotIn("@", lines[6])  # Saturday mid-density
-        self.assertTrue(lines[3].startswith("Wed"))
-        self.assertIsNone(wrapped.render_heatmap_ascii(None))
-        self.assertIsNone(wrapped.render_heatmap_ascii({"share": 0.1}))
-        self.assertEqual(art, wrapped.render_heatmap_ascii({"grid": _HEATMAP}))
+        art = wrapped_html.render_heatmap(_HEATMAP)
+        self.assertEqual(art.count('class="hm-row"'), 7)  # one per weekday
+        cells = re.findall(r'class="hm-cell q(\d)"', art)
+        self.assertEqual(len(cells), 7 * 24 + 8)  # grid + the legend's scale
+        self.assertIn("Wed", art)
+        # Exact counts survive in the hover tooltip; the busiest cell takes the
+        # top ramp step, an empty one the surface step.
+        self.assertIn('title="Wed 10 PM · 9 messages"', art)
+        self.assertIn('<span class="hm-cell q7" title="Wed 10 PM · 9 messages">', art)
+        self.assertIn('<span class="hm-cell q0" title="Mon 12 AM · 0 messages">', art)
+        self.assertIsNone(wrapped_html.render_heatmap(None))
+        self.assertIsNone(wrapped_html.render_heatmap({"share": 0.1}))
+        self.assertEqual(art, wrapped_html.render_heatmap({"grid": _HEATMAP}))
+
+    def test_quantile_shading_spreads_a_skewed_grid(self):
+        # One outlier must not flatten everything else onto one mid step: with
+        # a linear ramp 1..8 all land on the same band.
+        grid = [[0] * 24 for _ in range(7)]
+        for hour in range(24):
+            grid[0][hour] = hour + 1
+        grid[1][0] = 5000  # outlier sets the peak
+        art = wrapped_html.render_heatmap(grid)
+        steps = {int(m) for m in re.findall(r"hm-cell q(\d)", art)}
+        self.assertTrue({1, 7} <= steps, f"ramp under-used: {steps}")
+
+
+class TestRenderValue(unittest.TestCase):
+    def test_shapes_render_without_json(self):
+        html = wrapped_html.render_value(
+            {"messages_sent": 1234, "share": 0.25, "note_text": None,
+             "people": [{"name": "Alice", "guid": "x", "messages": 3}]}
+        )
+        self.assertIn("1,234", html)  # thousands separator
+        self.assertIn("25.0%", html)  # share keys render as percentages
+        self.assertIn("—", html)  # None -> em dash
+        self.assertIn("Messages sent", html)  # humanized tile label
+        self.assertIn("<td>Alice</td>", html)
+        self.assertNotIn("guid", html)  # db plumbing dropped
+        self.assertNotIn("{", html)
+
+    def test_unavailable_and_empty(self):
+        self.assertIn(
+            "no lexicon",
+            wrapped_html.render_value({"available": False, "note": "no lexicon"}),
+        )
+        self.assertIn("None.", wrapped_html.render_value({"rows": []}))
+
+    def test_uniform_dict_becomes_one_table(self):
+        html = wrapped_html.render_value(
+            {"me": {"median_s": 1}, "them": {"median_s": 2}}, depth=1
+        )
+        self.assertEqual(html.count("<table"), 1)
+        self.assertIn('<th scope="row">Me</th>', html)
+        # A ragged pair keeps the generic nested-block path.
+        ragged = wrapped_html.render_value(
+            {"me": {"median_s": 1}, "them": {"other": 2}}, depth=1
+        )
+        self.assertIn("block-title", ragged)
+
+    def test_escaping(self):
+        html = wrapped_html.render_value({"text": "<script>&x"})
+        self.assertNotIn("<script>", html)
+        self.assertIn("&lt;script&gt;&amp;x", html)
 
 
 class TestMainFlow(WrappedTestCase):
@@ -276,34 +332,48 @@ class TestMainFlow(WrappedTestCase):
 
     def test_report_composition(self):
         self._seed_basic()
-        self.patch_tools(get_word_trends={"available": False}, get_milestones=None)
+        self.patch_tools(get_word_trends={"available": False})
         self.patch_llm()
-        out = self.out_path("compose.md")
+        out = self.out_path("compose.html")
         code, stdout = self.run_main(["--year", "2025", "--yes", "--no-llm", "--out", out])
         self.assertEqual(code, 0)
         self.assertIn("Featured roster:", stdout)
         self.assertIn(out, stdout)
         with open(out, encoding="utf-8") as f:
-            md = f.read()
-        self.assertIn("# Wrapped — 2025", md)
-        self.assertIn("## Year in Numbers", md)
-        self.assertIn('"messages_sent": 8', md)
-        self.assertIn("## Your People", md)
-        self.assertIn("## Tempo", md)
-        self.assertIn("## Reactions", md)
-        self.assertIn("## Late Nights, Streaks & the Heatmap", md)
-        self.assertIn("Wed", md)  # ASCII heatmap rendered
-        self.assertIn("@", md)
-        # get_milestones attribute missing entirely -> skipped with a note.
-        self.assertIn("## Milestones & Anniversaries", md)
-        self.assertIn("get_milestones is not available yet", md)
-        # get_word_trends {"available": false} -> word_frequency data still used.
-        self.assertIn("## Words & Inside Jokes", md)
-        self.assertIn('"word": "hello"', md)
-        self.assertIn("## Groups", md)
-        self.assertIn("The Gang", md)
+            page = f.read()
+        self.assertTrue(page.startswith("<!doctype html>"))
+        self.assertIn("<title>Wrapped — 2025</title>", page)
+        self.assertIn("<h1>Wrapped — 2025</h1>", page)
+        self.assertIn("<h2>Year in Numbers</h2>", page)
+        self.assertIn(">8</div>", page)  # messages_sent tile
+        self.assertIn("Messages sent", page)
+        self.assertIn("<h2>Your People</h2>", page)
+        self.assertIn('class="hbars"', page)  # people render as a bar list
+        self.assertIn("<h2>Tempo</h2>", page)
+        self.assertIn("<h2>Reactions</h2>", page)
+        self.assertIn('class="bubbles"', page)  # hall of fame as chat bubbles
+        self.assertIn("<h2>Late Nights, Streaks &amp; the Heatmap</h2>", page)
+        self.assertIn('class="chart heatmap"', page)  # heatmap rendered
+        self.assertIn('title="Wed 10 PM · 9 messages"', page)
+        # Milestones was removed from the report by design.
+        self.assertNotIn("Milestones", page)
+        # get_word_trends {"available": false} -> word_frequency data still
+        # feeds the word cloud.
+        self.assertIn("<h2>Words &amp; Inside Jokes</h2>", page)
+        self.assertIn('class="cloud"', page)
+        self.assertIn("zamboni", page)
+        self.assertIn("<h2>Groups</h2>", page)
+        self.assertIn("The Gang", page)
         # chunk_annotations/topics empty -> Eras omitted silently.
-        self.assertNotIn("Eras & Emotional Arc", md)
+        self.assertNotIn("Eras &amp; Emotional Arc", page)
+        # The whole point of the HTML report: no JSON reaches the page.
+        self.assertNotIn("```", page)
+        self.assertNotIn('"messages_sent"', page)
+        # Print restore: the beforeprint reveal hook and CSS-var bar heights
+        # (an inline height: could never be restored over the hidden state).
+        self.assertIn("beforeprint", page)
+        self.assertIn("--h:", page)
+        self.assertNotIn('style="height:', page)
 
     def test_words_section_skipped_when_both_unavailable(self):
         self._seed_basic()
@@ -312,13 +382,13 @@ class TestMainFlow(WrappedTestCase):
             get_word_frequency=mock.Mock(return_value={"error": "nope"}),
         )
         self.patch_llm()
-        out = self.out_path("words.md")
+        out = self.out_path("words.html")
         code, _ = self.run_main(["--yes", "--no-llm", "--out", out])
         self.assertEqual(code, 0)
         with open(out, encoding="utf-8") as f:
-            md = f.read()
-        self.assertIn("## Words & Inside Jokes", md)
-        self.assertIn("_Skipped:", md)
+            page = f.read()
+        self.assertIn("<h2>Words &amp; Inside Jokes</h2>", page)
+        self.assertIn("Skipped:", page)
 
     def test_eras_section_when_annotations_exist(self):
         self._seed_basic()
@@ -326,16 +396,20 @@ class TestMainFlow(WrappedTestCase):
             "INSERT INTO chunk_annotations (chunk_id, valence) VALUES (1, 0.5)"
         )
         self.con.commit()
-        trends = mock.Mock(return_value={"emotions": {"joy": 3}, "valence": {"mean": 0.2}})
+        trends = mock.Mock(return_value={
+            "emotions": {"top": [{"emotion": "joy", "count": 3}], "chunks_annotated": 3},
+            "valence": {"series": [{"period": "2025", "mean_valence": 0.2, "n_chunks": 3}]},
+        })
         self.patch_tools(get_word_trends=trends)
         self.patch_llm()
-        out = self.out_path("eras.md")
+        out = self.out_path("eras.html")
         code, _ = self.run_main(["--yes", "--no-llm", "--out", out])
         self.assertEqual(code, 0)
         with open(out, encoding="utf-8") as f:
-            md = f.read()
-        self.assertIn("## Eras & Emotional Arc", md)
-        self.assertIn('"joy": 3', md)
+            page = f.read()
+        self.assertIn("<h2>Eras &amp; Emotional Arc</h2>", page)
+        self.assertIn("Joy", page)
+        self.assertIn('<span class="hb-val">3</span>', page)  # emotions as bars
         # The arc call asks for the emotions/valence sections explicitly.
         includes = [c.kwargs.get("include") for c in trends.call_args_list]
         self.assertIn(["emotions", "valence"], includes)
@@ -355,15 +429,15 @@ class TestMainFlow(WrappedTestCase):
         self.patch_llm()
         with mock.patch.object(config, "WRAPPED_SILENT_MIN_MESSAGES", 5), \
                 mock.patch.object(config, "WRAPPED_SILENT_MONTHS", 6):
-            out = self.out_path("silent.md")
+            out = self.out_path("silent.html")
             code, stdout = self.run_main(["--yes", "--no-llm", "--out", out])
             self.assertEqual(code, 0)
             self.assertIn("excluded (went quiet 2025-01): Bob", stdout)
             self.assertIn('pass --include "Bob" to feature them', stdout)
             with open(out, encoding="utf-8") as f:
-                self.assertNotIn('"name": "Bob"', f.read())
+                self.assertNotIn("Bob", f.read())
 
-            out2 = self.out_path("silent-include.md")
+            out2 = self.out_path("silent-include.html")
             code, stdout = self.run_main(
                 ["--yes", "--no-llm", "--include", "Bob", "--out", out2]
             )
@@ -375,7 +449,7 @@ class TestMainFlow(WrappedTestCase):
         self._seed_basic()
         self.patch_tools()
         self.patch_llm()
-        out = self.out_path("abort.md")
+        out = self.out_path("abort.html")
         with mock.patch("builtins.input", return_value="n") as fake_input:
             code, stdout = self.run_main(["--no-llm", "--out", out])
         self.assertEqual(code, 1)
@@ -392,7 +466,7 @@ class TestMainFlow(WrappedTestCase):
         self._seed_basic()
         self.patch_tools()
         llm = self.patch_llm()
-        out = self.out_path("nollm.md")
+        out = self.out_path("nollm.html")
         code, _ = self.run_main(["--yes", "--no-llm", "--out", out])
         self.assertEqual(code, 0)
         llm.assert_not_called()
@@ -402,24 +476,24 @@ class TestMainFlow(WrappedTestCase):
         self._seed_basic()
         self.patch_tools()
         llm = self.patch_llm()
-        out = self.out_path("llm.md")
+        out = self.out_path("llm.html")
         code, _ = self.run_main(["--yes", "--out", out])
         self.assertEqual(code, 0)
         self.assertGreater(llm.call_count, 0)
         self.assertEqual(llm.call_args.kwargs.get("model"), config.WRAPPED_MODEL)
         with open(out, encoding="utf-8") as f:
-            md = f.read()
-        self.assertIn("A fine narrative.", md)
+            page = f.read()
+        self.assertIn('<p class="narrative">A fine narrative.</p>', page)
         os.unlink(out)
 
         self.patch_llm(side_effect=RuntimeError("ollama down"))
-        out2 = self.out_path("llm-fail.md")
+        out2 = self.out_path("llm-fail.html")
         code, _ = self.run_main(["--yes", "--out", out2])
         self.assertEqual(code, 0)  # stats-only fallback, never a crash
         with open(out2, encoding="utf-8") as f:
-            md = f.read()
-        self.assertIn("_Narrative unavailable", md)
-        self.assertIn('"messages_sent"', md)
+            page = f.read()
+        self.assertIn("Narrative unavailable", page)
+        self.assertIn("Messages sent", page)  # stats-only fallback still renders
         os.unlink(out2)
 
     def test_contact_mode_scopes_calls_and_ambiguity_exits(self):
@@ -430,7 +504,7 @@ class TestMainFlow(WrappedTestCase):
             search_contacts_by_name=mock.Mock(return_value=[alice])
         )
         self.patch_llm()
-        out = self.out_path("contact.md")
+        out = self.out_path("contact.html")
         code, stdout = self.run_main(
             ["--contact", "Alice", "--year", "2025", "--yes", "--no-llm", "--out", out]
         )
@@ -440,9 +514,9 @@ class TestMainFlow(WrappedTestCase):
         self.assertEqual(dyn.call_args.kwargs.get("contact_id"), 1)
         self.assertEqual(dyn.call_args.kwargs.get("date_from"), "2025-01-01")
         with open(out, encoding="utf-8") as f:
-            md = f.read()
-        self.assertNotIn("## Your People", md)  # deep-dive drops corpus sections
-        self.assertNotIn("## Groups", md)
+            page = f.read()
+        self.assertNotIn("<h2>Your People</h2>", page)  # deep-dive drops corpus sections
+        self.assertNotIn("<h2>Groups</h2>", page)
         os.unlink(out)
 
         self.patch_tools(search_contacts_by_name=mock.Mock(return_value=[alice, dict(alice)]))
@@ -459,12 +533,75 @@ class TestMainFlow(WrappedTestCase):
         bob = {"id": 2, "first_name": "Bob", "last_name": "", "nickname": None, "handles": []}
         self.patch_tools(search_contacts_by_name=mock.Mock(return_value=[bob]))
         self.patch_llm()
-        out = self.out_path("exclude.md")
+        out = self.out_path("exclude.html")
         code, stdout = self.run_main(
             ["--yes", "--no-llm", "--exclude", "Bob", "--out", out]
         )
         self.assertEqual(code, 0)
         self.assertNotIn("Bob", stdout.split("excluded")[0])
+        os.unlink(out)
+
+    def test_excluded_person_expands_to_their_direct_chats(self):
+        """--exclude NAME must carve the person's 1:1 chats (never their
+        group chats) out of every corpus-wide tool call, and their name out
+        of the page -- the leak PR #33 fixes."""
+        self._seed_basic()
+        seed_contact(self.con, 2, "Bob")
+        seed_handle(self.con, 2, "+15550002", 2)
+        seed_chat(self.con, 3, "c3")  # Bob's 1:1 -- must be excluded
+        self.con.executemany(
+            "INSERT INTO chat_participants (chat_id, handle_id) VALUES (?, ?)",
+            [(3, 2), (2, 1), (2, 2)],  # Bob 1:1; Alice + Bob in group 2
+        )
+        seed_msgs(self.con, 3, 2, [f"2025-06-{d:02d}T12:00:00" for d in range(1, 4)])
+        self.con.commit()
+        bob = {"id": 2, "first_name": "Bob", "last_name": "", "nickname": None, "handles": []}
+        mocks = self.patch_tools(search_contacts_by_name=mock.Mock(return_value=[bob]))
+        self.patch_llm()
+        out = self.out_path("exclude-expand.html")
+        code, stdout = self.run_main(
+            ["--yes", "--no-llm", "--exclude", "Bob", "--out", out]
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("also excluding 1 direct chat(s)", stdout)
+        # Every corpus-wide tool call gets the expanded exclusion list: Bob's
+        # 1:1 chat 3 is in it, the shared group chat 2 is not.
+        for name in ("get_activity_patterns", "get_reaction_stats",
+                     "get_word_frequency", "get_word_trends"):
+            for call in mocks[name].call_args_list:
+                excluded = call.kwargs.get("exclude_chat_id")
+                self.assertIn(3, excluded, f"{name} missing the 1:1 exclusion")
+                self.assertNotIn(2, excluded, f"{name} must keep the group chat")
+        with open(out, encoding="utf-8") as f:
+            self.assertNotIn("Bob", f.read())  # _excluded_name_set path
+        os.unlink(out)
+
+    def test_business_chats_excluded_from_every_section(self):
+        """urn:biz handles must not just be kept off the roster -- their chats
+        must be carved out of every corpus-wide tool call, or the raw
+        identifier surfaces as a 'contact' in sections like Late Nights."""
+        self._seed_basic()
+        seed_handle(self.con, 9, "urn:biz:b15ed773-9eed-11e7-baa2-test")
+        seed_chat(self.con, 4, "biz1")
+        self.con.execute(
+            "INSERT INTO chat_participants (chat_id, handle_id) VALUES (4, 9)"
+        )
+        seed_msgs(self.con, 4, 9, [f"2025-06-{d:02d}T01:00:00" for d in range(1, 4)])
+        self.con.commit()
+        mocks = self.patch_tools()
+        self.patch_llm()
+        out = self.out_path("exclude-biz.html")
+        code, stdout = self.run_main(["--yes", "--no-llm", "--out", out])
+        self.assertEqual(code, 0)
+        self.assertIn("also excluding 1 business chat(s)", stdout)
+        self.assertNotIn("urn:biz", stdout.split("business chat(s)")[0])
+        for name in ("get_activity_patterns", "get_reaction_stats",
+                     "get_word_frequency", "get_word_trends"):
+            for call in mocks[name].call_args_list:
+                excluded = call.kwargs.get("exclude_chat_id")
+                self.assertIn(4, excluded, f"{name} missing the business-chat exclusion")
+        with open(out, encoding="utf-8") as f:
+            self.assertNotIn("urn:biz", f.read())
         os.unlink(out)
 
 

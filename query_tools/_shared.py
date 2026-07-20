@@ -45,7 +45,8 @@ MAX_STATS_ROWS = 50      # get_chat_summary_stats group_by_chat=True
 MAX_ID_LIST = 50         # cap on chat_id/handle_id/contact_id/guid list params
 MAX_CONTEXT_MESSAGES = 25   # get_message_context before/after ceiling
 MAX_SCOPE_CHATS = 500       # cap on the person -> chats expansion (chunk + analytics tools)
-MAX_WORD_FREQ_TOP = 100     # get_word_frequency `top` ceiling
+MAX_WORD_FREQ_TOP = 250     # get_word_frequency `top` ceiling (~5KB of rows;
+                            # wrapped over-fetches then filters COMMON_WORDS)
 MAX_LEADERBOARD_ROWS = 10   # leaderboard sections in the analytics dict tools
 MAX_SERIES_BUCKETS = 120    # time-series sections (auto-coarsen day->month past this)
 MIN_LEADERBOARD_MESSAGES = 50  # min messages for a contact to enter unscoped leaderboards
@@ -121,6 +122,34 @@ def _as_id_list(value):
     if isinstance(value, (list, tuple)):
         return list(value)[:MAX_ID_LIST] or None
     return [value]
+
+
+def _as_exclusion_list(value):
+    """Normalize an exclude param (None, scalar, or list) into None or a
+    non-empty list. Unlike _as_id_list this never truncates: an exclusion is
+    a privacy guard, and silently dropping entries past MAX_ID_LIST would
+    quietly re-admit the excluded -- the opposite failure mode of an
+    oversized scope list."""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return list(value) or None
+    return [value]
+
+
+def _exclude_id_filters(clauses, params, exclude_chat_ids, prefix="m."):
+    """Append a `{prefix}chat_id NOT IN (?,...)` clause for a normalized
+    exclusion list (no-op when None/empty) -- the mirror of
+    _append_id_filters for carving chats *out* of a scope. NULL chat_id rows
+    (messages not attached to any chat) survive: NULL fails NOT IN, so
+    without the IS NULL arm an exclusion would silently drop them from
+    otherwise-unscoped aggregates."""
+    if not exclude_chat_ids:
+        return
+    placeholders = ",".join("?" * len(exclude_chat_ids))
+    clauses.append(f"({prefix}chat_id IS NULL OR "
+                   f"{prefix}chat_id NOT IN ({placeholders}))")
+    params.extend(exclude_chat_ids)
 
 
 def _scope_requested(*values):

@@ -50,8 +50,9 @@ Full design history, schema, rationale, and data forensics:
   die with `database is locked`) and contend for one serialized Ollama
   instance, so parallelism costs correctness and buys nothing.
 - Wrapped report: `.venv/bin/python3 wrapped.py [--year YYYY] [--contact NAME]
-  [--no-llm] [--yes]` — markdown; previews the featured roster (with
-  silent-contact auto-exclusions) before generating
+  [--no-llm] [--yes]` — a self-contained HTML page (inline CSS + JS, no
+  network, light/dark, scroll-reveal animations); previews the featured
+  roster (with silent-contact auto-exclusions) before generating
 - Eval sweep: `eval/fast_eval.sh eval/prompts-smoke.txt [-m model]` — runs a
   prompts file (`id|prompt` lines) through `chat.py -p` sequentially with
   reduced-context env defaults; transcripts land in `eval/results/`. Never
@@ -149,10 +150,14 @@ with initiator/ender), `lexicon_build.py` (`person_period_lexicon` +
 regexes + GoEmotions labels. Standalone batch CLIs: `annotate.py` (LLM chunk
 annotations + dyad-term curation via `ollama.chat_once_json`; the distilled
 kNN tier lives in `annotate_distill.py`, which annotate.py calls),
-`topics.py` (k-means topic clusters + LLM labels), `wrapped.py` (markdown
-report composing the query tools deterministically; LLM only narrates
-computed numbers — the `_sec_*` section builders live in
-`wrapped_sections.py`). `eval/evalkit/` is the analytics eval harness
+`topics.py` (k-means topic clusters + LLM labels), `wrapped.py` (HTML report
+composing the query tools deterministically; LLM only narrates computed
+numbers — the `_sec_*` section builders live in `wrapped_sections.py`, and
+`wrapped_html.py` holds the page shell (incl. the inline scroll-reveal JS),
+the shape-dispatching stats renderer (tiles/tables/charts), and the visual
+builders — hbars, split bars, iMessage bubbles, word cloud, share bars, joke
+cards; sections put visuals in `extra_html` and the full shaped data in
+`narrate_stats` so the narrator still sees everything). `eval/evalkit/` is the analytics eval harness
 (stdlib-only; imports the app in-process, lazily — env overrides must be set
 before app modules import): `cases.py` suite loading/validation, `roster.py`
 roster resolution, `recipes/` SQL ground-truth recipes (a package: `_base.py`

@@ -127,8 +127,14 @@ clustering is fine.
 
 ### Wrapped report
 
-A year-in-review markdown report, composed deterministically from the tools
-above — the LLM only narrates numbers it was given.
+A year-in-review HTML report, composed deterministically from the tools
+above — the LLM only narrates numbers it was given. The page is a single
+self-contained file (inline CSS + JS, no network — nothing leaves the
+machine): stat tiles, bar and split-bar charts, a weekday × hour heatmap, a
+word cloud, inside-joke cards, and the year's most-reacted messages as
+iMessage-style bubbles, in light or dark to match the reader's system theme.
+Sections reveal and bars grow as you scroll (static under reduced-motion or
+with JS off). Open it in a browser; print to PDF to keep a copy.
 
 ```sh
 .venv/bin/python3 wrapped.py --year 2025             # previews the featured roster, then generates
@@ -139,7 +145,7 @@ above — the LLM only narrates numbers it was given.
 Contacts who have gone quiet are auto-excluded from the roster; the preview
 shows who made the cut before anything is generated. Override with
 `--exclude`/`--include`, skip the prompt with `--yes`, choose a path with
-`--out`.
+`--out` (default `wrapped_<year>_<scope>.html`).
 
 Tunables (session gap, late-night hours, `LOCAL_TZ`, dyad-term thresholds,
 annotation quality/workers/seed pool, topic `k`, wrapped roster size) all

@@ -24,8 +24,10 @@ from ._shared import (
     MAX_SERIES_BUCKETS,
     _REAL_MESSAGE_CLAUSES,
     _append_id_filters,
+    _as_exclusion_list,
     _connect,
     _date_clauses,
+    _exclude_id_filters,
     _id_filter_clause,
     _normalize_date_bound,
     _resolve_chat_scope,
@@ -67,13 +69,14 @@ def _period_len(granularity):
     return 7 if granularity == "month" else 4
 
 
-def _lexicon_rows(con, chat_ids, date_from, date_to):
+def _lexicon_rows(con, chat_ids, date_from, date_to, exclude_chat_ids=None):
     """person_period_lexicon rows in scope (handle_id NULL = my side)."""
     clauses, params = [], []
     clause, cparams = _id_filter_clause("chat_id", chat_ids)
     if clause:
         clauses.append(clause)
         params.extend(cparams)
+    _exclude_id_filters(clauses, params, exclude_chat_ids, prefix="")
     lo, hi = _month_bounds(date_from, date_to)
     if lo is not None:
         clauses.append("month >= ?")
@@ -110,10 +113,12 @@ def _lsm_score(rates_a, rates_b):
 # get_word_trends sections
 # ---------------------------------------------------------------------------
 
-def _phrase_trend(con, phrase, chat_ids, date_from, date_to, granularity):
+def _phrase_trend(con, phrase, chat_ids, date_from, date_to, granularity,
+                  exclude_chat_ids=None):
     n = _period_len(granularity)
     clauses, params = list(_TEXT_MESSAGE_CLAUSES), []
     _append_id_filters(clauses, params, chat_ids, None)
+    _exclude_id_filters(clauses, params, exclude_chat_ids)
     _date_clauses(clauses, params, date_from, date_to)
     # Phrase-quote the FTS query so the model's raw words never reach FTS5's
     # query parser (a stray AND/NEAR/quote would change or break the match).
@@ -197,11 +202,15 @@ def _rates_section(lex, granularity):
     return section
 
 
-def _distinctive_terms(con, chat_ids):
+def _distinctive_terms(con, chat_ids, exclude_chat_ids=None):
     if not chat_ids:
         return {"available": False,
                 "note": "distinctive terms are per chat -- pass chat_id or a person scope"}
-    clause, params = _id_filter_clause("chat_id", chat_ids)
+    clauses, params = [], []
+    clause, cparams = _id_filter_clause("chat_id", chat_ids)
+    clauses.append(clause)
+    params.extend(cparams)
+    _exclude_id_filters(clauses, params, exclude_chat_ids, prefix="")
     # Curated keepers (inside_joke/nickname) outrank uncurated candidates;
     # LLM-rejected terms (ordinary/noise) are dropped entirely.
     rows = con.execute(
@@ -209,7 +218,7 @@ def _distinctive_terms(con, chat_ids):
         SELECT chat_id, term, lift, n_uses, first_message_id,
                coined_by_handle_id, coined_is_me, llm_verdict
         FROM dyad_terms
-        WHERE {clause} AND (llm_verdict IS NULL
+        WHERE {' AND '.join(clauses)} AND (llm_verdict IS NULL
                             OR llm_verdict IN ('inside_joke', 'nickname'))
         ORDER BY (llm_verdict IS NOT NULL) DESC, lift DESC
         LIMIT ?
@@ -288,7 +297,7 @@ def _lsm_section(lex, granularity):
     return section
 
 
-def _annotation_rows(con, chat_ids, date_from, date_to):
+def _annotation_rows(con, chat_ids, date_from, date_to, exclude_chat_ids=None):
     """chunk_annotations joined to chunks for scope/date (chunks.first_date
     is the same unlabeled-UTC string form as messages.date)."""
     clauses, params = [], []
@@ -296,6 +305,7 @@ def _annotation_rows(con, chat_ids, date_from, date_to):
     if clause:
         clauses.append(clause)
         params.extend(cparams)
+    _exclude_id_filters(clauses, params, exclude_chat_ids, prefix="c.")
     _date_clauses(clauses, params, date_from, date_to, column="c.first_date")
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     return con.execute(
@@ -350,7 +360,8 @@ def _valence_section(ann, granularity):
 
 
 def get_word_trends(phrase=None, chat_id=None, handle_id=None, contact_id=None,
-                    date_from=None, date_to=None, granularity="year", include=None):
+                    date_from=None, date_to=None, granularity="year", include=None,
+                    exclude_chat_id=None):
     """Language-over-time analytics in one call. Sections (include=[...]
     selects; default is every applicable one): phrase_trend (how often
     `phrase` appears per period, split me/them -- only when phrase is given),
@@ -361,9 +372,12 @@ def get_word_trends(phrase=None, chat_id=None, handle_id=None, contact_id=None,
     per-category, monthly trajectory), emotions/valence (LLM-annotated, only
     after annotate.py has run). granularity is 'month' or 'year'.
     handle_id/contact_id scope to that person's chats (both sides counted);
-    no scope means the whole corpus."""
+    no scope means the whole corpus. exclude_chat_id (scalar or list; not in
+    the LLM schema -- wrapped.py's carve-out) drops those chats from every
+    section."""
     _period_len(granularity)  # validate early
     wanted = _validate_include(include, _TREND_SECTIONS, "get_word_trends")
+    exclude_chat_ids = _as_exclusion_list(exclude_chat_id)
 
     def want(name):
         return name in wanted
@@ -378,20 +392,23 @@ def get_word_trends(phrase=None, chat_id=None, handle_id=None, contact_id=None,
 
         if phrase and want("phrase_trend"):
             result["phrase_trend"] = _phrase_trend(
-                con, phrase, chat_ids, date_from, date_to, granularity)
+                con, phrase, chat_ids, date_from, date_to, granularity,
+                exclude_chat_ids)
         lex = None
         if want("emoji") or want("rates") or want("lsm"):
-            lex = _lexicon_rows(con, chat_ids, date_from, date_to)
+            lex = _lexicon_rows(con, chat_ids, date_from, date_to, exclude_chat_ids)
         if want("emoji"):
             result["emoji"] = _emoji_section(lex)
         if want("rates"):
             result["rates"] = _rates_section(lex, granularity)
         if want("distinctive_terms"):
-            result["distinctive_terms"] = _distinctive_terms(con, chat_ids)
+            result["distinctive_terms"] = _distinctive_terms(con, chat_ids,
+                                                             exclude_chat_ids)
         if want("lsm"):
             result["lsm"] = _lsm_section(lex, granularity)
         if want("emotions") or want("valence"):
-            ann = _annotation_rows(con, chat_ids, date_from, date_to)
+            ann = _annotation_rows(con, chat_ids, date_from, date_to,
+                                   exclude_chat_ids)
             if want("emotions"):
                 result["emotions"] = _emotions_section(ann)
             if want("valence"):

@@ -378,5 +378,50 @@ class ResponseDynamicsTest(FixtureBase):
         self.assertEqual(res["sessions"]["count"], 1)  # Mar 2 session starts later
 
 
+class ExcludeChatIdTest(FixtureBase):
+    """The Python-only exclude_chat_id carve-out (wrapped.py's --exclude):
+    excluded chats leave the aggregate, everything else -- including
+    messages with NO chat_id, which a bare NOT IN silently drops -- stays."""
+
+    def seed(self):
+        c = self.con
+        add_msg(c, 1, 10, 60, 0, "bob a", "2026-03-01T10:00:00")
+        add_msg(c, 2, 10, 0, 1, "bob b", "2026-03-01T10:01:00")
+        add_msg(c, 3, 10, 60, 0, "bob c", "2026-03-01T10:02:00")
+        add_msg(c, 4, 13, 62, 0, "carol a", "2026-03-02T10:00:00")
+        add_msg(c, 5, 13, 0, 1, "carol b", "2026-03-02T10:01:00")
+        # A real, dated message attached to no chat: the exclusion clause's
+        # `chat_id IS NULL OR` arm exists for exactly this row.
+        add_msg(c, 6, None, 62, 0, "orphaned", "2026-03-03T10:00:00")
+
+    def test_exclusion_scalar_and_null_chat_survival(self):
+        self.assertEqual(analytics_time.get_activity_patterns()["message_count"], 6)
+        res = analytics_time.get_activity_patterns(exclude_chat_id=10)
+        self.assertEqual(res["message_count"], 3)  # chat 13 + the NULL-chat row
+        self.assertEqual(res["volume_series"]["rows"],
+                         [{"period": "2026-03", "sent": 1, "received": 2}])
+
+    def test_exclusion_list(self):
+        res = analytics_time.get_activity_patterns(exclude_chat_id=[10, 13])
+        self.assertEqual(res["message_count"], 1)  # only the NULL-chat row
+
+    def test_exclusion_composes_with_scope(self):
+        # Excluding a chat must not turn an unscoped call scoped, and must
+        # also carve out of an explicit scope.
+        res = analytics_time.get_activity_patterns(chat_id=[10, 13],
+                                                   exclude_chat_id=13)
+        self.assertEqual(res["message_count"], 3)
+
+    def test_as_exclusion_list_never_truncates(self):
+        from query_tools._shared import MAX_ID_LIST, _as_exclusion_list
+        self.assertIsNone(_as_exclusion_list(None))
+        self.assertIsNone(_as_exclusion_list([]))
+        self.assertEqual(_as_exclusion_list(7), [7])
+        big = list(range(MAX_ID_LIST * 3))
+        # An exclusion is a privacy guard: truncating at MAX_ID_LIST would
+        # silently re-admit the excluded.
+        self.assertEqual(_as_exclusion_list(big), big)
+
+
 if __name__ == "__main__":
     unittest.main()
