@@ -500,3 +500,29 @@ NUDGE_DORMANT_MIN_MESSAGES = int(os.getenv("NUDGE_DORMANT_MIN_MESSAGES") or "200
 # its p90 is tiny).
 NUDGE_DORMANT_MIN_GAP_DAYS = int(os.getenv("NUDGE_DORMANT_MIN_GAP_DAYS") or "21")
 # --- end feature: nudges ---
+# --- feature: wellbeing ---
+# --- Wellbeing trajectory (query_tools/analytics_wellbeing.py; RES-61 / W2) --
+# The pinned gates for the deterministic change-point core (wellbeing.py, W1),
+# which takes each as a keyword argument. W2 owns these knobs and wires them
+# through; the math module hard-codes none of them. Conservative by design --
+# false positives are the enemy, so raising any threshold only makes the tool
+# quieter. WELLBEING_MIN_MARKER_HITS mirrors wellbeing.WELLBEING_MIN_MARKER_HITS
+# (the lifetime raw-hit floor W2 applies to a marker BEFORE calling W1).
+WELLBEING_Z_THRESHOLD = float(os.getenv("WELLBEING_Z_THRESHOLD") or "3.5")
+WELLBEING_MIN_RUN_MONTHS = int(os.getenv("WELLBEING_MIN_RUN_MONTHS") or "3")
+WELLBEING_MIN_BASELINE_MONTHS = int(os.getenv("WELLBEING_MIN_BASELINE_MONTHS") or "12")
+WELLBEING_FAMILY_CAP = float(os.getenv("WELLBEING_FAMILY_CAP") or "2.0")
+WELLBEING_CUSUM_K = float(os.getenv("WELLBEING_CUSUM_K") or "0.5")
+WELLBEING_CUSUM_H = float(os.getenv("WELLBEING_CUSUM_H") or "4.0")
+WELLBEING_MIN_MARKER_HITS = int(os.getenv("WELLBEING_MIN_MARKER_HITS") or "30")
+# Grounding excerpts returned per firing window.
+WELLBEING_N_EXAMPLES = int(os.getenv("WELLBEING_N_EXAMPLES") or "3")
+# Corpus floor: below this many words in scope the tool returns an
+# insufficient-data envelope and runs no analysis.
+MIN_WELLBEING_WORDS = int(os.getenv("MIN_WELLBEING_WORDS") or "5000")
+# Per-contact allowlist (Master Spec A12): a comma/space-separated list of
+# `contacts.id` values opted in to per-contact wellbeing analysis. Empty (the
+# default) means self-only -- any named contact is refused. Parsed via
+# consent.parse_consent_ids (tolerant; non-positive/non-integer tokens skipped).
+WELLBEING_CONSENT_IDS = os.getenv("WELLBEING_CONSENT_IDS", "")
+# --- end feature: wellbeing ---

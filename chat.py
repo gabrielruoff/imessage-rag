@@ -76,6 +76,11 @@ SYSTEM_PROMPT = (
     "we-talk ratios, style-matching, session roles, latency/volume -- no "
     "aggressor verdict; surface any resource_footer verbatim)\n"
     # --- end feature: conflict ---
+    # --- feature: wellbeing ---
+    "- get_language_trajectory (sustained cross-family shift in someone's texting "
+    "language over months -- your own by default, or an allowlisted contact; "
+    "deterministic, never a diagnosis)\n"
+    # --- end feature: wellbeing ---
     "- search_contacts_by_name (name/org -> contact + their handle_ids)\n"
     "- list_chats (name/participant -> chat_id, or label a chat_id)\n"
     "- search_contact_by_handle (a phone/email/handle_id -> contact name)\n"
