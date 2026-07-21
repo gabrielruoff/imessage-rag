@@ -658,5 +658,150 @@ class DraftReplyTest(_DBCase):
         self.assertIn("error", res)
 
 
+class CheckStyleMatchTest(_DBCase):
+    """V3 check_style_match: deterministic LSM/feature distance of a user-written
+    draft to a stored person_voiceprint row, with rule-based top-3 divergences.
+    No model in the loop -- nothing is mocked because nothing calls Ollama.
+
+    Fixture: I text Mom (contact 12) and Al (contact 13) in ALL-lowercase, no
+    '!' anywhere; Mom texts back with Capitalized words. So across dyad rows
+    lowercase_ratio VARIES (std > 0 -> comparable) while exclaim_rate is constant
+    0 (std 0 -> omitted from feature_std_json, and skipped by the matcher)."""
+
+    def populate(self, con):
+        con.executemany(
+            "INSERT INTO contacts(id, source_uniqueid, first_name, last_name) "
+            "VALUES (?, ?, ?, ?)",
+            [(12, "u12", "Mom", None), (13, "u13", "Al", "B")],
+        )
+        con.executemany(
+            "INSERT INTO handles(id, handle_identifier, contact_id, service) "
+            "VALUES (?, ?, ?, 'iMessage')",
+            [(70, "+1700", 12), (71, "+1710", 13)],
+        )
+        con.executemany(
+            "INSERT INTO chats(id, chat_identifier, display_name, is_group, service) "
+            "VALUES (?, ?, ?, ?, 'iMessage')",
+            [(100, "c100", None, 0), (101, "c101", None, 0)],
+        )
+        con.executemany("INSERT INTO chat_participants VALUES (?, ?)",
+                        [(100, 70), (101, 71)])
+        import datetime
+        base = datetime.datetime(2026, 1, 1, 10, 0, 0)
+        rows = []
+        mid = 1
+        # me + Mom: me lowercase, Mom Capitalized -> lowercase_ratio varies.
+        for d in range(5):
+            day = base + datetime.timedelta(days=d * 20)
+            for i in range(6):
+                t = day + datetime.timedelta(seconds=i * 30)
+                from_me = 1 if i % 2 == 0 else 0
+                rows.append(_msg(mid, 100, 0 if from_me else 70, from_me,
+                                 "hey how are you doing today" if from_me
+                                 else "I Am Doing Well Thank You", t.isoformat()))
+                mid += 1
+        # me + Al: shorter messages -> avg_msg_len varies across dyad rows.
+        for d in range(4):
+            day = base + datetime.timedelta(days=d * 25)
+            for i in range(4):
+                t = day + datetime.timedelta(seconds=i * 20)
+                from_me = 1 if i % 2 == 0 else 0
+                rows.append(_msg(mid, 101, 0 if from_me else 71, from_me,
+                                 "yo" if from_me else "ok", t.isoformat()))
+                mid += 1
+        con.executemany(
+            "INSERT INTO messages(id, guid, chat_id, handle_id, is_from_me, text, "
+            "date, has_attachment) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
+        _quiet(lexicon_build.build_person_period_lexicon, con)
+        _quiet(sessions.build_sessions, con)
+
+    def _std_map(self):
+        import json
+        return json.loads(self.rows(
+            "SELECT feature_std_json FROM person_voiceprint WHERE member_key='me' "
+            "AND counterpart_key='contact:12' AND scope='dyad'")[0]["feature_std_json"])
+
+    def test_deterministic_same_inputs_same_output(self):
+        self.build()
+        draft = "WHY ARE YOU DOING THIS"
+        a = query_tools.check_style_match(draft, contact_id=12)
+        b = query_tools.check_style_match(draft, contact_id=12)
+        self.assertEqual(a, b)  # byte-identical: no model, no randomness
+
+    def test_distance_and_top3_are_rule_based(self):
+        self.build()
+        res = query_tools.check_style_match("WHY ARE YOU DOING THIS", contact_id=12)
+        self.assertIsInstance(res["distance"], float)
+        self.assertGreater(res["n_features_compared"], 0)
+        self.assertLessEqual(len(res["top_divergences"]), 3)
+        # Every divergence is rule-based: a feature name, a z gap, and a
+        # human explanation string (no LLM critique).
+        for d in res["top_divergences"]:
+            self.assertIn("feature", d)
+            self.assertIsInstance(d["z"], float)
+            self.assertIsInstance(d["explanation"], str)
+            self.assertTrue(d["explanation"])
+        # Sorted by z descending.
+        zs = [d["z"] for d in res["divergences"]]
+        self.assertEqual(zs, sorted(zs, reverse=True))
+
+    def test_std_zero_feature_skipped_no_divide_by_zero(self):
+        self.build()
+        std = self._std_map()
+        # exclaim_rate is constant 0 across the corpus -> omitted from the std map.
+        self.assertNotIn("exclaim_rate", std)
+        # A draft loaded with '!' still never surfaces exclaim_rate (skipped,
+        # and no ZeroDivisionError is raised).
+        res = query_tools.check_style_match("hey!!! what!!! now!!!", contact_id=12)
+        feats = {d["feature"] for d in res["divergences"]}
+        self.assertNotIn("exclaim_rate", feats)
+        # lowercase_ratio DOES vary in this fixture -> it is comparable.
+        self.assertIn("lowercase_ratio", std)
+
+    def test_all_caps_draft_diverges_on_capitalization(self):
+        self.build()
+        # I text Mom in all-lowercase; an all-caps draft must flag capitalization.
+        res = query_tools.check_style_match(
+            "WHY WOULD YOU EVER SAY THAT TO ME", contact_id=12)
+        lc = next((d for d in res["divergences"]
+                   if d["feature"] == "lowercase_ratio"), None)
+        self.assertIsNotNone(lc)
+        self.assertIn("capitalization", lc["explanation"])
+        # The draft's own lowercase_ratio (all caps -> 0) is far below my typical.
+        self.assertLess(res["draft_features"]["lowercase_ratio"], 0.1)
+
+    def test_uses_stored_std_never_rescans_corpus(self):
+        self.build()
+        # The read path must NOT recompute a voiceprint: make the corpus-scan
+        # entry points explode. _msg_style (a pure helper) is left intact.
+        with mock.patch.object(voiceprint, "compute_voiceprint",
+                               side_effect=AssertionError("rescanned the corpus")), \
+             mock.patch.object(voiceprint, "member_chats",
+                               side_effect=AssertionError("rescanned the corpus")), \
+             mock.patch.object(voiceprint, "scan_size",
+                               side_effect=AssertionError("rescanned the corpus")):
+            res = query_tools.check_style_match("hey how are you", contact_id=12)
+        self.assertIsInstance(res["distance"], float)
+        self.assertGreater(res["n_features_compared"], 0)
+
+    def test_subject_them_targets_their_voiceprint(self):
+        self.build()
+        res = query_tools.check_style_match(
+            "hey how are you", contact_id=12, subject="them")
+        self.assertEqual(res["member_key"], "contact:12")
+        self.assertEqual(res["counterpart_key"], "me")
+
+    def test_missing_draft_and_missing_person_error(self):
+        self.build()
+        self.assertIn("error", query_tools.check_style_match("   ", contact_id=12))
+        self.assertIn("error", query_tools.check_style_match("hi there", scope="dyad"))
+
+    def test_missing_voiceprint_row_returns_note(self):
+        self.build()
+        res = query_tools.check_style_match("hi there", contact_id=99999)
+        self.assertFalse(res.get("found", True))
+        self.assertIn("note", res)
+
+
 if __name__ == "__main__":
     unittest.main()
