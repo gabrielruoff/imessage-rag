@@ -4,6 +4,7 @@ spine, and the three query tools. Temp SQLite only -- no Ollama, no real chat.db
 (narration is never exercised here; the CLI runs with --no-llm)."""
 
 import datetime
+import json
 import os
 import sqlite3
 import statistics
@@ -14,6 +15,7 @@ from pathlib import Path
 from unittest import mock
 
 import config
+import db
 import loose_ends
 import query_tools
 import reset_db
@@ -827,6 +829,373 @@ class UnansweredQuestionConfigTest(unittest.TestCase):
         import lexicon_build
         src = Path(lexicon_build.__file__).read_text()
         self.assertIn('if "?" in text:', src)
+
+
+# ---------------------------------------------------------------------------
+# dropped_plan detector (RES-57 / N4) -- flag- + precision-gated
+# ---------------------------------------------------------------------------
+
+def _build_dropped_plan_fixture(db_path):
+    """One direct dyad (Alice) whose most-recent plan-cue message never gets
+    followed through, plus a group chat carrying a cue message (direct-chat
+    filter must drop it). Alice has an outbound message so Stage-0 never mutes
+    her for zero outbound, and no negative llm valence."""
+    con = sqlite3.connect(db_path)
+    try:
+        schema.create_schema(con)
+        con.executemany(
+            "INSERT INTO contacts(id, source_uniqueid, first_name) VALUES (?, ?, ?)",
+            [(1, "u1", "Alice"), (9, "u9", "Grace")],
+        )
+        con.executemany(
+            "INSERT INTO handles(id, handle_identifier, contact_id, service) "
+            "VALUES (?, ?, ?, 'iMessage')",
+            [(10, "+10", 1), (90, "+90", 9)],
+        )
+        con.executemany(
+            "INSERT INTO chats(id, chat_identifier, display_name, is_group, service) "
+            "VALUES (?, ?, NULL, ?, 'iMessage')",
+            [(100, "c100", 0), (500, "c500", 1)],
+        )
+        con.executemany(
+            "INSERT INTO chat_participants(chat_id, handle_id) VALUES (?, ?)",
+            [(100, 10), (500, 90)],
+        )
+        con.executemany(
+            "INSERT INTO messages(id, guid, chat_id, handle_id, is_from_me, text, date) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                (1000, "g1000", 100, 0, 1, "hey", "2026-05-01T10:00:00"),
+                (1001, "g1001", 100, 10, 0,
+                 "let's grab dinner next week", "2026-05-02T10:00:00"),   # anchor
+                (1002, "g1002", 100, 0, 1, "sounds good", "2026-05-02T10:05:00"),
+                (1003, "g1003", 100, 10, 0, "ok", "2026-05-03T10:00:00"),
+                # Group chat cue message -- must be filtered by the direct-chat gate.
+                (5000, "g5000", 500, 90, 0, "we should reschedule", "2026-05-04T10:00:00"),
+            ],
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+class _DroppedPlanFixtureTest(unittest.TestCase):
+    def setUp(self):
+        fd, self.db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.addCleanup(lambda: os.path.exists(self.db_path) and os.remove(self.db_path))
+        _build_dropped_plan_fixture(self.db_path)
+        for module in (loose_ends, query_tools):
+            patcher = mock.patch.object(module, "DB_PATH", self.db_path)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _open(self):
+        con = sqlite3.connect(self.db_path)
+        con.row_factory = sqlite3.Row
+        self.addCleanup(con.close)
+        return con
+
+    def _cfg(self, con, *, enabled=True):
+        cfg = loose_ends._build_cfg(con)
+        cfg["dropped_plan_enabled"] = enabled
+        return cfg
+
+    def _pass_gate(self):
+        con = sqlite3.connect(self.db_path)
+        try:
+            db.set_state(con, "eval_gate:dropped_plan",
+                         json.dumps({"passed": ["dropped_plan"], "failed": []}))
+            con.commit()
+        finally:
+            con.close()
+
+    def _fail_gate(self):
+        con = sqlite3.connect(self.db_path)
+        try:
+            db.set_state(con, "eval_gate:dropped_plan",
+                         json.dumps({"passed": [], "failed": ["dropped_plan"]}))
+            con.commit()
+        finally:
+            con.close()
+
+    def _dropped_rows(self):
+        con = sqlite3.connect(self.db_path)
+        con.row_factory = sqlite3.Row
+        try:
+            return con.execute(
+                "SELECT chat_id, evidence_json FROM loose_threads "
+                "WHERE kind = 'dropped_plan' ORDER BY chat_id").fetchall()
+        finally:
+            con.close()
+
+
+class DroppedPlanDetectorTest(_DroppedPlanFixtureTest):
+    def test_disabled_flag_yields_nothing_and_calls_no_model(self):
+        con = self._open()
+        cfg = self._cfg(con, enabled=False)
+        with mock.patch.object(loose_ends.ollama, "chat_once_json") as m:
+            self.assertEqual(list(loose_ends.detect_dropped_plan(con, cfg)), [])
+        m.assert_not_called()
+
+    def test_enabled_but_gate_absent_writes_nothing_and_skips_llm(self):
+        # Flag ON, but no eval_gate:dropped_plan key and no seed -> suppressed
+        # BEFORE any verification call.
+        con = self._open()
+        cfg = self._cfg(con, enabled=True)
+        with mock.patch.object(loose_ends.ollama, "chat_once_json") as m:
+            self.assertEqual(list(loose_ends.detect_dropped_plan(con, cfg)), [])
+        m.assert_not_called()
+
+    def test_enabled_but_gate_failing_writes_nothing_and_skips_llm(self):
+        self._fail_gate()
+        con = self._open()
+        cfg = self._cfg(con, enabled=True)
+        with mock.patch.object(loose_ends.ollama, "chat_once_json") as m:
+            self.assertEqual(list(loose_ends.detect_dropped_plan(con, cfg)), [])
+        m.assert_not_called()
+
+    def test_unknown_verdict_suppresses(self):
+        self._pass_gate()
+        con = self._open()
+        cfg = self._cfg(con, enabled=True)
+        with mock.patch.object(loose_ends.ollama, "chat_once_json",
+                               return_value={"verdict": "UNKNOWN"}) as m:
+            cands = list(loose_ends.detect_dropped_plan(con, cfg))
+        self.assertEqual(cands, [])
+        m.assert_called_once()   # the gate passed, so the verifier DID run
+
+    def test_none_reply_suppresses(self):
+        self._pass_gate()
+        con = self._open()
+        cfg = self._cfg(con, enabled=True)
+        with mock.patch.object(loose_ends.ollama, "chat_once_json", return_value=None):
+            self.assertEqual(list(loose_ends.detect_dropped_plan(con, cfg)), [])
+
+    def test_fulfilled_verdict_suppresses(self):
+        self._pass_gate()
+        con = self._open()
+        cfg = self._cfg(con, enabled=True)
+        with mock.patch.object(loose_ends.ollama, "chat_once_json",
+                               return_value={"verdict": "fulfilled"}):
+            self.assertEqual(list(loose_ends.detect_dropped_plan(con, cfg)), [])
+
+    def test_unfulfilled_fires_on_the_direct_dyad_only(self):
+        self._pass_gate()
+        con = self._open()
+        cfg = self._cfg(con, enabled=True)
+        with mock.patch.object(loose_ends.ollama, "chat_once_json",
+                               return_value={"verdict": "unfulfilled"}) as m:
+            cands = {c.chat_id: c for c in loose_ends.detect_dropped_plan(con, cfg)}
+        # Only the direct chat 100 fires; the group chat 500 is filtered out, so
+        # the verifier is asked exactly once (one candidate chat).
+        self.assertEqual(set(cands), {100})
+        m.assert_called_once()
+        alice = cands[100]
+        self.assertEqual(alice.kind, "dropped_plan")
+        self.assertEqual(alice.handle_id, 10)
+        self.assertEqual(alice.anchor_message_id, 1001)
+        self.assertEqual(alice.evidence["verdict"], "unfulfilled")
+        self.assertTrue(alice.evidence["anchor_text"].startswith("let's grab"))
+
+    def test_think_passed_through_per_tristate(self):
+        # The verifier forwards think=cfg['nudges_think'] (ollama's tri-state).
+        self._pass_gate()
+        con = self._open()
+        cfg = self._cfg(con, enabled=True)
+        cfg["nudges_think"] = False
+        with mock.patch.object(loose_ends.ollama, "chat_once_json",
+                               return_value={"verdict": "unfulfilled"}) as m:
+            list(loose_ends.detect_dropped_plan(con, cfg))
+        self.assertEqual(m.call_args.kwargs.get("think"), False)
+
+
+class DroppedPlanDriverTest(_DroppedPlanFixtureTest):
+    def test_zero_rows_when_flag_off_through_the_driver(self):
+        # Default flag (OFF) via _build_cfg: detect_all writes no dropped_plan
+        # rows and never calls the verifier.
+        con = self._open()
+        cfg = loose_ends._build_cfg(con)   # dropped_plan_enabled defaults False
+        with mock.patch.object(loose_ends.ollama, "chat_once_json") as m:
+            loose_ends.detect_all(con, cfg, "2026-07-01T00:00:00+00:00")
+        m.assert_not_called()
+        self.assertEqual(self._dropped_rows(), [])
+
+    def test_zero_rows_when_gate_absent_through_the_driver(self):
+        con = self._open()
+        cfg = self._cfg(con, enabled=True)   # flag ON, gate absent
+        with mock.patch.object(loose_ends.ollama, "chat_once_json") as m:
+            loose_ends.detect_all(con, cfg, "2026-07-01T00:00:00+00:00")
+        m.assert_not_called()
+        self.assertEqual(self._dropped_rows(), [])
+
+    def test_row_written_when_enabled_gated_and_unfulfilled(self):
+        self._pass_gate()
+        con = self._open()
+        cfg = self._cfg(con, enabled=True)
+        with mock.patch.object(loose_ends.ollama, "chat_once_json",
+                               return_value={"verdict": "unfulfilled"}):
+            loose_ends.detect_all(con, cfg, "2026-07-01T00:00:00+00:00")
+        rows = self._dropped_rows()
+        self.assertEqual([r["chat_id"] for r in rows], [100])
+        ev = json.loads(rows[0]["evidence_json"])
+        self.assertEqual(ev["verdict"], "unfulfilled")
+
+
+class DroppedPlanConfigTest(unittest.TestCase):
+    def test_pinned_config_defaults(self):
+        self.assertFalse(config.NUDGE_DROPPED_PLAN_ENABLED)
+        self.assertFalse(config.NUDGE_GOODNEWS_ENABLED)
+        self.assertEqual(config.NUDGE_PLAN_CONTEXT_MSGS, 30)
+
+    def test_both_n4_detectors_registered(self):
+        kinds = [k for k, _ in loose_ends.DETECTORS]
+        self.assertIn("dropped_plan", kinds)
+        self.assertIn("unreciprocated_goodnews", kinds)
+
+    def test_cue_phrases_are_a_module_frozenset(self):
+        self.assertIsInstance(loose_ends._PLAN_CUE_PHRASES, frozenset)
+        self.assertIn("we should", loose_ends._PLAN_CUE_PHRASES)
+
+
+# ---------------------------------------------------------------------------
+# unreciprocated_goodnews detector (RES-57 / N4) -- opt-in, llm-source, coverage
+# ---------------------------------------------------------------------------
+
+def _goodnews_events(response_class):
+    return json.dumps([{"kind": "good_news", "excerpt": "I got the job!",
+                        "response_class": response_class}])
+
+
+def _build_goodnews_fixture(db_path):
+    """Direct dyads exercising the source='llm' gate + coverage:
+      Alice (100)  llm chunk, good news, passive_destructive  -> fires (coverage 0.5)
+      Bob   (200)  DISTILLED chunk with (impossible) events    -> excluded by source
+      Carol (300)  llm chunk, good news, active_constructive   -> reciprocated, no fire
+    """
+    con = sqlite3.connect(db_path)
+    try:
+        schema.create_schema(con)
+        con.executemany(
+            "INSERT INTO contacts(id, source_uniqueid, first_name) VALUES (?, ?, ?)",
+            [(1, "u1", "Alice"), (2, "u2", "Bob"), (3, "u3", "Carol")],
+        )
+        con.executemany(
+            "INSERT INTO handles(id, handle_identifier, contact_id, service) "
+            "VALUES (?, ?, ?, 'iMessage')",
+            [(10, "+10", 1), (20, "+20", 2), (30, "+30", 3)],
+        )
+        con.executemany(
+            "INSERT INTO chats(id, chat_identifier, display_name, is_group, service) "
+            "VALUES (?, ?, NULL, 0, 'iMessage')",
+            [(100, "c100"), (200, "c200"), (300, "c300")],
+        )
+        con.executemany(
+            "INSERT INTO chat_participants(chat_id, handle_id) VALUES (?, ?)",
+            [(100, 10), (200, 20), (300, 30)],
+        )
+        con.executemany(
+            "INSERT INTO messages(id, guid, chat_id, handle_id, is_from_me, text, date) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                (1000, "g1000", 100, 0, 1, "congrats", "2026-05-01T10:00:00"),
+                (1001, "g1001", 100, 10, 0, "I got the job!", "2026-05-01T09:00:00"),
+                (2000, "g2000", 200, 0, 1, "ok", "2026-05-01T10:00:00"),
+                (2001, "g2001", 200, 20, 0, "news", "2026-05-02T10:00:00"),
+                (3000, "g3000", 300, 0, 1, "amazing!!", "2026-05-01T10:00:00"),
+                (3001, "g3001", 300, 30, 0, "I got engaged!", "2026-05-01T09:00:00"),
+            ],
+        )
+        # Alice: one llm chunk (fires) + one distilled chunk (coverage denominator).
+        con.executemany(
+            "INSERT INTO chunks(id, chat_id, first_message_id, last_message_id, "
+            "first_date, last_date, n_messages, text) VALUES (?, ?, ?, ?, ?, ?, 2, 'x')",
+            [(900, 100, 1000, 1001, "2026-05-01T08:00:00", "2026-05-01T10:00:00"),
+             (901, 100, 1000, 1001, "2026-04-01T08:00:00", "2026-04-01T10:00:00"),
+             (902, 200, 2000, 2001, "2026-05-01T08:00:00", "2026-05-02T10:00:00"),
+             (903, 300, 3000, 3001, "2026-05-01T08:00:00", "2026-05-01T10:00:00")],
+        )
+        con.executemany(
+            "INSERT INTO chunk_annotations(chunk_id, valence, emotions_json, depth, "
+            "events_json, source) VALUES (?, ?, '[]', 2, ?, ?)",
+            [
+                (900, 0.5, _goodnews_events("passive_destructive"), "llm"),  # Alice: fires
+                (901, None, "[]", "distilled"),                              # coverage denom
+                (902, 0.5, _goodnews_events("passive_destructive"), "distilled"),  # excluded
+                (903, 0.5, _goodnews_events("active_constructive"), "llm"),  # reciprocated
+            ],
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+class _GoodnewsFixtureTest(unittest.TestCase):
+    def setUp(self):
+        fd, self.db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.addCleanup(lambda: os.path.exists(self.db_path) and os.remove(self.db_path))
+        _build_goodnews_fixture(self.db_path)
+        for module in (loose_ends, query_tools):
+            patcher = mock.patch.object(module, "DB_PATH", self.db_path)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _open(self):
+        con = sqlite3.connect(self.db_path)
+        con.row_factory = sqlite3.Row
+        self.addCleanup(con.close)
+        return con
+
+    def _cfg(self, con, *, enabled=True):
+        cfg = loose_ends._build_cfg(con)
+        cfg["goodnews_enabled"] = enabled
+        return cfg
+
+
+class UnreciprocatedGoodnewsDetectorTest(_GoodnewsFixtureTest):
+    def test_disabled_flag_yields_nothing(self):
+        con = self._open()
+        self.assertEqual(
+            list(loose_ends.detect_unreciprocated_goodnews(
+                con, self._cfg(con, enabled=False))), [])
+
+    def test_fires_on_llm_source_only_with_coverage(self):
+        con = self._open()
+        cands = {c.chat_id: c for c in loose_ends.detect_unreciprocated_goodnews(
+            con, self._cfg(con, enabled=True))}
+        # Alice fires; Bob is distilled (excluded despite the event); Carol's
+        # good news was reciprocated (active_constructive) so it does not fire.
+        self.assertEqual(set(cands), {100})
+        alice = cands[100]
+        self.assertEqual(alice.kind, "unreciprocated_goodnews")
+        self.assertEqual(alice.handle_id, 10)
+        self.assertEqual(alice.anchor_message_id, 1001)
+        self.assertEqual(alice.evidence["response_class"], "passive_destructive")
+        self.assertTrue(alice.evidence["good_news_excerpt"].startswith("I got"))
+        cov = alice.evidence["llm_annotation_coverage"]
+        self.assertEqual(cov["total_chunks"], 2)
+        self.assertEqual(cov["llm_annotated_chunks"], 1)
+        self.assertEqual(cov["fraction"], 0.5)
+        self.assertIn("precision_note", alice.evidence)
+
+    def test_driver_off_by_default_writes_nothing(self):
+        con = self._open()
+        cfg = loose_ends._build_cfg(con)   # goodnews_enabled defaults False
+        loose_ends.detect_all(con, cfg, "2026-07-01T00:00:00+00:00")
+        n = sqlite3.connect(self.db_path).execute(
+            "SELECT COUNT(*) FROM loose_threads WHERE kind = 'unreciprocated_goodnews'"
+        ).fetchone()[0]
+        self.assertEqual(n, 0)
+
+    def test_driver_writes_row_when_enabled(self):
+        con = self._open()
+        cfg = self._cfg(con, enabled=True)
+        loose_ends.detect_all(con, cfg, "2026-07-01T00:00:00+00:00")
+        rows = sqlite3.connect(self.db_path).execute(
+            "SELECT chat_id FROM loose_threads WHERE kind = 'unreciprocated_goodnews' "
+            "AND status = 'open' ORDER BY chat_id").fetchall()
+        self.assertEqual([r[0] for r in rows], [100])
 
 
 if __name__ == "__main__":
