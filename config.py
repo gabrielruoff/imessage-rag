@@ -628,3 +628,38 @@ NUDGE_GOODNEWS_ENABLED = os.getenv(
 # ISO date string in Python -- no SQL date function ever wraps the date column
 # in a WHERE clause (the load-bearing date-handling rule).
 NUDGE_OCCASION_MIN_YEARS = int(os.getenv("NUDGE_OCCASION_MIN_YEARS") or "2")
+
+# --- feature: persona (V5 simulate_contact; RES-69) --------------------------
+# simulate_contact is the highest-risk persona leg: ESTIMATE how a contact might
+# reply in their voice, or talk to your PAST SELF as of a date. It is OFF BY
+# DEFAULT and gated at REGISTRATION -- PERSONA_SIM_ENABLED withholds the schema
+# from chat.py's tool list unless truthy (withholding the schema is the repo's
+# one reliable stop -- see the gotchas). Flipping it on is the user's explicit,
+# PERSISTENT opt-in; the tool's per-call `acknowledged` param is a UX flow
+# device, NOT the security boundary. Nothing here auto-sends and nothing is
+# persisted. Separate appended fence (kept out of the V1-V3 persona block above)
+# so V5 stays a clean additive edit.
+PERSONA_SIM_ENABLED = os.getenv("PERSONA_SIM_ENABLED", "").strip().lower() in (
+    "1", "true", "yes", "on")
+# Hard deceased/grief denylist: a comma/space-separated list of `contacts.id`
+# the user marks do-not-simulate. The tool hard-refuses these in CODE with a
+# fixed compassionate message and never generates. DEFAULT-ALLOW (a contact
+# absent from the list is simulable -- owner considered default-deny and declined
+# for v1). There is NO reliable automatic deceased detection from chat.db; this
+# manual list is the FLOOR. Parsed via the shared consent.parse_consent_ids
+# (tolerant; non-positive/non-integer tokens skipped), same as the other id-list
+# consent knobs -- consent membership here means "blocked", not "opted-in".
+PERSONA_SIM_BLOCK_IDS = os.getenv("PERSONA_SIM_BLOCK_IDS", "")
+# Soft deceased/dormant heuristic (owner revision 2026-07-20): a FAIL-OPEN safety
+# net OVER the manual block list, not a substitute for it. Before simulating a
+# living contact the tool checks last-message age + a strongly one-sided
+# (texting-into-silence) pattern; when BOTH fire it WARNS and asks for
+# confirmation. It never blocks -- the heuristic cannot tell deceased from
+# long-lost. A contact's most-recent message TO the user older than this many
+# days is the age half of the signal.
+PERSONA_SIM_DORMANT_DAYS = int(os.getenv("PERSONA_SIM_DORMANT_DAYS") or "365")
+# ...and the user must have sent at least this many messages AFTER that last
+# inbound message with no reply since (texting into silence) for the one-sided
+# half to fire. Both halves are required; the result is a warning, not a block.
+PERSONA_SIM_ONESIDED_MIN_MSGS = int(os.getenv("PERSONA_SIM_ONESIDED_MIN_MSGS") or "3")
+# --- end feature: persona (V5 simulate_contact) ---

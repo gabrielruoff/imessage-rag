@@ -139,11 +139,11 @@ come from one model or retrieval silently degrades (see the gotcha below), and
 ingest runs no generation model at all.
 
 Module map: `query_tools/` holds the thirty-two retrieval functions the LLM
-calls by default (`len(tool_schemas.TOOL_DEFINITIONS)`); four more register
-only behind feature flags — the three drift read tools behind `DRIFT_ENABLED`
-and `trace_conflict_across_chats` behind `CONFLICT_TRACE_ENABLED` (all four
-functions are always importable from the package; only their schemas are
-conditional). The modules — `messages.py` (message-level SQL/FTS search, context expansion, full
+calls by default (`len(tool_schemas.TOOL_DEFINITIONS)`); five more register
+only behind feature flags — the three drift read tools behind `DRIFT_ENABLED`,
+`trace_conflict_across_chats` behind `CONFLICT_TRACE_ENABLED`, and
+`simulate_contact` behind `PERSONA_SIM_ENABLED` (all five functions are always
+importable from the package; only their schemas are conditional). The modules — `messages.py` (message-level SQL/FTS search, context expansion, full
 text, reactions), `chunks.py` (chunk-level semantic search, hybrid
 FTS+semantic fused with reciprocal-rank fusion, more-like-this, chunk → its
 messages), `directory.py` (summary stats; name/handle/chat resolution),
@@ -161,8 +161,14 @@ output tables, plus the generative surfaces `diagnose_conflict` — the
 deterministic scorecard — and `draft_apology` — the Lewicki-6 repair scaffold,
 both under the code-enforced DV floor — and, behind `CONFLICT_TRACE_ENABLED`,
 `trace_conflict_across_chats`), `persona.py` (`get_voiceprint` reading
-`person_voiceprint`, plus `draft_reply` and the deterministic
-`check_style_match`), `analytics_wellbeing.py` (`get_language_trajectory` — the
+`person_voiceprint`, plus `draft_reply`, the deterministic `check_style_match`,
+and — behind `PERSONA_SIM_ENABLED` — `simulate_contact`, the in-tool ESTIMATE of
+a contact's voice or your past self: it generates via `ollama.chat_once` and
+returns text it has already wrapped with a per-line "estimate, not <person>"
+label in code, under a hard deceased/grief denylist (`PERSONA_SIM_BLOCK_IDS`,
+parsed by `consent`), a soft last-message-age + one-sided dormant warning, and an
+`acknowledged` UX gate for living contacts), `analytics_wellbeing.py`
+(`get_language_trajectory` — the
 deterministic cross-family change-point read, self by default and consent-gated
 per contact via `consent.is_consented`), `drift.py` (the D2/D3 read tools
 `get_relationship_drift`/`get_fadeout_watchlist`/`get_reconnection_candidates`
@@ -408,7 +414,11 @@ chunk_vectors                     -- sqlite-vec vec0 table: chunk_id ->
   `dyad_drift` never build, AND withholds the three drift read tools + D3 from
   `TOOL_DEFINITIONS`; `CONFLICT_TRACE_ENABLED=false` (default) withholds
   `trace_conflict_across_chats` (its per-call `consent` param is a UX prompt
-  device, NOT the boundary — the schema gate is). Same principle as withholding
+  device, NOT the boundary — the schema gate is); `PERSONA_SIM_ENABLED=false`
+  (default) withholds `simulate_contact` (its per-call `acknowledged` param is a
+  UX flow, NOT the boundary — the schema gate is; the deceased/grief denylist and
+  the soft dormant warning are enforced in the tool's own code, not by the
+  prompt). Same principle as withholding
   tool schemas to stop a tool call: prompting a model not to do something is not
   a control; removing the capability is. The N4 nudge detectors gate at BUILD
   the same way — `NUDGE_DROPPED_PLAN_ENABLED`/`NUDGE_GOODNEWS_ENABLED` default
@@ -492,8 +502,10 @@ chunk_vectors                     -- sqlite-vec vec0 table: chunk_id ->
   `config.py` / `.env.example`; never hardcode them elsewhere. The Wave 0–4
   suite adds the `CONFLICT_*` (incl. `CONFLICT_DV_SCREEN`,
   `CONFLICT_TRACE_ENABLED`), `NUDGE_*` (dormant/question/dropped_plan/goodnews/
-  occasion knobs + the enable flags), `DRIFT_*`, `VOICEPRINT_*`, `WELLBEING_*`
-  (+ `WELLBEING_CONSENT_IDS`), and `WRAPPED_*` (`WRAPPED_WELLBEING`,
+  occasion knobs + the enable flags), `DRIFT_*`, `VOICEPRINT_*` (+ the V5
+  `PERSONA_SIM_*` family: `PERSONA_SIM_ENABLED`, `PERSONA_SIM_BLOCK_IDS`, and the
+  soft-dormant `PERSONA_SIM_DORMANT_DAYS`/`PERSONA_SIM_ONESIDED_MIN_MSGS`),
+  `WELLBEING_*` (+ `WELLBEING_CONSENT_IDS`), and `WRAPPED_*` (`WRAPPED_WELLBEING`,
   `WRAPPED_VOICEPRINT_CONSENT_IDS`) families — all env-driven with working
   defaults, same as the rest.
 - Participant-identity merging (me / contact / handle / unknown) has one home:
