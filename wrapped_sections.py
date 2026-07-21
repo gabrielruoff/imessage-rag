@@ -952,6 +952,10 @@ def build_sections(con, roster, contact_entry=None, year=None,
             sections.append(drifting)
     # --- end feature: drift ---
     sections.append(_sec_voiceprint(roster, contact_entry))  # feature: persona
+    # --- feature: conflict ---  (C5 / RES-54; builder appended at EOF)
+    sections += [s for s in [_sec_repair_report(
+        con, contact_entry, year, exclude_chat_ids)] if s is not None]
+    # --- end feature: conflict ---
     return sections
 
 
@@ -1158,3 +1162,274 @@ def _sec_voiceprint(roster, contact_entry=None):
                  "naming any of the players."),
     }
 # --- end feature: persona ---
+
+
+# --- feature: conflict ---
+# C5 (RES-54): the Wrapped "Repair Report" section. Deterministic aggregates
+# over the conflict finder's tables (conflicts / conflict_signals, RES-46 / C1);
+# the LLM only narrates the numbers, it never computes them.
+#
+# EVERY repair-derived stat is eval-gated (RES-70 / F4): a label class appears
+# only when eval_gate_passed(con, 'conflict_labels', <class>) clears it, so a
+# below-kappa class is SUPPRESSED, not softened. Gated stats:
+#   * personal most-common horseman -- computed over ONLY the gate-cleared
+#     Gottman horsemen, so the class it surfaces always cleared kappa;
+#   * most-repaired relationship AND the recovery-time trend -- BOTH ride the
+#     one 'repair' gate; if 'repair' hasn't cleared, BOTH vanish entirely.
+# Recovery time is a resolution claim, so off_text_flag=1 windows (a large
+# intra-window gap forbids a resolution verdict) are excluded from it.
+# The deterministic-finder facts (window counts, cool-off gap, volume collapse)
+# are NOT label-derived and are never gated -- they are the fallback the section
+# renders when no class clears; with no conflict windows at all the builder
+# returns None (skipped), never empty scaffolding.
+import json  # noqa: E402 (local to the additive C5 block)
+
+_CONFLICT_GATE_TASK = "conflict_labels"
+_HORSEMEN = ("criticism", "contempt", "defensiveness", "stonewalling")
+_HORSEMAN_LABELS = {
+    "criticism": "Criticism", "contempt": "Contempt",
+    "defensiveness": "Defensiveness", "stonewalling": "Stonewalling",
+}
+
+
+def _horseman_label(cls):
+    return _HORSEMAN_LABELS.get(cls, str(cls).replace("_", " ").capitalize())
+
+
+def _conflict_class_cleared(con, cls):
+    """Per-class eval clearance for the conflict_labels gate (RES-70 / F4). A
+    thin module-level seam: the import stays lazy (only runs once the section
+    has conflicts to report) and tests can patch this one point to drive the
+    suppressed path. eval_gate_passed treats an absent/failing verdict as
+    False, so an uncleared class is suppressed."""
+    from eval.evalkit.gates import eval_gate_passed
+    return eval_gate_passed(con, _CONFLICT_GATE_TASK, cls)
+
+
+def _conflict_tables_present(con):
+    names = {r[0] for r in con.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' "
+        "AND name IN ('conflicts', 'conflict_signals')")}
+    return {"conflicts", "conflict_signals"} <= names
+
+
+def _conflict_scope(con, contact_entry, year, exclude_chat_ids):
+    """(where, params) restricting `conflicts` (aliased `cf`) to the report
+    scope: the report year (on first_date), the deep-dive contact's chats, and
+    the excluded chats. Columns are qualified `cf.*` so the clause drops
+    unchanged into the join queries. Returns None when a contact scope resolves
+    to no chats. Plain-string date compares only (see the CLAUDE.md gotcha)."""
+    clauses, params = ["1 = 1"], []
+    if year is not None:
+        clauses += ["cf.first_date >= ?", "cf.first_date < ?"]
+        params += [f"{year:04d}-01-01", f"{year + 1:04d}-01-01"]
+    for cid in exclude_chat_ids:
+        clauses.append("cf.chat_id != ?")
+        params.append(cid)
+    if contact_entry is not None:
+        chat_ids = _person_chat_ids(con, contact_entry)
+        if not chat_ids:
+            return None
+        clauses.append(f"cf.chat_id IN ({','.join('?' * len(chat_ids))})")
+        params += chat_ids
+    return " AND ".join(clauses), params
+
+
+def _median(values):
+    ordered = sorted(values)
+    n = len(ordered)
+    if not n:
+        return None
+    mid = n // 2
+    return ordered[mid] if n % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def _conflict_base(con, where, params, period_width):
+    """Deterministic finder facts (NOT label-derived, never gated): the number
+    of conflict windows in scope, the typical cool-off gap (median peak reply
+    gap), how many windows saw a volume collapse, and the window count per
+    period. None when scope has no windows."""
+    rows = con.execute(
+        f"SELECT cf.first_date, cf.peak_signal_json FROM conflicts cf "
+        f"WHERE {where}", params).fetchall()
+    if not rows:
+        return None
+    gaps, collapses, by_period = [], 0, {}
+    for row in rows:
+        try:
+            peak = json.loads(row["peak_signal_json"]) if row["peak_signal_json"] else {}
+        except (TypeError, ValueError):
+            peak = {}
+        gap = peak.get("peak_gap_hours")
+        if isinstance(gap, (int, float)) and not isinstance(gap, bool):
+            gaps.append(float(gap))
+        if "volume_collapse" in (peak.get("signals") or []):
+            collapses += 1
+        period = (row["first_date"] or "")[:period_width]
+        if period:
+            by_period[period] = by_period.get(period, 0) + 1
+    return {
+        "conflict_windows": len(rows),
+        "typical_gap_hours": _median(gaps) if gaps else None,
+        "volume_collapses": collapses,
+        "windows_by_period": [{"period": p, "windows": by_period[p]}
+                              for p in sorted(by_period)],
+    }
+
+
+def _personal_horseman(con, where, params):
+    """The reader's own most-common Gottman horseman (actor_is_me = 1),
+    computed over ONLY the horseman classes that cleared the eval gate -- so
+    the surfaced class always cleared kappa. None when no cleared horseman
+    fired in scope."""
+    cleared = [h for h in _HORSEMEN if _conflict_class_cleared(con, h)]
+    if not cleared:
+        return None
+    placeholders = ",".join("?" * len(cleared))
+    rows = con.execute(
+        f"SELECT cs.label_class AS label_class, COUNT(*) AS n "
+        f"FROM conflict_signals cs JOIN conflicts cf ON cf.id = cs.conflict_id "
+        f"WHERE {where} AND cs.actor_is_me = 1 "
+        f"AND cs.label_class IN ({placeholders}) "
+        f"GROUP BY cs.label_class ORDER BY n DESC, cs.label_class",
+        params + cleared).fetchall()
+    if not rows:
+        return None
+    breakdown = [{"horseman": _horseman_label(r["label_class"]), "your_turns": r["n"]}
+                 for r in rows]
+    return {"horseman": breakdown[0]["horseman"],
+            "your_turns": breakdown[0]["your_turns"], "breakdown": breakdown}
+
+
+def _most_repaired(con, where, params):
+    """The relationship with the most repair turns in scope (either side), by
+    chat, resolved to the counterpart's contact label. Caller gates this on the
+    'repair' class clearing. None when no repair turns in scope."""
+    row = con.execute(
+        f"SELECT cf.chat_id AS chat_id, COUNT(*) AS n, "
+        f"NULLIF(ch.display_name, '') AS display_name, "
+        f"(SELECT {db.CONTACT_LABEL_SQL} FROM chat_participants cp "
+        f"JOIN handles h ON h.id = cp.handle_id "
+        f"LEFT JOIN contacts c ON c.id = h.contact_id "
+        f"WHERE cp.chat_id = cf.chat_id ORDER BY h.id LIMIT 1) AS partner "
+        f"FROM conflict_signals cs JOIN conflicts cf ON cf.id = cs.conflict_id "
+        f"JOIN chats ch ON ch.id = cf.chat_id "
+        f"WHERE {where} AND cs.label_class = 'repair' "
+        f"GROUP BY cf.chat_id ORDER BY n DESC, cf.chat_id LIMIT 1",
+        params).fetchone()
+    if row is None:
+        return None
+    label = row["display_name"] or row["partner"] or f"chat {row['chat_id']}"
+    return {"with": label, "repair_turns": row["n"]}
+
+
+def _recovery_trend(con, where, params, period_width):
+    """Average recovery time per period for repaired, RESOLVABLE conflicts:
+    windows that (a) have off_text_flag = 0 -- off-text forbids a resolution
+    verdict, so those windows are EXCLUDED -- AND (b) contain at least one
+    'repair' turn (a conflict with no repair has no recovery to time). Recovery
+    time is the window's own span (first_date -> last_date). Caller gates this
+    on the 'repair' class clearing."""
+    rows = con.execute(
+        f"SELECT cf.first_date, cf.last_date FROM conflicts cf "
+        f"WHERE {where} AND cf.off_text_flag = 0 AND EXISTS ("
+        f"SELECT 1 FROM conflict_signals cs "
+        f"WHERE cs.conflict_id = cf.id AND cs.label_class = 'repair')",
+        params).fetchall()
+    buckets = {}
+    for row in rows:
+        dur = _session_duration(row["first_date"], row["last_date"])
+        if dur is None:
+            continue
+        period = (row["first_date"] or "")[:period_width]
+        if period:
+            buckets.setdefault(period, []).append(dur)
+    return [{"period": p, "recovery_seconds": round(sum(v) / len(v)),
+             "conflicts": len(v)} for p, v in sorted(buckets.items())]
+
+
+def _sec_repair_report(con, contact_entry=None, year=None, exclude_chat_ids=()):
+    """The Repair Report: deterministic conflict aggregates, LLM-narrated. The
+    deterministic-finder facts always render (the fallback); the label-derived
+    stats (horseman, most-repaired relationship, recovery-time trend) appear
+    only for the eval-cleared classes. None (skipped) when there is no conflict
+    data in scope -- never empty scaffolding."""
+    if not _conflict_tables_present(con):
+        return None
+    scope = _conflict_scope(con, contact_entry, year, exclude_chat_ids)
+    if scope is None:
+        return None
+    where, params = scope
+    period_width = 7 if year is not None else 4
+    base = _conflict_base(con, where, params, period_width)
+    if base is None:  # no conflict windows in scope -> skip
+        return None
+
+    stats, narrate, visuals = {}, {}, []
+    # Deterministic-finder fallback (never gated): always survives here.
+    stats["conflict_windows"] = narrate["conflict_windows"] = base["conflict_windows"]
+    if base["typical_gap_hours"] is not None:
+        secs = round(base["typical_gap_hours"] * 3600)
+        stats["typical_cool_off_seconds"] = secs
+        narrate["typical_cool_off"] = wrapped_html.format_duration(secs)
+    if base["volume_collapses"]:
+        narrate["windows_with_volume_collapse"] = base["volume_collapses"]
+    if len(base["windows_by_period"]) > 1:
+        narrate["windows_by_period"] = base["windows_by_period"]
+        chart = wrapped_html.render_hbars(
+            base["windows_by_period"], "period", "windows", table=False)
+        if chart:
+            visuals.append(wrapped_html.block("Conflict windows over time", chart))
+
+    # Gated stat 1: personal most-common horseman (per-class gate; the helper
+    # already restricts to gate-cleared classes).
+    horseman = _personal_horseman(con, where, params)
+    if horseman is not None:
+        stats["your_top_horseman"] = horseman["horseman"]
+        narrate["your_most_common_horseman"] = horseman
+        if len(horseman["breakdown"]) > 1:
+            chart = wrapped_html.render_hbars(
+                horseman["breakdown"], "horseman", "your_turns")
+            if chart:
+                visuals.append(wrapped_html.block("Your escalation moves", chart))
+
+    # Gated stats 2 & 3: most-repaired relationship AND recovery-time trend both
+    # ride the single 'repair' gate -- if it has not cleared, BOTH are omitted.
+    if _conflict_class_cleared(con, "repair"):
+        repaired = _most_repaired(con, where, params)
+        if repaired is not None:
+            stats["most_repaired_relationship"] = repaired["with"]
+            narrate["most_repaired_relationship"] = repaired
+        trend = _recovery_trend(con, where, params, period_width)
+        if len(trend) > 1:
+            narrate["recovery_time_trend"] = trend
+            chart = wrapped_html.render_hbars(
+                trend, "period", "recovery_seconds", table=False)
+            if chart:
+                visuals.append(wrapped_html.block("Recovery time over time", chart))
+        elif trend:
+            # One period is not a trend, but its recovery time is still a real,
+            # gated number worth stating.
+            narrate["typical_recovery"] = wrapped_html.format_duration(
+                trend[0]["recovery_seconds"])
+
+    return {
+        "title": "Repair Report",
+        "stats": stats,
+        "narrate_stats": narrate,
+        "extra_html": "".join(visuals),
+        "caption": ("Conflict windows are tense stretches a local model flagged "
+                    "from deterministic signals (reply-latency withdrawal, "
+                    "one-sided sessions, volume collapse) -- a read, not a "
+                    "verdict. Escalation and repair labels appear only where "
+                    "they cleared an agreement check, and off-the-text stretches "
+                    "are left out of recovery times."),
+        "hint": ("Conflict windows are deterministic tense-stretch flags, never "
+                 "certainties -- describe them gently and never assign blame or "
+                 "name a 'winner'. The horseman is the reader's OWN most-common "
+                 "escalation move in their turns. The most-repaired relationship "
+                 "and recovery times appear only when those labels passed their "
+                 "gate; recovery time is how long a repaired window lasted. Keep "
+                 "it warm and non-judgmental, and name at most one relationship."),
+    }
+# --- end feature: conflict ---
