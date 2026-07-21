@@ -974,3 +974,38 @@ _CONFLICT_TRACE_TOOL_DEFINITIONS = [
 if _config.CONFLICT_TRACE_ENABLED:
     TOOL_DEFINITIONS.extend(_CONFLICT_TRACE_TOOL_DEFINITIONS)
 # --- end feature: conflict (C3 trace) ---
+
+
+# --- feature: conflict (C4 apology) ---
+# draft_apology scaffolds a repair message (Lewicki-6) and NEVER ghostwrites.
+# Unconditional (no config gate -- the DV floor is enforced inside the function,
+# not by withholding the schema). Appended as its own additive block rather than
+# folded into C1/C2's conflict fence, so it stays a clean edit alongside the
+# concurrent conflict worktrees.
+TOOL_DEFINITIONS.append({
+    "name": "draft_apology",
+    "description": "SCAFFOLD (never ghostwrite) a repair message for one "
+                    "conflict episode (a conflict_id from find_conflicts). "
+                    "Returns the ranked Lewicki-6 apology checklist (components "
+                    "ordered by measured effectiveness: acknowledging "
+                    "responsibility first, offering repair second, requesting "
+                    "forgiveness last and flagged skippable), the user's REAL "
+                    "grievance excerpts pulled VERBATIM from the episode (never "
+                    "invented), and -- only where the `repair` label class is "
+                    "eval-cleared -- the ignored repair attempts the other "
+                    "person made (otherwise that component is marked "
+                    "unavailable, never guessed). It emits NO finished apology "
+                    "prose: do NOT ghostwrite the message -- walk the user "
+                    "through the checklist grounded in their real excerpts. A "
+                    "built-in DV safety screen may WITHHOLD the entire scaffold "
+                    "and return only a support-resource pointer; if a "
+                    "resource_footer is present, include it verbatim.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "conflict_id": {"type": "integer"},
+        },
+        "required": ["conflict_id"],
+    },
+})
+# --- end feature: conflict (C4 apology) ---

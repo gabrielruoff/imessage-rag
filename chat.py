@@ -193,6 +193,20 @@ if _conflict_trace_config.CONFLICT_TRACE_ENABLED:
         "nothing is saved)"
     )
 # --- end feature: conflict (C3 trace) ---
+# --- feature: conflict (C4 apology) ---
+# draft_apology is unconditional (no config gate; the DV floor is enforced in
+# the function). Appended, not folded into C1/C2's conflict block above, to stay
+# a clean additive edit alongside the concurrent conflict worktrees.
+SYSTEM_PROMPT += (
+    "\n- draft_apology (one conflict_id -> a repair SCAFFOLD, not an apology: "
+    "the ranked Lewicki-6 apology checklist + the user's REAL grievance "
+    "excerpts + the other person's ignored repair attempts where available. It "
+    "NEVER ghostwrites the apology -- walk the user through the checklist "
+    "grounded in their real excerpts; only draft text if they explicitly ask "
+    "after seeing the scaffold, and label it 'draft template -- edit before "
+    "sending'. Surface any resource_footer verbatim)"
+)
+# --- end feature: conflict (C4 apology) ---
 # --- feature: wellbeing ---
 # Layer 3 (UX polish, best-effort): non-clinical framing for
 # get_language_trajectory narration, folded into the FIRST system message
