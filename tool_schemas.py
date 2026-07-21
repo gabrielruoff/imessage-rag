@@ -880,3 +880,48 @@ _DRIFT_TOOL_DEFINITIONS = [
 if _config.DRIFT_ENABLED:
     TOOL_DEFINITIONS.extend(_DRIFT_TOOL_DEFINITIONS)
 # --- end feature: drift ---
+
+
+# --- feature: drift ---
+# D3 (RES-65): the grounded reconnection-opener helper. Registered ONLY when
+# DRIFT_ENABLED, exactly like the D2 tools above -- withholding the schema is
+# the repo's one reliable way to keep the model from calling it, so a disabled
+# deployment needs no prompt-level "don't reconnect" text. Kept in its own
+# appended block (not folded into _DRIFT_TOOL_DEFINITIONS) so concurrent drift
+# worktrees extend the file additively without reflowing each other's lists.
+import config as _config  # noqa: E402 (local to the additive drift block)
+
+_DRIFT_D3_TOOL_DEFINITIONS = [
+    {
+        "name": "get_reconnection_candidates",
+        "description": "Grounding step for drafting a reconnection opener to ONE "
+                        "1:1 relationship. Use on an explicit request like 'help "
+                        "me reach back out to X', 'write an opener to reconnect "
+                        "with Y'. It does NOT write an opener and stores nothing: "
+                        "it surfaces CANDIDATE curated shared references -- "
+                        "human-curated inside jokes / nicknames (dyad_terms) and "
+                        "high-valence LLM-annotated shared moments (kind "
+                        "shared_memory; distilled valence is never eligible). "
+                        "Identify the person with exactly one of contact_id / "
+                        "handle_id / chat_id (a group chat_id is an error). When "
+                        "candidates exist the result carries an `instruction`: "
+                        "present them and have the user PICK exactly one, then "
+                        "draft grounded strictly in that pick -- never invent or "
+                        "embellish a shared memory. When none exist "
+                        "(has_curated_reference false) it carries a `refusal`: do "
+                        "NOT fabricate a memory; offer a plain, reference-free "
+                        "opener instead. Never store the opener.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "contact_id": _ID_OR_LIST_SCHEMA,
+                "handle_id": _ID_OR_LIST_SCHEMA,
+                "chat_id": _ID_OR_LIST_SCHEMA,
+            },
+        },
+    },
+]
+
+if _config.DRIFT_ENABLED:
+    TOOL_DEFINITIONS.extend(_DRIFT_D3_TOOL_DEFINITIONS)
+# --- end feature: drift ---

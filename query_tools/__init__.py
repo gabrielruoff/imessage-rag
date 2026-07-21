@@ -106,6 +106,11 @@ from .drift import (
     get_relationship_drift,
 )
 # --- end feature: drift ---
+# --- feature: drift ---
+# D3 (RES-65): re-exported UNCONDITIONALLY like the D2 tools -- DRIFT_ENABLED
+# gates only its schema registration, not its importability.
+from .drift import get_reconnection_candidates
+# --- end feature: drift ---
 
 __all__ = [
     "DB_PATH",
@@ -158,5 +163,8 @@ __all__ = [
     # --- feature: drift ---
     "get_fadeout_watchlist",
     "get_relationship_drift",
+    # --- end feature: drift ---
+    # --- feature: drift ---
+    "get_reconnection_candidates",
     # --- end feature: drift ---
 ]
