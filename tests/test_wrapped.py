@@ -4,6 +4,7 @@ tools are integrated), and mocked ollama.chat_once -- no Ollama, no real DB."""
 
 import io
 import os
+import json
 import re
 import sqlite3
 import tempfile
@@ -110,6 +111,23 @@ def seed_msg(con, chat_id, handle_id, date, is_from_me=0, text="hi"):
 def seed_msgs(con, chat_id, handle_id, dates, **kw):
     for d in dates:
         seed_msg(con, chat_id, handle_id, d, **kw)
+
+
+
+def seed_conflict(con, cid, chat_id, first_date, last_date, peak=None, off_text=0):
+    con.execute(
+        "INSERT INTO conflicts (id, chat_id, first_date, last_date, "
+        "peak_signal_json, off_text_flag) VALUES (?, ?, ?, ?, ?, ?)",
+        (cid, chat_id, first_date, last_date, json.dumps(peak or {}), off_text),
+    )
+
+
+def seed_signal(con, conflict_id, label_class, actor_is_me=0):
+    con.execute(
+        "INSERT INTO conflict_signals (conflict_id, message_id, actor_is_me, "
+        "label_class, band, excerpt) VALUES (?, ?, ?, ?, ?, ?)",
+        (conflict_id, None, actor_is_me, label_class, "likely", ""),
+    )
 
 
 class WrappedTestCase(unittest.TestCase):
@@ -826,6 +844,167 @@ class TestVoiceprintSection(WrappedTestCase):
         self.assertIn("wubbaZZZ", page)       # Alice: featured + consented
         self.assertNotIn("bobbleZZZ", page)   # Bob: excluded despite consent
         self.assertNotIn("It’s Bob.", page)
+
+
+class TestRepairReport(WrappedTestCase):
+    """C5 / RES-54: the Wrapped Repair Report section. Deterministic aggregates
+    over conflicts/conflict_signals, per-class eval-gated. The committed seed
+    (eval/seed_gates/conflict_labels.json) pre-clears every class, so the gated
+    stats render by default; the suppressed path is driven by patching the
+    single gate seam."""
+
+    def _seed_corpus(self):
+        """Alice (chat 1) + Bob (chat 2), each a 1:1, with conflict windows:
+          - conflict 1 (chat 1, 2025-03, 4h span, off_text=0, volume collapse):
+            my stonewalling x2, my criticism x1, one repair
+          - conflict 2 (chat 1, 2025-06, 2h span, off_text=0): my stonewalling
+            x1, one repair  -> chat 1 has 2 repairs total
+          - conflict 3 (chat 2, 2025-04, off_text=1, volume collapse): one
+            repair -> EXCLUDED from recovery time (off-text)."""
+        seed_contact(self.con, 1, "Alice")
+        seed_contact(self.con, 2, "Bob")
+        seed_handle(self.con, 1, "+15550001", 1)
+        seed_handle(self.con, 2, "+15550002", 2)
+        seed_chat(self.con, 1, "c1")
+        seed_chat(self.con, 2, "c2")
+        self.con.executemany(
+            "INSERT INTO chat_participants (chat_id, handle_id) VALUES (?, ?)",
+            [(1, 1), (2, 2)],
+        )
+        seed_conflict(self.con, 1, 1, "2025-03-01T10:00:00", "2025-03-01T14:00:00",
+                      peak={"peak_gap_hours": 6,
+                            "signals": ["volume_collapse", "latency_withdrawal"]})
+        seed_signal(self.con, 1, "stonewalling", actor_is_me=1)
+        seed_signal(self.con, 1, "stonewalling", actor_is_me=1)
+        seed_signal(self.con, 1, "criticism", actor_is_me=1)
+        seed_signal(self.con, 1, "repair", actor_is_me=0)
+        seed_conflict(self.con, 2, 1, "2025-06-01T10:00:00", "2025-06-01T12:00:00",
+                      peak={"peak_gap_hours": 3, "signals": []})
+        seed_signal(self.con, 2, "stonewalling", actor_is_me=1)
+        seed_signal(self.con, 2, "repair", actor_is_me=1)
+        seed_conflict(self.con, 3, 2, "2025-04-01T10:00:00", "2025-04-05T10:00:00",
+                      peak={"peak_gap_hours": 50, "signals": ["volume_collapse"]},
+                      off_text=1)
+        seed_signal(self.con, 3, "repair", actor_is_me=0)
+        self.con.commit()
+
+    def _section(self, contact_entry=None, year=2025, exclude_chat_ids=()):
+        return wrapped_sections._sec_repair_report(
+            self.con, contact_entry, year, exclude_chat_ids)
+
+    def test_skipped_when_no_conflicts(self):
+        # Schema present (conflict tables exist) but no rows -> section skipped,
+        # never empty scaffolding.
+        self.assertIsNone(self._section())
+
+    def test_renders_all_stats_with_default_gate(self):
+        self._seed_corpus()
+        sec = self._section()
+        self.assertIsNotNone(sec)
+        self.assertEqual(sec["title"], "Repair Report")
+        # Deterministic base (never gated).
+        self.assertEqual(sec["stats"]["conflict_windows"], 3)
+        self.assertEqual(sec["stats"]["typical_cool_off_seconds"], 21600)  # median 6h
+        self.assertEqual(sec["narrate_stats"]["windows_with_volume_collapse"], 2)
+        # Gated horseman: stonewalling (3 of my turns) beats criticism (1).
+        self.assertEqual(sec["stats"]["your_top_horseman"], "Stonewalling")
+        self.assertEqual(
+            sec["narrate_stats"]["your_most_common_horseman"]["your_turns"], 3)
+        # Gated repair stats: chat 1 (Alice) has the most repairs.
+        self.assertEqual(sec["stats"]["most_repaired_relationship"], "Alice")
+        self.assertEqual(
+            sec["narrate_stats"]["most_repaired_relationship"]["repair_turns"], 2)
+
+    def test_recovery_trend_excludes_off_text_windows(self):
+        self._seed_corpus()
+        trend = self._section()["narrate_stats"]["recovery_time_trend"]
+        periods = [r["period"] for r in trend]
+        # 2025-04 is the off_text=1 window -> excluded; the two off_text=0
+        # repaired windows survive with their exact spans.
+        self.assertEqual(periods, ["2025-03", "2025-06"])
+        self.assertNotIn("2025-04", periods)
+        by_period = {r["period"]: r["recovery_seconds"] for r in trend}
+        self.assertEqual(by_period["2025-03"], 14400)  # 4h
+        self.assertEqual(by_period["2025-06"], 7200)   # 2h
+
+    def test_all_gated_stats_suppressed_when_no_class_clears(self):
+        self._seed_corpus()
+        with mock.patch.object(wrapped_sections, "_conflict_class_cleared",
+                               return_value=False):
+            sec = self._section()
+        # The deterministic fallback still renders.
+        self.assertIsNotNone(sec)
+        self.assertEqual(sec["stats"]["conflict_windows"], 3)
+        # No label-derived stat survives, in stats OR narration.
+        self.assertNotIn("your_top_horseman", sec["stats"])
+        self.assertNotIn("most_repaired_relationship", sec["stats"])
+        narr = sec["narrate_stats"]
+        for key in ("your_most_common_horseman", "most_repaired_relationship",
+                    "recovery_time_trend", "typical_recovery"):
+            self.assertNotIn(key, narr)
+
+    def test_repair_gate_suppresses_both_repair_stats_together(self):
+        self._seed_corpus()
+
+        def gate(con, cls):
+            return cls != "repair"  # horsemen clear, repair does not
+
+        with mock.patch.object(wrapped_sections, "_conflict_class_cleared",
+                               side_effect=gate):
+            sec = self._section()
+        # Horseman still renders (its classes cleared)...
+        self.assertEqual(sec["stats"]["your_top_horseman"], "Stonewalling")
+        # ...but BOTH repair-gated stats vanish together.
+        self.assertNotIn("most_repaired_relationship", sec["stats"])
+        self.assertNotIn("most_repaired_relationship", sec["narrate_stats"])
+        self.assertNotIn("recovery_time_trend", sec["narrate_stats"])
+        self.assertNotIn("typical_recovery", sec["narrate_stats"])
+
+    def test_only_gate_cleared_horseman_surfaces(self):
+        self._seed_corpus()
+
+        def gate(con, cls):
+            # Stonewalling (the true most-common) is NOT cleared; criticism is.
+            return cls != "stonewalling"
+
+        with mock.patch.object(wrapped_sections, "_conflict_class_cleared",
+                               side_effect=gate):
+            sec = self._section()
+        # The suppressed top class must not surface; the cleared runner-up does.
+        self.assertEqual(sec["stats"]["your_top_horseman"], "Criticism")
+        horsemen = [r["horseman"]
+                    for r in sec["narrate_stats"]["your_most_common_horseman"]["breakdown"]]
+        self.assertNotIn("Stonewalling", horsemen)
+
+    def test_section_appears_self_contained_in_full_report(self):
+        # Alice active across 2025 (kept off the silent-exclusion list), with
+        # conflict windows on her 1:1 chat.
+        seed_contact(self.con, 1, "Alice")
+        seed_handle(self.con, 1, "+15550001", 1)
+        seed_chat(self.con, 1, "c1")
+        self.con.execute(
+            "INSERT INTO chat_participants (chat_id, handle_id) VALUES (1, 1)")
+        seed_msgs(self.con, 1, 1, [f"2025-{m:02d}-15T12:00:00" for m in range(1, 13)])
+        seed_conflict(self.con, 1, 1, "2025-03-01T10:00:00", "2025-03-01T14:00:00",
+                      peak={"peak_gap_hours": 6, "signals": ["volume_collapse"]})
+        seed_signal(self.con, 1, "stonewalling", actor_is_me=1)
+        seed_signal(self.con, 1, "repair", actor_is_me=1)
+        self.con.commit()
+        self.patch_tools()
+        self.patch_llm()
+        out = self.out_path("repair.html")
+        code, _ = self.run_main(["--year", "2025", "--yes", "--no-llm", "--out", out])
+        self.assertEqual(code, 0)
+        with open(out, encoding="utf-8") as f:
+            page = f.read()
+        self.assertTrue(page.startswith("<!doctype html>"))
+        self.assertIn("<h2>Repair Report</h2>", page)
+        self.assertIn("Conflict windows", page)  # base tile label
+        self.assertIn("Stonewalling", page)      # gated horseman rendered
+        # No JSON reaches the page.
+        self.assertNotIn("peak_signal_json", page)
+        self.assertNotIn('"conflict_windows"', page)
+        os.unlink(out)
 
 
 if __name__ == "__main__":
