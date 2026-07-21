@@ -340,6 +340,13 @@ def create_schema(con: sqlite3.Connection):
     _create_nudges_tables(con)
     # --- end feature: nudges ---
 
+    # --- feature: persona ---
+    # Persona-feature derived tables (person_voiceprint, ...). Kept in a
+    # separate def + single call so the block stays additive and never touches
+    # _SCHEMA; IF NOT EXISTS makes it idempotent alongside create_schema.
+    _create_persona_tables(con)
+    # --- end feature: persona ---
+
     # Reactions used to be stored with chat.db's raw associated_message_guid,
     # which carries a message-part prefix ('p:0/<guid>' -- tapback on part N
     # -- or 'bp:<guid>' for balloon parts) that messages.guid never has, so
@@ -410,3 +417,51 @@ def _create_nudges_tables(con: sqlite3.Connection):
     of CREATE ... IF NOT EXISTS."""
     con.executescript(_NUDGES_SCHEMA)
 # --- end feature: nudges ---
+
+
+# --- feature: persona ---
+# Derived table behind the voiceprint pipeline (voiceprint.py) and the
+# get_voiceprint tool. member_key/counterpart_key are member_key() strings
+# ("me" / "contact:<id>" / "handle:<id>"); counterpart is the other party's
+# member_key for scope='dyad', "chat:<chat_id>" for scope='group', and "*" for
+# scope='all' (the global card). The fw_*_rate columns mirror
+# person_period_lexicon's 9 categories in the same (FUNCTION_WORDS) order.
+# feature_std_json holds the per-scope population std of each numeric feature,
+# replicated onto every row so a downstream z-normalization reads it off the
+# row without a join. Full-rebuild only (voiceprint.py DELETEs + reinserts),
+# so the NULL-free PK is never relied on for upserts.
+_PERSONA_SCHEMA = """
+CREATE TABLE IF NOT EXISTS person_voiceprint (
+    member_key TEXT,                 -- whose voice (member_key(); never 'unknown')
+    counterpart_key TEXT,            -- dyad: other member_key; group: 'chat:<id>'; all: '*'
+    scope TEXT,                      -- 'dyad' | 'group' | 'all'
+    avg_msg_len REAL,                -- mean chars per (text) message
+    lowercase_ratio REAL,            -- mean per-message lowercase-letter ratio
+    exclaim_rate REAL,               -- fraction of text messages containing '!'
+    ellipsis_rate REAL,              -- fraction of text messages with '...'/'…'
+    burst_size REAL,                 -- mean length of same-sender bursts
+    fw_pronoun_rate REAL,
+    fw_ipron_rate REAL,
+    fw_article_rate REAL,
+    fw_conj_rate REAL,
+    fw_prep_rate REAL,
+    fw_aux_rate REAL,
+    fw_adverb_rate REAL,
+    fw_negation_rate REAL,
+    fw_quant_rate REAL,
+    openers_json TEXT,               -- top session-opening phrases [{phrase,count}]
+    closers_json TEXT,               -- top session-closing phrases  [{phrase,count}]
+    tone_valence REAL,               -- LOW-TRUST: mean valence over source='llm' chunks
+    tone_emotions_json TEXT,         -- LOW-TRUST: top emotions; NULL when no llm rows
+    n_messages INTEGER,
+    n_reply_pairs INTEGER,
+    n_months INTEGER,
+    feature_std_json TEXT,           -- per-scope {feature: population std}, std==0 omitted
+    PRIMARY KEY (member_key, counterpart_key, scope)
+);
+"""
+
+
+def _create_persona_tables(con: sqlite3.Connection):
+    con.executescript(_PERSONA_SCHEMA)
+# --- end feature: persona ---

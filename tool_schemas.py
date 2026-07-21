@@ -590,4 +590,44 @@ TOOL_DEFINITIONS = [
         },
     },
     # --- end feature: nudges ---
+    # --- feature: persona ---
+    {
+        "name": "get_voiceprint",
+        "description": "How a person texts -- their deterministic 'voiceprint': "
+                        "message length, lowercase habit, exclamation/ellipsis "
+                        "rates, double-texting burst size, function-word rates, "
+                        "signature openers/closers, and a LOW-TRUST emotional "
+                        "tone. Defaults to YOUR voice: name a person "
+                        "(contact_id/handle_id/name) for your voice WITH them (a "
+                        "dyad), or omit for your overall voice. subject='them' "
+                        "returns the named person's voice instead. Group chats "
+                        "only with scope='group' + a group chat_id. Passing "
+                        "date_from/date_to recomputes over that window (capped). "
+                        "Returns a card with a confidence flag (high/low), "
+                        "coverage counts, and the per-feature corpus std "
+                        "(feature_std) for normalization.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "contact_id": {"type": "integer",
+                               "description": "the person (from search_contacts_by_name)"},
+                "handle_id": {"type": "integer"},
+                "name": {"type": "string",
+                         "description": "person name to resolve (contact_id is exact)"},
+                "subject": {"type": "string", "enum": ["me", "them"],
+                            "default": "me",
+                            "description": "whose voice: 'me' (default) or 'them' "
+                                           "(the named person)"},
+                "scope": {"type": "string", "enum": ["dyad", "group", "all"],
+                          "description": "dyad (default when a person is named), "
+                                         "all (default when none), group (needs a "
+                                         "group chat_id)"},
+                "chat_id": {"type": "integer",
+                            "description": "group chat id, required for scope='group'"},
+                "date_from": {"type": "string", "description": _DATE_PARAM_DESC},
+                "date_to": {"type": "string", "description": _DATE_PARAM_DESC},
+            },
+        },
+    },
+    # --- end feature: persona ---
 ]

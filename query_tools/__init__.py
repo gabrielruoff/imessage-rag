@@ -70,6 +70,9 @@ from .messages import (
     search_messages_fts,
     search_messages_sql,
 )
+# --- feature: persona ---
+from .persona import get_voiceprint
+# --- end feature: persona ---
 
 # --- feature: nudges ---
 from .nudges import (
@@ -94,6 +97,9 @@ __all__ = [
     "get_milestones",
     "get_reaction_stats",
     "get_response_dynamics",
+    # --- feature: persona ---
+    "get_voiceprint",
+    # --- end feature: persona ---
     "get_word_frequency",
     "get_word_trends",
     "list_chats",

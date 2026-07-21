@@ -270,7 +270,7 @@ topics:  ## Cluster embedded chunks into topics and label them
 # run these concurrently, and concurrent runs deadlock on the SQLite write
 # lock (each holds it across many LLM calls) while gaining nothing -- Ollama
 # serializes the inference anyway. Recipe lines run in order under any -j.
-pipeline:  ## ingest -> annotate -> nudges -> drift -> topics, in order (stays serial under -j)
+pipeline:  ## ingest -> annotate -> nudges -> drift -> voiceprint -> topics, in order (stays serial under -j)
 	$(MAKE) ingest
 	$(MAKE) annotate
 	$(MAKE) nudges          # --- feature: nudges (runs after annotate) ---
@@ -280,6 +280,10 @@ pipeline:  ## ingest -> annotate -> nudges -> drift -> topics, in order (stays s
 # serial under -j. DRIFT_ENABLED (default false) decides inside drift.py.
 	$(MAKE) drift
 # feature: drift <<<
+# feature: persona >>> voiceprint runs after annotate (its tone field reads
+# chunk_annotations); zero-LLM, so it stays a serial recipe line like the others.
+	$(MAKE) voiceprint
+# feature: persona <<<
 	$(MAKE) topics
 
 # --- feature: nudges ---
@@ -300,6 +304,14 @@ nudges:  ## Detect loose threads (nudges) -- run after annotate
 drift:  ## Score relationship drift into dyad_drift (opt-in: DRIFT_ENABLED=true)
 	.venv/bin/python3 drift.py
 # feature: drift <<<
+
+# feature: persona >>>
+# Deterministic per-person voiceprints (person_voiceprint). Pure SQL/Python, no
+# Ollama gate. Reads chunk_annotations for its low-trust tone, hence after annotate.
+.PHONY: voiceprint
+voiceprint:  ## Build deterministic per-person voiceprints (person_voiceprint)
+	.venv/bin/python3 voiceprint.py
+# feature: persona <<<
 
 # --- Running -----------------------------------------------------------------
 # ARGS passes flags through, e.g.:

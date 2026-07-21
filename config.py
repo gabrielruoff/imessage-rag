@@ -379,3 +379,26 @@ DRIFT_WEIGHTS = _parse_json_dict_env("DRIFT_WEIGHTS", _DRIFT_WEIGHTS_DEFAULT)
 DRIFT_PHASE_THRESHOLDS = _parse_json_dict_env(
     "DRIFT_PHASE_THRESHOLDS", _DRIFT_PHASE_THRESHOLDS_DEFAULT)
 # --- end feature: drift ---
+# --- feature: persona ---
+# --- Voiceprint (voiceprint.py) ------------------------------------------------
+# The card confidence gate: a person_voiceprint row reads 'high' only when it
+# clears ALL THREE of these, else 'low'. Volume, two-sided engagement, and
+# breadth-over-time -- a chatty one-week fling shouldn't outrank a three-year
+# tie.
+VOICEPRINT_MIN_MESSAGES = int(os.getenv("VOICEPRINT_MIN_MESSAGES") or "500")
+VOICEPRINT_MIN_REPLY_PAIRS = int(os.getenv("VOICEPRINT_MIN_REPLY_PAIRS") or "8")
+VOICEPRINT_MIN_MONTHS = int(os.getenv("VOICEPRINT_MIN_MONTHS") or "3")
+# A DIFFERENT floor from the gate above: V2 (draft_reply) degrades its
+# per-call style retrieval below this many example reply pairs. Separate knob,
+# separate job -- kept distinct on purpose.
+VOICEPRINT_MIN_CONTEXT_PAIRS = int(os.getenv("VOICEPRINT_MIN_CONTEXT_PAIRS") or "4")
+# Date-scoped get_voiceprint recomputes over a raw message scan. Below
+# MIN_RANGE_MESSAGES the window is too thin to trust (flagged); above
+# SCAN_MAX_MESSAGES the tool asks the caller to narrow the range rather than
+# run an unbounded scan.
+VOICEPRINT_MIN_RANGE_MESSAGES = int(os.getenv("VOICEPRINT_MIN_RANGE_MESSAGES") or "200")
+VOICEPRINT_SCAN_MAX_MESSAGES = int(os.getenv("VOICEPRINT_SCAN_MAX_MESSAGES") or "20000")
+# Max seconds between two consecutive same-sender messages for the second to
+# extend the same burst (double-text run) rather than start a new one.
+VOICEPRINT_BURST_GAP_SECONDS = int(os.getenv("VOICEPRINT_BURST_GAP_SECONDS") or "120")
+# --- end feature: persona ---
