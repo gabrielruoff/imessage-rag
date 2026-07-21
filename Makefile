@@ -307,6 +307,14 @@ nudges:  ## Detect loose threads (nudges) -- run after annotate
 .PHONY: drift
 drift:  ## Score relationship drift into dyad_drift (opt-in: DRIFT_ENABLED=true)
 	.venv/bin/python3 drift.py
+
+# One-command teardown, mirroring reset-db: wipe dyad_drift + its ingest_state
+# guard keys and print the DRIFT_ENABLED=false reminder. drift.py --purge runs
+# regardless of the flag (it is what you run WHILE turning the feature off); the
+# flag flip is the user's one manual step and is what makes the purge durable.
+.PHONY: drift-purge
+drift-purge:  ## Purge dyad_drift + its guard keys (then set DRIFT_ENABLED=false)
+	.venv/bin/python3 drift.py --purge
 # feature: drift <<<
 
 # feature: persona >>>

@@ -51,7 +51,7 @@ DRIFT_PHASE_THRESHOLDS (`drift_params_hash`) decide whether a rerun rebuilds or
 skips. DRIFT_ENABLED (default false) short-circuits the whole thing before any
 write, so a disabled pipeline never touches the table.
 
-Usage: drift.py [--force] [--dry-run]
+Usage: drift.py [--force] [--dry-run] [--purge]
 """
 
 import argparse
@@ -733,6 +733,36 @@ def build_drift(con, *, force=False, dry_run=False):
 
 
 # ---------------------------------------------------------------------------
+# Purge (one-command teardown)
+# ---------------------------------------------------------------------------
+
+def purge_drift(con):
+    """Tear down the drift artifact: delete every dyad_drift row and the two
+    ingest_state guard keys (drift_max_message_id, drift_params_hash) so a later
+    rerun starts clean, then print the one manual step this process cannot do.
+
+    A Python process cannot durably unset an env var, so flipping
+    DRIFT_ENABLED=false in .env stays the user's job -- and that flip is what
+    makes the purge durable: D1's build-side gate then never rebuilds the table.
+    Even unflipped nothing rebuilds until new messages arrive AND the flag is
+    true, so the purge holds until then regardless. Returns the number of
+    dyad_drift rows deleted."""
+    schema.create_schema(con)  # self-heal so a purge on a pre-ingest DB can't error
+    n = con.execute("SELECT COUNT(*) FROM dyad_drift").fetchone()[0]
+    con.execute("DELETE FROM dyad_drift")
+    con.execute("DELETE FROM ingest_state "
+                "WHERE key IN ('drift_max_message_id', 'drift_params_hash')")
+    con.commit()
+    print(f"Purged dyad_drift: {n} rows deleted; cleared ingest_state guard keys "
+          "drift_max_message_id and drift_params_hash.")
+    print("Now set DRIFT_ENABLED=false in .env to keep drift off -- a process "
+          "cannot unset an env var for you, so this flag flip is the one manual "
+          "step. Until DRIFT_ENABLED=true again AND new messages arrive, nothing "
+          "rebuilds dyad_drift.")
+    return n
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -744,7 +774,19 @@ def main(argv=None):
                         help="rebuild even when the corpus and params are unchanged")
     parser.add_argument("--dry-run", action="store_true",
                         help="report how many dyads would be scored; write nothing")
+    parser.add_argument("--purge", action="store_true",
+                        help="delete dyad_drift + its ingest_state guard keys, "
+                             "then print the DRIFT_ENABLED=false reminder "
+                             "(runs regardless of DRIFT_ENABLED)")
     args = parser.parse_args(argv)
+
+    # --purge runs regardless of DRIFT_ENABLED: it is the teardown you run WHILE
+    # turning the feature off, so gating it behind the flag would make it
+    # unreachable in exactly the state it exists for.
+    if args.purge:
+        with contextlib.closing(_connect()) as con:
+            purge_drift(con)
+        return 0
 
     # DRIFT_ENABLED gates before any DB access, so a disabled pipeline leaves
     # dyad_drift (and a durable D5 purge) completely untouched.

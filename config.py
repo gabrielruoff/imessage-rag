@@ -350,9 +350,28 @@ DRIFT_MIN_SESSIONS = int(os.getenv("DRIFT_MIN_SESSIONS") or "5")
 DRIFT_SLOPE_CI = float(os.getenv("DRIFT_SLOPE_CI") or "0.05")
 
 # The two structured vars. .env.example shows the full default JSON inline.
+#
+# HEURISTIC, NOT VALIDATED. These weights and phase cutoffs are a hand-tuned
+# starting point, not an empirically calibrated model: no study establishes
+# that this particular composite tracks real relationship "drift", and copy
+# built around drift output must never imply one does. They are deliberately
+# biased toward the signals we trust most:
+#   * the mandatory message-derived trio (volume, reciprocity, latency) carries
+#     the most weight -- it is always available, and two of its members
+#     (reciprocity, latency) are the ONLY corroborators that can lift a decline
+#     label past `cooling`, so under-weighting them would starve the phase floor;
+#   * silence is weighted lowest -- it is heavy-tailed and, by design, can never
+#     decide a decline on its own (the corroboration floor caps silence-only at
+#     cooling), so a large weight would only inflate scores it cannot act on;
+#   * valence/depth come from chunk_annotations that may be distilled (biased,
+#     and already down-weighted upstream), so they sit below the message trio.
+# Phase thresholds stay intentionally conservative (a high bar to call a tie
+# "fading"): for a nostalgia-adjacent tool a false "this friendship is dying"
+# is far costlier than a missed one. Re-tune freely -- any change here re-hashes
+# drift_params and forces a rebuild on the next run.
 _DRIFT_WEIGHTS_DEFAULT = (
-    '{"volume": 0.20, "reciprocity": 0.20, "latency": 0.15, '
-    '"silence": 0.10, "valence": 0.15, "depth": 0.10, "initiation": 0.10}'
+    '{"volume": 0.22, "reciprocity": 0.22, "latency": 0.16, '
+    '"silence": 0.06, "valence": 0.14, "depth": 0.10, "initiation": 0.10}'
 )
 _DRIFT_PHASE_THRESHOLDS_DEFAULT = (
     '{"thriving": 0.10, "steady": 0.35, "cooling": 0.60, "dormant_days": 90}'
