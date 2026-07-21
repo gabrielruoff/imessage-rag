@@ -418,7 +418,21 @@ def _stub_envelope(scope, note, *, refused=False, baseline=None):
     }
     if refused:
         env["refused"] = True
+    env["note"] = _sanitize_text(env["note"])  # W3: source-level scrub of tool prose
     return env
+
+
+# --------------------------------------------------------------------------
+# W3: source-level (non-clinical) sanitization of tool-authored free text
+# --------------------------------------------------------------------------
+
+def _sanitize_text(text):
+    """Strip any clinical-condition name from tool-AUTHORED prose before it can
+    seed the model's narration (defense in depth with chat.py's final-sentence
+    scrub). Applied to the envelope's framing/note fields. The grounding
+    excerpts are the target's OWN messages -- evidence, not narration -- so they
+    are returned verbatim and never redacted here."""
+    return wellbeing.sanitize_condition_names(text)[0]
 
 
 def get_language_trajectory(contact=None, date_from=None, date_to=None,
@@ -513,6 +527,14 @@ def get_language_trajectory(contact=None, date_from=None, date_to=None,
             "dropped_markers": dropped,
             "support_block": wellbeing.support_block() if flagged else None,
         }
+        # --- feature: wellbeing (W3) ---
+        # Code-emitted, direction-independent support text. chat.run_turn prints
+        # a tool's reserved `_epilogue` verbatim AFTER the reply, so support is
+        # ALWAYS present on a flagged result regardless of which way the window
+        # moved -- delivery is code's job here, not the model's narration.
+        if flagged:
+            env["_epilogue"] = wellbeing.support_block()
+        # --- end feature: wellbeing (W3) ---
 
         if "baseline" in wanted:
             env["baseline"] = {
@@ -546,8 +568,9 @@ def get_language_trajectory(contact=None, date_from=None, date_to=None,
                     "peak_z": round(result["peak_z"], 3),
                     "baseline_months": result["baseline_months"],
                     "departed_families": departed,
-                    "framing": (f"A sustained shift in {framing_noun} from "
-                                f"{start_m} to {end_m}."),
+                    "framing": _sanitize_text(
+                        f"A sustained shift in {framing_noun} from "
+                        f"{start_m} to {end_m}."),
                 }]
             else:
                 env["windows"] = []
@@ -570,5 +593,5 @@ def get_language_trajectory(contact=None, date_from=None, date_to=None,
 
         if not flagged:
             notes.append("no sustained cross-family departure detected")
-        env["note"] = "; ".join(notes)
+        env["note"] = _sanitize_text("; ".join(notes))  # W3: source-level scrub
         return env

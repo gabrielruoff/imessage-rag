@@ -285,5 +285,159 @@ class CapToolResultTest(unittest.TestCase):
         self.assertLessEqual(len(json.dumps(capped)), 500)
 
 
+# --- feature: wellbeing (W3) ---
+class FinalSentenceSanitizeTest(unittest.TestCase):
+    """chat.ollama_chat_stream, on a wellbeing turn (the _SANITIZE_FINAL_SENTENCE
+    module flag armed), buffers the FINAL sentence and runs it through
+    wellbeing.sanitize_condition_names before it is printed/returned. Earlier
+    sentences (already streamed) are untouched; the flag off is a no-op. Drives
+    the REAL ollama_chat_stream with ollama.chat_stream (the token generator)
+    mocked -- no socket, no model."""
+
+    def setUp(self):
+        # A file console is not a terminal, so use_live is False: the stream is
+        # accumulated then rendered/sanitized once, deterministically.
+        self._saved_console = chat.console
+        chat.console = Console(file=io.StringIO())
+        self.addCleanup(setattr, chat, "console", self._saved_console)
+
+        self._saved_flag = chat._SANITIZE_FINAL_SENTENCE
+        self.addCleanup(setattr, chat, "_SANITIZE_FINAL_SENTENCE", self._saved_flag)
+
+        self._saved_chat_stream = chat.ollama.chat_stream
+        self.addCleanup(setattr, chat.ollama, "chat_stream", self._saved_chat_stream)
+
+    def _stream_chunks(self, chunks):
+        def fake(messages, tools, model=None):
+            for piece in chunks:
+                yield {"role": "assistant", "content": piece}
+
+        chat.ollama.chat_stream = fake
+
+    def _run(self, chunks, armed):
+        self._stream_chunks(chunks)
+        chat._SANITIZE_FINAL_SENTENCE = armed
+        return chat.ollama_chat_stream(
+            [{"role": "system", "content": "s"}], show_model_header=False
+        )["content"]
+
+    def test_final_sentence_with_condition_is_redacted(self):
+        content = self._run(
+            ["Your messages got shorter over the winter. ",
+             "This really looks like depression."],
+            armed=True,
+        )
+        self.assertIn("Your messages got shorter over the winter.", content)
+        self.assertNotIn("depression", content)
+        self.assertIn("a sustained shift in your language patterns", content)
+
+    def test_only_the_final_sentence_is_sanitized(self):
+        # A denylist term in an EARLIER (already streamed) sentence survives --
+        # the owner-revision narrows sanitization to the buffered final sentence.
+        content = self._run(
+            ["I mentioned anxiety back in the spring. ", "Things read steadier now."],
+            armed=True,
+        )
+        self.assertIn("anxiety", content)
+        self.assertIn("Things read steadier now.", content)
+
+    def test_flag_off_leaves_the_final_sentence_untouched(self):
+        content = self._run(
+            ["Your tone shifted a lot. ", "This looks like depression."],
+            armed=False,
+        )
+        self.assertIn("depression", content)  # not a wellbeing turn: streamed as-is
+
+    def test_single_sentence_reply_is_sanitized(self):
+        content = self._run(["Honestly this reads like clinical depression."], armed=True)
+        self.assertNotIn("depression", content)
+        self.assertNotIn("clinical", content)
+        self.assertIn("a sustained shift in your language patterns", content)
+
+
+class WellbeingEpilogueTest(unittest.TestCase):
+    """run_turn collects a tool's reserved `_epilogue`, prints it verbatim after
+    the reply (and folds it into the returned string), strips it from the result
+    the model sees, and arms final-sentence sanitization once
+    get_language_trajectory has run. chat.ollama_chat_stream is mocked."""
+
+    def setUp(self):
+        self._saved_iterations = chat.MAX_TOOL_ITERATIONS
+        chat.MAX_TOOL_ITERATIONS = 4
+        self.addCleanup(setattr, chat, "MAX_TOOL_ITERATIONS", self._saved_iterations)
+
+        self._saved_console = chat.console
+        chat.console = Console(file=io.StringIO())
+        self.addCleanup(setattr, chat, "console", self._saved_console)
+
+        self._saved_stream = chat.ollama_chat_stream
+        self.addCleanup(setattr, chat, "ollama_chat_stream", self._saved_stream)
+
+        self._saved_flag = chat._SANITIZE_FINAL_SENTENCE
+        self.addCleanup(setattr, chat, "_SANITIZE_FINAL_SENTENCE", self._saved_flag)
+
+    def _wire(self, tool_result):
+        self.flag_at_final = None
+        saved_fn = chat.TOOL_FUNCTIONS.get("get_language_trajectory")
+
+        def restore():
+            if saved_fn is not None:
+                chat.TOOL_FUNCTIONS["get_language_trajectory"] = saved_fn
+            else:
+                chat.TOOL_FUNCTIONS.pop("get_language_trajectory", None)
+
+        chat.TOOL_FUNCTIONS["get_language_trajectory"] = lambda **kw: tool_result
+        self.addCleanup(restore)
+
+        script = [{
+            "role": "assistant", "content": "",
+            "tool_calls": [{"function": {"name": "get_language_trajectory",
+                                         "arguments": {}}}],
+        }]
+
+        def fake_stream(messages, tools=chat.OLLAMA_TOOLS, show_model_header=True, model=None):
+            if script:
+                return dict(script.pop(0))
+            self.flag_at_final = chat._SANITIZE_FINAL_SENTENCE
+            return {"role": "assistant", "content": "Your language shifted over several months."}
+
+        chat.ollama_chat_stream = fake_stream
+
+    def test_flagged_result_appends_support_and_hides_epilogue_from_model(self):
+        self._wire({"support_block": "SB", "windows": [{"start": "2024-01"}],
+                    "_epilogue": "SUPPORT-TEXT-XYZ"})
+        messages = [{"role": "system", "content": chat.SYSTEM_PROMPT}]
+        reply = chat.run_turn(messages)
+        self.assertIn("Your language shifted", reply)
+        self.assertIn("SUPPORT-TEXT-XYZ", reply)  # code-emitted after the reply
+        tool_msgs = [m for m in messages if m["role"] == "tool"]
+        self.assertTrue(tool_msgs)
+        self.assertNotIn("_epilogue", tool_msgs[0]["content"])  # reserved key stripped
+        self.assertNotIn("SUPPORT-TEXT-XYZ", tool_msgs[0]["content"])
+        self.assertTrue(self.flag_at_final)  # sanitization armed for the narration reply
+
+    def test_unflagged_result_emits_no_epilogue(self):
+        self._wire({"support_block": None, "windows": []})  # no departure, no _epilogue
+        messages = [{"role": "system", "content": chat.SYSTEM_PROMPT}]
+        reply = chat.run_turn(messages)
+        self.assertEqual(reply, "Your language shifted over several months.")
+        self.assertNotIn("SUPPORT-TEXT-XYZ", reply)
+        self.assertTrue(self.flag_at_final)  # armed once trajectory ran (harmless: clean sentence)
+
+    def test_non_wellbeing_turn_does_not_arm_sanitization(self):
+        # A turn with no get_language_trajectory call leaves the flag disarmed.
+        self.flag_at_final = None
+
+        def fake_stream(messages, tools=chat.OLLAMA_TOOLS, show_model_header=True, model=None):
+            self.flag_at_final = chat._SANITIZE_FINAL_SENTENCE
+            return dict(FINAL_REPLY)
+
+        chat.ollama_chat_stream = fake_stream
+        reply = chat.run_turn([{"role": "system", "content": chat.SYSTEM_PROMPT}])
+        self.assertEqual(reply, "the final answer")  # no epilogue folded in
+        self.assertFalse(self.flag_at_final)
+# --- end feature: wellbeing (W3) ---
+
+
 if __name__ == "__main__":
     unittest.main()
