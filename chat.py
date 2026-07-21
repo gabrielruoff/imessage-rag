@@ -64,6 +64,12 @@ SYSTEM_PROMPT = (
     "function-word rates, signature openers/closers, tone -- your voice, a "
     "person's voice, or your voice with them; scope='group' for group chats)\n"
     # --- end feature: persona ---
+    # --- feature: conflict ---
+    "- find_conflicts (detected argument/tense stretches in a 1:1 chat or with a "
+    "person -- deterministic signals with receipts, ranked; labels are gated bands)\n"
+    "- get_conflict (one conflict_id -> its evidence and up to 15 labeled signal "
+    "turns as tentative/likely bands)\n"
+    # --- end feature: conflict ---
     "- search_contacts_by_name (name/org -> contact + their handle_ids)\n"
     "- list_chats (name/participant -> chat_id, or label a chat_id)\n"
     "- search_contact_by_handle (a phone/email/handle_id -> contact name)\n"

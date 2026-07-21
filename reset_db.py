@@ -27,6 +27,14 @@ TABLES = [
     # --- end feature: persona ---
     "dyad_terms",
     "person_period_lexicon",
+    # --- feature: conflict ---
+    # Derived artifacts (RES-46 / C1). reset wipes ingest_state (below), which
+    # includes the `conflict_model` guard key -- but the committed F4 seed
+    # verdict is a repo file, not ingest_state, so the conflict label classes
+    # it pre-clears stay lit across a reset.
+    "conflict_signals",
+    "conflicts",
+    # --- end feature: conflict ---
     "sessions",
     "chunks",
     "attachments",

@@ -630,4 +630,52 @@ TOOL_DEFINITIONS = [
         },
     },
     # --- end feature: persona ---
+    # --- feature: conflict ---
+    {
+        "name": "find_conflicts",
+        "description": "Detected conflict/argument episodes ('tense stretches') "
+                        "in a 1:1 chat or with a person, found from DETERMINISTIC "
+                        "signals with receipts -- reply-latency withdrawal, "
+                        "one-sided sessions, dislike-tapback runs, message-volume "
+                        "collapse -- ranked strongest first. Use for 'did we fight "
+                        "in June', 'our worst arguments', 'tense periods with X'. "
+                        "1:1 only (group chats excluded). Prefer contact_id to "
+                        "cover a person across every handle. Each row names which "
+                        "`signals` fired and a `signal_count`; escalation labels "
+                        "are eval-gated and shown as bands, not certainties -- "
+                        "expand one with get_conflict(conflict_id). Returns "
+                        "{rows, total_matching, returned, order, truncated}.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "chat_id": _ID_OR_LIST_SCHEMA,
+                "handle_id": _ID_OR_LIST_SCHEMA,
+                "contact_id": _ID_OR_LIST_SCHEMA,
+                "date_from": {"type": "string", "description": _DATE_PARAM_DESC},
+                "date_to": {"type": "string", "description": _DATE_PARAM_DESC},
+                "limit": {"type": "integer", "default": 10},
+            },
+        },
+    },
+    {
+        "name": "get_conflict",
+        "description": "One conflict episode (by conflict_id from find_conflicts): "
+                        "its deterministic evidence (peak_signal), tone "
+                        "corroboration, off_text_flag, and up to 15 labeled "
+                        "signal turns (paginated; excerpts <= 200 chars). Labels "
+                        "are eval-gated BANDS (band 'tentative'/'likely'), never "
+                        "raw scores -- describe them as tentative, and never read "
+                        "a resolution or apology into an episode whose "
+                        "off_text_flag is true (the exchange moved off-channel).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "conflict_id": {"type": "integer"},
+                "offset": {"type": "integer", "default": 0},
+                "limit": {"type": "integer", "default": 15},
+            },
+            "required": ["conflict_id"],
+        },
+    },
+    # --- end feature: conflict ---
 ]

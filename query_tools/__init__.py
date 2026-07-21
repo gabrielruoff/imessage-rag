@@ -57,6 +57,12 @@ from .chunks import (
     search_conversations,
     search_messages_hybrid,
 )
+# --- feature: conflict ---
+from .conflict import (
+    find_conflicts,
+    get_conflict,
+)
+# --- end feature: conflict ---
 from .directory import (
     get_chat_summary_stats,
     list_chats,
@@ -86,6 +92,10 @@ __all__ = [
     "DB_PATH",
     "embed_texts",
     "find_similar_conversations",
+    # --- feature: conflict ---
+    "find_conflicts",
+    "get_conflict",
+    # --- end feature: conflict ---
     "get_activity_patterns",
     "get_chat_participant_stats",
     "get_chat_summary_stats",
