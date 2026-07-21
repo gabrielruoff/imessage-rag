@@ -55,7 +55,10 @@ Full design history, schema, rationale, and data forensics:
   `make nudges` (`loose_ends.py` — Loose Ends detectors → `loose_threads`;
   Ollama for the one-line nudge narration only), `make drift` (`drift.py` —
   relationship-drift scoring → `dyad_drift`; LLM-free and opt-in: `DRIFT_ENABLED`
-  defaults false, so the step is a no-op until you turn it on), `make voiceprint`
+  defaults false, so the step is a no-op until you turn it on;
+  `make drift-purge` runs `drift.py --purge` to wipe `dyad_drift` + its guard
+  keys regardless of the flag, the teardown you run while turning the feature
+  off), `make voiceprint`
   (`voiceprint.py` — per-person voiceprints → `person_voiceprint`; LLM-free),
   `make conflict` (`conflict_detect.py` — deterministic conflict finder +
   eval-gated labels → `conflicts`/`conflict_signals`; Ollama for the label pass).
@@ -66,9 +69,11 @@ Full design history, schema, rationale, and data forensics:
   die with `database is locked`) and contend for one serialized Ollama
   instance, so parallelism costs correctness and buys nothing.
 - Wrapped report: `.venv/bin/python3 wrapped.py [--year YYYY] [--contact NAME]
-  [--no-llm] [--yes]` — a self-contained HTML page (inline CSS + JS, no
-  network, light/dark, scroll-reveal animations); previews the featured
-  roster (with silent-contact auto-exclusions) before generating
+  [--no-llm] [--yes] [--wellbeing]` — a self-contained HTML page (inline CSS +
+  JS, no network, light/dark, scroll-reveal animations); previews the featured
+  roster (with silent-contact auto-exclusions) before generating. `--wellbeing`
+  (or `WRAPPED_WELLBEING=true`) opts the wellbeing trajectory section in — off
+  by default even when a window fires
 - Eval sweep: `eval/fast_eval.sh eval/prompts-smoke.txt [-m model]` — runs a
   prompts file (`id|prompt` lines) through `chat.py -p` sequentially with
   reduced-context env defaults; transcripts land in `eval/results/`. Never
@@ -133,8 +138,12 @@ deliberately NOT per-pipeline — query-side and document-side embeddings must
 come from one model or retrieval silently degrades (see the gotcha below), and
 ingest runs no generation model at all.
 
-Module map: `query_tools/` holds the twenty-seven retrieval functions the LLM
-calls — `messages.py` (message-level SQL/FTS search, context expansion, full
+Module map: `query_tools/` holds the thirty-two retrieval functions the LLM
+calls by default (`len(tool_schemas.TOOL_DEFINITIONS)`); four more register
+only behind feature flags — the three drift read tools behind `DRIFT_ENABLED`
+and `trace_conflict_across_chats` behind `CONFLICT_TRACE_ENABLED` (all four
+functions are always importable from the package; only their schemas are
+conditional). The modules — `messages.py` (message-level SQL/FTS search, context expansion, full
 text, reactions), `chunks.py` (chunk-level semantic search, hybrid
 FTS+semantic fused with reciprocal-rank fusion, more-like-this, chunk → its
 messages), `directory.py` (summary stats; name/handle/chat resolution),
@@ -148,7 +157,16 @@ bucketing; response dynamics over messages + the sessions table),
 `get_loose_threads`/`resolve_loose_thread`/`mute_contact_from_nudges` — over
 `loose_threads`/`nudge_exclusions`), `conflict.py`
 (`find_conflicts`/`get_conflict` over the deterministic conflict finder's
-output tables), `persona.py` (`get_voiceprint`, reading `person_voiceprint`)
+output tables, plus the generative surfaces `diagnose_conflict` — the
+deterministic scorecard — and `draft_apology` — the Lewicki-6 repair scaffold,
+both under the code-enforced DV floor — and, behind `CONFLICT_TRACE_ENABLED`,
+`trace_conflict_across_chats`), `persona.py` (`get_voiceprint` reading
+`person_voiceprint`, plus `draft_reply` and the deterministic
+`check_style_match`), `analytics_wellbeing.py` (`get_language_trajectory` — the
+deterministic cross-family change-point read, self by default and consent-gated
+per contact via `consent.is_consented`), `drift.py` (the D2/D3 read tools
+`get_relationship_drift`/`get_fadeout_watchlist`/`get_reconnection_candidates`
+over `dyad_drift`, all schema-gated behind `DRIFT_ENABLED`)
 — person scope means *that person's chats* for all analytics tools except
 `get_word_frequency`,
 `_shared.py` (connection, result caps, date-bound and scope resolution,
@@ -199,8 +217,12 @@ only for the label pass, guarded by `conflict_model`). Shared foundations they
 build on: `stats.py` (dependency-free robust-stats primitives — Theil-Sen trend
 + bootstrap CI, Kaplan-Meier survival, MAD outlier / CUSUM change-point —
 imported by drift/conflict/wellbeing), `consent.py` (default-closed opt-in id
-parsing; landed, no consumer wired yet), `wellbeing.py` (deterministic
-within-person change-point core; W1 core only — no pipeline or tool wired yet).
+parsing via `is_consented`, now consumed by the per-contact wellbeing gate and
+the Wrapped voiceprint card), `wellbeing.py` (deterministic within-person
+change-point core, now wired by `query_tools/analytics_wellbeing.py`'s
+`get_language_trajectory` and the opt-in Wrapped section; also owns the
+code-emitted `support_block` and the `sanitize_condition_names` scrub the chat
++ Wrapped surfaces run over their narration).
 `eval/evalkit/` is the analytics eval harness
 (stdlib-only; imports the app in-process, lazily — env overrides must be set
 before app modules import): `cases.py` suite loading/validation, `roster.py`
@@ -244,11 +266,13 @@ chunks(id, chat_id, first_message_id, last_message_id, first_date, last_date,
 ingest_state(key, value)          -- last_message_rowid for --since-last, plus
                                   -- embed_model/embed_dim guarding chunk_vectors,
                                   -- sessions_max_message_id/sessions_gap_minutes,
-                                  -- annotate_model, topic_model_k, and the
-                                  -- Wave 0+1 suite guards: loose_ends_model,
+                                  -- annotate_model, topic_model_k, the
+                                  -- suite guards: loose_ends_model,
                                   -- conflict_model, drift_max_message_id +
                                   -- drift_params_hash, voiceprint_max_message_id,
-                                  -- and eval_gate:<task> (F4 gate verdicts)
+                                  -- eval_gate:<task> (F4 gate verdicts), and
+                                  -- nudges_reconnect_ack (durable dormant-tie
+                                  -- reconnect opt-in; unset hides those rows)
 sessions(id, chat_id, first_message_id, last_message_id, first_date,
          last_date, n_messages, n_from_me, initiator_handle_id,
          initiator_is_me, ender_handle_id, ender_is_me)
@@ -282,7 +306,10 @@ loose_threads(id, kind, chat_id, handle_id, anchor_message_id, anchor_date,
                                   -- Loose Ends detector output (loose_ends.py);
                                   -- status 'open'|'dismissed' (dismissed rows are
                                   -- kept, never deleted); the LLM columns are
-                                  -- guarded by loose_ends_model. reset_db clears it
+                                  -- guarded by loose_ends_model. due_by is filled
+                                  -- by the inferred_occasion detector (next
+                                  -- upcoming date) and NULL for other kinds.
+                                  -- reset_db clears it
 nudge_exclusions(handle_id, contact_id, reason, created_at)
                                   -- contacts/handles muted from nudges; durable
                                   -- user intent, PRESERVED across reset_db
@@ -378,9 +405,49 @@ chunk_vectors                     -- sqlite-vec vec0 table: chunk_id ->
   stay suppressed until the owner hand-labels and gates them.
 - An enable-flag gates a feature's tool REGISTRATION or pipeline BUILD, never
   the prompt. `DRIFT_ENABLED=false` (the default) makes `drift.py` exit and
-  `dyad_drift` never build — the same principle as withholding tool schemas to
-  stop a tool call (above): prompting a model not to do something is not a
-  control; removing the capability is.
+  `dyad_drift` never build, AND withholds the three drift read tools + D3 from
+  `TOOL_DEFINITIONS`; `CONFLICT_TRACE_ENABLED=false` (default) withholds
+  `trace_conflict_across_chats` (its per-call `consent` param is a UX prompt
+  device, NOT the boundary — the schema gate is). Same principle as withholding
+  tool schemas to stop a tool call: prompting a model not to do something is not
+  a control; removing the capability is. The N4 nudge detectors gate at BUILD
+  the same way — `NUDGE_DROPPED_PLAN_ENABLED`/`NUDGE_GOODNEWS_ENABLED` default
+  off and their off-path runs no LLM and never consults the eval gate; even ON,
+  `dropped_plan` writes nothing until the F4 precision gate clears it
+  (`eval_gate_passed(con, 'dropped_plan', 'dropped_plan')`, and it ships no
+  seed, so an absent verdict suppresses). Wrapped's third-party content gates at
+  BUILD too: `WRAPPED_WELLBEING` (default off) decides whether the wellbeing
+  section is composed, and `WRAPPED_VOICEPRINT_CONSENT_IDS` (default empty) is
+  default-redacted — with no consented ids NO third-party verbatim/stylometric
+  card is emitted at all.
+- The DV floor (Master Spec A10) is SOFTENED and enforced in code, never by
+  prose. `query_tools.conflict._dv_screen` scans the full text of a conflict
+  window and returns a status: `clean` (no marker), `role-suppress`
+  (marker + `CONFLICT_DV_SCREEN` on — the default), or `bypassed-with-footer`
+  (marker + screen off, via `CONFLICT_DV_SCREEN=off` or `chat.py
+  --no-dv-screen` → `set_dv_screen_bypass`). A `role-suppress` hit makes
+  `diagnose_conflict` withhold ONLY the demand-withdraw/role read while STILL
+  returning its mechanical scorecard, whereas `draft_apology` withholds the
+  ENTIRE scaffold (drafting an apology is itself the risky output — it can
+  pressure a victim into apologizing to an abuser). The `resource_footer`
+  (hotline text) is NEVER removed: a `bypassed-with-footer` hit restores the
+  role read but still appends it. The scan is read-only; the hit is never
+  persisted.
+- Per-contact consent is enforced in code via `consent.is_consented`, never by
+  prompt. `get_language_trajectory` refuses a non-allowlisted `contact`
+  (`WELLBEING_CONSENT_IDS`) before any analysis; the Wrapped voiceprint card's
+  third-party game only renders cards for `WRAPPED_VOICEPRINT_CONSENT_IDS`.
+  Consent only ever ADDS a contact — it never overrides a roster/silent-contact
+  exclusion (those filter first).
+- Wellbeing narration is framed by two code mechanisms in `chat.run_turn`, not
+  by the prompt. When `get_language_trajectory` runs, the turn (a) arms a
+  final-sentence sanitize that holds back the reply's last sentence and runs it
+  through `wellbeing.sanitize_condition_names` before emitting, and (b) collects
+  any tool result's reserved `_epilogue` string (the code-emitted
+  `support_block`), strips it from the data the model sees, and prints it
+  verbatim after the reply. `_epilogue` is a generic hook any tool may set;
+  wrapped.py runs the same `sanitize_condition_names` scrub over its wellbeing
+  blurb.
 - `think` is per-call, not global: `ollama.chat_once`/`chat_stream` take
   `think=` with a `_UNSET` default. The tri-state is load-bearing — `None`
   means *omit* the flag (some models reject a `think` option) and is NOT the
@@ -422,7 +489,13 @@ chunk_vectors                     -- sqlite-vec vec0 table: chunk_id ->
   `chat.py` derives its dispatch table from that) + a one-line entry in
   `chat.py`'s `SYSTEM_PROMPT` tool list (keep all three in sync).
 - All tunables (models, hosts, timeouts, batch sizes, chunking) live in
-  `config.py` / `.env.example`; never hardcode them elsewhere.
+  `config.py` / `.env.example`; never hardcode them elsewhere. The Wave 0–4
+  suite adds the `CONFLICT_*` (incl. `CONFLICT_DV_SCREEN`,
+  `CONFLICT_TRACE_ENABLED`), `NUDGE_*` (dormant/question/dropped_plan/goodnews/
+  occasion knobs + the enable flags), `DRIFT_*`, `VOICEPRINT_*`, `WELLBEING_*`
+  (+ `WELLBEING_CONSENT_IDS`), and `WRAPPED_*` (`WRAPPED_WELLBEING`,
+  `WRAPPED_VOICEPRINT_CONSENT_IDS`) families — all env-driven with working
+  defaults, same as the rest.
 - Participant-identity merging (me / contact / handle / unknown) has one home:
   `query_tools/_shared.member_key`. Modules keep thin named wrappers for their
   exact contracts (`_person_key` maps no-identity rows to `None`, the others to

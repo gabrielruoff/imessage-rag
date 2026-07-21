@@ -928,6 +928,100 @@ three volume/engagement/breadth floors. Full rebuild, guarded by
 over a date window, capped). Later persona issues (draft-reply, style-match,
 simulate) will extend `query_tools/persona.py`, which stays a thin read layer.
 
+## 2026-07-21: the analytical suite (Waves 2–4 — surfaces, read tools, generative tools)
+
+The Wave 0+1 foundations above are deterministic cores and their first read
+tools; Waves 2–4 (same *Close Read* project, same Master Spec) put the last
+mile on each feature — the LLM-facing read tools the compute pipelines were
+built for, the generative tools that speak in the user's own material, and the
+Wrapped surfaces — each still additive behind its `# --- feature: X ---`
+fences. Default LLM tool count rose from 27 to **32**
+(`len(tool_schemas.TOOL_DEFINITIONS)`); four more register only behind flags
+(three drift tools + D3 behind `DRIFT_ENABLED`, `trace_conflict_across_chats`
+behind `CONFLICT_TRACE_ENABLED`). No new tables landed — every Wave 2–4 tool
+and detector reads the six derived tables Wave 0+1 already built.
+
+**Clearing the Air — conflict (C2–C5).** `diagnose_conflict` (RES-51) is a
+DETERMINISTIC scorecard over one episode — per-side I/you and we-talk ratios,
+LSM, who opened / had the last word, latency + volume read off C1's stored
+evidence, and a non-blame demand-withdraw read — carrying no aggressor/who-won
+verdict. It introduced the **softened, code-enforced DV floor** (Master Spec
+A10): `_dv_screen` scans a window's full text for threat/isolation/fear markers
+and returns `clean` / `role-suppress` / `bypassed-with-footer`; a role-suppress
+hit withholds ONLY the demand-withdraw read while the mechanical scorecard
+still returns, and the hotline `resource_footer` is never removed (a bypass
+restores the role read but still appends it). The scan is read-only and never
+persisted. `draft_apology` (RES-53) SCAFFOLDS a repair message — the Lewicki-6
+checklist ranked by measured effectiveness, the user's REAL grievance excerpts
+pulled verbatim from labeled turns, and (only when the `repair` label class has
+cleared its F4 kappa gate) the other person's ignored repair bids — and emits
+no finished prose (`emits_prose` always False). Because drafting an apology is
+itself the risky output, its DV floor is stricter than the scorecard's: a
+role-suppress hit WITHHOLDS the entire scaffold and returns only the resource
+pointer. `trace_conflict_across_chats` (RES-52) is an opt-in cross-chat
+spillover trace, registration-gated behind `CONFLICT_TRACE_ENABLED` (its
+per-call `consent` is a UX device, not the boundary), name-referenced, and
+never persisted. The Wrapped **Repair Report** (RES-54) aggregates the conflict
+tables into per-class stats, every one eval-gated (a class shows only when
+`conflict_labels` cleared it) and off-text episodes excluded from recovery-time.
+
+**Loose Ends — nudges (N2–N5).** Four detectors joined `faded_initiator` in the
+`DETECTORS` registry, each pure detection behind the shared Stage-0 exclusion
+gate: `dormant_tie` (RES-55, a once-close 1:1 tie gone quiet past its own p90
+cadence; written but hidden until the durable `nudges_reconnect_ack` opt-in),
+`unanswered_question` (RES-56, a session ending on the other person's genuine,
+length/stoplist-gated question, with a mandatory cross-session answered-check),
+`dropped_plan` (RES-57, an FTS cue-phrase pre-filter + a Searle-style LLM
+verifier — HARD-GATED off by default AND, even on, writing nothing until the F4
+`dropped_plan` precision gate clears at ≥ 0.85, which ships no seed so it stays
+suppressed), and `unreciprocated_goodnews` (RES-57, opt-in, reading
+`response_class` out of `chunk_annotations.events_json` for source='llm' rows
+only and reporting llm-coverage so "no good news" ≠ "not annotated").
+`inferred_occasion` (RES-58) infers a recurring birthday/anniversary from
+congratulatory messages on the same calendar date across years and is the one
+detector that fills `loose_threads.due_by` (the next upcoming occurrence). The
+Wrapped **Open Loops** board (RES-58) surfaces the digest, honoring the same
+exclusions.
+
+**Fadeout Radar — drift (D2–D4).** The read layer the Wave-1 doc marked "not yet
+landed" now exists: `query_tools/drift.py` (RES-59) reads `dyad_drift` verbatim
+(no re-scoring, no Ollama) as `get_relationship_drift` (one resolved
+counterparty) and `get_fadeout_watchlist` (a leaderboard partitioned by
+coverage — the rankable tier never ranked against the insufficient-signal
+bucket), both code-emitting the "still talk elsewhere?" channel caveat on any
+cooling/fading/dormant phase and narrating strictly at the pipeline's
+`confidence_tier`. `get_reconnection_candidates` (RES-65 / D3) surfaces curated
+shared references (dyad_terms + high-valence llm shared moments) for a grounded
+opener or refuses rather than fabricating; it writes nothing. All are the
+name-twin of the compute `drift.py` and import nothing from it, and all are
+schema-gated behind `DRIFT_ENABLED`. Calibration + the `--purge` /
+`make drift-purge` teardown and heuristic defaults landed alongside (RES-60).
+The Wrapped **Who's Drifting** section (RES-66) is opt-in (DRIFT_ENABLED-gated),
+corroborated-only, and excludes the same silent contacts as the roster.
+
+**Baseline — wellbeing (W2–W4).** `get_language_trajectory` (RES-61) wires the
+W1 change-point core to the DB: count-based markers pooled across a scope, self
+by default and per-contact ONLY for an id on the `WELLBEING_CONSENT_IDS`
+allowlist (`consent.is_consented`, refused in code otherwise). Framing is
+enforced by code, not prompt (RES-67 / W3): the tool emits a code-built
+`support_block` via the generic `_epilogue` hook that `chat.run_turn` strips
+from the model's view and prints verbatim, and the turn holds back its reply's
+final sentence to run `wellbeing.sanitize_condition_names` over it; an S10
+evalkit case guards the behavior. The opt-in Wrapped wellbeing section (RES-68 /
+W4) reuses the same support footer + narration scrub and stays off unless
+`--wellbeing` / `WRAPPED_WELLBEING`.
+
+**Voiceprint — persona (V2–V4).** `draft_reply` (RES-62) drafts a reply in the
+user's own voice grounded ONLY in real retrieved reply pairs from that 1:1 chat,
+declining structurally (no draft) below the context-pairs floor.
+`check_style_match` (RES-63) scores a user-written draft against a stored
+voiceprint DETERMINISTICALLY (feature-distance + rule-based top-3 divergences —
+no model judges it). The Wrapped **Your Voiceprint** card (RES-64) renders the
+reader's own ("me", "\*", "all") card, plus a consent-gated "guess who texts
+like this" game that is default-redacted: with an empty
+`WRAPPED_VOICEPRINT_CONSENT_IDS` no third-party card appears, and consent only
+adds a contact — it never overrides a roster exclusion.
+
 ## Linting
 
 `ruff check .` (config in `pyproject.toml`: `line-length = 100`,

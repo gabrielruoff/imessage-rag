@@ -51,6 +51,7 @@ _FEATURE_TOOLS = (
     "find_conflicts",
     "get_conflict",
     "diagnose_conflict",
+    "draft_apology",
     # --- feature: wellbeing ---
     "get_language_trajectory",
     # --- feature: nudges ---
