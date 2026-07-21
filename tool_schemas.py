@@ -1009,3 +1009,68 @@ TOOL_DEFINITIONS.append({
     },
 })
 # --- end feature: conflict (C4 apology) ---
+
+
+# --- feature: persona (V5 simulate) ---
+# simulate_contact is registered ONLY when PERSONA_SIM_ENABLED (RES-69), mirroring
+# the DRIFT_ENABLED / CONFLICT_TRACE_ENABLED gates above. This registration gate
+# is the REAL security boundary: withholding the schema is the repo's one reliable
+# way to stop the model calling a tool, so a disabled deployment (the default)
+# never needs prompt-level "don't simulate" text -- the tool simply does not exist
+# to the model. The per-call `acknowledged` param is a UX flow device, NOT the
+# boundary. The function is always importable from query_tools; only its schema
+# (and the SYSTEM_PROMPT block in chat.py) is conditional.
+import config as _config  # noqa: E402 (local to the additive persona V5 block)
+
+_PERSONA_SIM_TOOL_DEFINITIONS = [
+    {
+        "name": "simulate_contact",
+        "description": "ESTIMATE how a contact might reply in their voice, or talk "
+                        "to your PAST SELF as of a date. Returns a STATISTICAL "
+                        "ESTIMATE, never real words: the `simulation` text is "
+                        "code-labeled an estimate on EVERY line -- relay it "
+                        "verbatim with those labels, never strip them or present "
+                        "it as the person's actual message. subject='them' "
+                        "(default) simulates the named person (contact_id/handle_id"
+                        "/name); it FIRST returns acknowledgment_required (relay "
+                        "any deceased_warning, confirm the user understands it is "
+                        "an estimate, THEN call again with acknowledged=true), and "
+                        "a deny-listed contact is hard-refused (refused=true). It "
+                        "also carries a reaction base-rate tapback prediction. "
+                        "subject='me' + as_of_date talks to your past self (name a "
+                        "person to scope to your past voice with them). On a "
+                        "low-confidence/note/refusal decline, relay it as-is and "
+                        "generate no substitute. 1:1 only; nothing is sent or saved.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "message": {"type": "string",
+                            "description": "the message the simulated persona "
+                                           "should respond to"},
+                "contact_id": {"type": "integer",
+                               "description": "the person (from search_contacts_by_name)"},
+                "handle_id": {"type": "integer"},
+                "name": {"type": "string",
+                         "description": "person name to resolve (contact_id is exact)"},
+                "subject": {"type": "string", "enum": ["them", "me"],
+                            "default": "them",
+                            "description": "'them' (a contact, default) or 'me' "
+                                           "(your past self -- needs as_of_date)"},
+                "as_of_date": {"type": "string",
+                               "description": "for subject='me': the date to "
+                                              "simulate your past self as of "
+                                              "(ISO date)"},
+                "acknowledged": {"type": "boolean", "default": False,
+                                 "description": "living-contact UX flow: pass true "
+                                                "ONLY after confirming with the "
+                                                "user; a UX gate, NOT the security "
+                                                "boundary"},
+            },
+            "required": ["message"],
+        },
+    },
+]
+
+if _config.PERSONA_SIM_ENABLED:
+    TOOL_DEFINITIONS.extend(_PERSONA_SIM_TOOL_DEFINITIONS)
+# --- end feature: persona (V5 simulate) ---

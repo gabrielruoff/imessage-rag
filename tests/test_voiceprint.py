@@ -8,6 +8,7 @@ map) are hand-computed and pinned.
 """
 
 import contextlib
+import importlib
 import io
 import os
 import sqlite3
@@ -16,6 +17,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+import chat
 import config
 import lexicon_build
 import ollama
@@ -23,6 +25,7 @@ import query_tools
 import reset_db
 import schema
 import sessions
+import tool_schemas
 import voiceprint
 from query_tools import persona
 
@@ -801,6 +804,282 @@ class CheckStyleMatchTest(_DBCase):
         res = query_tools.check_style_match("hi there", contact_id=99999)
         self.assertFalse(res.get("found", True))
         self.assertIn("note", res)
+
+
+# --- V5 (RES-69): simulate_contact + past-self ------------------------------
+
+
+class SimulateContactTest(_DBCase):
+    """V5 simulate_contact for a named contact: the code-applied per-line estimate
+    label, the block-list hard-refuse, the acknowledged UX gate + soft dormant
+    warning, the structural decline below the floor, and the reaction base-rate
+    tapback prediction. Ollama is always mocked -- no network.
+
+    Fixture: chat 100 (me + Mom, contact 12). chunk 1 holds 4 (my message -> her
+    reply) adjacency pairs, all matchable by FTS on the incoming's 'dinner'. Mom
+    sent tapbacks on my messages (3 love, 1 laugh) over her 4 real messages."""
+
+    def populate(self, con):
+        con.execute("INSERT INTO contacts(id, source_uniqueid, first_name) "
+                    "VALUES (12, 'u12', 'Mom')")
+        con.execute("INSERT INTO handles(id, handle_identifier, contact_id, service) "
+                    "VALUES (70, '+1700', 12, 'iMessage')")
+        con.execute("INSERT INTO chats(id, chat_identifier, display_name, is_group, "
+                    "service) VALUES (100, 'c100', NULL, 0, 'iMessage')")
+        con.execute("INSERT INTO chat_participants VALUES (100, 70)")
+
+        def msg(mid, chunk, from_me, text, date):
+            con.execute(
+                "INSERT INTO messages(id, guid, chat_id, handle_id, is_from_me, "
+                "text, date, has_attachment, is_emote, item_type, chunk_id) "
+                "VALUES (?, ?, 100, ?, ?, ?, ?, 0, 0, 0, ?)",
+                (mid, f"g{mid}", 0 if from_me else 70, from_me, text, date, chunk))
+
+        # chunk 1: 4 (me -> Mom) adjacency pairs, matchable by FTS 'dinner'.
+        c1 = [
+            (1, 1, "are we still on for dinner"),
+            (2, 0, "yes dinner sounds great"),
+            (3, 1, "what time dinner"),
+            (4, 0, "seven works for dinner"),
+            (5, 1, "where should we dinner"),
+            (6, 0, "the usual dinner spot"),
+            (7, 1, "cool see you at dinner"),
+            (8, 0, "cant wait for dinner"),
+        ]
+        for mid, from_me, text in c1:
+            msg(mid, 1, from_me, text, f"2026-03-01T10:00:{mid:02d}")
+        con.execute(
+            "INSERT INTO chunks(id, chat_id, first_message_id, last_message_id, "
+            "first_date, last_date, n_messages, text) VALUES "
+            "(1, 100, 1, 8, '2026-03-01', '2026-03-01', 8, 'x')")
+        # Mom's tapbacks on my messages: 3 love (2000), 1 laugh (2003).
+        con.executemany(
+            "INSERT INTO reactions(id, target_message_guid, chat_id, handle_id, "
+            "is_from_me, associated_message_type, date) "
+            "VALUES (?, ?, 100, 70, 0, ?, '2026-03-01T10:05:00')",
+            [(901, "g1", 2000), (902, "g3", 2000), (903, "g5", 2000),
+             (904, "g7", 2003)])
+
+    def test_every_simulation_line_carries_the_estimate_label(self):
+        # Multi-line generation: EVERY non-empty returned line must be labeled in
+        # code (post-generation), so the outer model can only relay a pre-labeled
+        # artifact -- there is no unlabeled version to strip.
+        with mock.patch.object(
+                ollama, "chat_once",
+                return_value={"content": "sure sounds good\nsee you at seven\n"}):
+            res = query_tools.simulate_contact(
+                "want to grab dinner tonight", contact_id=12, acknowledged=True)
+        self.assertTrue(res["generated"])
+        self.assertEqual(res["confidence"], "high")
+        sim_lines = [ln for ln in res["simulation"].split("\n") if ln.strip()]
+        self.assertTrue(sim_lines)
+        for ln in sim_lines:
+            self.assertIn("ESTIMATE", ln)
+        self.assertIn("disclaimer", res)
+
+    def test_empty_generation_declines_instead_of_blank_estimate(self):
+        # An empty model reply must degrade to a low-confidence decline, never a
+        # generated:true / confidence:high payload carrying a blank simulation.
+        with mock.patch.object(ollama, "chat_once", return_value={"content": "   "}):
+            res = query_tools.simulate_contact(
+                "want to grab dinner tonight", contact_id=12, acknowledged=True)
+        self.assertFalse(res["generated"])
+        self.assertEqual(res["confidence"], "low")
+        self.assertIsNone(res["simulation"])
+        self.assertTrue(res["notes"])
+
+    def test_blocked_contact_hard_refuses_without_generating(self):
+        saved = config.PERSONA_SIM_BLOCK_IDS
+        config.PERSONA_SIM_BLOCK_IDS = "12"
+        self.addCleanup(setattr, config, "PERSONA_SIM_BLOCK_IDS", saved)
+        with mock.patch.object(ollama, "chat_once") as chat_once:
+            res = query_tools.simulate_contact(
+                "hey", contact_id=12, acknowledged=True)
+        chat_once.assert_not_called()  # never generates for a blocked contact
+        self.assertTrue(res["refused"])
+        self.assertEqual(res["reason"], "blocked_contact")
+        self.assertFalse(res["generated"])
+        self.assertIn("turned off", res["message"])
+
+    def test_living_contact_requires_acknowledged(self):
+        with mock.patch.object(ollama, "chat_once") as chat_once:
+            res = query_tools.simulate_contact("want dinner", contact_id=12)
+        chat_once.assert_not_called()  # no generation before acknowledgment
+        self.assertTrue(res["acknowledgment_required"])
+        self.assertFalse(res["generated"])
+        # A fresh (non-dormant) dyad surfaces no deceased warning.
+        self.assertNotIn("deceased_warning", res)
+
+    def test_below_floor_declines_structurally(self):
+        saved = config.VOICEPRINT_MIN_CONTEXT_PAIRS
+        config.VOICEPRINT_MIN_CONTEXT_PAIRS = 5  # 4 dinner pairs available
+        self.addCleanup(setattr, config, "VOICEPRINT_MIN_CONTEXT_PAIRS", saved)
+        with mock.patch.object(ollama, "chat_once") as chat_once:
+            res = query_tools.simulate_contact(
+                "want to grab dinner tonight", contact_id=12, acknowledged=True)
+        chat_once.assert_not_called()  # STRUCTURAL: no generation attempt
+        self.assertEqual(res["confidence"], "low")
+        self.assertIsNone(res["simulation"])
+        self.assertEqual(res["n_context_pairs"], 4)
+        self.assertTrue(res["exemplars"])
+
+    def test_reaction_base_rate_tapback_prediction(self):
+        with mock.patch.object(ollama, "chat_once",
+                               return_value={"content": "ok"}):
+            res = query_tools.simulate_contact(
+                "want dinner", contact_id=12, acknowledged=True)
+        tb = res["likely_tapback"]
+        # Full-message denominator = Mom's 4 real messages (NOT the reacted ones).
+        self.assertEqual(tb["denominator_messages"], 4)
+        self.assertEqual(tb["most_likely"], "love")
+        self.assertAlmostEqual(tb["base_rates"]["love"], 0.75, places=4)
+        self.assertAlmostEqual(tb["base_rates"]["laugh"], 0.25, places=4)
+
+    def test_soft_deceased_warning_in_acknowledgment_payload(self):
+        # Mom goes quiet after 2026-03-01 and I keep texting into silence.
+        con = self._con()
+        con.executemany(
+            "INSERT INTO messages(id, guid, chat_id, handle_id, is_from_me, text, "
+            "date, has_attachment, is_emote, item_type) VALUES "
+            "(?, ?, 100, 0, 1, ?, ?, 0, 0, 0)",
+            [(50, "g50", "you there?", "2026-06-01T10:00:00"),
+             (51, "g51", "miss you", "2026-06-15T10:00:00"),
+             (52, "g52", "thinking of you", "2026-07-01T10:00:00")])
+        con.commit()
+        for var, val in (("PERSONA_SIM_DORMANT_DAYS", 30),
+                         ("PERSONA_SIM_ONESIDED_MIN_MSGS", 3)):
+            saved = getattr(config, var)
+            setattr(config, var, val)
+            self.addCleanup(setattr, config, var, saved)
+        with mock.patch.object(ollama, "chat_once") as chat_once:
+            res = query_tools.simulate_contact("hey", contact_id=12)
+        chat_once.assert_not_called()
+        self.assertTrue(res["acknowledgment_required"])
+        warn = res["deceased_warning"]
+        self.assertEqual(warn["your_messages_since_with_no_reply"], 3)
+        self.assertGreaterEqual(warn["days_since_their_last_message"], 30)
+
+    def test_requires_message_and_person(self):
+        with mock.patch.object(ollama, "chat_once") as chat_once:
+            self.assertIn("error", query_tools.simulate_contact("  ", contact_id=12))
+            self.assertIn("error", query_tools.simulate_contact(
+                "hi", acknowledged=True))  # no person
+        chat_once.assert_not_called()
+
+
+class SimulatePastSelfTest(_DBCase):
+    """V5 past-self: subject='me' + as_of_date via a bounded date-scoped raw
+    rescan, gated at VOICEPRINT_MIN_RANGE_MESSAGES per range and capped at
+    VOICEPRINT_SCAN_MAX_MESSAGES. Ollama mocked."""
+
+    def populate(self, con):
+        con.execute("INSERT INTO handles(id, handle_identifier, contact_id, service) "
+                    "VALUES (90, '+1900', NULL, 'iMessage')")
+        con.execute("INSERT INTO chats(id, chat_identifier, display_name, is_group, "
+                    "service) VALUES (300, 'c300', NULL, 0, 'iMessage')")
+        con.execute("INSERT INTO chat_participants VALUES (300, 90)")
+        import datetime
+        base = datetime.datetime(2026, 1, 1, 9, 0, 0)
+        rows = []
+        mid = 1
+        # them, me, them, me per month across 3 months -> (them -> me) pairs.
+        for d in range(3):
+            day = base + datetime.timedelta(days=d * 20)
+            for i in range(4):
+                t = day + datetime.timedelta(seconds=i * 30)
+                from_me = 1 if i % 2 == 1 else 0
+                rows.append(_msg(mid, 300, 0 if from_me else 90, from_me,
+                                 "how are you doing today" if from_me
+                                 else "not too bad you", t.isoformat()))
+                mid += 1
+        con.executemany(
+            "INSERT INTO messages(id, guid, chat_id, handle_id, is_from_me, text, "
+            "date, has_attachment) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
+
+    def _low_floors(self):
+        for var, val in (("VOICEPRINT_MIN_RANGE_MESSAGES", 4),
+                         ("VOICEPRINT_MIN_CONTEXT_PAIRS", 2)):
+            saved = getattr(config, var)
+            setattr(config, var, val)
+            self.addCleanup(setattr, config, var, saved)
+
+    def test_past_self_generates_labeled_estimate(self):
+        self._low_floors()
+        with mock.patch.object(ollama, "chat_once",
+                               return_value={"content": "hanging in there"}) as chat_once:
+            res = query_tools.simulate_contact(
+                "how are you?", subject="me", as_of_date="2026-06-01")
+        chat_once.assert_called_once()
+        self.assertTrue(res["generated"])
+        self.assertEqual(res["subject"], "me")
+        for ln in [x for x in res["simulation"].split("\n") if x.strip()]:
+            self.assertIn("ESTIMATE", ln)
+
+    def test_past_self_needs_as_of_date(self):
+        with mock.patch.object(ollama, "chat_once") as chat_once:
+            res = query_tools.simulate_contact("hi", subject="me")
+        chat_once.assert_not_called()
+        self.assertIn("error", res)
+
+    def test_past_self_scan_cap_refuses(self):
+        saved = config.VOICEPRINT_SCAN_MAX_MESSAGES
+        config.VOICEPRINT_SCAN_MAX_MESSAGES = 2
+        self.addCleanup(setattr, config, "VOICEPRINT_SCAN_MAX_MESSAGES", saved)
+        with mock.patch.object(ollama, "chat_once") as chat_once:
+            res = query_tools.simulate_contact(
+                "hi", subject="me", as_of_date="2026-06-01")
+        chat_once.assert_not_called()
+        self.assertFalse(res["generated"])
+        self.assertIn("scan cap", res["note"])
+        self.assertGreater(res["messages_in_range"], 2)
+
+    def test_past_self_below_min_range_declines(self):
+        saved = config.VOICEPRINT_MIN_RANGE_MESSAGES
+        config.VOICEPRINT_MIN_RANGE_MESSAGES = 1000
+        self.addCleanup(setattr, config, "VOICEPRINT_MIN_RANGE_MESSAGES", saved)
+        with mock.patch.object(ollama, "chat_once") as chat_once:
+            res = query_tools.simulate_contact(
+                "hi", subject="me", as_of_date="2026-06-01")
+        chat_once.assert_not_called()
+        self.assertFalse(res["generated"])
+        self.assertIn("too little", res["note"])
+
+
+class SimulateRegistrationGateTest(unittest.TestCase):
+    """simulate_contact's schema is registered ONLY when PERSONA_SIM_ENABLED; that
+    registration gate -- not the per-call acknowledged param -- is the security
+    boundary. Reloads tool_schemas + chat with the flag toggled (mirrors
+    test_conflict.TraceRegistrationGateTest)."""
+
+    NAME = "simulate_contact"
+
+    def setUp(self):
+        self._saved = importlib.import_module("config").PERSONA_SIM_ENABLED
+        self.addCleanup(self._reload, self._saved)
+
+    @staticmethod
+    def _reload(enabled):
+        importlib.import_module("config").PERSONA_SIM_ENABLED = enabled
+        importlib.reload(tool_schemas)
+        importlib.reload(chat)
+
+    def test_disabled_is_default_and_registers_nothing(self):
+        self._reload(False)
+        self.assertFalse(importlib.import_module("config").PERSONA_SIM_ENABLED)
+        self.assertTrue(callable(query_tools.simulate_contact))  # still importable
+        names = {t["name"] for t in tool_schemas.TOOL_DEFINITIONS}
+        self.assertNotIn(self.NAME, names)
+        self.assertNotIn(self.NAME, chat.TOOL_FUNCTIONS)
+        self.assertNotIn(self.NAME, chat.SYSTEM_PROMPT)
+
+    def test_enabled_registers_schema_dispatch_and_prompt(self):
+        self._reload(True)
+        names = {t["name"] for t in tool_schemas.TOOL_DEFINITIONS}
+        self.assertIn(self.NAME, names)
+        self.assertIn(self.NAME, chat.TOOL_FUNCTIONS)
+        ollama_names = {t["function"]["name"] for t in chat.OLLAMA_TOOLS}
+        self.assertIn(self.NAME, ollama_names)
+        self.assertIn(self.NAME, chat.SYSTEM_PROMPT)
 
 
 if __name__ == "__main__":

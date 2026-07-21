@@ -127,6 +127,14 @@ from .conflict import trace_conflict_across_chats
 from .conflict import draft_apology
 # --- end feature: conflict (C4 apology) ---
 
+# --- feature: persona (V5 simulate) ---
+# Re-exported UNCONDITIONALLY (the function always exists); PERSONA_SIM_ENABLED
+# gates only whether its SCHEMA is registered (tool_schemas/chat), the repo's one
+# reliable way to keep the model from calling it. Separate appended fence so V5
+# stays a clean additive edit alongside the V1-V3 persona re-exports above.
+from .persona import simulate_contact
+# --- end feature: persona (V5 simulate) ---
+
 __all__ = [
     "DB_PATH",
     "embed_texts",
@@ -188,4 +196,7 @@ __all__ = [
     # --- feature: conflict (C4 apology) ---
     "draft_apology",
     # --- end feature: conflict (C4 apology) ---
+    # --- feature: persona (V5 simulate) ---
+    "simulate_contact",
+    # --- end feature: persona (V5 simulate) ---
 ]

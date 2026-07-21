@@ -223,6 +223,30 @@ SYSTEM_PROMPT += (
     "after your reply."
 )
 # --- end feature: wellbeing ---
+# --- feature: persona (V5 simulate) ---
+# simulate_contact is schema-gated on PERSONA_SIM_ENABLED (see tool_schemas.py's
+# matching gate -- the real off-switch). ONLY when it is registered do we advertise
+# it here and fold in the estimate-relay + acknowledgment rules. When disabled,
+# the tool does not exist to the model, so there is no prompt-level "don't
+# simulate" text. Appended, never reflowing the base prompt, to stay a clean
+# additive edit.
+import config as _persona_sim_config  # noqa: E402 (local to this block)
+
+if _persona_sim_config.PERSONA_SIM_ENABLED:
+    SYSTEM_PROMPT += (
+        "\n- simulate_contact (ESTIMATE how a contact might reply in their voice, "
+        "or talk to your PAST SELF as of a date -- grounded in real style/replies; "
+        "every line is code-labeled an estimate, never their real words)"
+        "\nsimulate_contact returns a STATISTICAL ESTIMATE, never real words. For a "
+        "living contact it first returns acknowledgment_required: relay any "
+        "deceased_warning, confirm the user understands the output is an estimate, "
+        "THEN call again with acknowledged=true. Relay the returned `simulation` "
+        "text VERBATIM with its per-line labels intact -- never strip them or "
+        "present the output as the person's actual message. If it hard-refuses "
+        "(refused=true) or returns a note / low-confidence decline, relay that "
+        "as-is and do not generate a substitute yourself."
+    )
+# --- end feature: persona (V5 simulate) ---
 
 def _build_system_prompt():
     """SYSTEM_PROMPT plus the current UTC date/time, computed fresh each time --
