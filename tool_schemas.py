@@ -726,4 +726,44 @@ TOOL_DEFINITIONS = [
         },
     },
     # --- end feature: conflict ---
+    # --- feature: wellbeing ---
+    {
+        "name": "get_language_trajectory",
+        "description": "Detect a SUSTAINED, cross-family shift in someone's "
+                        "texting language over months -- for questions like 'has "
+                        "my texting changed', 'am I doing okay', 'how has the way "
+                        "I write shifted this year'. Deterministic (no guessing): "
+                        "it pools count-based markers (first-person 'I', "
+                        "absolutist words, negation, laugh + emoji rate, "
+                        "late-night share, who-initiates share) and only fires "
+                        "when a lexical AND the behavioral family depart together "
+                        "for several months. Defaults to YOUR own language "
+                        "(self). A `contact` (a contacts.id) analyzes that "
+                        "person instead, but ONLY if they are on the opt-in "
+                        "allowlist -- a non-consented contact is refused. Returns "
+                        "an envelope: scope, markers_available, dropped_markers, "
+                        "baseline, series, windows, examples, note, and (only "
+                        "when a shift fires) a support_block. Never diagnoses a "
+                        "condition; report the window and framing plainly.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "contact": {"type": "integer",
+                            "description": "a contacts.id to analyze instead of "
+                                           "yourself (allowlisted contacts only; "
+                                           "omit for your own language)"},
+                "date_from": {"type": "string", "description": _DATE_PARAM_DESC},
+                "date_to": {"type": "string", "description": _DATE_PARAM_DESC},
+                "include": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "envelope sections to return: series, windows, "
+                                   "examples, baseline (default all)",
+                },
+                "min_words": {"type": "integer",
+                              "description": "corpus floor; below it no analysis "
+                                             "runs (default MIN_WELLBEING_WORDS)"},
+            },
+        },
+    },
+    # --- end feature: wellbeing ---
 ]

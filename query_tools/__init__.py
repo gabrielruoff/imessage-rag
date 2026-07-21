@@ -93,6 +93,10 @@ from .nudges import (
 )
 # --- end feature: nudges ---
 
+# --- feature: wellbeing ---
+from .analytics_wellbeing import get_language_trajectory
+# --- end feature: wellbeing ---
+
 __all__ = [
     "DB_PATH",
     "embed_texts",
@@ -137,4 +141,7 @@ __all__ = [
     "mute_contact_from_nudges",
     "resolve_loose_thread",
     # --- end feature: nudges ---
+    # --- feature: wellbeing ---
+    "get_language_trajectory",
+    # --- end feature: wellbeing ---
 ]
