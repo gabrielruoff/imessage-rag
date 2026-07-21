@@ -41,7 +41,10 @@ ANALYTICS_TOOLS = (
 # (persona / conflict / nudges / wellbeing). ALL_TOOLS must mirror the schema
 # names exactly -- selfcheck fails on any drift -- so they are reconciled here.
 # Fenced by feature so the PM can dedupe if a sibling worktree adds the same
-# names. (DRIFT_ENABLED-gated tools are intentionally absent from both sides.)
+# names. The flag-gated tools (DRIFT_ENABLED / CONFLICT_TRACE_ENABLED /
+# PERSONA_SIM_ENABLED -- see tool_schemas.GATED_TOOLS) are intentionally absent
+# here; selfcheck subtracts the active ones from the schema before diffing, so it
+# stays flag-config-agnostic without this module importing config.
 _FEATURE_TOOLS = (
     # --- feature: persona ---
     "get_voiceprint",

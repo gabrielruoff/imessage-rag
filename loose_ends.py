@@ -829,6 +829,11 @@ def detect_dropped_plan(con, cfg) -> Iterable[CandidateRow]:
     # zero rows AND zero verification calls (dropped_plan ships no seed).
     if not eval_gate_passed(con, "dropped_plan", "dropped_plan"):
         return
+    # --dry-run is a read-only preview that must call no model (see main's help).
+    # dropped_plan is the ONLY model-backed detector, and its verdict cannot be
+    # produced offline, so a dry run necessarily omits its candidates from scope.
+    if cfg.get("dry_run"):
+        return
     rows = con.execute(
         f"SELECT m.chat_id AS chat_id, m.id AS id, m.date AS date, "
         f"m.text AS text, m.is_from_me AS is_from_me "
@@ -1019,13 +1024,17 @@ def _recent_llm_valence(con, chat_id):
     return row[0] if row else None
 
 
-def run_exclusion_gate(con, cfg, now):
+def run_exclusion_gate(con, cfg, now, dry_run=False):
     """Stage 0, always first. Load stored exclusions, then auto-mute any 1:1
     counterparty whose most-recent llm-annotated exchange is negative
     (<= NUDGE_VALENCE_EXCLUDE) or who has never received an outbound message.
     Persists new auto-mutes to nudge_exclusions (dedup-safe) AND returns the
     in-memory (handles, contacts) sets, so no candidate is ever generated for
-    them. Returns (excluded_handles, excluded_contacts, n_added)."""
+    them. Returns (excluded_handles, excluded_contacts, n_added).
+
+    Under dry_run the auto-mutes are NOT written or committed (--dry-run is a
+    read-only preview), but the in-memory sets and n_added still reflect what
+    WOULD be muted -- the returned sets drive suppression for this same run."""
     excluded_handles, excluded_contacts = _load_exclusions(con)
     n_added = 0
     for chat_id, handle_id, contact_id in _direct_chat_counterparties(con):
@@ -1041,13 +1050,14 @@ def run_exclusion_gate(con, cfg, now):
         if reason is None:
             continue
         if _add_exclusion(con, handle_id=handle_id, contact_id=contact_id,
-                          reason=reason, now=now):
+                          reason=reason, now=now, persist=not dry_run):
             n_added += 1
         if handle_id is not None:
             excluded_handles.add(handle_id)
         if contact_id is not None:
             excluded_contacts.add(contact_id)
-    con.commit()
+    if not dry_run:
+        con.commit()
     return excluded_handles, excluded_contacts, n_added
 
 
@@ -1141,7 +1151,9 @@ def detect_all(con, cfg, event_now, dry_run=False):
     """The shared driver loop: Stage 0 gate, then every detector, with the
     exclusion gate and urgency scoring applied OUTSIDE the detectors. Returns a
     summary dict (and the written thread ids)."""
-    excluded_handles, excluded_contacts, n_auto = run_exclusion_gate(con, cfg, event_now)
+    cfg["dry_run"] = dry_run  # rides cfg so detectors (uniform detect_fn(con, cfg)) can read it
+    excluded_handles, excluded_contacts, n_auto = run_exclusion_gate(
+        con, cfg, event_now, dry_run=dry_run)
     n_candidates = n_written = n_suppressed = 0
     thread_ids = []
     for _kind, detect_fn in DETECTORS:
@@ -1275,7 +1287,8 @@ def main(argv=None):
                         help="skip the nudge_text narration (SQL detection only)")
     parser.add_argument("--dry-run", action="store_true",
                         help="detect and print the scope without writing rows or "
-                             "calling the model")
+                             "calling the model (the LLM-backed dropped_plan "
+                             "detector is skipped under --dry-run)")
     # --- detector: dormant_tie ---
     parser.add_argument("--acknowledge-reconnect", action="store_true",
                         help="opt in (once, durably) to dormant-tie reconnect "

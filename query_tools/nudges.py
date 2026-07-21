@@ -67,17 +67,22 @@ def _exclusion_exists(con, handle_id, contact_id, reason):
     ).fetchone() is not None
 
 
-def _add_exclusion(con, handle_id=None, contact_id=None, reason="muted", now=None):
+def _add_exclusion(con, handle_id=None, contact_id=None, reason="muted", now=None,
+                   persist=True):
     """Insert one nudge_exclusions row unless an identical (handle_id,
-    contact_id, reason) already exists. Returns True if a row was added. Does
-    NOT commit -- the caller owns the transaction."""
+    contact_id, reason) already exists. Returns True if a row was (or, with
+    persist=False, would have been) added. With persist=False the existence
+    check still runs but the INSERT is skipped -- so a --dry-run caller gets the
+    same would-add count without mutating the table. Does NOT commit -- the
+    caller owns the transaction."""
     if _exclusion_exists(con, handle_id, contact_id, reason):
         return False
-    con.execute(
-        "INSERT INTO nudge_exclusions(handle_id, contact_id, reason, created_at) "
-        "VALUES (?, ?, ?, ?)",
-        (handle_id, contact_id, reason, now or _utcnow_iso()),
-    )
+    if persist:
+        con.execute(
+            "INSERT INTO nudge_exclusions(handle_id, contact_id, reason, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (handle_id, contact_id, reason, now or _utcnow_iso()),
+        )
     return True
 
 

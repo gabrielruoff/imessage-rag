@@ -239,6 +239,15 @@ class ExclusionGateTest(_FixtureTest):
     def test_dry_run_writes_nothing(self):
         loose_ends.main(["--no-llm", "--dry-run"])
         self.assertEqual(self._threads(), [])
+        # --dry-run must not persist the Stage-0 auto-mutes either: only Dan's
+        # pre-existing 'muted' row survives. A non-dry run would additionally add
+        # auto:negative_valence (Bob) and auto:zero_outbound (Carol), and those
+        # rows are preserved across reset_db -- so a "preview" writing them would
+        # permanently mute contacts.
+        rows = sqlite3.connect(self.db_path).execute(
+            "SELECT contact_id, handle_id, reason FROM nudge_exclusions "
+            "ORDER BY contact_id").fetchall()
+        self.assertEqual(rows, [(4, 40, "muted")])
 
     def test_rerun_is_idempotent_and_respects_dismissal(self):
         loose_ends.main(["--no-llm"])
@@ -1040,6 +1049,19 @@ class DroppedPlanDriverTest(_DroppedPlanFixtureTest):
         self.assertEqual([r["chat_id"] for r in rows], [100])
         ev = json.loads(rows[0]["evidence_json"])
         self.assertEqual(ev["verdict"], "unfulfilled")
+
+    def test_dry_run_skips_the_verifier_model(self):
+        # Even fully enabled + gated (where a normal run WOULD call the LLM and
+        # write a row), --dry-run must call no model: dropped_plan is the only
+        # model-backed detector, and the help text promises "without ... calling
+        # the model". No dropped_plan rows are produced under dry-run.
+        self._pass_gate()
+        con = self._open()
+        cfg = self._cfg(con, enabled=True)
+        with mock.patch.object(loose_ends.ollama, "chat_once_json") as m:
+            loose_ends.detect_all(con, cfg, "2026-07-01T00:00:00+00:00", dry_run=True)
+        m.assert_not_called()
+        self.assertEqual(self._dropped_rows(), [])
 
 
 class DroppedPlanConfigTest(unittest.TestCase):

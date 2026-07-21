@@ -259,11 +259,14 @@ def _fw_rates(con, member_key_str, chat_ids, month_from=None, month_to=None):
             for i, col in enumerate(_FW_COLUMNS)}
 
 
-def _phrase_counts(con, member_key_str, chat_ids, msg_col, role, first):
+def _phrase_counts(con, member_key_str, chat_ids, msg_col, role, first,
+                   date_from=None, date_to=None):
     """Top lowercased first/last-3-token phrases of the member's session-
     opening (role='initiator', msg_col='first_message_id') or -closing
     (role='ender', 'last_message_id') messages. Kept: top _SIGNATURE_TOP with
-    count >= _SIGNATURE_MIN_COUNT. Empty when the sessions table is unbuilt."""
+    count >= _SIGNATURE_MIN_COUNT. Empty when the sessions table is unbuilt.
+    date_from/date_to bound the boundary message's date (half-open, mirroring
+    _scan_chats) so a windowed voiceprint does not leak whole-corpus phrases."""
     if member_key_str == "me":
         member_clause = f"s.{role}_is_me = 1"
         member_params = []
@@ -279,6 +282,12 @@ def _phrase_counts(con, member_key_str, chat_ids, msg_col, role, first):
     if chat_ids is not None:
         clauses.append(f"s.chat_id IN ({','.join('?' * len(chat_ids))})")
         params += list(chat_ids)
+    if date_from is not None:
+        clauses.append("mo.date >= ?")
+        params.append(date_from)
+    if date_to is not None:
+        clauses.append("mo.date < ?")
+        params.append(date_to)
     counts = collections.Counter()
     for (text,) in con.execute(
         f"SELECT mo.text FROM sessions s "
@@ -296,17 +305,29 @@ def _phrase_counts(con, member_key_str, chat_ids, msg_col, role, first):
             if n >= _SIGNATURE_MIN_COUNT]
 
 
-def _tone(con, chat_ids):
+def _tone(con, chat_ids, date_from=None, date_to=None):
     """LOW-TRUST persona tone over the scope's chunk_annotations, source='llm'
     ONLY -- distilled rows carry the seed model's bias and empty events, so
     they never contribute. Returns (mean_valence|None, [emotions]|None); both
     None when the scope has zero llm annotations, so the caller omits tone
-    entirely rather than reporting a spurious neutral."""
+    entirely rather than reporting a spurious neutral.
+
+    date_from/date_to window on the chunk's START (c.first_date, half-open) so a
+    windowed voiceprint does not leak whole-corpus tone. Filtering on first_date
+    (vs. an overlap test) keeps windows a clean partition -- a boundary-straddling
+    chunk lands in exactly one window; its post-boundary tail is negligible for
+    this already-low-trust, chunk-granular signal."""
     clauses = ["ca.source = 'llm'"]
     params = []
     if chat_ids is not None:
         clauses.append(f"c.chat_id IN ({','.join('?' * len(chat_ids))})")
         params += list(chat_ids)
+    if date_from is not None:
+        clauses.append("c.first_date >= ?")
+        params.append(date_from)
+    if date_to is not None:
+        clauses.append("c.first_date < ?")
+        params.append(date_to)
     rows = con.execute(
         f"SELECT ca.valence, ca.emotions_json FROM chunk_annotations ca "
         f"JOIN chunks c ON c.id = ca.chunk_id "
@@ -349,10 +370,13 @@ def compute_voiceprint(con, member_key_str, chat_ids, *, date_from=None,
     month_from = date_from[:7] if date_from else None
     month_to = date_to[:7] if date_to else None
     openers = _phrase_counts(con, member_key_str, chat_ids,
-                             "first_message_id", "initiator", first=True)
+                             "first_message_id", "initiator", first=True,
+                             date_from=date_from, date_to=date_to)
     closers = _phrase_counts(con, member_key_str, chat_ids,
-                             "last_message_id", "ender", first=False)
-    tone_valence, tone_emotions = _tone(con, chat_ids)
+                             "last_message_id", "ender", first=False,
+                             date_from=date_from, date_to=date_to)
+    tone_valence, tone_emotions = _tone(con, chat_ids, date_from=date_from,
+                                        date_to=date_to)
     return {
         "avg_msg_len": (acc["sum_len"] / n_text) if n_text else 0.0,
         "lowercase_ratio": (acc["sum_lower"] / acc["n_lower"]) if acc["n_lower"] else 0.0,

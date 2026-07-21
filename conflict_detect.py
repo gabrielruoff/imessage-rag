@@ -471,9 +471,13 @@ def _consecutive_runs(hot_flags):
     return runs
 
 
-def detect_chat(con, chat_id, corpus_end, classify_fn, model):
+def detect_chat(con, chat_id, corpus_end, classify_fn, model, label=True,
+                max_label_turns=CONFLICT_MAX_LABEL_TURNS):
     """Detect + write every conflict in one 1:1 chat (delete-then-rewrite, so
-    re-runs are idempotent). Returns the number of conflicts written."""
+    re-runs are idempotent). Returns the number of conflicts written. With
+    label=False the deterministic windows are still written but the per-turn
+    escalation labeling (the only LLM work) is skipped -- no conflict_signals,
+    no topic. max_label_turns caps the LLM-labeled turns per window."""
     sessions = _load_sessions(con, chat_id)
     messages = _load_messages(con, chat_id)
     # Idempotent rewrite: drop this chat's prior conflicts (+ their signals).
@@ -546,43 +550,51 @@ def detect_chat(con, chat_id, corpus_end, classify_fn, model):
         )
         conflict_id = cur.lastrowid
 
-        seg = [m for m in messages
-               if first_dt <= _dt(m["date"]) <= last_dt and m["text"]]
-        turns = [(m["id"], m["is_from_me"], m["text"]) for m in seg][:CONFLICT_MAX_LABEL_TURNS]
-        _n_labels, survivors = _label_turns(con, conflict_id, turns, classify_fn,
-                                            four_way_cleared)
-        if survivors:
-            topic = statistics.mode(survivors)
-            con.execute("UPDATE conflicts SET topic = ? WHERE id = ?",
-                        (topic, conflict_id))
+        if label:
+            seg = [m for m in messages
+                   if first_dt <= _dt(m["date"]) <= last_dt and m["text"]]
+            turns = [(m["id"], m["is_from_me"], m["text"]) for m in seg][:max_label_turns]
+            _n_labels, survivors = _label_turns(con, conflict_id, turns, classify_fn,
+                                                four_way_cleared)
+            if survivors:
+                topic = statistics.mode(survivors)
+                con.execute("UPDATE conflicts SET topic = ? WHERE id = ?",
+                            (topic, conflict_id))
         n_written += 1
     return n_written
 
 
-def detect_conflicts(con, model, classify_fn=None, limit=None, dry_run=False):
+def detect_conflicts(con, model, classify_fn=None, limit=None, dry_run=False,
+                     label=True, max_label_turns=CONFLICT_MAX_LABEL_TURNS):
     """Sweep every 1:1 chat (via _restrict_to_direct_chats -- F3). classify_fn
-    is the injectable label path (default: the real LLM); tests pass a stub."""
+    is the injectable label path (default: the real LLM); tests pass a stub.
+    label=False is the deterministic-only fast path: windows are written but the
+    per-turn LLM labeling is skipped (zero Ollama calls), so the model guard and
+    classifier are never touched."""
     all_ids = [r[0] for r in con.execute("SELECT id FROM chats ORDER BY id").fetchall()]
     direct = _restrict_to_direct_chats(con, all_ids)
     if limit is not None:
         direct = direct[:limit]
-    print(f"{len(direct)} direct (1:1) chats to scan for conflicts (model {model})")
+    scope = f"(model {model})" if label else "(deterministic only -- no labeling)"
+    print(f"{len(direct)} direct (1:1) chats to scan for conflicts {scope}")
     if dry_run:
         print(f"--dry-run: first chat ids: "
               f"{', '.join(str(c) for c in direct[:10]) or '(none)'}")
         return 0
     if not direct:
         return 0
-    _check_model_guard(con, model)
-    if classify_fn is None:
-        classify_fn = lambda text: _classify_turn(text, model, CONFLICT_THINK)  # noqa: E731
+    if label:
+        _check_model_guard(con, model)
+        if classify_fn is None:
+            classify_fn = lambda text: _classify_turn(text, model, CONFLICT_THINK)  # noqa: E731
 
     corpus_end = _corpus_end(con)
     total = 0
     try:
         with progress.track("Detecting conflicts", total=len(direct), header=False) as p:
             for chat_id in direct:
-                total += detect_chat(con, chat_id, corpus_end, classify_fn, model)
+                total += detect_chat(con, chat_id, corpus_end, classify_fn, model,
+                                     label=label, max_label_turns=max_label_turns)
                 con.commit()
                 p.advance()
     except KeyboardInterrupt:
@@ -591,6 +603,82 @@ def detect_conflicts(con, model, classify_fn=None, limit=None, dry_run=False):
         return total
     print(f"Detected {total} conflicts across {len(direct)} chats")
     return total
+
+
+# ---------------------------------------------------------------------------
+# Budgeted labeling: label only the N strongest already-detected windows
+# ---------------------------------------------------------------------------
+
+# corroboration -> rank, so an llm-corroborated window outranks a bare one at
+# equal signal count (mirrors the corroboration ladder in _corroboration).
+_CORROB_RANK = {"llm": 2, "weak": 1, "none": 0}
+
+
+def _conflict_strength(peak_signal_json, corroboration):
+    """Rank key for a detected window (higher = label first): signal count, then
+    valence corroboration, then dislike volume, then peak reply gap. Reads the
+    deterministic evidence the finder already stored in peak_signal_json."""
+    try:
+        ps = json.loads(peak_signal_json or "{}")
+    except (ValueError, TypeError):
+        ps = {}
+    return (
+        ps.get("signal_count", 0),
+        _CORROB_RANK.get(corroboration, 0),
+        ps.get("dislike_count", 0),
+        ps.get("peak_gap_hours") or 0.0,
+    )
+
+
+def label_top_conflicts(con, model, n, max_label_turns, classify_fn=None):
+    """Second pass over already-detected windows: label ONLY the N strongest
+    (by _conflict_strength), leaving weaker windows detected-but-unlabeled. This
+    is the budgeted middle tier -- LLM calls are bounded by N * max_label_turns.
+    Assumes a prior deterministic detection pass cleared stale signals (the
+    per-chat delete-then-rewrite in detect_chat), so re-runs stay idempotent.
+    Resumable within a run (commits per window, Ctrl-C safe)."""
+    _check_model_guard(con, model)
+    if classify_fn is None:
+        classify_fn = lambda text: _classify_turn(text, model, CONFLICT_THINK)  # noqa: E731
+    four_way_cleared = all(eval_gate_passed(con, GATE_TASK, h) for h in HORSEMEN)
+    rows = con.execute(
+        "SELECT id, chat_id, first_date, last_date, peak_signal_json, corroboration "
+        "FROM conflicts"
+    ).fetchall()
+    ranked = sorted(
+        rows,
+        key=lambda r: _conflict_strength(r["peak_signal_json"], r["corroboration"]),
+        reverse=True,
+    )[:max(0, n)]
+    if not ranked:
+        print("No conflicts to label.")
+        return 0
+    msg_cache = {}
+    labeled = 0
+    try:
+        with progress.track("Labeling top conflicts", total=len(ranked), header=False) as p:
+            for r in ranked:
+                cid = r["chat_id"]
+                if cid not in msg_cache:
+                    msg_cache[cid] = _load_messages(con, cid)
+                first_dt, last_dt = _dt(r["first_date"]), _dt(r["last_date"])
+                seg = [m for m in msg_cache[cid]
+                       if first_dt <= _dt(m["date"]) <= last_dt and m["text"]]
+                turns = [(m["id"], m["is_from_me"], m["text"]) for m in seg][:max_label_turns]
+                _n, survivors = _label_turns(con, r["id"], turns, classify_fn, four_way_cleared)
+                if survivors:
+                    con.execute("UPDATE conflicts SET topic = ? WHERE id = ?",
+                                (statistics.mode(survivors), r["id"]))
+                labeled += 1
+                con.commit()
+                p.advance()
+    except KeyboardInterrupt:
+        con.commit()
+        print(f"\nInterrupted -- labeled {labeled} of top {len(ranked)}; rerun to resume.")
+        return labeled
+    print(f"Labeled top {labeled} of {len(rows)} conflict windows "
+          f"(<= {len(ranked) * max_label_turns} LLM calls budgeted)")
+    return labeled
 
 
 # ---------------------------------------------------------------------------
@@ -607,6 +695,21 @@ def main(argv=None):
                         help="scan at most N direct chats this run")
     parser.add_argument("--dry-run", action="store_true",
                         help="print the scan scope and exit without LLM calls or writes")
+    parser.add_argument("--max-label-turns", type=int, metavar="N", default=None,
+                        help=f"cap LLM-labeled turns per conflict (default "
+                             f"{CONFLICT_MAX_LABEL_TURNS}); lower = fewer LLM calls, "
+                             f"coarser labels")
+    speed = parser.add_mutually_exclusive_group()
+    speed.add_argument("--no-llm", action="store_true",
+                       help="FAST path: write the deterministic conflict windows "
+                            "but skip the per-turn escalation labeling (the only "
+                            "LLM work) -- no conflict_signals, no topic, zero "
+                            "Ollama calls")
+    speed.add_argument("--label-top", type=int, metavar="N", default=None,
+                       help="BUDGETED path: detect all windows, but label only the "
+                            "N strongest (by signal count, corroboration, dislikes, "
+                            "peak gap); weaker windows stay detected-but-unlabeled. "
+                            "Bounds LLM calls to N * max-label-turns.")
     args = parser.parse_args(argv)
 
     model = args.model or CONFLICT_MODEL
@@ -618,7 +721,17 @@ def main(argv=None):
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='conflicts'"
         ).fetchone():
             schema.create_schema(con)
-        detect_conflicts(con, model, limit=args.limit, dry_run=args.dry_run)
+        max_turns = args.max_label_turns or CONFLICT_MAX_LABEL_TURNS
+        if args.label_top is not None:
+            # Two-phase: fast deterministic detection over all chats, then label
+            # only the N strongest windows (the rest stay detected-but-unlabeled).
+            detect_conflicts(con, model, limit=args.limit, dry_run=args.dry_run,
+                             label=False, max_label_turns=max_turns)
+            if not args.dry_run:
+                label_top_conflicts(con, model, args.label_top, max_turns)
+        else:
+            detect_conflicts(con, model, limit=args.limit, dry_run=args.dry_run,
+                             label=not args.no_llm, max_label_turns=max_turns)
     finally:
         con.close()
 

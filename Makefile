@@ -270,25 +270,25 @@ topics:  ## Cluster embedded chunks into topics and label them
 # run these concurrently, and concurrent runs deadlock on the SQLite write
 # lock (each holds it across many LLM calls) while gaining nothing -- Ollama
 # serializes the inference anyway. Recipe lines run in order under any -j.
-pipeline:  ## ingest -> annotate -> nudges -> drift -> voiceprint -> conflict -> topics, in order (stays serial under -j)
+pipeline:  ## ingest -> annotate -> suite -> topics, in order (stays serial under -j)
 	$(MAKE) ingest
 	$(MAKE) annotate
-	$(MAKE) nudges          # --- feature: nudges (runs after annotate) ---
-# feature: drift >>> (additive fence; kept off "# --- " so it isn't parsed as a
-# help section) -- drift runs after annotate (its affective-cooling signal
-# reads chunk_annotations) and, like the others, is a recipe line so it stays
-# serial under -j. DRIFT_ENABLED (default false) decides inside drift.py.
-	$(MAKE) drift
-# feature: drift <<<
-# feature: persona >>> voiceprint runs after annotate (its tone field reads
-# chunk_annotations); zero-LLM, so it stays a serial recipe line like the others.
-	$(MAKE) voiceprint
-# feature: persona <<<
-# feature: conflict >>> conflict detection runs after annotate (its valence
-# corroboration reads chunk_annotations); Ollama only for the label pass.
-	$(MAKE) conflict
-# feature: conflict <<<
+	$(MAKE) suite
 	$(MAKE) topics
+
+# The analytical suite: the four derived-analytics features this repo layers on
+# top of the base ingest/annotate/topics flow. Kept as its own target so it can
+# be rebuilt on its own (`make suite`, after ingest+annotate) without a full
+# re-ingest; `pipeline` calls it between annotate and topics. Each feature is a
+# $(MAKE) recipe line so the group stays serial under -j (same reason as
+# `pipeline` above), and all four run AFTER annotate because each reads
+# chunk_annotations -- the per-feature rationale lives at each target below.
+.PHONY: suite
+suite:  ## Build the analytical suite: nudges -> drift -> voiceprint -> conflict
+	$(MAKE) nudges
+	$(MAKE) drift
+	$(MAKE) voiceprint
+	$(MAKE) conflict
 
 # --- feature: nudges ---
 # Standalone loose-ends detector pass. Runs AFTER annotate in `pipeline` because
@@ -334,6 +334,10 @@ voiceprint:  ## Build deterministic per-person voiceprints (person_voiceprint)
 conflict:  ## Detect conflict windows (deterministic) + eval-gated labels
 	@$(REQUIRE_OLLAMA)
 	.venv/bin/python3 conflict_detect.py
+
+.PHONY: conflict-fast
+conflict-fast:  ## Detect conflict windows only (deterministic, no LLM labeling)
+	.venv/bin/python3 conflict_detect.py --no-llm
 # feature: conflict <<<
 
 # --- Running -----------------------------------------------------------------

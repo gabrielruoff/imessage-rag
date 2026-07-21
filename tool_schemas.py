@@ -1074,3 +1074,19 @@ _PERSONA_SIM_TOOL_DEFINITIONS = [
 if _config.PERSONA_SIM_ENABLED:
     TOOL_DEFINITIONS.extend(_PERSONA_SIM_TOOL_DEFINITIONS)
 # --- end feature: persona (V5 simulate) ---
+
+
+# The flag-gated tools, keyed by the config flag that registers them -- DERIVED
+# from the same definition lists the conditional .extend blocks above consume, so
+# a newly-added gated tool is picked up automatically and can never drift from the
+# schema. evalkit selfcheck reads this to reconcile cases.ALL_TOOLS (which, by
+# design, omits every gated tool) against the ACTIVE tool set for the current
+# flag configuration.
+GATED_TOOLS = {
+    "DRIFT_ENABLED": tuple(
+        d["name"] for d in _DRIFT_TOOL_DEFINITIONS + _DRIFT_D3_TOOL_DEFINITIONS),
+    "CONFLICT_TRACE_ENABLED": tuple(
+        d["name"] for d in _CONFLICT_TRACE_TOOL_DEFINITIONS),
+    "PERSONA_SIM_ENABLED": tuple(
+        d["name"] for d in _PERSONA_SIM_TOOL_DEFINITIONS),
+}

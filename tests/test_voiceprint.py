@@ -414,6 +414,78 @@ class ToneTest(_DBCase):
         self.assertNotIn("anger", card["tone"]["emotions"])
 
 
+class DateScopedSignatureAndToneTest(_DBCase):
+    """openers/closers (_phrase_counts) and tone (_tone) must honor the date
+    window -- they previously leaked the whole corpus into a windowed voiceprint.
+    Fixtures build sessions + chunk_annotations both inside and outside the
+    window (unlike DateScopedTest, which builds neither, so it can't see this)."""
+
+    def populate(self, con):
+        con.execute("INSERT INTO contacts(id, source_uniqueid, first_name) "
+                    "VALUES (12, 'u12', 'Mom')")
+        con.execute("INSERT INTO handles(id, handle_identifier, contact_id, service) "
+                    "VALUES (70, '+1700', 12, 'iMessage')")
+        con.execute("INSERT INTO chats(id, chat_identifier, display_name, is_group, "
+                    "service) VALUES (100, 'c100', NULL, 0, 'iMessage')")
+        con.execute("INSERT INTO chat_participants VALUES (100, 70)")
+        import datetime
+        rows, mid = [], 1
+        # 3 in-window (Jan) + 3 out-of-window (Jun) sessions, days apart (> the
+        # 60-min gap) so each day is its own session. Each session: me opens, Mom
+        # replies, me closes -> me is both initiator and ender. 3 repeats clears
+        # the _SIGNATURE_MIN_COUNT=3 floor for each opener/closer phrase.
+        for month, opener, closer in ((1, "alpha start here", "omega end alpha"),
+                                      (6, "zulu start here", "omega end zulu")):
+            for day in (3, 6, 9):
+                base = datetime.datetime(2026, month, day, 10, 0, 0)
+                rows.append(_msg(mid, 100, 0, 1, opener, base.isoformat()))
+                mid += 1
+                rows.append(_msg(mid, 100, 70, 0, "ok thanks mom",
+                                 (base + datetime.timedelta(seconds=30)).isoformat()))
+                mid += 1
+                rows.append(_msg(mid, 100, 0, 1, closer,
+                                 (base + datetime.timedelta(seconds=60)).isoformat()))
+                mid += 1
+        con.executemany(
+            "INSERT INTO messages(id, guid, chat_id, handle_id, is_from_me, text, "
+            "date, has_attachment) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
+        _quiet(sessions.build_sessions, con)
+        # Chunks + llm annotations: A in-window, B out-of-window, C straddles the
+        # LOWER bound (starts BEFORE, ends INSIDE) -> excluded by the first_date rule.
+        con.executemany(
+            "INSERT INTO chunks(id, chat_id, first_message_id, last_message_id, "
+            "first_date, last_date, n_messages, text) VALUES (?, 100, ?, ?, ?, ?, 2, 'x')",
+            [(1, 1, 3, "2026-01-05", "2026-01-05"),
+             (2, 10, 12, "2026-06-05", "2026-06-05"),
+             (3, 1, 2, "2025-12-20", "2026-01-10")])
+        con.executemany(
+            "INSERT INTO chunk_annotations(chunk_id, valence, emotions_json, depth, "
+            "events_json, source) VALUES (?, ?, ?, 3, '[]', 'llm')",
+            [(1, 0.8, '["joy"]'), (2, -0.9, '["anger"]'), (3, 0.2, '["fear"]')])
+
+    def _vp(self, **kw):
+        return voiceprint.compute_voiceprint(self._con(), "me", [100], **kw)
+
+    def test_openers_closers_windowed_to_in_range_only(self):
+        r = self._vp(date_from="2026-01-01", date_to="2026-02-01")
+        self.assertEqual({o["phrase"] for o in r["openers"]}, {"alpha start here"})
+        self.assertEqual({c["phrase"] for c in r["closers"]}, {"omega end alpha"})
+
+    def test_full_corpus_openers_closers_unchanged(self):
+        r = self._vp()  # no window -> both windows present (byte-for-byte old behavior)
+        self.assertEqual({o["phrase"] for o in r["openers"]},
+                         {"alpha start here", "zulu start here"})
+        self.assertEqual({c["phrase"] for c in r["closers"]},
+                         {"omega end alpha", "omega end zulu"})
+
+    def test_tone_windowed_and_straddle_excluded_by_first_date(self):
+        r = self._vp(date_from="2026-01-01", date_to="2026-02-01")
+        self.assertAlmostEqual(r["tone_valence"], 0.8, places=4)  # only chunk A
+        self.assertEqual(r["tone_emotions"], ["joy"])
+        self.assertNotIn("anger", r["tone_emotions"])  # chunk B out of window
+        self.assertNotIn("fear", r["tone_emotions"])   # chunk C starts before df
+
+
 class DateScopedTest(_DBCase):
     """Date-scoped get_voiceprint recomputes over a capped raw scan."""
 

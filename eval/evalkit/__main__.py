@@ -30,10 +30,21 @@ def cmd_selfcheck(args):
         return 1
     # cases.ALL_TOOLS is a hardcoded copy of the registry (kept import-light
     # for hermetic tests), so guard against drift from tool_schemas.py here.
+    # ALL_TOOLS lists only the UNCONDITIONAL tools; the flag-gated tools appear in
+    # TOOL_DEFINITIONS only when their flag is on, so subtract the ACTIVE gated
+    # tools before diffing -- otherwise selfcheck false-fails whenever DRIFT/
+    # CONFLICT_TRACE/PERSONA_SIM are enabled (e.g. the owner's own .env).
+    import config
     import tool_schemas  # import-light: dict literals only
 
     schema_names = {d["name"] for d in tool_schemas.TOOL_DEFINITIONS}
-    drift = set(cases.ALL_TOOLS) ^ schema_names
+    active_gated = {
+        name
+        for flag, names in tool_schemas.GATED_TOOLS.items()
+        if getattr(config, flag, False)
+        for name in names
+    }
+    drift = set(cases.ALL_TOOLS) ^ (schema_names - active_gated)
     if drift:
         print(
             "selfcheck FAILED: cases.ALL_TOOLS out of sync with "
@@ -43,7 +54,8 @@ def cmd_selfcheck(args):
     print(
         f"selfcheck ok: {len(suites)} suites, {n_cases} cases, "
         f"{len(recipes.RECIPES)} recipes registered, "
-        f"{len(schema_names)} tools in sync with tool_schemas"
+        f"{len(schema_names - active_gated)} unconditional tools in sync "
+        f"with tool_schemas ({len(active_gated)} flag-gated active)"
     )
     return 0
 

@@ -356,7 +356,7 @@ NUDGE_KIND_WEIGHTS = _nudge_kind_weights()
 # malformed input (a bad .env must fail loudly at import, not silently later).
 import json as _json  # noqa: E402  (local to the drift block; keeps the edit additive)
 
-DRIFT_ENABLED = os.getenv("DRIFT_ENABLED", "").strip().lower() in ("1", "true", "yes")
+DRIFT_ENABLED = os.getenv("DRIFT_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
 # A dyad needs at least this many total messages, distinct active months, and
 # (per signal) valid monthly data points to be scored; robust_slope itself
 # needs >= 4 points, so DRIFT_MIN_VALID_MONTHS below 4 makes every trend absent.
