@@ -249,6 +249,16 @@ WRAPPED_SILENT_MIN_MESSAGES = int(os.getenv("WRAPPED_SILENT_MIN_MESSAGES", "200"
 # overrides a roster exclusion (silent-contact guard / --contact / --exclude).
 WRAPPED_VOICEPRINT_CONSENT_IDS = os.getenv("WRAPPED_VOICEPRINT_CONSENT_IDS", "")
 # --- end feature: persona ---
+# --- feature: wellbeing ---
+# Opt-in Wrapped wellbeing trajectory section (RES-68 / W4). OFF by default:
+# the section is built only when this is truthy OR wrapped.py's --wellbeing flag
+# is passed (the flag overrides this config for that run). When a flagged window
+# renders, the section carries the same code-emitted, direction-independent
+# support footer as the chat surface (wellbeing.support_block), and every piece
+# of its narration is run through wellbeing.sanitize_condition_names first.
+WRAPPED_WELLBEING = os.getenv("WRAPPED_WELLBEING", "").strip().lower() in (
+    "1", "true", "yes", "on")
+# --- end feature: wellbeing ---
 
 # --- Conversation chunking ------------------------------------------------------
 # Messages are embedded as conversation chunks, not individually: contiguous
