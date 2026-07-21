@@ -50,7 +50,17 @@ Full design history, schema, rationale, and data forensics:
 - Topic clusters: `make topics`, or `.venv/bin/python3 topics.py [--k K]
   [--relabel] [--model M]` — k-means over chunk_vectors (assignment in
   sqlite-vec), then an LLM label pass
-- Everything, in order: `make pipeline` (ingest → annotate → topics). These
+- Analytical-suite pipelines (Wave 0+1), each a standalone CLI + `make` target,
+  all reading `chunk_annotations` so they run after `annotate`:
+  `make nudges` (`loose_ends.py` — Loose Ends detectors → `loose_threads`;
+  Ollama for the one-line nudge narration only), `make drift` (`drift.py` —
+  relationship-drift scoring → `dyad_drift`; LLM-free and opt-in: `DRIFT_ENABLED`
+  defaults false, so the step is a no-op until you turn it on), `make voiceprint`
+  (`voiceprint.py` — per-person voiceprints → `person_voiceprint`; LLM-free),
+  `make conflict` (`conflict_detect.py` — deterministic conflict finder +
+  eval-gated labels → `conflicts`/`conflict_signals`; Ollama for the label pass).
+- Everything, in order: `make pipeline`
+  (ingest → annotate → nudges → drift → voiceprint → conflict → topics). These
   MUST run sequentially and the target is written to stay serial under `make
   -j`: they hold a SQLite write lock across many LLM calls (concurrent runs
   die with `database is locked`) and contend for one serialized Ollama
@@ -71,6 +81,13 @@ Full design history, schema, rationale, and data forensics:
   need no Ollama; `run` does (sequential, one case at a time — the no-parallel
   rule above applies). Usage + agent-orchestration guide: `eval/README.md`.
   `fast_eval.sh` is the separate, older smoke path — leave it as-is.
+- Eval-gate labeling (F4): `.venv/bin/python3 -m eval.evalkit label <task>`
+  interactively hand-labels sampled items into the gitignored
+  `eval/labels/<task>.jsonl` (owner-only — agents never write there);
+  `... gate <task>` runs the task's production classifier over those labels,
+  scores kappa/precision vs gold, and persists the pass/fail verdict to
+  `ingest_state`. Tasks: `conflict_labels` (kappa), `dropped_plan` (precision),
+  `wellbeing_narration`. See the eval-gate gotcha below for clearance precedence.
 - Test: `.venv/bin/python3 -m unittest discover tests` (hermetic — no Ollama or real `chat.db`).
   NEVER run tests unless your changes touched files in `tests/` or the user
   directly asks — the suite is slow and hangs the terminal. When you do run
@@ -116,7 +133,7 @@ deliberately NOT per-pipeline — query-side and document-side embeddings must
 come from one model or retrieval silently degrades (see the gotcha below), and
 ingest runs no generation model at all.
 
-Module map: `query_tools/` holds the twenty-one retrieval functions the LLM
+Module map: `query_tools/` holds the twenty-seven retrieval functions the LLM
 calls — `messages.py` (message-level SQL/FTS search, context expansion, full
 text, reactions), `chunks.py` (chunk-level semantic search, hybrid
 FTS+semantic fused with reciprocal-rank fusion, more-like-this, chunk → its
@@ -127,12 +144,18 @@ bucketing; response dynamics over messages + the sessions table),
 `analytics_social.py` (reaction stats; milestones), `analytics_language.py`
 (word trends/LSM/distinctive terms from the lexicon tables),
 `analytics_group.py` (group dynamics; imports the lexicon/LSM primitives from
-`analytics_language.py`)
+`analytics_language.py`), `nudges.py` (the Loose Ends read tools —
+`get_loose_threads`/`resolve_loose_thread`/`mute_contact_from_nudges` — over
+`loose_threads`/`nudge_exclusions`), `conflict.py`
+(`find_conflicts`/`get_conflict` over the deterministic conflict finder's
+output tables), `persona.py` (`get_voiceprint`, reading `person_voiceprint`)
 — person scope means *that person's chats* for all analytics tools except
 `get_word_frequency`,
 `_shared.py` (connection, result caps, date-bound and scope resolution,
-`_REAL_MESSAGE_CLAUSES` excluding emote/system rows from every aggregate, and
-`member_key` — the single source of participant-identity merging), all
+`_REAL_MESSAGE_CLAUSES` excluding emote/system rows from every aggregate,
+`_restrict_to_direct_chats` — the shared 1:1-only scope narrowing the dyad
+features (nudges/conflict) reuse — and `member_key`, the single source of
+participant-identity merging), all
 re-exported from `__init__.py` so `import query_tools` is the only import
 callers need (`DB_PATH`/`embed_texts` are patchable package attributes,
 resolved through the package at call time); `tool_schemas.py` their JSON
@@ -163,7 +186,22 @@ numbers — the `_sec_*` section builders live in `wrapped_sections.py`, and
 the shape-dispatching stats renderer (tiles/tables/charts), and the visual
 builders — hbars, split bars, iMessage bubbles, word cloud, share bars, joke
 cards; sections put visuals in `extra_html` and the full shaped data in
-`narrate_stats` so the narrator still sees everything). `eval/evalkit/` is the analytics eval harness
+`narrate_stats` so the narrator still sees everything). The analytical-suite
+pipelines (Wave 0+1) are standalone CLIs too — each its own `make` target and a
+serial step in `make pipeline`, none run by `ingest.py`: `loose_ends.py` (Loose
+Ends / nudge detectors → `loose_threads`; Ollama only for the one-line
+`nudge_text`, guarded by `loose_ends_model`), `drift.py` (deterministic
+relationship-drift scoring → `dyad_drift`; opt-in behind `DRIFT_ENABLED`,
+LLM-free), `voiceprint.py` (deterministic per-person voiceprints →
+`person_voiceprint`; LLM-free), `conflict_detect.py` (deterministic conflict
+finder + eval-gated escalation labels → `conflicts`/`conflict_signals`; Ollama
+only for the label pass, guarded by `conflict_model`). Shared foundations they
+build on: `stats.py` (dependency-free robust-stats primitives — Theil-Sen trend
++ bootstrap CI, Kaplan-Meier survival, MAD outlier / CUSUM change-point —
+imported by drift/conflict/wellbeing), `consent.py` (default-closed opt-in id
+parsing; landed, no consumer wired yet), `wellbeing.py` (deterministic
+within-person change-point core; W1 core only — no pipeline or tool wired yet).
+`eval/evalkit/` is the analytics eval harness
 (stdlib-only; imports the app in-process, lazily — env overrides must be set
 before app modules import): `cases.py` suite loading/validation, `roster.py`
 roster resolution, `recipes/` SQL ground-truth recipes (a package: `_base.py`
@@ -171,7 +209,10 @@ holds the `@recipe` registry + shared helpers, one module per suite family
 registers its recipes on import), `manifest.py`
 corpus-fingerprinted ground truth, `runner.py` the transcript-capturing sweep,
 `checks.py` deterministic grading, `p3.py` LLM-graded checks, `report.py` the
-scorecard. Its slow loops (`run`, `manifest`'s ground truth, `p3 --judge`)
+scorecard; plus the F4 eval-gate harness — `gates.py` (the measurement-gate
+registry + the `eval_gate_passed` clearance helper), `agreement.py` (Cohen's
+kappa / detector-precision math), `labeling.py` (the owner-only `label` + `gate`
+subcommands). Its slow loops (`run`, `manifest`'s ground truth, `p3 --judge`)
 reuse `progress.track` — imported function-locally, like every other app
 import here, because `progress` pulls in `config` and `__main__` imports all
 submodules eagerly.
@@ -203,16 +244,24 @@ chunks(id, chat_id, first_message_id, last_message_id, first_date, last_date,
 ingest_state(key, value)          -- last_message_rowid for --since-last, plus
                                   -- embed_model/embed_dim guarding chunk_vectors,
                                   -- sessions_max_message_id/sessions_gap_minutes,
-                                  -- annotate_model, topic_model_k
+                                  -- annotate_model, topic_model_k, and the
+                                  -- Wave 0+1 suite guards: loose_ends_model,
+                                  -- conflict_model, drift_max_message_id +
+                                  -- drift_params_hash, voiceprint_max_message_id,
+                                  -- and eval_gate:<task> (F4 gate verdicts)
 sessions(id, chat_id, first_message_id, last_message_id, first_date,
          last_date, n_messages, n_from_me, initiator_handle_id,
          initiator_is_me, ender_handle_id, ender_is_me)
                                   -- gap-split conversation sessions (derived,
                                   -- rebuilt per chat; handle NULL = me)
 person_period_lexicon(chat_id, handle_id, month, ...9 fw_*_rate cols...,
-         we_count, question_count, laugh_count, emoji_json)
+         we_count, question_count, laugh_count, emoji_json,
+         i_count, you_count, absolutist_count)
                                   -- per-person-per-month style stats
-                                  -- (derived, full rebuild; handle NULL = me)
+                                  -- (derived, full rebuild; handle NULL = me).
+                                  -- i/you/absolutist are raw PRONOUN_I /
+                                  -- PRONOUN_YOU / ABSOLUTIST token counts (F1),
+                                  -- nullable until the next full rebuild fills them
 dyad_terms(chat_id, term, lift, n_uses, first_message_id,
          coined_by_handle_id, coined_is_me, llm_verdict, curate_failures)
                                   -- chat-distinctive vocabulary; llm_verdict
@@ -227,6 +276,46 @@ chunk_annotations(chunk_id, valence, emotions_json, depth, events_json,
                                   -- 'llm' or 'distilled' (kNN, empty events)
 topics(cluster_id, label, n_chunks); chunk_topics(chunk_id, cluster_id)
                                   -- k-means topic clusters (topics.py)
+loose_threads(id, kind, chat_id, handle_id, anchor_message_id, anchor_date,
+         due_by, urgency, status, evidence_json, llm_verdict, llm_reason,
+         nudge_text, source, detected_at, dismissed_at)
+                                  -- Loose Ends detector output (loose_ends.py);
+                                  -- status 'open'|'dismissed' (dismissed rows are
+                                  -- kept, never deleted); the LLM columns are
+                                  -- guarded by loose_ends_model. reset_db clears it
+nudge_exclusions(handle_id, contact_id, reason, created_at)
+                                  -- contacts/handles muted from nudges; durable
+                                  -- user intent, PRESERVED across reset_db
+dyad_drift(contact_key, label, n_messages, n_months, first_month, last_month,
+         drift_score, phase, phase_corroborated, mandatory_complete,
+         confidence_tier, ...7x <signal>_value/<signal>_gate...,
+         per_signal_gate_json, coverage_json, monthly_series_json)
+                                  -- per-counterparty relationship drift (drift.py;
+                                  -- one row per member_key, opt-in DRIFT_ENABLED);
+                                  -- full rebuild, guarded by drift_max_message_id +
+                                  -- drift_params_hash
+person_voiceprint(member_key, counterpart_key, scope, avg_msg_len,
+         lowercase_ratio, exclaim_rate, ellipsis_rate, burst_size,
+         ...9 fw_*_rate cols..., openers_json, closers_json, tone_valence,
+         tone_emotions_json, n_messages, n_reply_pairs, n_months,
+         feature_std_json)        -- deterministic per-person voice profile
+                                  -- (voiceprint.py); scope 'dyad'|'group'|'all';
+                                  -- tone_* are LOW-TRUST (source='llm' chunks
+                                  -- only); full rebuild, guarded by
+                                  -- voiceprint_max_message_id
+conflicts(id, chat_id, first_date, last_date, start_session_id, end_session_id,
+         topic, peak_signal_json, corroboration, off_text_flag, source)
+                                  -- deterministic conflict episodes
+                                  -- (conflict_detect.py; 1:1 only); corroboration
+                                  -- 'none'|'weak'|'llm' (valence, source='llm'
+                                  -- only); source guarded by conflict_model. NO
+                                  -- role/aggressor/status column by design (C2)
+conflict_signals(id, conflict_id, message_id, actor_is_me, label_class,
+         top2_labels_json, band, excerpt)
+                                  -- per-turn escalation labels for a conflict;
+                                  -- band 'tentative'|'likely' (never a raw score),
+                                  -- only for eval-gate-cleared classes; excerpt
+                                  -- verbatim <= 200 chars
 messages_fts                      -- FTS5 external-content table over messages.text
 chunk_vectors                     -- sqlite-vec vec0 table: chunk_id ->
                                   -- FLOAT[detected dim] distance_metric=cosine,
@@ -270,6 +359,28 @@ chunk_vectors                     -- sqlite-vec vec0 table: chunk_id ->
   `events_json` is always `[]` (events can't be distilled — LLM-only), so
   event-based aggregates silently undercount until an LLM tier with
   `--upgrade-distilled` has covered the chats in question.
+- Valence-dependent reads trust ONLY `chunk_annotations` rows with
+  `source='llm'`; distilled (kNN) rows are never consumed for a high-stakes
+  read. Conflict corroboration, the nudge Stage-0 valence exclusion, and the
+  voiceprint tone field all read llm rows only and degrade honestly when there
+  are none: conflict writes `corroboration='none'` and still detects, a dyad
+  with no llm chunks is simply not valence-excluded, and `tone_*` reads NULL.
+  Run `annotate.py --quality balanced --upgrade-distilled` over the chats you
+  care about to light them.
+- The F4 eval gate decides whether a pipeline's high-stakes labels ship.
+  `eval_gate_passed(con, task, cls)` resolves clearance by precedence: an owner
+  verdict in `ingest_state` under `eval_gate:<task>` (written by
+  `eval.evalkit gate`) wins; else a committed `eval/seed_gates/<task>.json`
+  seed; else nothing. An ABSENT verdict means the gated classes are SUPPRESSED
+  (default-closed — Master Spec A2), not shown. Only `conflict_labels` ships a
+  seed (pre-cleared out of the box, and because the seed lives in the repo it
+  survives `reset_db` / a fresh DB); `dropped_plan` and `wellbeing_narration`
+  stay suppressed until the owner hand-labels and gates them.
+- An enable-flag gates a feature's tool REGISTRATION or pipeline BUILD, never
+  the prompt. `DRIFT_ENABLED=false` (the default) makes `drift.py` exit and
+  `dyad_drift` never build — the same principle as withholding tool schemas to
+  stop a tool call (above): prompting a model not to do something is not a
+  control; removing the capability is.
 - `think` is per-call, not global: `ollama.chat_once`/`chat_stream` take
   `think=` with a `_UNSET` default. The tri-state is load-bearing — `None`
   means *omit* the flag (some models reject a `think` option) and is NOT the
