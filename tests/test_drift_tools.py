@@ -351,12 +351,21 @@ class RegistrationGateTest(unittest.TestCase):
     DRIFT_NAMES = {"get_relationship_drift", "get_fadeout_watchlist"}
 
     def setUp(self):
-        self._saved = config.DRIFT_ENABLED
+        # Snapshot off the LIVE config module (importlib.import_module re-imports
+        # it if a sibling test popped it from sys.modules), not this file's
+        # possibly-stale top-level `config` ref, so this test is robust to leaks.
+        self._saved = importlib.import_module("config").DRIFT_ENABLED
         self.addCleanup(self._reload, self._saved)  # restore last
 
     @staticmethod
     def _reload(enabled):
-        config.DRIFT_ENABLED = enabled
+        # Set the flag on the LIVE config object -- the same one tool_schemas'
+        # `import config` will resolve through sys.modules on reload. If config
+        # was popped, import_module re-imports and re-registers it, so the flag
+        # lands where the reload reads it (guarding against sibling isolation
+        # leaks, e.g. test_consent popping config).
+        live_config = importlib.import_module("config")
+        live_config.DRIFT_ENABLED = enabled
         importlib.reload(tool_schemas)
         importlib.reload(chat)
 
