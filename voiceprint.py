@@ -575,12 +575,21 @@ def build_voiceprints(con, *, force=False, dry_run=False):
 
     con.execute("DELETE FROM person_voiceprint")
 
+    # Skip sub-floor profiles: a row built from fewer than
+    # VOICEPRINT_MIN_RETURN_MESSAGES of the member's own messages is noise the
+    # read tool would decline anyway, so it is not worth storing -- and dropping
+    # it also keeps the long tail of 1-4 message profiles out of the per-scope
+    # feature_std population.
+    floor = config.VOICEPRINT_MIN_RETURN_MESSAGES
     built = []  # (member_key, counterpart_key, scope, result)
+    skipped = 0
     with progress.track("Building voiceprints", total=len(tasks)) as p:
         for member_key_str, counterpart_key, scope, chat_ids in tasks:
             result = compute_voiceprint(con, member_key_str, chat_ids)
-            if result is not None:
+            if result is not None and result["n_messages"] >= floor:
                 built.append((member_key_str, counterpart_key, scope, result))
+            elif result is not None:
+                skipped += 1
             p.advance()
 
     # Per-scope corpus std, replicated onto each row of that scope.
@@ -601,7 +610,8 @@ def build_voiceprints(con, *, force=False, dry_run=False):
 
     n_scope = collections.Counter(scope for _m, _c, scope, _r in built)
     print(f"Built {len(built)} voiceprints "
-          f"({dict(sorted(n_scope.items()))}; max message id {current_max})")
+          f"({dict(sorted(n_scope.items()))}; max message id {current_max}; "
+          f"{skipped} skipped below {floor}-message floor)")
     return len(built)
 
 

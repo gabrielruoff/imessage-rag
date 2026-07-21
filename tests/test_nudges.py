@@ -1066,9 +1066,32 @@ class DroppedPlanDriverTest(_DroppedPlanFixtureTest):
 
 class DroppedPlanConfigTest(unittest.TestCase):
     def test_pinned_config_defaults(self):
-        self.assertFalse(config.NUDGE_DROPPED_PLAN_ENABLED)
-        self.assertFalse(config.NUDGE_GOODNEWS_ENABLED)
-        self.assertEqual(config.NUDGE_PLAN_CONTEXT_MSGS, 30)
+        # Guards the *shipped* defaults in config.py, not the developer's
+        # effective config: these opt-in detectors may legitimately be enabled
+        # in a local .env (e.g. NUDGE_GOODNEWS_ENABLED=true), so read the module
+        # attrs live would make this test .env-dependent (non-hermetic). Reload
+        # config with the relevant env vars cleared and .env loading suppressed
+        # to observe the pinned defaults, then restore the real config.
+        import importlib
+
+        import dotenv
+        keys = ("NUDGE_DROPPED_PLAN_ENABLED", "NUDGE_GOODNEWS_ENABLED",
+                "NUDGE_PLAN_CONTEXT_MSGS")
+        saved = {k: os.environ.pop(k, None) for k in keys}
+        try:
+            # Patch dotenv.load_dotenv at the source: reload re-runs config's
+            # `from dotenv import load_dotenv`, so patching config's own attr
+            # would be clobbered. The no-op keeps .env from re-injecting values.
+            with mock.patch.object(dotenv, "load_dotenv", lambda *a, **k: False):
+                importlib.reload(config)
+            self.assertFalse(config.NUDGE_DROPPED_PLAN_ENABLED)
+            self.assertFalse(config.NUDGE_GOODNEWS_ENABLED)
+            self.assertEqual(config.NUDGE_PLAN_CONTEXT_MSGS, 30)
+        finally:
+            for k, v in saved.items():
+                if v is not None:
+                    os.environ[k] = v
+            importlib.reload(config)  # re-reads .env, restores real values
 
     def test_both_n4_detectors_registered(self):
         kinds = [k for k, _ in loose_ends.DETECTORS]
@@ -1203,8 +1226,14 @@ class UnreciprocatedGoodnewsDetectorTest(_GoodnewsFixtureTest):
 
     def test_driver_off_by_default_writes_nothing(self):
         con = self._open()
-        cfg = loose_ends._build_cfg(con)   # goodnews_enabled defaults False
-        loose_ends.detect_all(con, cfg, "2026-07-01T00:00:00+00:00")
+        # Pin the opt-in flags OFF so the test asserts the *default* behavior
+        # regardless of the developer's .env (which may set GOODNEWS=true).
+        # _build_cfg reads these names from loose_ends' own namespace (imported
+        # via `from config import ...`), so patch them there.
+        with mock.patch.object(loose_ends, "NUDGE_GOODNEWS_ENABLED", False), \
+                mock.patch.object(loose_ends, "NUDGE_DROPPED_PLAN_ENABLED", False):
+            cfg = loose_ends._build_cfg(con)   # goodnews_enabled defaults False
+            loose_ends.detect_all(con, cfg, "2026-07-01T00:00:00+00:00")
         n = sqlite3.connect(self.db_path).execute(
             "SELECT COUNT(*) FROM loose_threads WHERE kind = 'unreciprocated_goodnews'"
         ).fetchone()[0]
@@ -1218,6 +1247,30 @@ class UnreciprocatedGoodnewsDetectorTest(_GoodnewsFixtureTest):
             "SELECT chat_id FROM loose_threads WHERE kind = 'unreciprocated_goodnews' "
             "AND status = 'open' ORDER BY chat_id").fetchall()
         self.assertEqual([r[0] for r in rows], [100])
+
+    def test_null_response_class_does_not_fire(self):
+        # An unclassified good-news event (response_class null) is 'unknown', not
+        # 'under-received' -- it must NOT fire (this was a false-positive source
+        # producing near-zero-urgency noise rows).
+        self.assertEqual(loose_ends._unreciprocated_good_news(
+            _goodnews_events(None)), [])
+
+    def test_under_received_classes_fire(self):
+        for cls in ("passive_constructive", "passive_destructive", "active_destructive"):
+            self.assertEqual(
+                len(loose_ends._unreciprocated_good_news(_goodnews_events(cls))), 1, cls)
+
+    def test_reciprocated_class_does_not_fire(self):
+        self.assertEqual(loose_ends._unreciprocated_good_news(
+            _goodnews_events("active_constructive")), [])
+
+    def test_recency_floor_suppresses_stale_goodnews(self):
+        # Alice's good-news chunk is ~1 day before corpus-now; a 0-day floor
+        # makes even that "stale", so the dyad is skipped entirely.
+        con = self._open()
+        cfg = self._cfg(con, enabled=True)
+        cfg["goodnews_max_age_days"] = 0
+        self.assertEqual(list(loose_ends.detect_unreciprocated_goodnews(con, cfg)), [])
 
 
 # ---------------------------------------------------------------------------

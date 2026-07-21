@@ -145,6 +145,27 @@ def _tone_block(valence, emotions_json):
 def _base_card(con, member_key_str, counterpart_key, scope, n_messages,
                n_reply_pairs, n_months, features, openers, closers,
                feature_std, tone):
+    # HARD floor: below VOICEPRINT_MIN_RETURN_MESSAGES the member's own message
+    # count is too small for the stylometry to mean anything, so decline the
+    # card entirely (coverage note only) rather than emit precise-looking
+    # numbers behind a soft 'low' flag -- mirrors draft_reply's structural
+    # decline. Read at call time so tests/.env can move it.
+    if (n_messages or 0) < config.VOICEPRINT_MIN_RETURN_MESSAGES:
+        return {
+            "member_key": member_key_str,
+            "counterpart_key": counterpart_key,
+            "scope": scope,
+            "member": _label_for_key(con, member_key_str),
+            "counterpart": _label_for_key(con, counterpart_key),
+            "found": False,
+            "note": (f"Too little interaction to characterize a voice "
+                     f"({n_messages} messages; need "
+                     f">= {config.VOICEPRINT_MIN_RETURN_MESSAGES}). Stylometry "
+                     "omitted -- it would be noise at this volume."),
+            "n_messages": n_messages,
+            "n_reply_pairs": n_reply_pairs,
+            "n_months": n_months,
+        }
     card = {
         "member_key": member_key_str,
         "counterpart_key": counterpart_key,

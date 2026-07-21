@@ -56,6 +56,13 @@ class _DBCase(unittest.TestCase):
         saved = query_tools.DB_PATH
         query_tools.DB_PATH = self.db_path
         self.addCleanup(setattr, query_tools, "DB_PATH", saved)
+        # These hand-scripted fixtures are intentionally tiny (well under the
+        # production VOICEPRINT_MIN_RETURN_MESSAGES floor); drop the floor to 0
+        # so build + read behave as they did before the floor existed. Tests
+        # that exercise the floor set it explicitly.
+        saved_floor = config.VOICEPRINT_MIN_RETURN_MESSAGES
+        config.VOICEPRINT_MIN_RETURN_MESSAGES = 0
+        self.addCleanup(setattr, config, "VOICEPRINT_MIN_RETURN_MESSAGES", saved_floor)
 
     def populate(self, con):  # overridden
         pass
@@ -256,6 +263,33 @@ class CoreBuildTest(_DBCase):
         res = query_tools.get_voiceprint(contact_id=99999)
         self.assertFalse(res.get("found", False))
         self.assertIn("note", res)
+
+
+class MinReturnFloorTest(CoreBuildTest):
+    """The hard VOICEPRINT_MIN_RETURN_MESSAGES floor: a sub-floor profile (the
+    fixture's Mom dyad is 15 of my messages) is neither built nor returned."""
+
+    def test_read_declines_below_floor(self):
+        self.build()  # floor 0 during build (base setUp) -> the row exists
+        config.VOICEPRINT_MIN_RETURN_MESSAGES = 50  # base setUp restores it
+        card = query_tools.get_voiceprint(contact_id=12)
+        self.assertFalse(card.get("found", False))
+        self.assertIn("Too little interaction", card["note"])
+        self.assertEqual(card["n_messages"], 15)
+        self.assertNotIn("features", card)
+
+    def test_read_returns_at_or_above_floor(self):
+        self.build()
+        config.VOICEPRINT_MIN_RETURN_MESSAGES = 10  # 15 >= 10
+        card = query_tools.get_voiceprint(contact_id=12)
+        self.assertEqual(card["scope"], "dyad")
+        self.assertIn("features", card)
+
+    def test_build_skips_below_floor(self):
+        config.VOICEPRINT_MIN_RETURN_MESSAGES = 50  # above every fixture profile
+        self.assertEqual(self.build(force=True), 0)
+        self.assertEqual(
+            self.rows("SELECT COUNT(*) AS c FROM person_voiceprint")[0]["c"], 0)
 
 
 class BurstAndReplyPairTest(_DBCase):

@@ -111,7 +111,7 @@ from eval.evalkit.gates import eval_gate_passed
 # Additive per-detector import (RES-57 / N4). Opt-in flag only; the signal is
 # read out of chunk_annotations.events_json (source='llm') and its precision is
 # inherited from the gemma annotations, not SQL-exact.
-from config import NUDGE_GOODNEWS_ENABLED
+from config import NUDGE_GOODNEWS_ENABLED, NUDGE_GOODNEWS_MAX_AGE_DAYS
 # --- end detector: unreciprocated_goodnews ---
 
 # Module attribute so tests can patch it; _connect() reads it at call time.
@@ -921,9 +921,14 @@ DETECTORS.append(("dropped_plan", detect_dropped_plan))
 # "the dyad was barely annotated". Pure detection; the shared driver runs Stage-0
 # exclusion + urgency outside this function, as for every detector.
 
-# A good-news event whose response_class is anything but this was under-received;
-# null ("no response") and every non-ideal class count as unreciprocated.
+# Gable's capitalization taxonomy: active_constructive is the ideal (reciprocated)
+# response; the three below are genuinely UNDER-received. A null/absent
+# response_class means the annotator did NOT classify the response -- that is
+# "unknown", not "under-received", so it must NOT fire (it was a false-positive
+# source: unclassified good-news events with urgency ~0).
 _GOODNEWS_RECIPROCATED = "active_constructive"
+_GOODNEWS_UNDER_RECEIVED = frozenset({
+    "passive_constructive", "passive_destructive", "active_destructive"})
 
 
 def _goodnews_coverage(con, chat_id):
@@ -948,9 +953,10 @@ def _goodnews_coverage(con, chat_id):
 
 
 def _unreciprocated_good_news(events_json):
-    """The good_news events in one chunk whose response_class is NOT
-    active-constructive (null included). [] on malformed JSON or when there is
-    no such event."""
+    """The good_news events in one chunk whose response_class is a genuine
+    UNDER-RECEIVED class (passive_constructive / passive_destructive /
+    active_destructive). A null/absent or reciprocated (active_constructive)
+    class does NOT fire. [] on malformed JSON or when there is no such event."""
     try:
         events = json.loads(events_json or "[]")
     except (ValueError, TypeError):
@@ -959,7 +965,7 @@ def _unreciprocated_good_news(events_json):
         return []
     return [e for e in events
             if isinstance(e, dict) and e.get("kind") == "good_news"
-            and e.get("response_class") != _GOODNEWS_RECIPROCATED]
+            and e.get("response_class") in _GOODNEWS_UNDER_RECEIVED]
 
 
 def detect_unreciprocated_goodnews(con, cfg) -> Iterable[CandidateRow]:
@@ -981,6 +987,8 @@ def detect_unreciprocated_goodnews(con, cfg) -> Iterable[CandidateRow]:
     if not rows:
         return
     direct = set(_restrict_to_direct_chats(con, list({r["chat_id"] for r in rows})))
+    max_age_days = cfg.get("goodnews_max_age_days")
+    now = cfg["now"]
     seen = set()
     for r in rows:
         chat_id = r["chat_id"]
@@ -990,6 +998,13 @@ def detect_unreciprocated_goodnews(con, cfg) -> Iterable[CandidateRow]:
         if not unrecip:
             continue  # this chunk had no under-received good news; try older ones
         seen.add(chat_id)  # newest unreciprocated good-news chunk owns the chat
+        # Recency floor: the newest unreciprocated good-news is the freshest one
+        # this dyad has -- if even that is stale, belatedly nudging about it is
+        # noise (and its urgency decays to ~0), so the dyad is skipped entirely.
+        if max_age_days is not None and r["last_date"]:
+            age_days = (now - datetime.datetime.fromisoformat(r["last_date"])).days
+            if age_days > max_age_days:
+                continue
         first = unrecip[0]
         yield CandidateRow(
             kind="unreciprocated_goodnews",
@@ -1180,6 +1195,7 @@ def _build_cfg(con):
         # --- end detector: dropped_plan ---
         # --- detector: unreciprocated_goodnews ---
         "goodnews_enabled": NUDGE_GOODNEWS_ENABLED,
+        "goodnews_max_age_days": NUDGE_GOODNEWS_MAX_AGE_DAYS,
         # --- end detector: unreciprocated_goodnews ---
     }
 

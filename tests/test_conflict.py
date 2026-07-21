@@ -165,6 +165,34 @@ class SchemaTest(unittest.TestCase):
 # --- deterministic detection -------------------------------------------------
 
 
+class WindowQualifiesTest(unittest.TestCase):
+    """The independence gate: a window needs an active-tension signal, not just
+    two correlated low-activity signals (one_sided_session + volume_collapse)."""
+
+    def test_low_activity_pair_alone_is_rejected(self):
+        # The exact pair that dominated the raw corpus (~40% of windows): a
+        # quiet, one-directional lull double-counted. Must NOT qualify.
+        self.assertFalse(
+            conflict_detect._window_qualifies({"one_sided_session", "volume_collapse"}))
+
+    def test_active_tension_plus_low_activity_qualifies(self):
+        # Pin the min-signals floor so the test is hermetic w.r.t. .env.
+        with mock.patch.object(conflict_detect, "CONFLICT_MIN_SIGNALS", 2):
+            self.assertTrue(
+                conflict_detect._window_qualifies({"latency_withdrawal", "one_sided_session"}))
+            self.assertTrue(
+                conflict_detect._window_qualifies({"dislike_run", "volume_collapse"}))
+
+    def test_active_tension_signal_alone_is_below_min_signals(self):
+        # One active-tension signal is real tension but still fewer than
+        # CONFLICT_MIN_SIGNALS distinct signals -- both conditions must hold.
+        with mock.patch.object(conflict_detect, "CONFLICT_MIN_SIGNALS", 2):
+            self.assertFalse(conflict_detect._window_qualifies({"latency_withdrawal"}))
+
+    def test_single_low_activity_signal_is_rejected(self):
+        self.assertFalse(conflict_detect._window_qualifies({"one_sided_session"}))
+
+
 class DetectionTest(_TempDBTest):
     def test_finds_window_with_injected_signals(self):
         _build_fixture(self.db_path, classify_fn=_stub_criticism)
@@ -292,6 +320,40 @@ class ReadToolCapTest(_TempDBTest):
         con.close()
         self.assertEqual(query_tools.find_conflicts()["rows"], [])
         self.assertIn("error", query_tools.get_conflict(1))
+
+
+class FindConflictsRankingTest(_TempDBTest):
+    """find_conflicts surfaces the best-substantiated episode first:
+    corroboration outranks raw signal_count."""
+
+    def _insert(self, cid, corroboration, signal_count, last_date):
+        con = sqlite3.connect(self.db_path)
+        schema.create_schema(con)
+        con.execute("INSERT OR IGNORE INTO chats(id, is_group) VALUES (1, 0)")
+        con.execute(
+            "INSERT INTO conflicts(id, chat_id, first_date, last_date, "
+            "peak_signal_json, corroboration, off_text_flag, source) VALUES "
+            "(?, 1, ?, ?, ?, ?, 0, 'llm')",
+            (cid, last_date, last_date,
+             json.dumps({"signals": ["s"] * signal_count, "signal_count": signal_count}),
+             corroboration))
+        con.commit()
+        con.close()
+
+    def test_corroborated_lower_signal_outranks_uncorroborated_higher(self):
+        # id 1: more signals but no tone corroboration; id 2: fewer signals but
+        # llm-corroborated. The corroborated one must rank first.
+        self._insert(1, "none", 4, "2026-03-02")
+        self._insert(2, "llm", 2, "2026-03-01")
+        rows = query_tools.find_conflicts(chat_id=1)["rows"]
+        self.assertEqual([r["conflict_id"] for r in rows], [2, 1])
+
+    def test_within_same_corroboration_signal_count_then_recency(self):
+        self._insert(1, "none", 2, "2026-03-01")
+        self._insert(2, "none", 3, "2026-03-01")  # more signals -> first
+        self._insert(3, "none", 2, "2026-03-05")  # same signals as 1, newer -> before 1
+        rows = query_tools.find_conflicts(chat_id=1)["rows"]
+        self.assertEqual([r["conflict_id"] for r in rows], [2, 3, 1])
 
 
 # --- F4 gate wiring ----------------------------------------------------------

@@ -35,6 +35,8 @@ from .analytics_language import _lsm_score, _weighted_rates
 MAX_CONFLICT_ROWS = 25       # find_conflicts page size
 MAX_SIGNAL_ROWS = 15         # get_conflict signal rows per page
 EXCERPT_CAP = 200            # defensive re-cap on stored excerpts
+# find_conflicts rank tie-break: tone-corroborated episodes surface first.
+_CORROBORATION_RANK = {"llm": 2, "weak": 1, "none": 0}
 
 
 def _has_conflict_tables(con):
@@ -77,8 +79,10 @@ def _conflict_summary(con, row):
 
 def find_conflicts(chat_id=None, handle_id=None, contact_id=None,
                    date_from=None, date_to=None, limit=10):
-    """Detected conflict episodes in scope, ranked by deterministic signal
-    strength then recency. Each is a tense stretch found from deterministic
+    """Detected conflict episodes in scope, ranked so the best-substantiated
+    surface first: tone-corroborated episodes (corroboration llm > weak > none),
+    then deterministic signal strength, then recency. Each is a tense stretch
+    found from deterministic
     signals WITH RECEIPTS (reply-latency withdrawal, one-sided sessions,
     dislike-tapback runs, volume collapse); `signals` names which fired and
     `signal_count` how many. 1:1 chats only. handle_id/contact_id scope to that
@@ -87,7 +91,7 @@ def find_conflicts(chat_id=None, handle_id=None, contact_id=None,
     envelope {rows, total_matching, returned, order, truncated}; expand one with
     get_conflict(conflict_id)."""
     limit = max(1, min(int(limit), MAX_CONFLICT_ROWS))
-    order = "signal_count-desc, most-recent-first"
+    order = "corroboration-desc, signal_count-desc, most-recent-first"
     with contextlib.closing(_connect()) as con:
         if not _has_conflict_tables(con):
             return _envelope([], 0, order)
@@ -111,9 +115,15 @@ def find_conflicts(chat_id=None, handle_id=None, contact_id=None,
         ).fetchall()
         summaries = [_conflict_summary(con, r) for r in rows]
 
-    # Strongest (most distinct deterministic signals) first, then most recent.
-    summaries.sort(key=lambda s: (s["signal_count"], s["last_date"] or ""),
-                   reverse=True)
+    # Best-substantiated first: tone-corroborated episodes (llm > weak > none)
+    # outrank raw signal count, so the ~5% with a corroborated valence drop
+    # surface ahead of the majority of uncorroborated lulls; then most distinct
+    # deterministic signals, then most recent. (Detection + total_matching are
+    # unchanged -- this only reorders which episodes fill the top `limit`.)
+    summaries.sort(
+        key=lambda s: (_CORROBORATION_RANK.get(s["corroboration"], 0),
+                       s["signal_count"], s["last_date"] or ""),
+        reverse=True)
     total = len(summaries)
     return _envelope(summaries[:limit], total, order)
 

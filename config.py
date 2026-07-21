@@ -428,6 +428,13 @@ DRIFT_PHASE_THRESHOLDS = _parse_json_dict_env(
 VOICEPRINT_MIN_MESSAGES = int(os.getenv("VOICEPRINT_MIN_MESSAGES") or "500")
 VOICEPRINT_MIN_REPLY_PAIRS = int(os.getenv("VOICEPRINT_MIN_REPLY_PAIRS") or "8")
 VOICEPRINT_MIN_MONTHS = int(os.getenv("VOICEPRINT_MIN_MONTHS") or "3")
+# HARD floor (distinct from the high/low gate above): below this many of the
+# member's own messages a profile is statistically meaningless, so the pipeline
+# neither builds nor returns it. get_voiceprint declines with a coverage note
+# (like draft_reply's structural decline), and the build skips writing the row.
+# 30 keeps the huge self/dyad profiles while dropping the long tail of 1-4
+# message "voiceprints" that are pure noise.
+VOICEPRINT_MIN_RETURN_MESSAGES = int(os.getenv("VOICEPRINT_MIN_RETURN_MESSAGES") or "30")
 # A DIFFERENT floor from the gate above: V2 (draft_reply) degrades its
 # per-call style retrieval below this many example reply pairs. Separate knob,
 # separate job -- kept distinct on purpose.
@@ -614,6 +621,11 @@ NUDGE_PLAN_CONTEXT_MSGS = int(os.getenv("NUDGE_PLAN_CONTEXT_MSGS") or "30")
 # the gemma annotations, not an SQL-exact signal, and the tool payload says so.
 NUDGE_GOODNEWS_ENABLED = os.getenv(
     "NUDGE_GOODNEWS_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+# Recency floor: a good-news moment older than this many days is not actionable
+# (nudging someone to belatedly celebrate months-old news is noise), and its
+# urgency decays to ~0 anyway, so it is never even written. Keeps the digest
+# table clean rather than filled with unreachable stale rows.
+NUDGE_GOODNEWS_MAX_AGE_DAYS = int(os.getenv("NUDGE_GOODNEWS_MAX_AGE_DAYS") or "90")
 # --- end feature: nudges ---
 
 

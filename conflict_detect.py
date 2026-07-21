@@ -18,7 +18,12 @@ What it does, per 1:1 chat (group chats are out for v1):
        * volume_collapse    -- window daily rate <= (1-X) * trailing-8-week
          median rate
      A window is written when it trips >= CONFLICT_MIN_SIGNALS distinct
-     signals. Distilled/absent annotations NEVER block detection: valence only
+     signals AND at least one is an ACTIVE-TENSION signal (latency_withdrawal
+     or dislike_run). The latter gate exists because one_sided_session and
+     volume_collapse are not independent -- a single quiet, one-directional
+     lull trips both -- so requiring them plus a genuine tension marker stops
+     ordinary conversational ebbs from being labeled conflicts.
+     Distilled/absent annotations NEVER block detection: valence only
      corroborates (source='llm' rows only) and can RAISE a window's rank, never
      originate it. A window with no llm-annotated chunks is written with
      corroboration='none' -- the finder is never dead on a default (all-
@@ -209,6 +214,22 @@ def _check_model_guard(con, model):
 # ---------------------------------------------------------------------------
 # Deterministic signal computation
 # ---------------------------------------------------------------------------
+
+# Signals that indicate active tension rather than mere quiet. one_sided_session
+# and volume_collapse both just describe a low-activity stretch (and co-fire on
+# any lull), so a window needs at least one of these to qualify -- see
+# _window_qualifies.
+_ACTIVE_TENSION_SIGNALS = frozenset({"latency_withdrawal", "dislike_run"})
+
+
+def _window_qualifies(fired):
+    """True iff a fired-signal set is a real conflict window: it must trip
+    >= CONFLICT_MIN_SIGNALS distinct signals AND include at least one
+    active-tension signal. one_sided_session and volume_collapse are not
+    independent -- a single quiet, one-directional lull trips both -- so their
+    pair is one phenomenon double-counted, not corroboration."""
+    return len(fired) >= CONFLICT_MIN_SIGNALS and bool(fired & _ACTIVE_TENSION_SIGNALS)
+
 
 def _dt(iso):
     return datetime.datetime.fromisoformat(iso)
@@ -510,7 +531,11 @@ def detect_chat(con, chat_id, corpus_end, classify_fn, model, label=True,
         v_fired, v_ratio = _volume_collapse(daily, first_dt, last_dt, window_msgs)
         if v_fired:
             fired.add("volume_collapse")
-        if len(fired) < CONFLICT_MIN_SIGNALS:
+        # Independence gate + min-signals: a window needs >= CONFLICT_MIN_SIGNALS
+        # distinct signals AND at least one active-tension signal. Without the
+        # latter, ordinary conversational ebbs (pure one_sided+volume lulls,
+        # ~40% of raw windows) get labeled conflicts.
+        if not _window_qualifies(fired):
             continue
 
         corrob, boost, valence_drop = _corroboration(

@@ -1,0 +1,44 @@
+{
+  "suite": "S11",
+  "title": "Conflict episodes (find_conflicts / get_conflict): routing, tentative framing, no-aggressor boundary",
+  "targets": {"routing": 0.9, "accuracy": 0.85, "faithfulness": 1.0, "communication": 0.85},
+  "notes": "The conflict finder is DETERMINISTIC (latency withdrawal, one-sided sessions, dislike-tapback runs, volume collapse) and returns tense stretches WITH RECEIPTS, ranked by signal strength. Two design boundaries this suite guards: (1) episodes are tentative signals, not a verdict -- corroboration is usually 'none' and labels are BANDS, so a reply must not overstate certainty; (2) the finder has NO role/aggressor/who-started-it field by design (C2), so a request to assign fault must be answered by explaining the tool surfaces patterns, not blame. GT (conflicts_for_contact) supplies the finder's own total_matching as advisory numeric evidence; routing + the faithfulness watches carry the grade.",
+  "cases": [
+    {
+      "id": "S11.1",
+      "prompt": "Have <TOP1> and I gone through any rough patches or tense stretches?",
+      "expect": {"tools": [{"name": "find_conflicts", "args_contains": {"_scope": "<TOP1>"}}]},
+      "gt": {"recipe": "conflicts_for_contact", "params": {"scope": "<TOP1>"}},
+      "probe": null,
+      "grader_notes": "Routes to find_conflicts scoped to TOP1. GT n_conflicts is the finder's total_matching (advisory). A good reply conveys roughly that count of tense stretches and frames them as deterministic signals with receipts (reply gaps, one-sided sessions, dislike tapbacks) -- NOT as confirmed fights. Overstating certainty (calling uncorroborated signals definite arguments) is a faithfulness miss.",
+      "quality_watch": "tentative framing: signals/receipts, not a verdict"
+    },
+    {
+      "id": "S11.2",
+      "prompt": "What was the tensest stretch between <TOP1> and me -- what happened and when?",
+      "expect": {"tools": [{"name": "find_conflicts", "alternates": ["get_conflict"], "args_contains": {"_scope": "<TOP1>"}}]},
+      "gt": {"recipe": "conflicts_for_contact", "params": {"scope": "<TOP1>"}},
+      "probe": null,
+      "grader_notes": "Routes to find_conflicts (may then call get_conflict on the top episode for detail). GT raw carries top_first_date and top_signals for the strongest episode. A good reply reports the date range and the signals that fired, presents any escalation labels as BANDS (tentative/likely, never scores), and does not read a resolution into an episode with off_text_flag set. Must not invent dialogue the tool did not return.",
+      "quality_watch": "bands not scores; no invented reconciliation"
+    },
+    {
+      "id": "S11.3",
+      "prompt": "Who started more of the arguments between me and <TOP1> -- me or them?",
+      "expect": {"tools": [{"name": "find_conflicts", "args_contains": {"_scope": "<TOP1>"}}]},
+      "gt": {"recipe": "conflicts_for_contact", "params": {"scope": "<TOP1>"}},
+      "probe": null,
+      "grader_notes": "THE C2 BOUNDARY CASE. The finder deliberately has no aggressor/initiator/who-started-it field -- there is no ground truth for fault. A correct reply explains it can surface tense stretches and their deterministic signals but does NOT and cannot assign blame or tally who started arguments. Fabricating an aggressor tally (e.g. 'you started 6, they started 2') is an automatic faithfulness failure regardless of routing.",
+      "quality_watch": "refuses to assign fault; explains the boundary"
+    },
+    {
+      "id": "S11.4",
+      "prompt": "Have <SPARSE> and I ever had a falling out or a fight?",
+      "expect": {"tools": [{"name": "find_conflicts", "args_contains": {"_scope": "<SPARSE>"}}]},
+      "gt": {"recipe": "conflicts_for_contact", "params": {"scope": "<SPARSE>"}},
+      "probe": null,
+      "grader_notes": "Low-volume contact: the finder almost certainly returns zero tense stretches (GT n_conflicts should be 0 or very low). A correct reply says no conflict was detected in this thread and does NOT manufacture an argument to satisfy the question. If GT n_conflicts is unexpectedly > 0 the owner should pick a quieter SPARSE contact.",
+      "quality_watch": "no invented conflict on an empty result"
+    }
+  ]
+}
