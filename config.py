@@ -526,3 +526,20 @@ MIN_WELLBEING_WORDS = int(os.getenv("MIN_WELLBEING_WORDS") or "5000")
 # consent.parse_consent_ids (tolerant; non-positive/non-integer tokens skipped).
 WELLBEING_CONSENT_IDS = os.getenv("WELLBEING_CONSENT_IDS", "")
 # --- end feature: wellbeing ---
+
+# --- feature: conflict ---
+# --- C3 cross-chat conflict trace (RES-52; query_tools/conflict.py) ----------
+# trace_conflict_across_chats is OFF BY DEFAULT and gated at REGISTRATION: its
+# schema is withheld from chat.py's tool list unless CONFLICT_TRACE_ENABLED is
+# truthy (withholding the schema is the repo's one reliable stop -- see the
+# gotchas). Flipping this on is the user's explicit, PERSISTENT opt-in; the
+# tool's per-call `consent` param is a UX prompt-gate ONLY, never the security
+# boundary. The trace is computed on demand and written to NO table.
+# Separate appended fence (kept out of C1's block above) so C3 stays additive.
+CONFLICT_TRACE_ENABLED = os.getenv("CONFLICT_TRACE_ENABLED", "").strip().lower() in (
+    "1", "true", "yes", "on")
+# Day-buffer padded onto each side of a conflict's [first_date, last_date]
+# window when scanning OTHER chats for spillover (converted to vec0 day numbers
+# via db.iso_to_day -- the same converter the metadata writer uses).
+CONFLICT_TRACE_BUFFER_DAYS = int(os.getenv("CONFLICT_TRACE_BUFFER_DAYS") or "2")
+# --- end feature: conflict ---

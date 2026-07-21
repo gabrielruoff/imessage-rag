@@ -173,6 +173,24 @@ if _drift_d3_config.DRIFT_ENABLED:
         "reference-free opener instead. Never store an opener."
     )
 # --- end feature: drift ---
+# --- feature: conflict (C3 trace) ---
+# The cross-chat conflict trace is schema-gated on CONFLICT_TRACE_ENABLED (see
+# tool_schemas.py's matching gate -- the real off-switch). ONLY when it is
+# registered do we advertise it here and fold in the ask-first rule. When
+# disabled, the tool does not exist to the model, so there is no prompt-level
+# "don't trace" text. Appended, never reflowing the base prompt, to stay a
+# clean additive edit.
+import config as _conflict_trace_config  # noqa: E402 (local to this block)
+
+if _conflict_trace_config.CONFLICT_TRACE_ENABLED:
+    SYSTEM_PROMPT += (
+        "\n- trace_conflict_across_chats (does ONE conflict episode -- a "
+        "conflict_id from find_conflicts -- spill into the user's OTHER chats? "
+        "Cross-chat, so ASK THE USER FIRST, then call with consent=true; each "
+        "returned link both matches the episode AND names the partner, and "
+        "nothing is saved)"
+    )
+# --- end feature: conflict (C3 trace) ---
 
 def _build_system_prompt():
     """SYSTEM_PROMPT plus the current UTC date/time, computed fresh each time --

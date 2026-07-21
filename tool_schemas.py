@@ -925,3 +925,52 @@ _DRIFT_D3_TOOL_DEFINITIONS = [
 if _config.DRIFT_ENABLED:
     TOOL_DEFINITIONS.extend(_DRIFT_D3_TOOL_DEFINITIONS)
 # --- end feature: drift ---
+
+
+# --- feature: conflict (C3 trace) ---
+# The cross-chat conflict trace is registered ONLY when CONFLICT_TRACE_ENABLED
+# (RES-52 / C3), mirroring the DRIFT_ENABLED gate above. This registration gate
+# is the REAL security boundary: withholding the schema is the repo's one
+# reliable way to stop the model calling a tool, so a disabled deployment (the
+# default) never needs prompt-level "don't trace" text -- the tool simply does
+# not exist to the model. The per-call `consent` param is a UX prompt-gate only,
+# NOT the boundary. The function is always importable from query_tools; only its
+# schema (and the SYSTEM_PROMPT line in chat.py) is conditional.
+import config as _config  # noqa: E402 (local to the additive C3 block)
+
+_CONFLICT_TRACE_TOOL_DEFINITIONS = [
+    {
+        "name": "trace_conflict_across_chats",
+        "description": "OPT-IN cross-chat trace: did ONE conflict episode (a "
+                        "conflict_id from find_conflicts) spill into the user's "
+                        "OTHER conversations? Finds conversation chunks in a "
+                        "DIFFERENT chat, within a few days of the episode, that "
+                        "are BOTH semantically close to it AND literally name "
+                        "the episode's partner (their handle, first name, or one "
+                        "of the chat's distinctive terms); topically-similar but "
+                        "unnamed chunks are dropped. Because it reads across "
+                        "chats, ASK THE USER FIRST, then call again with "
+                        "consent=true -- `consent` is a UX prompt device, NOT "
+                        "the security boundary (this tool only exists when the "
+                        "user has enabled it in config). Without consent=true it "
+                        "returns a fixed ask-the-user payload and reads no data. "
+                        "Nothing is ever persisted.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "conflict_id": {"type": "integer"},
+                "k": {"type": "integer", "default": 10,
+                      "description": "max cross-chat links to return"},
+                "consent": {"type": "boolean", "default": False,
+                            "description": "pass true ONLY after the user agrees "
+                                           "to trace across their other chats; a "
+                                           "UX gate, not the security boundary"},
+            },
+            "required": ["conflict_id"],
+        },
+    },
+]
+
+if _config.CONFLICT_TRACE_ENABLED:
+    TOOL_DEFINITIONS.extend(_CONFLICT_TRACE_TOOL_DEFINITIONS)
+# --- end feature: conflict (C3 trace) ---

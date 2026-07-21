@@ -112,6 +112,14 @@ from .drift import (
 from .drift import get_reconnection_candidates
 # --- end feature: drift ---
 
+# --- feature: conflict (C3 trace) ---
+# Re-exported UNCONDITIONALLY (the function always exists); CONFLICT_TRACE_ENABLED
+# gates only whether its SCHEMA is registered (tool_schemas/chat), the repo's
+# one reliable way to keep the model from calling it. Separate appended fence so
+# C3 stays a clean additive edit alongside C1/C2's conflict re-exports above.
+from .conflict import trace_conflict_across_chats
+# --- end feature: conflict (C3 trace) ---
+
 __all__ = [
     "DB_PATH",
     "embed_texts",
@@ -167,4 +175,7 @@ __all__ = [
     # --- feature: drift ---
     "get_reconnection_candidates",
     # --- end feature: drift ---
+    # --- feature: conflict (C3 trace) ---
+    "trace_conflict_across_chats",
+    # --- end feature: conflict (C3 trace) ---
 ]
