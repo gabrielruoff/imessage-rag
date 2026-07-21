@@ -71,16 +71,27 @@ def _day_bounds(date_from, date_to):
     return from_day, to_day
 
 
-def _chunk_knn(con, query_vec, k, chat_ids, from_day, to_day, exclude_chunk_id=None):
+def _chunk_knn(con, query_vec, k, chat_ids, from_day, to_day, exclude_chunk_id=None,
+               exclude_chat_ids=None):
     """KNN over chunk_vectors with scope/date pushed down as vec0 metadata
     constraints (applied inside the scan -- no over-fetch needed). A chunk
-    overlaps the date range when last_day >= from AND first_day <= to."""
+    overlaps the date range when last_day >= from AND first_day <= to.
+
+    exclude_chat_ids (RES-52 / C3) drops whole chats from the scan via a vec0
+    `chat_id NOT IN (...)` metadata constraint -- verified supported in-scan on
+    sqlite-vec 0.1.9, so k stays exact and no over-fetch is needed (unlike the
+    single-row exclude_chunk_id, which post-filters). None/empty = no change to
+    existing callers."""
     fetch_k = k + 1 if exclude_chunk_id is not None else k
     clauses, params = ["v.embedding MATCH ?", "k = ?"], [query_vec, fetch_k]
     if chat_ids:
         placeholders = ",".join("?" * len(chat_ids))
         clauses.append(f"v.chat_id IN ({placeholders})")
         params.extend(chat_ids)
+    if exclude_chat_ids:
+        placeholders = ",".join("?" * len(exclude_chat_ids))
+        clauses.append(f"v.chat_id NOT IN ({placeholders})")
+        params.extend(exclude_chat_ids)
     if from_day is not None:
         clauses.append("v.last_day >= ?")
         params.append(from_day)

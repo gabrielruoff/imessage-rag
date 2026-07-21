@@ -6,17 +6,22 @@ classifier), no real chat.db -- everything runs against a temporary SQLite DB.
 Run from the repo root:  python3 -m unittest tests.test_conflict
 """
 
+import importlib
 import json
 import os
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
+
+import sqlite_vec
 
 import conflict_detect
 import lexicon_build
 import query_tools
 import schema
 import sessions
+from db import iso_to_day, load_vec_extension
 from eval.evalkit import gates, labeling
 from query_tools import conflict as conflict_mod
 
@@ -459,6 +464,206 @@ class DiagnoseRegistrationTest(unittest.TestCase):
         self.assertIn("diagnose_conflict", chat.TOOL_FUNCTIONS)  # dispatch
         self.assertTrue(callable(query_tools.diagnose_conflict))  # re-export
         self.assertIn("diagnose_conflict", chat.SYSTEM_PROMPT)    # prompt line
+
+
+# --- C3 (RES-52): gated cross-chat conflict trace ----------------------------
+
+
+def _build_trace_fixture(db_path):
+    """A corpus for trace_conflict_across_chats: origin chat 1 (partner Jordan,
+    handle 50) holds conflict 7; chat 2 (another chat) holds two same-day chunks
+    -- one that NAMES Jordan, one that names 'my boss' (no name) -- both with a
+    vector identical to the query (cosine sim 1.0). Chat 3 holds a Jordan-naming
+    chunk with an ORTHOGONAL vector (sim 0.0, below threshold). The origin chat
+    itself holds a Jordan-naming, high-sim chunk that must be EXCLUDED (the trace
+    is cross-chat). All vectors are hand-planted; embed_texts is stubbed to the
+    query vector [1,0,0]."""
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    load_vec_extension(con)
+    schema.create_schema(con)
+    con.execute("INSERT INTO contacts(id, source_uniqueid, first_name, last_name) "
+                "VALUES (2, 'uid-2', 'Jordan', 'Lee')")
+    con.execute("INSERT INTO handles(id, handle_identifier, contact_id, service) "
+                "VALUES (50, '+15550001111', 2, 'iMessage')")
+    for cid, ident in ((1, 'origin'), (2, 'other-B'), (3, 'other-C')):
+        con.execute("INSERT INTO chats(id, chat_identifier, is_group, service) "
+                    "VALUES (?, ?, 0, 'iMessage')", (cid, ident))
+    con.execute("INSERT INTO chat_participants(chat_id, handle_id) VALUES (1, 50)")
+    # The episode's own message (becomes the trace query text).
+    con.execute(
+        "INSERT INTO messages(id, guid, chat_id, handle_id, is_from_me, text, date, "
+        "item_type, is_emote, has_attachment) VALUES "
+        "(10, 'g-10', 1, 50, 0, 'you never listen to me this weekend', "
+        "'2026-03-02T10:00:00', 0, 0, 0)")
+    con.execute("INSERT INTO conflicts(id, chat_id, first_date, last_date) VALUES "
+                "(7, 1, '2026-03-02T10:00:00', '2026-03-02T10:04:00')")
+    # (chunk_id, chat_id, text, vector) -- day '2026-03-02', inside the ±2d window.
+    rows = [
+        (100, 2, 'ranting about the weekend with Jordan again', [1.0, 0.0, 0.0]),
+        (101, 2, 'the weekend with my boss was rough too',      [1.0, 0.0, 0.0]),
+        (102, 3, 'Jordan came up but this is unrelated',        [0.0, 1.0, 0.0]),
+        (103, 1, 'still upset at Jordan about the weekend',     [1.0, 0.0, 0.0]),
+    ]
+    for cid, chat_id, text, _vec in rows:
+        con.execute(
+            "INSERT INTO chunks(id, chat_id, first_message_id, last_message_id, "
+            "first_date, last_date, n_messages, text) VALUES "
+            "(?, ?, ?, ?, '2026-03-02T09:00:00', '2026-03-02T09:05:00', 1, ?)",
+            (cid, chat_id, cid, cid, text))
+    con.execute(
+        "CREATE VIRTUAL TABLE chunk_vectors USING vec0("
+        "chunk_id INTEGER PRIMARY KEY, embedding FLOAT[3] distance_metric=cosine, "
+        "chat_id INTEGER, first_day INTEGER, last_day INTEGER)")
+    day = iso_to_day('2026-03-02')
+    for cid, chat_id, _text, vec in rows:
+        con.execute(
+            "INSERT INTO chunk_vectors(chunk_id, embedding, chat_id, first_day, "
+            "last_day) VALUES (?, ?, ?, ?, ?)",
+            (cid, sqlite_vec.serialize_float32(vec), chat_id, day, day))
+    con.commit()
+    con.close()
+
+
+class TraceAcrossChatsTest(_TempDBTest):
+    def setUp(self):
+        super().setUp()
+        _build_trace_fixture(self.db_path)
+        patcher = mock.patch.object(
+            query_tools, "embed_texts",
+            lambda texts, kind="document": [[1.0, 0.0, 0.0]] * len(texts))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_consent_required_returns_ask_no_data(self):
+        # Without consent the tool returns a fixed ask-the-user payload -- no
+        # embedding, no query, no links (consent is the UX layer).
+        out = query_tools.trace_conflict_across_chats(7)
+        self.assertEqual(out["status"], "consent_required")
+        self.assertEqual(out["links"], [])
+        self.assertIn("ask", out)
+        self.assertNotIn("origin_chat_id", out)  # no data was read
+
+    def test_name_reference_gate_filters_unnamed(self):
+        # The acceptance case: two topically-identical, equally-similar chunks in
+        # chat 2 -- only the one that literally NAMES Jordan links; "weekend with
+        # my boss" is dropped despite sim 1.0.
+        out = query_tools.trace_conflict_across_chats(7, consent=True)
+        linked = [ln["chunk_id"] for ln in out["links"]]
+        self.assertIn(100, linked)          # names Jordan
+        self.assertNotIn(101, linked)       # "my boss" -- no name reference
+        by_id = {ln["chunk_id"]: ln for ln in out["links"]}
+        self.assertEqual(by_id[100]["matched_reference"]["value"], "jordan")
+        self.assertEqual(by_id[100]["matched_reference"]["kind"], "name")
+
+    def test_excludes_origin_chat(self):
+        # Chunk 103 is in the origin chat, names Jordan, and is sim 1.0 -- but the
+        # trace is cross-chat by construction, so it must never link.
+        out = query_tools.trace_conflict_across_chats(7, consent=True)
+        self.assertEqual(out["origin_chat_id"], 1)
+        self.assertNotIn(103, [ln["chunk_id"] for ln in out["links"]])
+        for ln in out["links"]:
+            self.assertNotEqual(ln["chat_id"], 1)
+
+    def test_similarity_threshold_filters_low_sim(self):
+        # Chunk 102 names Jordan but is orthogonal (sim 0.0 < 0.65) -- filtered.
+        out = query_tools.trace_conflict_across_chats(7, consent=True)
+        self.assertNotIn(102, [ln["chunk_id"] for ln in out["links"]])
+        for ln in out["links"]:
+            self.assertGreater(ln["similarity"], out["sim_threshold"])
+
+    def _vec_con(self):
+        con = sqlite3.connect(self.db_path)
+        self.addCleanup(con.close)
+        con.row_factory = sqlite3.Row
+        load_vec_extension(con)   # chunk_vectors is a vec0 virtual table
+        return con
+
+    def test_nothing_persisted(self):
+        counts = ("conflicts", "chunks", "chunk_vectors")
+        con = self._vec_con()
+        before = {t: con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                  for t in counts}
+        query_tools.trace_conflict_across_chats(7, consent=True)
+        con2 = self._vec_con()
+        tables = {r[0] for r in con2.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertNotIn("conflict_links", tables)   # no such table exists
+        after = {t: con2.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                 for t in counts}
+        self.assertEqual(before, after)              # trace wrote nothing
+
+    def test_missing_conflict_errors_gracefully(self):
+        out = query_tools.trace_conflict_across_chats(999999, consent=True)
+        self.assertIn("error", out)
+        self.assertEqual(out["links"], [])
+
+    def test_chunk_knn_exclude_chat_ids_drops_whole_chat(self):
+        # Direct _chunk_knn check: exclude_chat_ids removes a chat in-scan, and
+        # leaving it unset is a no-op vs the existing callers.
+        from query_tools.chunks import _chunk_knn
+        con = sqlite3.connect(self.db_path)
+        self.addCleanup(con.close)
+        con.row_factory = sqlite3.Row
+        load_vec_extension(con)
+        qvec = sqlite_vec.serialize_float32([1.0, 0.0, 0.0])
+        base = _chunk_knn(con, qvec, 10, None, None, None)
+        base_ids = {r["chunk_id"] for r in base}
+        self.assertIn(103, base_ids)   # origin chunk present without exclusion
+        excl = _chunk_knn(con, qvec, 10, None, None, None, exclude_chat_ids=[1])
+        excl_ids = {r["chunk_id"] for r in excl}
+        self.assertNotIn(103, excl_ids)                 # chat 1 dropped in-scan
+        self.assertEqual(excl_ids, base_ids - {103})    # only chat 1 removed
+        for r in excl:
+            self.assertNotEqual(r["chat_id"], 1)
+
+
+class TraceRegistrationGateTest(unittest.TestCase):
+    """The trace schema is registered ONLY when CONFLICT_TRACE_ENABLED; that
+    registration gate -- not the per-call consent param -- is the security
+    boundary. Reloads tool_schemas + chat with the flag toggled (mirrors
+    test_drift_tools.RegistrationGateTest so it is robust under full discover:
+    the live config module is used, and the flag is restored in cleanup)."""
+
+    NAME = "trace_conflict_across_chats"
+
+    def setUp(self):
+        self._saved = importlib.import_module("config").CONFLICT_TRACE_ENABLED
+        self.addCleanup(self._reload, self._saved)
+
+    @staticmethod
+    def _reload(enabled):
+        import chat
+        import tool_schemas
+        importlib.import_module("config").CONFLICT_TRACE_ENABLED = enabled
+        importlib.reload(tool_schemas)
+        importlib.reload(chat)
+
+    def test_disabled_is_default_and_registers_nothing(self):
+        # Off out of the box: the function still imports, but no schema/dispatch/
+        # prompt line exists, so the model can never call it.
+        self._reload(False)
+        import chat
+        import tool_schemas
+        self.assertFalse(importlib.import_module("config").CONFLICT_TRACE_ENABLED)
+        self.assertTrue(callable(query_tools.trace_conflict_across_chats))  # importable
+        names = {t["name"] for t in tool_schemas.TOOL_DEFINITIONS}
+        self.assertNotIn(self.NAME, names)
+        self.assertNotIn(self.NAME, chat.TOOL_FUNCTIONS)
+        ollama_names = {t["function"]["name"] for t in chat.OLLAMA_TOOLS}
+        self.assertNotIn(self.NAME, ollama_names)
+        self.assertNotIn(self.NAME, chat.SYSTEM_PROMPT)
+
+    def test_enabled_registers_schema_dispatch_and_prompt(self):
+        self._reload(True)
+        import chat
+        import tool_schemas
+        names = {t["name"] for t in tool_schemas.TOOL_DEFINITIONS}
+        self.assertIn(self.NAME, names)
+        self.assertIn(self.NAME, chat.TOOL_FUNCTIONS)
+        ollama_names = {t["function"]["name"] for t in chat.OLLAMA_TOOLS}
+        self.assertIn(self.NAME, ollama_names)
+        self.assertIn(self.NAME, chat.SYSTEM_PROMPT)
 
 
 if __name__ == "__main__":
