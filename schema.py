@@ -138,6 +138,14 @@ CREATE TABLE IF NOT EXISTS person_period_lexicon (
     question_count INTEGER,
     laugh_count INTEGER,
     emoji_json TEXT,
+    -- Pronoun-split + absolutist token counts (raw tokens in PRONOUN_I /
+    -- PRONOUN_YOU / ABSOLUTIST, not per-message flags): nullable, filled on
+    -- full rebuild. Downstream sums these across rows and forms rates against
+    -- summed n_words. Declared last to match the ALTER migration's append
+    -- order on pre-existing DBs (see create_schema).
+    i_count INTEGER,
+    you_count INTEGER,
+    absolutist_count INTEGER,
     -- NULL handle_id in the PK is fine: the table is full-rebuild only
     -- (plain INSERTs, never upserts), so PK uniqueness is never relied on.
     PRIMARY KEY (chat_id, handle_id, month)
@@ -260,6 +268,17 @@ def create_schema(con: sqlite3.Connection):
     if term_cols and "curate_failures" not in term_cols:
         con.execute("ALTER TABLE dyad_terms "
                     "ADD COLUMN curate_failures INTEGER NOT NULL DEFAULT 0")
+
+    # Pre-F1 person_period_lexicon: add the pronoun-split + absolutist counts.
+    # Nullable, no DEFAULT -- pre-existing rows predate the counters and read
+    # NULL until the next full lexicon rebuild fills them. Idempotent: each
+    # column is added only if absent, so re-running create_schema is a no-op
+    # (and on a fresh DB lex_cols is empty, so SCHEMA creates them instead).
+    lex_cols = {row[1] for row in con.execute("PRAGMA table_info(person_period_lexicon)")}
+    if lex_cols:
+        for col in ("i_count", "you_count", "absolutist_count"):
+            if col not in lex_cols:
+                con.execute(f"ALTER TABLE person_period_lexicon ADD COLUMN {col} INTEGER")
 
     # The update trigger used to fire on ANY messages update; drop it so
     # FTS_SCHEMA recreates it scoped to UPDATE OF text (see comment there).
