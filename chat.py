@@ -120,6 +120,33 @@ SYSTEM_PROMPT = (
     "and pass ALL of them to the tool you call."
 )
 
+# --- feature: drift ---
+# Drift tools are schema-gated on DRIFT_ENABLED (see tool_schemas.py's matching
+# gate). ONLY when they are registered do we advertise them here and fold in the
+# two load-bearing narration rules (relay the channel caveat first; narrate at
+# the payload's confidence_tier). When disabled, the tools don't exist to the
+# model, so there is no prompt-level "don't use drift" text. Appended, never
+# reflowing the base prompt, to stay a clean additive edit.
+import config as _drift_config  # noqa: E402 (local to the additive drift block)
+
+if _drift_config.DRIFT_ENABLED:
+    SYSTEM_PROMPT += (
+        "\n- get_relationship_drift (how ONE 1:1 relationship is trending over "
+        "time: phase, drift score, per-signal monthly evidence, current gap vs "
+        "typical, confidence tier -- 'are X and I drifting apart')"
+        "\n- get_fadeout_watchlist (relationships fading out, ranked WITHIN a "
+        "coverage tier; a separate insufficient_signal bucket is never ranked "
+        "against it -- 'who am I drifting from')"
+        "\nFor a get_relationship_drift result whose phase is "
+        "cooling/fading/dormant, the payload carries a channel_caveat -- relay "
+        "its `ask` (whether you still talk elsewhere: calls, IG, in person) "
+        "BEFORE characterizing the tie, because this read is iMessage-only. "
+        "Narrate strictly at the payload's confidence_tier `narration` template; "
+        "never phrase more confidently than the tier allows, and never rank "
+        "fadeout rows across the two coverage buckets."
+    )
+# --- end feature: drift ---
+
 def _build_system_prompt():
     """SYSTEM_PROMPT plus the current UTC date/time, computed fresh each time --
     message dates in the DB are stored as unlabeled-UTC ISO strings (see

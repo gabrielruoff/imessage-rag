@@ -767,3 +767,78 @@ TOOL_DEFINITIONS = [
     },
     # --- end feature: wellbeing ---
 ]
+
+
+# --- feature: drift ---
+# Drift read tools are registered ONLY when DRIFT_ENABLED (mirrors drift.py's
+# build-side gate). Withholding the schema is the repo's one reliable way to
+# stop the model calling a tool, so a disabled deployment does not need any
+# prompt-level "don't use drift" text -- the tools simply do not exist to the
+# model. The functions are always importable from query_tools; only their
+# schemas (and the SYSTEM_PROMPT lines in chat.py) are conditional.
+import config as _config  # noqa: E402 (local to the additive drift block)
+
+_DRIFT_TOOL_DEFINITIONS = [
+    {
+        "name": "get_relationship_drift",
+        "description": "How ONE 1:1 relationship is trending over time, read "
+                        "from the drift pipeline (deterministic; no re-scoring). "
+                        "Use for 'are X and I drifting apart', 'how is my "
+                        "friendship with Y doing', 'am I losing touch with Z'. "
+                        "Identify the person with exactly one of contact_id / "
+                        "handle_id / chat_id (a group chat_id is an error). "
+                        "Returns the resolved contact, the phase "
+                        "(thriving/steady/cooling/fading/dormant) with "
+                        "phase_corroborated, a drift_score, the ranked "
+                        "contributing signals each with a monthly evidence trail "
+                        "and gate verdict, the current gap vs its typical size, a "
+                        "reconnection_window, coverage, and a confidence_tier. "
+                        "When the phase is cooling/fading/dormant the result "
+                        "carries a channel_caveat: relay its `ask` (whether you "
+                        "still talk elsewhere -- calls, IG, in person) BEFORE "
+                        "characterizing the relationship, and narrate strictly at "
+                        "the `narration` confidence_tier template -- never phrase "
+                        "more confidently than the tier allows.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "contact_id": _ID_OR_LIST_SCHEMA,
+                "handle_id": _ID_OR_LIST_SCHEMA,
+                "chat_id": _ID_OR_LIST_SCHEMA,
+            },
+        },
+    },
+    {
+        "name": "get_fadeout_watchlist",
+        "description": "A leaderboard of relationships that are fading out, read "
+                        "from the drift pipeline. Use for 'who am I drifting from', "
+                        "'which friendships are cooling off', 'who's fading'. "
+                        "PARTITIONED BY COVERAGE: `watchlist` is the rankable tier "
+                        "(all mandatory signals present), ordered by drift_score; "
+                        "`insufficient_signal` is a SEPARATE bucket (a mandatory "
+                        "signal missing) that is never ranked against the "
+                        "watchlist -- do not compare scores across the two. Each "
+                        "row carries its gated signal_count, its top_driver, and "
+                        "(for cooling/fading/dormant rows) a channel_caveat. "
+                        "min_messages floors the dyad size; phase_filter (a phase "
+                        "name or list) narrows to given phases; limit caps each "
+                        "bucket.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "default": 10},
+                "min_messages": {"type": "integer", "default": 0},
+                "phase_filter": {
+                    "type": ["string", "array"],
+                    "items": {"type": "string"},
+                    "description": "a phase name (thriving/steady/cooling/fading/"
+                                   "dormant) or a list of them",
+                },
+            },
+        },
+    },
+]
+
+if _config.DRIFT_ENABLED:
+    TOOL_DEFINITIONS.extend(_DRIFT_TOOL_DEFINITIONS)
+# --- end feature: drift ---
