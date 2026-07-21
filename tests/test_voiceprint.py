@@ -14,14 +14,17 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import config
 import lexicon_build
+import ollama
 import query_tools
 import reset_db
 import schema
 import sessions
 import voiceprint
+from query_tools import persona
 
 
 def _msg(mid, chat, handle, from_me, text, date):
@@ -488,6 +491,171 @@ class ResetDbTest(_DBCase):
         self.assertEqual(
             self.rows("SELECT COUNT(*) AS n FROM ingest_state "
                       "WHERE key = 'voiceprint_max_message_id'")[0]["n"], 0)
+
+
+class DraftReplyTest(_DBCase):
+    """V2 draft_reply: reply-in-context pairing, the structural decline below
+    VOICEPRINT_MIN_CONTEXT_PAIRS (zero generation calls), and the in-tool
+    dyad_terms post-check. Ollama is always mocked -- no network."""
+
+    def populate(self, con):
+        con.execute("INSERT INTO contacts(id, source_uniqueid, first_name) "
+                    "VALUES (12, 'u12', 'Mom')")
+        con.execute("INSERT INTO handles(id, handle_identifier, contact_id, service) "
+                    "VALUES (70, '+1700', 12, 'iMessage')")
+        con.execute("INSERT INTO chats(id, chat_identifier, display_name, is_group, "
+                    "service) VALUES (100, 'c100', NULL, 0, 'iMessage')")
+        con.execute("INSERT INTO chat_participants VALUES (100, 70)")
+
+        def msg(mid, chunk, from_me, text, day, is_emote=0):
+            date = f"2026-0{day}-01T10:00:{mid % 60:02d}"
+            con.execute(
+                "INSERT INTO messages(id, guid, chat_id, handle_id, is_from_me, "
+                "text, date, has_attachment, is_emote, item_type, chunk_id) "
+                "VALUES (?, ?, 100, ?, ?, ?, ?, 0, ?, 0, ?)",
+                (mid, f"g{mid}", 0 if from_me else 70, from_me, text, date,
+                 is_emote, chunk),
+            )
+
+        # chunk 1 (month 03, most recent): the "dinner" retrieval fixture --
+        # 4 real (their message -> my reply) pairs, all matchable by FTS on
+        # the incoming's "dinner".
+        c1 = [
+            (1, 0, "are we still on for dinner"),
+            (2, 1, "yes dinner sounds great"),
+            (3, 0, "what time dinner"),
+            (4, 1, "seven works for dinner"),
+            (5, 0, "where should we dinner"),
+            (6, 1, "the usual dinner spot"),
+            (7, 0, "cool see you at dinner"),
+            (8, 1, "cant wait for dinner"),
+        ]
+        for mid, from_me, text in c1:
+            msg(mid, 1, from_me, text, day=3)
+
+        # chunk 2 (month 02): a hand-built stream for the pairing rigor test.
+        # Real order: them aaa, me bbb, them ccc, them ddd, me eee, me fff,
+        # them ggg. Only aaa->bbb and ddd->eee are true adjacency pairs; a
+        # naive inbound x self co-occurrence would wrongly yield 4x3=12.
+        c2 = [
+            (11, 0, "aaa"), (12, 1, "bbb"), (13, 0, "ccc"), (14, 0, "ddd"),
+            (15, 1, "eee"), (16, 1, "fff"), (17, 0, "ggg"),
+        ]
+        for mid, from_me, text in c2:
+            msg(mid, 2, from_me, text, day=2)
+
+        # chunk 3 (month 01): emote transparency. Real stream after dropping the
+        # emote rows: them hello, me hi_back, me yo. Emotes (21 from me, 23 from
+        # them) can neither serve as a reply nor anchor one -> exactly one pair
+        # (hello -> hi_back); yo follows a self message so it pairs with nothing.
+        msg(31, 3, 0, "hello", day=1)
+        msg(21, 3, 1, "Loved a message", day=1, is_emote=1)
+        msg(32, 3, 1, "hi back", day=1)
+        msg(23, 3, 0, "Liked a message", day=1, is_emote=1)
+        msg(33, 3, 1, "yo", day=1)
+
+        con.executemany(
+            "INSERT INTO chunks(id, chat_id, first_message_id, last_message_id, "
+            "first_date, last_date, n_messages, text) VALUES (?, 100, ?, ?, ?, ?, ?, 'x')",
+            [(1, 1, 8, "2026-03-01", "2026-03-01", 8),
+             (2, 11, 17, "2026-02-01", "2026-02-01", 7),
+             (3, 31, 33, "2026-01-01", "2026-01-01", 5)],
+        )
+        # dyad_terms: "wombat" belongs to THIS dyad (grounded, allowed);
+        # "floopy" belongs to another chat (an inside-joke universe member that
+        # is NOT grounded in this dyad -> must be stripped from a draft).
+        con.executemany(
+            "INSERT INTO dyad_terms(chat_id, term) VALUES (?, ?)",
+            [(100, "wombat"), (999, "floopy")],
+        )
+
+    # --- reply-in-context pairing (vs naive co-occurrence) ------------------
+    def test_reply_pairs_only_true_adjacency(self):
+        con = self._con()
+        pairs = persona.reply_pairs_in_chunk(con, 2)
+        # Only the two adjacency pairs -- never the 12 naive inbound x self combos.
+        self.assertEqual([(p["incoming"], p["reply"]) for p in pairs],
+                         [("aaa", "bbb"), ("ddd", "eee")])
+
+    def test_emote_rows_neither_anchor_nor_serve(self):
+        con = self._con()
+        pairs = persona.reply_pairs_in_chunk(con, 3)
+        # The emote between hello and hi_back is transparent (the pair still
+        # forms); the emote before yo can't anchor, so yo pairs with nothing.
+        self.assertEqual([(p["incoming"], p["reply"]) for p in pairs],
+                         [("hello", "hi back")])
+
+    # --- structural decline below the per-call floor ------------------------
+    def test_below_floor_declines_with_zero_generation_calls(self):
+        # 4 similar pairs available, floor raised to 5 -> low, no LLM call.
+        saved = config.VOICEPRINT_MIN_CONTEXT_PAIRS
+        config.VOICEPRINT_MIN_CONTEXT_PAIRS = 5
+        self.addCleanup(setattr, config, "VOICEPRINT_MIN_CONTEXT_PAIRS", saved)
+
+        with mock.patch.object(ollama, "chat_once") as chat_once:
+            res = query_tools.draft_reply(
+                "hey want to grab dinner tonight", contact_id=12)
+        chat_once.assert_not_called()  # STRUCTURAL: no generation attempt at all
+        self.assertEqual(res["confidence"], "low")
+        self.assertIsNone(res["draft"])
+        self.assertEqual(res["n_context_pairs"], 4)
+        # The labeled "recent replies" pack is returned instead.
+        self.assertTrue(res["exemplars"])
+        self.assertTrue(all("reply" in ex and "incoming" in ex
+                            for ex in res["exemplars"]))
+
+    # --- generation path + dyad_terms post-check ----------------------------
+    def test_high_confidence_generates_and_bundles_exemplars(self):
+        with mock.patch.object(ollama, "chat_once",
+                               return_value={"content": "sure sounds good"}) as chat_once:
+            res = query_tools.draft_reply(
+                "hey want to grab dinner tonight", contact_id=12)
+        chat_once.assert_called_once()
+        self.assertEqual(res["confidence"], "high")
+        self.assertEqual(res["draft"], "sure sounds good")
+        self.assertEqual(res["n_context_pairs"], 4)
+        self.assertLessEqual(len(res["exemplars"]), 8)
+        self.assertTrue(res["exemplars"])
+
+    def test_exemplars_truncated_to_text_preview_chars(self):
+        from query_tools._shared import TEXT_PREVIEW_CHARS
+        # A long inbound in chunk 1 must be clipped in the returned exemplar.
+        con = sqlite3.connect(self.db_path)
+        con.execute("UPDATE messages SET text = ? WHERE id = 1",
+                    ("dinner " + "x" * (TEXT_PREVIEW_CHARS + 50),))
+        con.commit()
+        con.close()
+        with mock.patch.object(ollama, "chat_once",
+                               return_value={"content": "ok"}):
+            res = query_tools.draft_reply("dinner plans", contact_id=12)
+        for ex in res["exemplars"]:
+            self.assertLessEqual(len(ex["incoming"]), TEXT_PREVIEW_CHARS + 1)
+            self.assertLessEqual(len(ex["reply"]), TEXT_PREVIEW_CHARS + 1)
+
+    def test_postcheck_strips_ungrounded_inside_joke(self):
+        # The model emits a grounded term (wombat, this dyad's) and an
+        # ungrounded one (floopy, another chat's). Only floopy is stripped.
+        with mock.patch.object(ollama, "chat_once",
+                               return_value={"content": "sounds good wombat floopy"}):
+            res = query_tools.draft_reply(
+                "hey want to grab dinner tonight", contact_id=12)
+        self.assertIn("wombat", res["draft"])
+        self.assertNotIn("floopy", res["draft"])
+        self.assertTrue(res["notes"])
+        self.assertIn("floopy", " ".join(res["notes"]))
+
+    # --- input / scope guards -----------------------------------------------
+    def test_requires_incoming_text(self):
+        with mock.patch.object(ollama, "chat_once") as chat_once:
+            res = query_tools.draft_reply("   ", contact_id=12)
+        chat_once.assert_not_called()
+        self.assertIn("error", res)
+
+    def test_requires_a_person(self):
+        with mock.patch.object(ollama, "chat_once") as chat_once:
+            res = query_tools.draft_reply("hello there")
+        chat_once.assert_not_called()
+        self.assertIn("error", res)
 
 
 if __name__ == "__main__":
