@@ -572,3 +572,35 @@ NUDGE_QUESTION_MIN_CHARS = int(os.getenv("NUDGE_QUESTION_MIN_CHARS") or "12")
 # fast-cadence pair from firing on a single afternoon's silence.
 NUDGE_QUESTION_GRACE_HOURS = float(os.getenv("NUDGE_QUESTION_GRACE_HOURS") or "72")
 # --- end feature: nudges ---
+# --- feature: nudges ---
+# --- N4 nudges: dropped_plan + unreciprocated_goodnews (loose_ends.py; RES-57) ---
+# Both detectors ship HARD-GATED (default OFF). Their flag-off path never runs
+# an LLM and never consults the eval gate -- turning them off is a pure config
+# read, independent of whether the owner has run the F4 measurement gate.
+#
+# dropped_plan (a.k.a. unmet_commitment): an FTS cue-phrase pre-filter finds a
+# message that proposes a plan or makes a commitment, then ollama.chat_once_json
+# asks Searle-style questions over the anchor + capped following context and
+# returns fulfilled | unfulfilled | UNKNOWN. UNKNOWN => SUPPRESS. Off by default;
+# even when ON, a row is written ONLY if the F4 precision gate clears the
+# dropped_plan class (>= 0.85) -- eval_gate_passed(con, 'dropped_plan',
+# 'dropped_plan') is checked at write time, and an absent verdict suppresses
+# (dropped_plan ships no seed). The verification call passes think=NUDGES_THINK
+# via ollama's tri-state; with gemma the effective value must be false -- a
+# one-word verdict does not warrant a reasoning pass (~11x latency for the same
+# answer), and NUDGES_THINK is only ever True/False/None (config._think), never
+# an effort-level string, so no such string is ever inherited into gemma.
+NUDGE_DROPPED_PLAN_ENABLED = os.getenv(
+    "NUDGE_DROPPED_PLAN_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+# How many messages following the anchor are shown to the verifier as context.
+NUDGE_PLAN_CONTEXT_MSGS = int(os.getenv("NUDGE_PLAN_CONTEXT_MSGS") or "30")
+# unreciprocated_goodnews: reads response_class out of chunk_annotations.
+# events_json (a JSON field, NOT a column) for source='llm' rows ONLY, and fires
+# when a good-news moment drew anything other than an active-constructive
+# response. Coverage (the fraction of the dyad's chunks that carry an llm-source
+# annotation) is reported in evidence_json so "no good news" is never confused
+# with "not annotated". Opt-in (default OFF); its precision is inherited from
+# the gemma annotations, not an SQL-exact signal, and the tool payload says so.
+NUDGE_GOODNEWS_ENABLED = os.getenv(
+    "NUDGE_GOODNEWS_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+# --- end feature: nudges ---

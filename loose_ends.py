@@ -88,6 +88,23 @@ from config import NUDGE_QUESTION_GRACE_HOURS, NUDGE_QUESTION_MIN_CHARS
 from query_tools._shared import TEXT_PREVIEW_CHARS
 # --- end detector: unanswered_question ---
 
+# --- detector: dropped_plan ---
+# Additive per-detector imports (RES-57 / N4), fenced so concurrent N-wave
+# detectors never contend for the shared import block. The F4 precision gate is
+# CONSUMED here (never built here): eval.evalkit.gates is stdlib-only to import
+# and pulls in no app module, so loading it costs no Ollama. TEXT_PREVIEW_CHARS
+# (imported above) caps the anchor/context text this detector renders.
+from config import NUDGE_DROPPED_PLAN_ENABLED, NUDGE_PLAN_CONTEXT_MSGS
+from eval.evalkit.gates import eval_gate_passed
+# --- end detector: dropped_plan ---
+
+# --- detector: unreciprocated_goodnews ---
+# Additive per-detector import (RES-57 / N4). Opt-in flag only; the signal is
+# read out of chunk_annotations.events_json (source='llm') and its precision is
+# inherited from the gemma annotations, not SQL-exact.
+from config import NUDGE_GOODNEWS_ENABLED
+# --- end detector: unreciprocated_goodnews ---
+
 # Module attribute so tests can patch it; _connect() reads it at call time.
 DB_PATH = TARGET_DB
 
@@ -580,6 +597,281 @@ DETECTORS.append(("unanswered_question", detect_unanswered_question))
 
 
 # ---------------------------------------------------------------------------
+# Detector: dropped_plan / unmet_commitment (RES-57 / N4)
+# ---------------------------------------------------------------------------
+# --- detector: dropped_plan ---
+# A plan or commitment raised in a 1:1 chat that the following conversation gives
+# no sign was ever carried out. HARD-GATED and OFF BY DEFAULT
+# (NUDGE_DROPPED_PLAN_ENABLED): the off path returns immediately -- it runs no
+# LLM and never consults the eval gate, so turning the detector off does NOT
+# depend on the owner having run the F4 measurement gate. Two stages once
+# enabled:
+#   Stage 1 -- an FTS cue-phrase pre-filter over messages_fts finds the
+#              most-recent message that reads like a plan/commitment (the
+#              anchor). One anchor per chat bounds the verifier to a single LLM
+#              call per candidate chat.
+#   Stage 2 -- ollama.chat_once_json asks Searle-style questions over the anchor
+#              + up to NUDGE_PLAN_CONTEXT_MSGS following messages and returns
+#              fulfilled | unfulfilled | UNKNOWN. Only "unfulfilled" is a loose
+#              end; UNKNOWN -- and "fulfilled", and any unparseable reply --
+#              SUPPRESS.
+# Precision gate (F4): even enabled, nothing is written unless the dropped_plan
+# class is cleared at >= 0.85 -- eval_gate_passed(con, 'dropped_plan',
+# 'dropped_plan') is checked UP FRONT (so a failing/absent gate also skips the
+# expensive verification). dropped_plan ships no seed, so an absent verdict
+# suppresses. The Stage-0 exclusion gate + urgency run OUTSIDE this function in
+# the shared driver, exactly as for every detector.
+
+# PINNED module-level cue phrases (a frozenset, next to the detector) OR-joined
+# into one FTS5 MATCH query. These are commissive / plan markers -- a message
+# matching one is only a CANDIDATE anchor; the Stage-2 verifier decides whether
+# it is a genuine, unfulfilled plan. Extending the list is expected.
+_PLAN_CUE_PHRASES = frozenset({
+    "let's grab", "lets grab", "let's get", "lets get", "let's do", "lets do",
+    "we should", "we need to", "we have to", "we gotta", "we ought to",
+    "rain check", "raincheck", "reschedule", "next week", "next time",
+    "catch up soon", "grab dinner", "grab lunch", "grab coffee", "grab drinks",
+    "get coffee", "get dinner", "get drinks", "come visit", "come over",
+    "i'll send", "i'll get you", "i'll let you know", "i'll text you",
+    "i promise", "let me know when", "circle back", "follow up", "we'll figure",
+})
+
+_PLAN_VERIFY_SYSTEM = (
+    "You judge whether a plan or commitment made in a personal text conversation "
+    "was followed through. You are given an ANCHOR message that may propose a "
+    "plan or promise an action, followed by the messages that came AFTER it in "
+    "the same chat. Answer two Searle-style questions: (1) Does the ANCHOR "
+    "actually commit the speakers to a specific future action or plan -- a "
+    "commissive or a concrete directive -- rather than small talk? (2) If so, do "
+    "the following messages show it was carried out? Respond with ONLY one JSON "
+    'object: {"verdict": "fulfilled" | "unfulfilled" | "UNKNOWN"}. Use '
+    '"unfulfilled" ONLY when the ANCHOR is a genuine plan/commitment AND the '
+    'following messages give no sign it happened. Use "UNKNOWN" whenever you are '
+    "unsure, the ANCHOR is not a real plan, or there is too little context to "
+    "tell."
+)
+
+_PLAN_VERIFY_NUDGE = (
+    'Respond with only the JSON object {"verdict": "fulfilled" | "unfulfilled" '
+    '| "UNKNOWN"} -- no prose, no code fences, nothing else.'
+)
+
+
+def _plan_fts_query():
+    """The cue-phrase frozenset OR-joined into one FTS5 MATCH query. Each phrase
+    is double-quoted so FTS5 treats it as a consecutive-token phrase -- an
+    apostrophe in "let's" is a token separator, so it still matches "let's grab"."""
+    return " OR ".join(f'"{p}"' for p in sorted(_PLAN_CUE_PHRASES))
+
+
+def _plan_following_context(con, chat_id, anchor_id, anchor_date, limit):
+    """Up to `limit` real messages strictly after the anchor, in time order --
+    the hindsight the verifier reads to decide whether the plan happened."""
+    return con.execute(
+        f"SELECT m.is_from_me AS is_from_me, m.text AS text FROM messages m "
+        f"WHERE m.chat_id = ? AND m.date IS NOT NULL "
+        f"AND (m.date > ? OR (m.date = ? AND m.id > ?)) AND {_REAL} "
+        f"ORDER BY m.date, m.id LIMIT ?",
+        (chat_id, anchor_date, anchor_date, anchor_id, limit),
+    ).fetchall()
+
+
+def _render_plan_context(anchor_text, anchor_is_me, following):
+    """The anchor + following messages as speaker-labelled lines for the
+    verifier ('Me' / 'Them'), each capped at TEXT_PREVIEW_CHARS."""
+    def who(is_me):
+        return "Me" if is_me else "Them"
+    lines = [f"ANCHOR {who(anchor_is_me)}: {(anchor_text or '')[:TEXT_PREVIEW_CHARS]}"]
+    for row in following:
+        lines.append(
+            f"{who(row['is_from_me'])}: {(row['text'] or '')[:TEXT_PREVIEW_CHARS]}")
+    return "\n".join(lines)
+
+
+def _verify_plan(anchor_text, anchor_is_me, following, cfg):
+    """Stage-2 verdict from ollama.chat_once_json: 'fulfilled' / 'unfulfilled' /
+    'unknown' (lowercased), or None when the model returns no usable JSON. think
+    is passed per the tri-state via cfg['nudges_think']; with gemma the effective
+    value must be false -- a one-word verdict is not worth a reasoning pass, and
+    NUDGES_THINK is only ever True/False/None (never an effort-level string)."""
+    context = _render_plan_context(anchor_text, anchor_is_me, following)
+    user = ("ANCHOR message and the conversation that followed it:\n\n"
+            f"{context}\n\nWas the plan or commitment in the ANCHOR carried out?")
+    result = ollama.chat_once_json(
+        [{"role": "system", "content": _PLAN_VERIFY_SYSTEM},
+         {"role": "user", "content": user}],
+        model=cfg["nudges_model"], retry_nudge=_PLAN_VERIFY_NUDGE,
+        timeout=cfg["nudges_timeout"], think=cfg["nudges_think"],
+    )
+    if not result:
+        return None
+    return str(result.get("verdict", "")).strip().lower()
+
+
+def detect_dropped_plan(con, cfg) -> Iterable[CandidateRow]:
+    """Fire for a plan/commitment a 1:1 chat raised and then let drop (see the
+    fence header). OFF unless cfg['dropped_plan_enabled'] AND the F4 dropped_plan
+    precision gate is cleared -- BOTH checked before any FTS or LLM work, so the
+    disabled / ungated path writes nothing and calls no model. One candidate per
+    chat: the most-recent cue-phrase message owns the verdict; UNKNOWN suppresses."""
+    if not cfg["dropped_plan_enabled"]:
+        return
+    # Precision gate BEFORE the FTS/LLM work: a failing or absent verdict means
+    # zero rows AND zero verification calls (dropped_plan ships no seed).
+    if not eval_gate_passed(con, "dropped_plan", "dropped_plan"):
+        return
+    rows = con.execute(
+        f"SELECT m.chat_id AS chat_id, m.id AS id, m.date AS date, "
+        f"m.text AS text, m.is_from_me AS is_from_me "
+        f"FROM messages_fts f JOIN messages m ON m.id = f.rowid "
+        f"WHERE messages_fts MATCH ? AND m.date IS NOT NULL AND {_REAL} "
+        f"ORDER BY m.date DESC, m.id DESC",
+        (_plan_fts_query(),),
+    ).fetchall()
+    if not rows:
+        return
+    direct = set(_restrict_to_direct_chats(con, list({r["chat_id"] for r in rows})))
+    seen = set()
+    for r in rows:
+        chat_id = r["chat_id"]
+        if chat_id in seen or chat_id not in direct:
+            continue
+        seen.add(chat_id)  # the most-recent cue message owns this chat's verdict
+        following = _plan_following_context(
+            con, chat_id, r["id"], r["date"], cfg["plan_context_msgs"])
+        verdict = _verify_plan(r["text"], r["is_from_me"], following, cfg)
+        if verdict != "unfulfilled":
+            continue  # UNKNOWN / fulfilled / unparseable -> SUPPRESS
+        yield CandidateRow(
+            kind="dropped_plan",
+            chat_id=chat_id,
+            handle_id=_counterparty_handle(con, chat_id),
+            anchor_message_id=r["id"],
+            anchor_date=r["date"],
+            evidence={
+                "anchor_text": (r["text"] or "")[:TEXT_PREVIEW_CHARS],
+                "anchor_from_me": bool(r["is_from_me"]),
+                "verdict": verdict,
+                "context_messages": len(following),
+                "verified_by": cfg["nudges_model"],
+                "gate": "dropped_plan (F4 precision gate cleared >= 0.85)",
+            },
+        )
+
+
+DETECTORS.append(("dropped_plan", detect_dropped_plan))
+# --- end detector: dropped_plan ---
+
+
+# ---------------------------------------------------------------------------
+# Detector: unreciprocated_goodnews (RES-57 / N4)
+# ---------------------------------------------------------------------------
+# --- detector: unreciprocated_goodnews ---
+# Someone shared good news in a 1:1 chat and it drew anything other than an
+# active-constructive response -- a moment worth circling back on. OPT-IN and OFF
+# BY DEFAULT (NUDGE_GOODNEWS_ENABLED); the off path returns immediately. The
+# signal is read straight out of the gemma chunk annotations: response_class
+# inside chunk_annotations.events_json (a JSON FIELD, not a column), for
+# source='llm' rows ONLY (distilled rows carry empty events). Because this leans
+# on the annotator's judgement, its precision is INHERITED (gemma), not
+# SQL-exact -- evidence_json says so in a precision_note, and also reports
+# llm-annotation COVERAGE for the dyad so "no good news" is never confused with
+# "the dyad was barely annotated". Pure detection; the shared driver runs Stage-0
+# exclusion + urgency outside this function, as for every detector.
+
+# A good-news event whose response_class is anything but this was under-received;
+# null ("no response") and every non-ideal class count as unreciprocated.
+_GOODNEWS_RECIPROCATED = "active_constructive"
+
+
+def _goodnews_coverage(con, chat_id):
+    """The dyad's llm-annotation coverage: how many of its chunks carry a
+    source='llm' annotation, out of all its chunks. Reported in evidence so a
+    firing dyad's numbers can be read in context -- the good-news signal only
+    ever sees llm rows, so low coverage means a soft, thin signal."""
+    row = con.execute(
+        "SELECT COUNT(*) AS total, "
+        "SUM(CASE WHEN a.source = 'llm' THEN 1 ELSE 0 END) AS llm "
+        "FROM chunks c LEFT JOIN chunk_annotations a ON a.chunk_id = c.id "
+        "WHERE c.chat_id = ?",
+        (chat_id,),
+    ).fetchone()
+    total = row["total"] or 0
+    llm = row["llm"] or 0
+    return {
+        "llm_annotated_chunks": llm,
+        "total_chunks": total,
+        "fraction": round(llm / total, 4) if total else 0.0,
+    }
+
+
+def _unreciprocated_good_news(events_json):
+    """The good_news events in one chunk whose response_class is NOT
+    active-constructive (null included). [] on malformed JSON or when there is
+    no such event."""
+    try:
+        events = json.loads(events_json or "[]")
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(events, list):
+        return []
+    return [e for e in events
+            if isinstance(e, dict) and e.get("kind") == "good_news"
+            and e.get("response_class") != _GOODNEWS_RECIPROCATED]
+
+
+def detect_unreciprocated_goodnews(con, cfg) -> Iterable[CandidateRow]:
+    """Fire for a 1:1 chat whose most-recent llm-annotated good-news moment drew
+    a non active-constructive response (see the fence header). OFF unless
+    cfg['goodnews_enabled']; reads events_json for source='llm' rows only and
+    reports llm-annotation coverage in evidence. One candidate per chat: the
+    newest chunk carrying an unreciprocated good-news event owns it."""
+    if not cfg["goodnews_enabled"]:
+        return
+    rows = con.execute(
+        "SELECT c.chat_id AS chat_id, c.last_message_id AS mid, "
+        "c.last_date AS last_date, a.events_json AS events_json "
+        "FROM chunks c JOIN chunk_annotations a ON a.chunk_id = c.id "
+        "WHERE a.source = 'llm' AND a.events_json IS NOT NULL "
+        "AND a.events_json NOT IN ('', '[]') "
+        "ORDER BY c.chat_id, c.last_date DESC, c.id DESC"
+    ).fetchall()
+    if not rows:
+        return
+    direct = set(_restrict_to_direct_chats(con, list({r["chat_id"] for r in rows})))
+    seen = set()
+    for r in rows:
+        chat_id = r["chat_id"]
+        if chat_id in seen or chat_id not in direct:
+            continue
+        unrecip = _unreciprocated_good_news(r["events_json"])
+        if not unrecip:
+            continue  # this chunk had no under-received good news; try older ones
+        seen.add(chat_id)  # newest unreciprocated good-news chunk owns the chat
+        first = unrecip[0]
+        yield CandidateRow(
+            kind="unreciprocated_goodnews",
+            chat_id=chat_id,
+            handle_id=_counterparty_handle(con, chat_id),
+            anchor_message_id=r["mid"],
+            anchor_date=r["last_date"],
+            evidence={
+                "good_news_excerpt": (first.get("excerpt") or "")[:TEXT_PREVIEW_CHARS],
+                "response_class": first.get("response_class"),
+                "n_unreciprocated": len(unrecip),
+                "llm_annotation_coverage": _goodnews_coverage(con, chat_id),
+                "precision_note": "Signal inherited from gemma chunk annotations "
+                                  "(events_json response_class), not an SQL-exact "
+                                  "measure; treat as a soft hint.",
+            },
+        )
+
+
+DETECTORS.append(("unreciprocated_goodnews", detect_unreciprocated_goodnews))
+# --- end detector: unreciprocated_goodnews ---
+
+
+# ---------------------------------------------------------------------------
 # Stage 0: exclusion gate
 # ---------------------------------------------------------------------------
 
@@ -717,6 +1009,19 @@ def _build_cfg(con):
         "question_min_chars": NUDGE_QUESTION_MIN_CHARS,
         "question_grace_hours": NUDGE_QUESTION_GRACE_HOURS,
         # --- end detector: unanswered_question ---
+        # --- detector: dropped_plan ---
+        # HARD-GATED: dropped_plan_enabled is the default-OFF flag; the verifier
+        # reuses the narration model/timeout and passes think=nudges_think per
+        # ollama's tri-state (false/omitted for gemma -- a one-word verdict).
+        "dropped_plan_enabled": NUDGE_DROPPED_PLAN_ENABLED,
+        "plan_context_msgs": NUDGE_PLAN_CONTEXT_MSGS,
+        "nudges_model": NUDGES_MODEL,
+        "nudges_think": NUDGES_THINK,
+        "nudges_timeout": NUDGES_TIMEOUT,
+        # --- end detector: dropped_plan ---
+        # --- detector: unreciprocated_goodnews ---
+        "goodnews_enabled": NUDGE_GOODNEWS_ENABLED,
+        # --- end detector: unreciprocated_goodnews ---
     }
 
 
