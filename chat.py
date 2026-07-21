@@ -65,6 +65,13 @@ SYSTEM_PROMPT = (
     "- get_message_reactions (tapbacks on a message, by its guid)\n"
     "- get_full_messages (full untruncated text for one or more message ids, "
     "when a search result was truncated)\n"
+    # --- feature: nudges ---
+    "- get_loose_threads (the user's 'loose ends' digest: drifted relationships "
+    "to reach back out to, urgency-ranked -- 'who should I reconnect with')\n"
+    "- resolve_loose_thread (dismiss one loose thread by its id)\n"
+    "- mute_contact_from_nudges (stop nudging about a contact and dismiss their "
+    "open loose threads)\n"
+    # --- end feature: nudges ---
     "When a question names a person or group, first use search_contacts_by_name "
     "or list_chats to resolve it to the handle_id / chat_id / contact_id the "
     "search tools need. For 'what did we say about X' or topic/analysis "

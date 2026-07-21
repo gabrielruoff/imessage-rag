@@ -71,6 +71,14 @@ from .messages import (
     search_messages_sql,
 )
 
+# --- feature: nudges ---
+from .nudges import (
+    get_loose_threads,
+    mute_contact_from_nudges,
+    resolve_loose_thread,
+)
+# --- end feature: nudges ---
+
 __all__ = [
     "DB_PATH",
     "embed_texts",
@@ -100,4 +108,9 @@ __all__ = [
     "_normalize_date_bound",
     # shared query helper for the dyad-scoped features (1:1-only restriction)
     "_restrict_to_direct_chats",
+    # --- feature: nudges ---
+    "get_loose_threads",
+    "mute_contact_from_nudges",
+    "resolve_loose_thread",
+    # --- end feature: nudges ---
 ]

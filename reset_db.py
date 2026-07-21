@@ -32,6 +32,14 @@ TABLES = [
     "contacts",
     "chats",
     "ingest_state",
+    # --- feature: nudges ---
+    # loose_threads is a derived detector artifact -> cleared. nudge_exclusions
+    # is durable user intent (mutes) and is deliberately NOT listed here, so it
+    # survives a reset (its source-PK handle/contact ids dangle harmlessly until
+    # re-ingest), the same way dyad_terms.llm_verdict is preserved across
+    # rebuilds.
+    "loose_threads",
+    # --- end feature: nudges ---
 ]
 
 # Dropped outright rather than emptied: their declared vector dimension is
