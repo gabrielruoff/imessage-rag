@@ -326,3 +326,56 @@ def _nudge_kind_weights():
 
 NUDGE_KIND_WEIGHTS = _nudge_kind_weights()
 # --- end feature: nudges ---
+# --- feature: drift ---
+# Relationship-drift pipeline (drift.py). DRIFT_ENABLED gates the whole
+# pipeline end-to-end: false (the default) makes the `make pipeline` drift step
+# a no-op -- drift.py exits immediately and the dyad_drift table is never built
+# out of the box. DRIFT_WEIGHTS and DRIFT_PHASE_THRESHOLDS are this repo's first
+# JSON-valued env vars: each is parsed once, here, with a clear ValueError on
+# malformed input (a bad .env must fail loudly at import, not silently later).
+import json as _json  # noqa: E402  (local to the drift block; keeps the edit additive)
+
+DRIFT_ENABLED = os.getenv("DRIFT_ENABLED", "").strip().lower() in ("1", "true", "yes")
+# A dyad needs at least this many total messages, distinct active months, and
+# (per signal) valid monthly data points to be scored; robust_slope itself
+# needs >= 4 points, so DRIFT_MIN_VALID_MONTHS below 4 makes every trend absent.
+DRIFT_MIN_MESSAGES = int(os.getenv("DRIFT_MIN_MESSAGES") or "100")
+DRIFT_MIN_MONTHS = int(os.getenv("DRIFT_MIN_MONTHS") or "4")
+DRIFT_MIN_VALID_MONTHS = int(os.getenv("DRIFT_MIN_VALID_MONTHS") or "4")
+# A dyad needs this many gap-split sessions before the initiation-asymmetry
+# signal is computed at all (too few sessions makes the share meaningless).
+DRIFT_MIN_SESSIONS = int(os.getenv("DRIFT_MIN_SESSIONS") or "5")
+# Confidence level for every trend's bootstrap CI (robust_slope alpha): a CI
+# that still spans 0 at this level contributes 0 to the composite.
+DRIFT_SLOPE_CI = float(os.getenv("DRIFT_SLOPE_CI") or "0.05")
+
+# The two structured vars. .env.example shows the full default JSON inline.
+_DRIFT_WEIGHTS_DEFAULT = (
+    '{"volume": 0.20, "reciprocity": 0.20, "latency": 0.15, '
+    '"silence": 0.10, "valence": 0.15, "depth": 0.10, "initiation": 0.10}'
+)
+_DRIFT_PHASE_THRESHOLDS_DEFAULT = (
+    '{"thriving": 0.10, "steady": 0.35, "cooling": 0.60, "dormant_days": 90}'
+)
+
+
+def _parse_json_dict_env(name, default):
+    """Parse a JSON-object-valued env var (drift's weights / phase thresholds).
+    A malformed value raises a clear ValueError at import rather than silently
+    poisoning a downstream aggregate."""
+    raw = os.getenv(name, "").strip() or default
+    try:
+        value = _json.loads(raw)
+    except (ValueError, TypeError) as e:
+        raise ValueError(f"{name} must be valid JSON, got {raw!r}: {e}") from None
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"{name} must be a JSON object (got {type(value).__name__})"
+        )
+    return value
+
+
+DRIFT_WEIGHTS = _parse_json_dict_env("DRIFT_WEIGHTS", _DRIFT_WEIGHTS_DEFAULT)
+DRIFT_PHASE_THRESHOLDS = _parse_json_dict_env(
+    "DRIFT_PHASE_THRESHOLDS", _DRIFT_PHASE_THRESHOLDS_DEFAULT)
+# --- end feature: drift ---
