@@ -392,5 +392,191 @@ class RegistrationGateTest(unittest.TestCase):
         self.assertIn("channel_caveat", chat.SYSTEM_PROMPT)
 
 
+# --- D3 (RES-65): grounded reconnection-opener candidates -------------------
+
+
+def _insert_dyad_term(con, chat_id, term, verdict, *, n_uses=10, lift=3.0):
+    """Seed one dyad_terms row (llm_verdict drives eligibility)."""
+    con.execute(
+        "INSERT INTO dyad_terms(chat_id, term, lift, n_uses, first_message_id, "
+        "coined_by_handle_id, coined_is_me, llm_verdict) VALUES (?,?,?,?,?,?,?,?)",
+        (chat_id, term, lift, n_uses, 100, 50, 0, verdict))
+
+
+def _insert_chunk_annotation(con, chunk_id, chat_id, valence, source,
+                             text="that day at the lake was the best"):
+    """Seed a chunk + its annotation (source gates memory eligibility)."""
+    con.execute(
+        "INSERT INTO chunks(id, chat_id, first_message_id, last_message_id, "
+        "first_date, last_date, n_messages, text) VALUES (?,?,?,?,?,?,?,?)",
+        (chunk_id, chat_id, chunk_id * 10, chunk_id * 10 + 1,
+         "2023-06-01T00:00:00", "2023-06-01T01:00:00", 5, text))
+    con.execute(
+        "INSERT INTO chunk_annotations(chunk_id, valence, emotions_json, depth, "
+        "events_json, source) VALUES (?,?,?,?,?,?)",
+        (chunk_id, valence, '["joy"]', 4, "[]", source))
+
+
+class ReconnectionCandidatesTest(_TempDBTest):
+    """contact:2 (handle 50 -> chat 1) with curated terms and mixed-source
+    chunks: the tool surfaces curated inside-joke/nickname terms and
+    high-valence LLM chunks, and excludes uncurated terms, distilled chunks,
+    and low-valence chunks."""
+
+    LLM_HIGH = 101        # high valence, source=llm       -> eligible memory
+    LLM_LOW = 102         # low valence,  source=llm       -> below threshold
+    DISTILLED_HIGH = 103  # high valence, source=distilled -> NEVER eligible
+
+    def setUp(self):
+        super().setUp()
+        con = self._con()
+        self._seed_identity(con)
+        _insert_dyad_term(con, 1, "goblin mode", "inside_joke")
+        _insert_dyad_term(con, 1, "Captain", "nickname")
+        _insert_dyad_term(con, 1, "the store", None)       # uncurated -> excluded
+        _insert_dyad_term(con, 1, "literally", "literal")  # other verdict -> excluded
+        _insert_chunk_annotation(con, self.LLM_HIGH, 1, 0.9, "llm")
+        _insert_chunk_annotation(con, self.LLM_LOW, 1, 0.1, "llm")
+        _insert_chunk_annotation(con, self.DISTILLED_HIGH, 1, 0.95, "distilled")
+        con.commit()
+
+    def test_surfaces_curated_terms_and_llm_memory(self):
+        out = query_tools.get_reconnection_candidates(contact_id=2)
+        self.assertTrue(out["has_curated_reference"])
+        self.assertIn("instruction", out)
+        self.assertNotIn("refusal", out)
+        self.assertEqual(out["contact"], "Alex Rivers")
+        kinds = [c["kind"] for c in out["candidates"]]
+        self.assertIn("inside_joke", kinds)
+        self.assertIn("nickname", kinds)
+        self.assertIn("shared_memory", kinds)
+
+    def test_excludes_uncurated_terms(self):
+        out = query_tools.get_reconnection_candidates(contact_id=2)
+        refs = {c.get("reference") for c in out["candidates"]}
+        self.assertNotIn("the store", refs)   # NULL verdict is not a confirmed ref
+        self.assertNotIn("literally", refs)   # a non-curated verdict is excluded
+
+    def test_distilled_and_low_valence_chunks_excluded(self):
+        out = query_tools.get_reconnection_candidates(contact_id=2)
+        mem_ids = {c["chunk_id"] for c in out["candidates"]
+                   if c["kind"] == "shared_memory"}
+        self.assertIn(self.LLM_HIGH, mem_ids)
+        self.assertNotIn(self.DISTILLED_HIGH, mem_ids)  # distilled never nominates
+        self.assertNotIn(self.LLM_LOW, mem_ids)         # below valence threshold
+
+    def test_resolves_via_handle_and_one_to_one_chat(self):
+        by_handle = query_tools.get_reconnection_candidates(handle_id=50)
+        by_chat = query_tools.get_reconnection_candidates(chat_id=1)
+        self.assertTrue(by_handle["has_curated_reference"])
+        self.assertTrue(by_chat["has_curated_reference"])
+
+    def test_nothing_persisted(self):
+        con = self._con()
+
+        def counts():
+            return tuple(con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                         for t in ("dyad_terms", "chunk_annotations", "chunks"))
+
+        before = counts()
+        out = query_tools.get_reconnection_candidates(contact_id=2)
+        self.assertTrue(out["never_persisted"])
+        self.assertEqual(counts(), before)  # a pure read -- no writes
+        # A second identical call is idempotent (nothing was stored between them).
+        self.assertEqual(query_tools.get_reconnection_candidates(contact_id=2), out)
+
+    def test_group_chat_is_an_error(self):
+        self.assertIn("error", query_tools.get_reconnection_candidates(chat_id=2))
+
+    def test_no_identifier_is_an_error(self):
+        self.assertIn("error", query_tools.get_reconnection_candidates())
+
+
+class ReconnectionRefusalTest(_TempDBTest):
+    """A relationship with NO curated reference: the tool refuses and points at
+    a plain, reference-free opener rather than inventing a shared memory."""
+
+    def setUp(self):
+        super().setUp()
+        con = self._con()
+        self._seed_identity(con)
+        # An uncurated term and a distilled-only chunk -- neither is eligible.
+        _insert_dyad_term(con, 1, "the store", None)
+        _insert_chunk_annotation(con, 201, 1, 0.95, "distilled")
+        con.commit()
+
+    def test_refuses_without_curated_reference(self):
+        out = query_tools.get_reconnection_candidates(contact_id=2)
+        self.assertFalse(out["has_curated_reference"])
+        self.assertEqual(out["candidates"], [])
+        self.assertIn("refusal", out)
+        self.assertNotIn("instruction", out)
+        self.assertIn("invent", out["refusal"].lower())
+        self.assertIn("plain", out["refusal"].lower())
+        self.assertTrue(out["never_persisted"])
+
+
+class ReconnectionDistilledOnlyTest(_TempDBTest):
+    """A distilled-only annotation fixture yields NO memory candidates: the
+    curated term still stands, but no chunk is nominated (distilled valence is
+    kNN-inherited and must never become a 'shared memory')."""
+
+    def setUp(self):
+        super().setUp()
+        con = self._con()
+        self._seed_identity(con)
+        _insert_dyad_term(con, 1, "Captain", "nickname")
+        _insert_chunk_annotation(con, 301, 1, 0.99, "distilled")
+        _insert_chunk_annotation(con, 302, 1, 0.88, "distilled")
+        con.commit()
+
+    def test_distilled_only_yields_no_memory_candidates(self):
+        out = query_tools.get_reconnection_candidates(contact_id=2)
+        kinds = [c["kind"] for c in out["candidates"]]
+        self.assertNotIn("shared_memory", kinds)     # no llm-source chunk exists
+        self.assertIn("nickname", kinds)             # the curated term still stands
+        self.assertTrue(out["has_curated_reference"])
+
+
+class ReconnectionGateTest(unittest.TestCase):
+    """get_reconnection_candidates' SCHEMA (RES-65 / D3) is registered ONLY when
+    DRIFT_ENABLED, mirroring the D2 gate. Reloads tool_schemas + chat with the
+    flag toggled off the LIVE config module (importlib.import_module, so it is
+    robust when a sibling test popped config from sys.modules under a full
+    discover); state is restored via addCleanup (tearDown)."""
+
+    NAME = "get_reconnection_candidates"
+
+    def setUp(self):
+        self._saved = importlib.import_module("config").DRIFT_ENABLED
+        self.addCleanup(self._reload, self._saved)  # restore last
+
+    @staticmethod
+    def _reload(enabled):
+        live_config = importlib.import_module("config")
+        live_config.DRIFT_ENABLED = enabled
+        importlib.reload(tool_schemas)
+        importlib.reload(chat)
+
+    def test_disabled_does_not_register(self):
+        self._reload(False)
+        names = {t["name"] for t in tool_schemas.TOOL_DEFINITIONS}
+        self.assertNotIn(self.NAME, names)
+        self.assertNotIn(self.NAME, chat.TOOL_FUNCTIONS)
+        ollama_names = {t["function"]["name"] for t in chat.OLLAMA_TOOLS}
+        self.assertNotIn(self.NAME, ollama_names)
+        self.assertNotIn(self.NAME, chat.SYSTEM_PROMPT)
+
+    def test_enabled_registers_schema_and_prompt(self):
+        self._reload(True)
+        names = {t["name"] for t in tool_schemas.TOOL_DEFINITIONS}
+        self.assertIn(self.NAME, names)
+        self.assertIn(self.NAME, chat.TOOL_FUNCTIONS)
+        ollama_names = {t["function"]["name"] for t in chat.OLLAMA_TOOLS}
+        self.assertIn(self.NAME, ollama_names)
+        self.assertIn(self.NAME, chat.SYSTEM_PROMPT)
+        self.assertIn("PICK", chat.SYSTEM_PROMPT)  # the pick-or-refuse flow
+
+
 if __name__ == "__main__":
     unittest.main()

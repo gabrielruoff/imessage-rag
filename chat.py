@@ -150,6 +150,30 @@ if _drift_config.DRIFT_ENABLED:
     )
 # --- end feature: drift ---
 
+
+# --- feature: drift ---
+# D3 (RES-65): grounded reconnection-opener flow. Same DRIFT_ENABLED gate as
+# above -- the tool's schema only exists to the model when enabled, so this
+# guidance rides the same flag. Appended, never reflowing the base prompt.
+import config as _drift_d3_config  # noqa: E402 (local to the additive drift block)
+
+if _drift_d3_config.DRIFT_ENABLED:
+    SYSTEM_PROMPT += (
+        "\n- get_reconnection_candidates (grounding step for a reconnection "
+        "opener to ONE 1:1 relationship: surfaces human-curated shared "
+        "references -- inside jokes, nicknames, LLM-annotated high points -- "
+        "'help me reach back out to X', 'write an opener to reconnect with Y')"
+        "\nReconnection openers are human-in-the-loop and reference-grounded. "
+        "ONLY on an explicit in-turn request, call get_reconnection_candidates; "
+        "never volunteer an opener. If it returns candidates, present them and "
+        "have the user PICK exactly one, then draft the opener ONLY after they "
+        "choose, grounded strictly in the picked reference -- never combine, "
+        "embellish, or invent a shared memory. If has_curated_reference is "
+        "false, relay its `refusal`: do not fabricate a memory; offer a plain, "
+        "reference-free opener instead. Never store an opener."
+    )
+# --- end feature: drift ---
+
 def _build_system_prompt():
     """SYSTEM_PROMPT plus the current UTC date/time, computed fresh each time --
     message dates in the DB are stored as unlabeled-UTC ISO strings (see

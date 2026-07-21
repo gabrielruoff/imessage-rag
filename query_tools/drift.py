@@ -391,3 +391,161 @@ def get_fadeout_watchlist(limit=10, min_messages=0, phase_filter=None):
                 "insufficient_signal rows are missing a mandatory signal and "
                 "are not comparable to the ranked watchlist",
     }
+
+
+# --- feature: drift ---
+# D3 (RES-65): grounded reconnection-opener CANDIDATES. Prompt-only,
+# human-in-the-loop, NOTHING persisted (no new table, no stored openers). This
+# tool does not write an opener and does not decide for the user: it SURFACES
+# candidate curated references for one 1:1 relationship so the chat flow can ask
+# the user to PICK one before any opener is drafted. When no curated reference
+# exists it REFUSES and points at a plain, reference-free opener rather than
+# letting the model invent a shared memory. Registered ONLY when DRIFT_ENABLED
+# (mirrors D2's schema gate); the function itself is always importable.
+#
+# Curated-only grounding (never free text, never a distilled guess):
+#   * dyad_terms whose llm_verdict is 'inside_joke' or 'nickname' -- vocabulary a
+#     human-graded curation pass (annotate.py --terms) actually confirmed.
+#   * high-valence chunks from chunk_annotations with source='llm' ONLY. A
+#     'distilled' valence is kNN-inherited from a seed sample, so it is not
+#     trustworthy enough to nominate a "shared memory"; a contact whose chats
+#     carry only distilled annotations yields NO memory candidates by
+#     construction. Both are read verbatim -- no re-scoring, no Ollama, no writes.
+from ._shared import (  # noqa: E402 (additive drift block; import at use site)
+    CHUNK_PREVIEW_CHARS as _D3_CHUNK_PREVIEW_CHARS,
+    _resolve_chat_scope as _d3_resolve_chat_scope,
+    _restrict_to_direct_chats as _d3_restrict_direct,
+)
+
+# chunk_annotations.valence is -1..1; a shared "high point" worth referencing is
+# a clearly positive chunk. Caps are this tool's own (like D2's MAX_WATCHLIST_ROWS
+# / _MAX_TRAIL_MONTHS), comfortably under TOOL_RESULT_MAX_CHARS.
+_RECONNECT_MIN_VALENCE = 0.5
+_MAX_TERM_CANDIDATES = 8
+_MAX_MEMORY_CANDIDATES = 5
+_CURATED_VERDICTS = ("inside_joke", "nickname")
+
+
+def _reconnection_term_candidates(con, chat_ids):
+    """Human-curated dyad terms (llm_verdict in inside_joke/nickname) for the
+    relationship's chats -- the strongest 'curated reference' signal, read
+    verbatim. Ordered most-used first so the top of the list is the reference
+    most likely to land. NULL / any other verdict is deliberately excluded: an
+    uncurated term is not a confirmed shared reference."""
+    if not chat_ids:
+        return []
+    ph_chats = ",".join("?" * len(chat_ids))
+    ph_verd = ",".join("?" * len(_CURATED_VERDICTS))
+    rows = con.execute(
+        f"SELECT term, llm_verdict, lift, n_uses, chat_id FROM dyad_terms "
+        f"WHERE chat_id IN ({ph_chats}) AND llm_verdict IN ({ph_verd}) "
+        f"ORDER BY n_uses DESC, lift DESC, term ASC LIMIT ?",
+        (*chat_ids, *_CURATED_VERDICTS, _MAX_TERM_CANDIDATES),
+    ).fetchall()
+    return [{
+        "kind": r["llm_verdict"],              # 'inside_joke' | 'nickname'
+        "reference": r["term"],
+        "n_uses": r["n_uses"],
+        "lift": r["lift"],
+        "chat_id": r["chat_id"],
+        "source": "dyad_terms (human-curated llm_verdict)",
+    } for r in rows]
+
+
+def _reconnection_memory_candidates(con, chat_ids):
+    """High-valence chunks from chunk_annotations with source='llm' ONLY, joined
+    to their chunk for the text preview and dates. The source='llm' filter is
+    load-bearing: a 'distilled' valence is kNN-inherited and must never nominate
+    a shared memory, so distilled-only chats produce nothing here. Ordered by
+    valence so the warmest moments surface first; the preview is truncated (the
+    full window is one get_conversation(chunk_id) away)."""
+    if not chat_ids:
+        return []
+    ph_chats = ",".join("?" * len(chat_ids))
+    rows = con.execute(
+        f"SELECT ca.chunk_id, ca.valence, ca.emotions_json, "
+        f"c.chat_id, c.first_date, c.last_date, c.text "
+        f"FROM chunk_annotations ca JOIN chunks c ON c.id = ca.chunk_id "
+        f"WHERE c.chat_id IN ({ph_chats}) AND ca.source = 'llm' "
+        f"AND ca.valence >= ? "
+        f"ORDER BY ca.valence DESC, ca.chunk_id ASC LIMIT ?",
+        (*chat_ids, _RECONNECT_MIN_VALENCE, _MAX_MEMORY_CANDIDATES),
+    ).fetchall()
+    out = []
+    for r in rows:
+        text = r["text"] or ""
+        preview = (text[:_D3_CHUNK_PREVIEW_CHARS] + "…"
+                   if len(text) > _D3_CHUNK_PREVIEW_CHARS else text)
+        try:
+            emotions = json.loads(r["emotions_json"] or "[]")
+        except (TypeError, ValueError):
+            emotions = []
+        out.append({
+            "kind": "shared_memory",
+            "chunk_id": r["chunk_id"],
+            "valence": r["valence"],
+            "emotions": emotions,
+            "preview": preview,
+            "date_range": [r["first_date"], r["last_date"]],
+            "chat_id": r["chat_id"],
+            "source": "chunk_annotations (source=llm; distilled excluded)",
+        })
+    return out
+
+
+def get_reconnection_candidates(contact_id=None, handle_id=None, chat_id=None):
+    """Surface CANDIDATE curated references for reconnecting with ONE 1:1
+    relationship -- the grounding step before drafting a reconnection opener.
+    This is prompt-only and human-in-the-loop: it NEVER writes an opener, never
+    stores anything, and never decides for the user. Identify the person with
+    exactly ONE of contact_id / handle_id / chat_id (a group chat_id is an
+    error; same resolution as get_relationship_drift).
+
+    Returns the resolved `contact`, a flat `candidates` list, and either an
+    `instruction` (when curated references exist -- present them and have the
+    user PICK exactly one before drafting) or a `refusal` (when none exist --
+    do NOT invent a shared memory; offer a plain, reference-free opener). A
+    candidate is EITHER a human-curated dyad term (kind inside_joke/nickname)
+    OR a high-valence LLM-annotated chunk (kind shared_memory; distilled
+    valence is never eligible). Nothing here is persisted."""
+    with contextlib.closing(_connect()) as con:
+        key, err = _resolve_contact_key(con, contact_id, handle_id, chat_id)
+        if err:
+            return err
+        label = _label_for_key(con, key, None)
+        chat_ids, _empty = _d3_resolve_chat_scope(con, chat_id, handle_id, contact_id)
+        chat_ids = _d3_restrict_direct(con, chat_ids)
+
+        terms = _reconnection_term_candidates(con, chat_ids)
+        memories = _reconnection_memory_candidates(con, chat_ids)
+        candidates = terms + memories
+
+        payload = {
+            "contact_key": key,
+            "contact": label,
+            "candidates": candidates,
+            "n_candidates": len(candidates),
+            "has_curated_reference": bool(candidates),
+            # A marker the chat flow leans on: an opener is drafted only on an
+            # explicit in-turn request, and only after the user picks a candidate.
+            "explicit_request_required": True,
+            "never_persisted": True,
+        }
+        if candidates:
+            payload["instruction"] = (
+                "Present these candidate shared references to the user and ask "
+                "them to PICK exactly ONE before you draft anything. Draft a "
+                "reconnection opener ONLY after they choose, grounding it "
+                "strictly in the reference they picked. Never combine, "
+                "embellish, or invent a reference that is not in this list, and "
+                "never store the opener.")
+        else:
+            payload["refusal"] = (
+                f"No curated shared reference (a human-confirmed inside joke or "
+                f"nickname, or an LLM-annotated high point) exists for {label}. "
+                "Do NOT invent or imply a shared memory. Offer a plain, "
+                "reference-free opener instead -- an honest 'it's been a while, "
+                "thinking of you' with no fabricated callback -- and only if the "
+                "user still wants to reach out.")
+        return payload
+# --- end feature: drift ---
