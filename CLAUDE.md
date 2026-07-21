@@ -20,7 +20,7 @@ Full design history, schema, rationale, and data forensics:
   `make install` on purpose: that target is fast and offline, this one pulls
   ~15GB and installs a background service.
 - Ingest: `make ingest`, or `.venv/bin/python3 ingest.py [--no-embed]
-  [--since-last] [--senders=...]`
+  [--since-last] [--senders=...] [--exclude=...]`
 - Chat CLI: `.venv/bin/python3 chat.py` (interactive REPL), or
   `chat.py -p "..."` for a one-shot answer (prints only the reply; exit 1 if
   Ollama is unreachable)

@@ -18,6 +18,9 @@ Usage:
     python3 ingest.py --senders="+12015551234,alice@example.com"
                                         # only ingest chats (direct or group) containing
                                         # at least one of the given phone numbers/emails
+    python3 ingest.py --exclude="+12015551234,alice@example.com"
+                                        # ingest everything EXCEPT chats (direct or group)
+                                        # containing any of the given phone numbers/emails
 """
 
 import argparse
@@ -176,6 +179,12 @@ def resolve_allowed_chat_ids(src, senders):
         WHERE h.id IN ({placeholders})
     """, senders).fetchall()
     return {r[0] for r in rows}
+
+
+def all_chat_ids(src):
+    """Every chat ROWID in the source db -- used to turn a bare --exclude
+    (no --senders) into an explicit allowlist of everything-but-excluded."""
+    return {r[0] for r in src.execute("SELECT ROWID FROM chat")}
 
 
 def _chat_id_filter_sql(column, allowed_chat_ids, params):
@@ -408,6 +417,14 @@ def ingest_attachments(src, tgt, since_rowid=0, allowed_chat_ids=None):
 # Main
 # ---------------------------------------------------------------------------
 
+def _split_csv(value):
+    """Comma-separated phone/email string -> list of trimmed non-empty items,
+    or None when the flag was not given (the "no filter" sentinel)."""
+    if not value:
+        return None
+    return [s.strip() for s in value.split(",") if s.strip()]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-embed", action="store_true", help="skip the embedding step")
@@ -416,11 +433,13 @@ def main():
     ap.add_argument("-s", "--senders", default=None,
                      help="comma-separated list of phone numbers/emails; only ingest "
                           "chats (direct or group) that include at least one of them")
+    ap.add_argument("-x", "--exclude", default=None,
+                     help="comma-separated list of phone numbers/emails; skip any "
+                          "chat (direct or group) that includes at least one of them")
     args = ap.parse_args()
 
-    senders = None
-    if args.senders:
-        senders = [s.strip() for s in args.senders.split(",") if s.strip()]
+    senders = _split_csv(args.senders)
+    excluded = _split_csv(args.exclude)
 
     snapshot_source(SOURCE_DB, SNAPSHOT_DB)
 
@@ -450,6 +469,22 @@ def main():
                 else:
                     print(f"Sender filter: no chats found matching {senders} -- check the "
                           f"phone/email format (e.g. +12015551234)")
+
+            if excluded is not None:
+                excluded_chat_ids = resolve_allowed_chat_ids(src, excluded) or set()
+                if excluded_chat_ids:
+                    # No --senders means "ingest everything"; realize that as an
+                    # explicit allowlist so exclusion threads through the same
+                    # chat_id plumbing (subtraction otherwise, when --senders set).
+                    if allowed_chat_ids is None:
+                        allowed_chat_ids = all_chat_ids(src) - excluded_chat_ids
+                    else:
+                        allowed_chat_ids = allowed_chat_ids - excluded_chat_ids
+                    print(f"Exclude filter: dropping {len(excluded_chat_ids)} chat(s) "
+                          f"matching {excluded}")
+                else:
+                    print(f"Exclude filter: no chats found matching {excluded} -- check "
+                          f"the phone/email format (e.g. +12015551234)")
 
             ingest_chats(src, tgt, allowed_chat_ids)
             contacts, handle_to_contact = build_contact_lookup()
