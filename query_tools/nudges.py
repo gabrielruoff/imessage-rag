@@ -18,7 +18,7 @@ import datetime
 import json
 
 from config import NUDGE_MAX_RESULTS
-from db import CONTACT_LABEL_SQL
+from db import CONTACT_LABEL_SQL, get_state
 
 from ._shared import _connect
 
@@ -102,6 +102,19 @@ def get_loose_threads(status="open", kind=None, limit=5):
         params.append(kind)
 
     with contextlib.closing(_connect()) as con:
+        # --- feature: nudges ---
+        # First-run batch-hide (N2). Dormant-tie ("reconnect") nudges are a
+        # sensitive class: they are DETECTED and written as normal open rows by
+        # loose_ends.py, but stay hidden from this digest until the user opts in
+        # ONCE via `loose_ends.py --acknowledge-reconnect` (which sets the
+        # durable ingest_state key nudges_reconnect_ack). Absent key => filter
+        # dormant_tie out of the open digest and surface a one-line notice
+        # instead. Keeps the batch pipeline non-interactive; the opt-in is
+        # explicit and durable.
+        hide_dormant = status == "open" and get_state(con, "nudges_reconnect_ack") is None
+        if hide_dormant:
+            clauses.append("lt.kind != 'dormant_tie'")
+        # --- end feature: nudges ---
         rows = con.execute(
             f"""
             SELECT lt.id, lt.kind, lt.chat_id, lt.handle_id, lt.anchor_message_id,
@@ -119,12 +132,30 @@ def get_loose_threads(status="open", kind=None, limit=5):
             """,
             params + [limit],
         ).fetchall()
+        # --- feature: nudges ---
+        hidden_dormant = 0
+        if hide_dormant and kind in (None, "dormant_tie"):
+            hidden_dormant = con.execute(
+                "SELECT COUNT(*) FROM loose_threads "
+                "WHERE status = 'open' AND kind = 'dormant_tie'"
+            ).fetchone()[0]
+        # --- end feature: nudges ---
 
     out = []
     for r in rows:
         row = dict(r)
         row["evidence"] = json.loads(row.pop("evidence_json") or "null")
         out.append(row)
+    # --- feature: nudges ---
+    if hidden_dormant:
+        out.append({
+            "notice": f"{hidden_dormant} dormant-tie reconnect nudge(s) hidden. "
+                      "Run `loose_ends.py --acknowledge-reconnect` to include them "
+                      "in the digest.",
+            "kind": "dormant_tie",
+            "hidden": hidden_dormant,
+        })
+    # --- end feature: nudges ---
     return out
 
 

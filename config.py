@@ -477,3 +477,26 @@ CONFLICT_MAX_LABEL_TURNS = int(os.getenv("CONFLICT_MAX_LABEL_TURNS") or "12")
 CONFLICT_DV_SCREEN = os.getenv("CONFLICT_DV_SCREEN", "on").strip().lower() not in (
     "0", "off", "false", "no")
 # --- end feature: conflict ---
+
+# --- feature: nudges ---
+# --- Dormant-tie nudges (loose_ends.py dormant_tie detector; RES-55 / N2) -----
+# A once-close 1:1 tie that has now gone quiet for anomalously long. "Once-
+# close" = the top NUDGE_DORMANT_TOP_FRAC of eligible dyads by a z-scored
+# closeness composite over the trailing 12 months:
+#   closeness = z(total messages) + z(mean chunk depth) + z(LSM),
+# each term z-scored across ALL eligible dyads (a dyad missing a component --
+# no annotated chunk, or one-sided lexicon -- contributes 0 for that term).
+# Depth is read from chunk_annotations of ANY source (it distills fine); LSM
+# comes from person_period_lexicon via query_tools' public lsm_score. A dyad is
+# eligible when it is a direct (1:1) chat with at least NUDGE_DORMANT_MIN_MESSAGES
+# real messages in that trailing window.
+NUDGE_DORMANT_TOP_FRAC = float(os.getenv("NUDGE_DORMANT_TOP_FRAC") or "0.2")
+NUDGE_DORMANT_MIN_MESSAGES = int(os.getenv("NUDGE_DORMANT_MIN_MESSAGES") or "200")
+# "Overdue" = the current silence (corpus now minus the dyad's last message)
+# exceeds BOTH the dyad's own p90 inter-message gap (the FULL gap distribution
+# via loose_ends._dyad_gap_p90 -- deliberately NOT reply-latency median, which
+# excludes the long silences and is circular) AND this absolute floor in days
+# (so a naturally short-cadence pair does not fire on a two-week lull even when
+# its p90 is tiny).
+NUDGE_DORMANT_MIN_GAP_DAYS = int(os.getenv("NUDGE_DORMANT_MIN_GAP_DAYS") or "21")
+# --- end feature: nudges ---

@@ -65,6 +65,18 @@ from query_tools.nudges import (
     _utcnow_iso,
 )
 
+# --- detector: dormant_tie ---
+# Additive per-detector imports (RES-55 / N2). Kept in their own fenced block so
+# concurrent N-wave detectors never contend for the same import statement, and
+# so the public lsm_score re-export is used rather than the package-private name.
+from config import (
+    NUDGE_DORMANT_MIN_GAP_DAYS,
+    NUDGE_DORMANT_MIN_MESSAGES,
+    NUDGE_DORMANT_TOP_FRAC,
+)
+from query_tools.analytics_language import lsm_score
+# --- end detector: dormant_tie ---
+
 # Module attribute so tests can patch it; _connect() reads it at call time.
 DB_PATH = TARGET_DB
 
@@ -247,6 +259,150 @@ DETECTORS.append(("faded_initiator", detect_faded_initiator))
 
 
 # ---------------------------------------------------------------------------
+# Detector: dormant_tie (RES-55 / N2)
+# ---------------------------------------------------------------------------
+# --- detector: dormant_tie ---
+# A once-close 1:1 tie now overdue for contact. Both halves are defined against
+# the trailing 12 months; the pinned knobs live in config.NUDGE_DORMANT_*. Like
+# every detector this is PURE detection -- the shared driver runs the Stage-0
+# exclusion gate first, so an excluded / negative-valence / zero-outbound
+# contact is never surfaced here (that spine is N1's, relied on, not re-done).
+
+_DORMANT_WINDOW_DAYS = 365
+
+
+def _dormant_window_start(now):
+    """ISO lower bound of the trailing-12-month closeness/eligibility window."""
+    return (now - datetime.timedelta(days=_DORMANT_WINDOW_DAYS)).isoformat()
+
+
+def _dormant_mean_depth(con, chat_id, window_start):
+    """Mean chunk_annotations.depth (ANY source -- depth distills fine) over the
+    chat's chunks whose last_date is in the trailing window; None when no
+    annotated chunk is in range (that dyad contributes 0 to the depth z-term)."""
+    row = con.execute(
+        "SELECT AVG(a.depth) FROM chunks c "
+        "JOIN chunk_annotations a ON a.chunk_id = c.id "
+        "WHERE c.chat_id = ? AND c.last_date >= ? AND a.depth IS NOT NULL",
+        (chat_id, window_start),
+    ).fetchone()
+    return row[0] if row and row[0] is not None else None
+
+
+def _dormant_lsm(con, chat_id, window_start):
+    """The dyad's language-style-matching score over its person_period_lexicon
+    rows in the trailing window, via query_tools' public lsm_score. None when
+    either side has no words in range (one-sided lexicon -> nothing to match)."""
+    rows = con.execute(
+        "SELECT * FROM person_period_lexicon WHERE chat_id = ? AND month >= ?",
+        (chat_id, window_start[:7]),
+    ).fetchall()
+    return lsm_score(rows) if rows else None
+
+
+def _dormant_eligible(con, cfg, window_start):
+    """Every eligible direct dyad with its three raw closeness components over
+    the trailing window: dicts {chat_id, messages, depth, lsm}. Eligible = a 1:1
+    chat with >= dormant_min_messages real messages in the window."""
+    counts = con.execute(
+        f"SELECT m.chat_id AS chat_id, COUNT(*) AS n FROM messages m "
+        f"WHERE m.date IS NOT NULL AND m.date >= ? AND {_REAL} "
+        f"GROUP BY m.chat_id HAVING n >= ?",
+        (window_start, cfg["dormant_min_messages"]),
+    ).fetchall()
+    direct = set(_restrict_to_direct_chats(con, [r["chat_id"] for r in counts]))
+    out = []
+    for r in counts:
+        cid = r["chat_id"]
+        if cid not in direct:
+            continue
+        out.append({
+            "chat_id": cid,
+            "messages": r["n"],
+            "depth": _dormant_mean_depth(con, cid, window_start),
+            "lsm": _dormant_lsm(con, cid, window_start),
+        })
+    return out
+
+
+def _zscores(values):
+    """z-score a list whose entries may be None. Mean/stdev are taken over the
+    PRESENT values only; a None (missing component) maps to 0.0, and a
+    degenerate spread (<2 present, or zero stdev) maps every entry to 0.0 -- so a
+    missing or non-discriminating component neither helps nor hurts the score."""
+    present = [v for v in values if v is not None]
+    if len(present) < 2:
+        return [0.0] * len(values)
+    mean = statistics.fmean(present)
+    sd = statistics.pstdev(present)
+    if sd == 0:
+        return [0.0] * len(values)
+    return [((v - mean) / sd if v is not None else 0.0) for v in values]
+
+
+def detect_dormant_tie(con, cfg) -> Iterable[CandidateRow]:
+    """Fire for a once-close 1:1 tie that has now gone quiet for anomalously
+    long. Once-close = the top cfg['dormant_top_frac'] of eligible dyads by a
+    z-scored closeness composite over the trailing 12 months:
+        closeness = z(messages) + z(mean chunk depth) + z(LSM),
+    each term z-scored across all eligible dyads (a dyad missing depth/LSM
+    contributes 0 for that term; depth from chunk_annotations of ANY source, LSM
+    via query_tools' public lsm_score). Overdue = the current silence (corpus
+    now - the dyad's last message) exceeds BOTH the dyad's own p90 inter-message
+    gap (_dyad_gap_p90 over the FULL gap distribution -- not reply latency, which
+    drops long silences and would fire on every pair) AND the absolute
+    cfg['dormant_min_gap_days'] floor. Pure detection; the driver's Stage-0 gate
+    suppresses any excluded counterparty before a row is written."""
+    now = cfg["now"]
+    window_start = _dormant_window_start(now)
+    eligible = _dormant_eligible(con, cfg, window_start)
+    if not eligible:
+        return
+    z_msgs = _zscores([e["messages"] for e in eligible])
+    z_depth = _zscores([e["depth"] for e in eligible])
+    z_lsm = _zscores([e["lsm"] for e in eligible])
+    for e, zm, zd, zl in zip(eligible, z_msgs, z_depth, z_lsm):
+        e["closeness"] = zm + zd + zl
+        e["z"] = {"messages": round(zm, 4), "depth": round(zd, 4), "lsm": round(zl, 4)}
+    ranked = sorted(eligible, key=lambda e: e["closeness"], reverse=True)
+    n_top = math.ceil(cfg["dormant_top_frac"] * len(ranked))
+    min_gap_seconds = cfg["dormant_min_gap_days"] * 86400
+    for e in ranked[:n_top]:
+        cid = e["chat_id"]
+        anchor_id, anchor_date = _last_message(con, cid)
+        if not anchor_date:
+            continue
+        current_gap = (
+            now - datetime.datetime.fromisoformat(anchor_date)
+        ).total_seconds()
+        p90 = _dyad_gap_p90(con, cid)
+        if p90 is None or current_gap <= p90 or current_gap <= min_gap_seconds:
+            continue
+        yield CandidateRow(
+            kind="dormant_tie",
+            chat_id=cid,
+            handle_id=_counterparty_handle(con, cid),
+            anchor_message_id=anchor_id,
+            anchor_date=anchor_date,
+            evidence={
+                "closeness": round(e["closeness"], 4),
+                "closeness_z": e["z"],
+                "trailing_messages": e["messages"],
+                "mean_depth": round(e["depth"], 3) if e["depth"] is not None else None,
+                "lsm": round(e["lsm"], 4) if e["lsm"] is not None else None,
+                "current_gap_days": round(current_gap / 86400, 1),
+                "p90_gap_days": round(p90 / 86400, 1),
+                "top_frac": cfg["dormant_top_frac"],
+                "window_start": window_start,
+            },
+        )
+
+
+DETECTORS.append(("dormant_tie", detect_dormant_tie))
+# --- end detector: dormant_tie ---
+
+
+# ---------------------------------------------------------------------------
 # Stage 0: exclusion gate
 # ---------------------------------------------------------------------------
 
@@ -375,6 +531,11 @@ def _build_cfg(con):
         "faded_window_days": NUDGE_FADED_INIT_WINDOW_DAYS,
         "kind_weights": NUDGE_KIND_WEIGHTS,
         "halflife_days": max(NUDGE_URGENCY_HALFLIFE_DAYS, 1e-9),
+        # --- detector: dormant_tie ---
+        "dormant_top_frac": NUDGE_DORMANT_TOP_FRAC,
+        "dormant_min_messages": NUDGE_DORMANT_MIN_MESSAGES,
+        "dormant_min_gap_days": NUDGE_DORMANT_MIN_GAP_DAYS,
+        # --- end detector: dormant_tie ---
     }
 
 
@@ -517,6 +678,13 @@ def main(argv=None):
     parser.add_argument("--dry-run", action="store_true",
                         help="detect and print the scope without writing rows or "
                              "calling the model")
+    # --- detector: dormant_tie ---
+    parser.add_argument("--acknowledge-reconnect", action="store_true",
+                        help="opt in (once, durably) to dormant-tie reconnect "
+                             "nudges: sets the ingest_state nudges_reconnect_ack "
+                             "key so get_loose_threads stops hiding them, then "
+                             "exits without running detection")
+    # --- end detector: dormant_tie ---
     args = parser.parse_args(argv)
 
     model = args.model or NUDGES_MODEL
@@ -525,6 +693,16 @@ def main(argv=None):
         # Self-heal the tables (standalone runs / older DBs). Idempotent.
         schema._create_nudges_tables(con)
         con.commit()
+        # --- detector: dormant_tie ---
+        # A pure toggle: record the durable opt-in and exit. Kept non-detecting
+        # so a batch run never has to be interactive to surface reconnect nudges.
+        if args.acknowledge_reconnect:
+            set_state(con, "nudges_reconnect_ack", _utcnow_iso())
+            con.commit()
+            print("Dormant-tie reconnect nudges enabled (nudges_reconnect_ack "
+                  "set); they will now appear in get_loose_threads.")
+            return 0
+        # --- end detector: dormant_tie ---
         cfg = _build_cfg(con)
         event_now = _utcnow_iso()
         summary = detect_all(con, cfg, event_now, dry_run=args.dry_run)
@@ -534,6 +712,20 @@ def main(argv=None):
               f"{' [--dry-run: nothing written]' if args.dry_run else ''}")
         if args.dry_run:
             return 0
+        # --- detector: dormant_tie ---
+        # First-run batch-hide setup: dormant-tie rows are written like any
+        # other, but get_loose_threads keeps them hidden until the opt-in above.
+        # Surface a one-line pointer when some were written and the key is unset.
+        if get_state(con, "nudges_reconnect_ack") is None:
+            n_dormant = con.execute(
+                "SELECT COUNT(*) FROM loose_threads "
+                "WHERE status = 'open' AND kind = 'dormant_tie'"
+            ).fetchone()[0]
+            if n_dormant:
+                print(f"{n_dormant} dormant-tie reconnect nudge(s) written but "
+                      "hidden from the digest. Run `loose_ends.py "
+                      "--acknowledge-reconnect` to include them.")
+        # --- end detector: dormant_tie ---
         if not args.no_llm:
             narrate_threads(con, model, NUDGES_THINK, NUDGES_TIMEOUT, limit=args.limit)
     finally:
