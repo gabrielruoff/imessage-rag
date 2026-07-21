@@ -63,6 +63,9 @@ SYSTEM_PROMPT = (
     "- get_voiceprint (how a person texts: message length, casing, bursts, "
     "function-word rates, signature openers/closers, tone -- your voice, a "
     "person's voice, or your voice with them; scope='group' for group chats)\n"
+    "- draft_reply (draft a reply to an incoming message in your own voice with "
+    "a person, grounded in your real past replies to them; declines with your "
+    "recent replies when there's too little similar context)\n"
     # --- end feature: persona ---
     # --- feature: conflict ---
     "- find_conflicts (detected argument/tense stretches in a 1:1 chat or with a "

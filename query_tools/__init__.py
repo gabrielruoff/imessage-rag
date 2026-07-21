@@ -79,7 +79,10 @@ from .messages import (
     search_messages_sql,
 )
 # --- feature: persona ---
-from .persona import get_voiceprint
+from .persona import (
+    draft_reply,
+    get_voiceprint,
+)
 # --- end feature: persona ---
 
 # --- feature: nudges ---
@@ -112,6 +115,7 @@ __all__ = [
     "get_reaction_stats",
     "get_response_dynamics",
     # --- feature: persona ---
+    "draft_reply",
     "get_voiceprint",
     # --- end feature: persona ---
     "get_word_frequency",

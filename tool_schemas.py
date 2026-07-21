@@ -629,6 +629,33 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        "name": "draft_reply",
+        "description": "Draft a reply to an incoming message in the USER's own "
+                        "voice with a specific person, grounded ONLY in real past "
+                        "exchanges retrieved from that 1:1 chat (their message -> "
+                        "how you actually replied). Name the person "
+                        "(contact_id/handle_id/name) and pass the `incoming` "
+                        "message text. Returns {draft, exemplars, confidence, "
+                        "notes}: on confidence='low' (too few similar reply "
+                        "examples) NO draft is generated (draft=null) and your "
+                        "recent replies to that person are returned instead. The "
+                        "draft mirrors the exemplars' style and invents no facts "
+                        "or inside jokes. 1:1 only.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "incoming": {"type": "string",
+                             "description": "the incoming message text to reply to"},
+                "contact_id": {"type": "integer",
+                               "description": "the person (from search_contacts_by_name)"},
+                "handle_id": {"type": "integer"},
+                "name": {"type": "string",
+                         "description": "person name to resolve (contact_id is exact)"},
+            },
+            "required": ["incoming"],
+        },
+    },
     # --- end feature: persona ---
     # --- feature: conflict ---
     {
