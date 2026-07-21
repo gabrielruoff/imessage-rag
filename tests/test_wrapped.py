@@ -18,6 +18,7 @@ import query_tools
 import schema
 import wrapped
 import wrapped_html
+import wrapped_sections
 
 # The six new tools plus the existing ones wrapped.py composes; every test
 # that drives main() patches all of these so no real query path runs.
@@ -603,6 +604,98 @@ class TestMainFlow(WrappedTestCase):
         with open(out, encoding="utf-8") as f:
             self.assertNotIn("urn:biz", f.read())
         os.unlink(out)
+
+
+# --- feature: drift ---
+class TestWindowChips(unittest.TestCase):
+    """The reconnection-window chip builder (RES-66 / D4) is self-contained
+    HTML over the shared .chip class -- no network, no new CSS."""
+
+    def test_render_and_empty(self):
+        html = wrapped_html.render_window_chips([
+            {"contact": "Zoe", "days_until_dormant": 50, "status": "open"},
+            {"contact": "Ada", "days_until_dormant": 1, "status": "closing"},
+        ])
+        self.assertIn('class="chips"', html)
+        self.assertIn("Zoe · 50 days left", html)
+        self.assertIn("Ada · 1 day left", html)  # singular unit
+        self.assertIn('title="open reconnection window"', html)
+        # Nothing to show -> empty string so the caller can drop the block.
+        self.assertEqual(wrapped_html.render_window_chips([]), "")
+
+
+class TestDriftSection(WrappedTestCase):
+    """The opt-in "Who's Drifting" Wrapped section (RES-66 / D4): gated on
+    DRIFT_ENABLED and rendering only corroborated fading/dormant ties."""
+
+    _TITLE = "Who&#x27;s Drifting"  # esc()'d section heading on the page
+
+    def _seed_basic(self):
+        seed_contact(self.con, 1, "Alice")
+        seed_handle(self.con, 1, "+15550001", 1)
+        seed_chat(self.con, 1, "c1")
+        seed_msgs(self.con, 1, 1, [f"2025-05-{d:02d}T12:00:00" for d in range(1, 6)])
+        self.con.commit()
+
+    def _seed_drift(self, contact_key, label, phase, corroborated,
+                    recip=0.5, latency=0.3, gap_days=40, score=0.7):
+        self.con.execute(
+            "INSERT INTO dyad_drift (contact_key, label, phase, "
+            "phase_corroborated, mandatory_complete, drift_score, "
+            "reciprocity_value, latency_value, coverage_json, last_month, "
+            "confidence_tier, n_messages) "
+            "VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, '2025-05', 'high', 300)",
+            (contact_key, label, phase, corroborated, score, recip, latency,
+             f'{{"last_message_days": {gap_days}}}'),
+        )
+        self.con.commit()
+
+    def _run(self, enabled):
+        out = self.out_path(f"drift-{int(enabled)}.html")
+        with mock.patch.object(config, "DRIFT_ENABLED", enabled):
+            code, _ = self.run_main(["--year", "2025", "--yes", "--no-llm", "--out", out])
+        self.assertEqual(code, 0)
+        with open(out, encoding="utf-8") as f:
+            page = f.read()
+        os.unlink(out)
+        return page
+
+    def test_gated_off_by_default(self):
+        """DRIFT_ENABLED off -> section absent even with a corroborated tie."""
+        self._seed_basic()
+        self._seed_drift("contact:2", "Zoe", "fading", 1)
+        self.patch_tools()
+        self.patch_llm()
+        self.assertNotIn(self._TITLE, self._run(enabled=False))
+
+    def test_renders_only_corroborated_cooldowns_when_enabled(self):
+        """DRIFT_ENABLED on -> section renders; only phase_corroborated
+        fading/dormant ties appear (a non-corroborated tie, and a corroborated
+        non-declining phase, are both excluded)."""
+        self._seed_basic()
+        self._seed_drift("contact:2", "Zoe", "fading", 1, gap_days=40)   # shown
+        self._seed_drift("contact:3", "Yara", "fading", 0)               # not corroborated
+        self._seed_drift("contact:4", "Xena", "steady", 1)              # not a cooldown
+        self.patch_tools()
+        self.patch_llm()
+        page = self._run(enabled=True)
+        self.assertIn(self._TITLE, page)
+        self.assertIn("Zoe", page)
+        self.assertIn('class="sbars"', page)          # corroborated magnitude split bars
+        self.assertIn("Reciprocity erosion", page)
+        self.assertIn("Zoe · 50 days left", page)     # open reconnection-window chip
+        self.assertNotIn("Yara", page)                # non-corroborated tie excluded
+        self.assertNotIn("Xena", page)                # non-declining phase excluded
+
+    def test_excluded_name_kept_out(self):
+        """A person the report drops (excluded_names) must not resurface here."""
+        self._seed_basic()
+        self._seed_drift("contact:2", "Zoe", "fading", 1)
+        with mock.patch.object(config, "DRIFT_ENABLED", True):
+            shown = wrapped_sections._sec_drifting(self.con, excluded_names=frozenset())
+            excluded = wrapped_sections._sec_drifting(self.con, excluded_names={"zoe"})
+        self.assertIsNotNone(shown)                 # the tie renders when kept
+        self.assertIsNone(excluded)                 # ...and is omitted when excluded
 
 
 if __name__ == "__main__":

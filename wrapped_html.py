@@ -1409,3 +1409,30 @@ def render_page(title, subtitle, body, footer="", hero=""):
         + body
         + f"\n{foot}\n</main>\n<script>{_JS}</script>\n</body>\n</html>\n"
     )
+
+
+# --- feature: drift ---
+def render_window_chips(rows, label_key="contact", days_key="days_until_dormant",
+                        status_key="status"):
+    """Open reconnection-window chips (RES-66 / D4): one chip per still-open
+    cooling tie -- the contact and how many days remain before the drift model
+    would count the tie dormant. Reuses the shared .chip styling (no new CSS,
+    so this stays a clean EOF append); the window status rides in the tooltip.
+    Returns '' when there is nothing to show, so the caller can drop the block."""
+    chips = []
+    for row in rows:
+        name = str(row.get(label_key, "") or "")
+        days = row.get(days_key)
+        status = str(row.get(status_key, "") or "")
+        if isinstance(days, (int, float)) and not isinstance(days, bool):
+            unit = "day" if int(days) == 1 else "days"
+            body = f"{name} · {int(days)} {unit} left"
+        else:
+            body = name
+        tip = f"{status} reconnection window" if status else ""
+        title = f' title="{esc(tip)}"' if tip else ""
+        chips.append(f'<span class="chip"{title}>{esc(body)}</span>')
+    if not chips:
+        return ""
+    return '<div class="chips">' + "".join(chips) + "</div>"
+# --- end feature: drift ---

@@ -942,4 +942,124 @@ def build_sections(con, roster, contact_entry=None, year=None,
     eras = _sec_eras(con, scope, dates, contact_entry, year, exclude_chat_ids)
     if eras is not None:
         sections.append(eras)
+    # --- feature: drift ---
+    # D4 (RES-66): opt-in, corpus-wide "Who's Drifting" surface. The builder
+    # self-gates on config.DRIFT_ENABLED (default off); like Your People and
+    # Groups it is a whole-corpus section, so it is dropped in the deep-dive.
+    if contact_entry is None:
+        drifting = _sec_drifting(con, excluded_names)
+        if drifting is not None:
+            sections.append(drifting)
+    # --- end feature: drift ---
     return sections
+
+
+# --- feature: drift ---
+def _sec_drifting(con, excluded_names=frozenset(), limit=8):
+    """Opt-in "Who's Drifting" section (RES-66 / D4) -- a reflective surface,
+    OFF by default. Renders ONLY when config.DRIFT_ENABLED, and only for
+    phase_corroborated fading/dormant ties: a decline label that an
+    intra-iMessage corroborator (reciprocity erosion, or reply-time inflation)
+    actually backs. Every number is read verbatim from the drift model's
+    dyad_drift table -- no re-scoring, no Ollama -- so the narrator only
+    narrates already-computed values. Returns None (section omitted) when
+    drift is disabled, the table is absent (a pre-feature DB), or nothing
+    corroborated survives the report's person exclusions.
+
+    Split bars contrast the two corroborating signals' magnitude per tie;
+    open reconnection-window chips flag ties still inside the window before the
+    drift model would count them dormant -- the same framing as
+    query_tools.drift._reconnection_window, reading config.DRIFT_PHASE_THRESHOLDS
+    at call time (the repo convention). excluded_names keeps a person the
+    report deliberately dropped (a named --exclude, or the silent-contact
+    guard) out of this section too: a 'who's drifting' card for an excluded ex
+    would defeat the exclusion."""
+    import json  # function-local: keeps this additive block off the top imports
+    if not config.DRIFT_ENABLED:
+        return None
+    if not con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='dyad_drift'"
+    ).fetchone():
+        return None
+    rows = con.execute(
+        """
+        SELECT contact_key, label, phase, drift_score,
+               reciprocity_value, latency_value, coverage_json,
+               last_month, confidence_tier, n_messages
+        FROM dyad_drift
+        WHERE phase_corroborated = 1 AND phase IN ('fading', 'dormant')
+        ORDER BY drift_score DESC
+        """
+    ).fetchall()
+
+    dormant_days = float(config.DRIFT_PHASE_THRESHOLDS.get("dormant_days", 90))
+    per_tie, windows, seen = [], [], set()
+    for row in rows:
+        label = row["label"] or row["contact_key"]
+        if str(label).lower() in excluded_names or row["contact_key"] in seen:
+            continue
+        seen.add(row["contact_key"])
+        try:
+            coverage = json.loads(row["coverage_json"] or "{}")
+        except (TypeError, ValueError):
+            coverage = {}
+        gap_days = coverage.get("last_message_days")
+        per_tie.append({
+            "contact": label,
+            "reciprocity_erosion": round(row["reciprocity_value"] or 0.0, 3),
+            "latency_inflation": round(row["latency_value"] or 0.0, 3),
+            "phase": row["phase"],
+            "quiet_for_days": gap_days,
+            "confidence": row["confidence_tier"],
+        })
+        # Days left before the dormant threshold, from the stored gap -- same
+        # open/closing/overdue framing as query_tools.drift._reconnection_window.
+        if isinstance(gap_days, (int, float)) and not isinstance(gap_days, bool):
+            days_until = round(dormant_days - gap_days)
+            if row["phase"] == "dormant" or days_until <= 0:
+                status = "overdue"
+            elif days_until <= 14:
+                status = "closing"
+            else:
+                status = "open"
+            if status in ("open", "closing"):
+                windows.append({"contact": label,
+                                "days_until_dormant": days_until,
+                                "status": status})
+        if len(per_tie) >= limit:
+            break
+
+    if not per_tie:
+        return None
+
+    split = wrapped_html.render_split_bars(
+        per_tie, "contact", "reciprocity_erosion", "latency_inflation",
+        left_label="Reciprocity erosion", right_label="Reply-time drift")
+    if split is None:  # nothing chartable -- degrade to the table view
+        split = wrapped_html._rows_table(per_tie, wrapped_html._columns(per_tie))
+    visuals = [wrapped_html.block("Cooling ties", split)]
+    chips = wrapped_html.render_window_chips(windows)
+    if chips:
+        visuals.append(wrapped_html.block("Still time to reach out", chips))
+
+    return {
+        "title": "Who's Drifting",
+        "stats": {},
+        "narrate_stats": {"cooling_ties": per_tie,
+                          "reconnection_windows": windows},
+        "extra_html": "".join(visuals),
+        "caption": ("iMessage only -- a thread that has gone quiet here may be "
+                    "loud on calls, in person, or elsewhere. Only ties whose "
+                    "cooling is corroborated by an eroding back-and-forth or "
+                    "stretching reply times appear; both magnitudes are read "
+                    "from the drift model, never re-scored."),
+        "hint": ("A gentle, reflective look at 1:1 ties that have cooled on "
+                 "iMessage ONLY -- never diagnose a relationship or give advice. "
+                 "Reciprocity erosion is how lopsided the sending became; "
+                 "reply-time drift is how much slower replies got (both are 0-1 "
+                 "magnitudes). A reconnection window is the days left before a "
+                 "tie is counted dormant. Note softly that iMessage is one "
+                 "channel, mention at most one or two ties, and quote the "
+                 "numbers exactly as given."),
+    }
+# --- end feature: drift ---
