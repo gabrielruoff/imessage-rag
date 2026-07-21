@@ -227,6 +227,52 @@ END;
 """
 
 
+# --- feature: drift ---
+def _create_drift_tables(con: sqlite3.Connection):
+    """Derived relationship-drift table (built by drift.py; reset_db clears it,
+    the append-only carve-out applies). One row per resolved counterparty,
+    keyed by member_key's stable string -- 'contact:<id>' for contact-resolved
+    handles, 'handle:<id>' for contact-less ones; 'me'/unknown never get a row.
+    A FULL-rebuild, skip-if-unchanged artifact guarded in ingest_state by
+    drift_max_message_id + drift_params_hash. Adjacent to create_schema and
+    called from it with a single line, so this stays out of the SCHEMA blob and
+    merges cleanly alongside other features' additive edits.
+
+    Each of the seven signals stores its normalized drift contribution
+    (`*_value`, 0..1; 0 when its trend's CI still spans 0) and a `*_gate` flag
+    (a significant trend was detected). The composite `drift_score`, the `phase`
+    label with its `phase_corroborated` flag, `mandatory_complete`,
+    `confidence_tier`, and three JSON evidence columns round out the row."""
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS dyad_drift (
+        contact_key TEXT PRIMARY KEY,     -- member_key: 'contact:<id>'|'handle:<id>'
+        label TEXT,                       -- human-readable contact/handle label
+        n_messages INTEGER,
+        n_months INTEGER,                 -- distinct active months for the dyad
+        first_month TEXT,                 -- 'YYYY-MM'
+        last_month TEXT,
+        drift_score REAL,                 -- 0..1 weighted composite (higher = more drift)
+        phase TEXT,                       -- thriving|steady|cooling|fading|dormant
+        phase_corroborated INTEGER,       -- 1 when an intra-iMessage corroborator
+                                          -- (reciprocity erosion / latency inflation)
+                                          -- backs a decline label
+        mandatory_complete INTEGER,       -- all mandatory signals present
+        confidence_tier TEXT,             -- high|medium|low (computed in Python)
+        volume_value REAL,      volume_gate INTEGER,
+        reciprocity_value REAL, reciprocity_gate INTEGER,
+        latency_value REAL,     latency_gate INTEGER,
+        silence_value REAL,     silence_gate INTEGER,
+        valence_value REAL,     valence_gate INTEGER,
+        depth_value REAL,       depth_gate INTEGER,
+        initiation_value REAL,  initiation_gate INTEGER,
+        per_signal_gate_json TEXT,        -- full per-signal trend detail
+        coverage_json TEXT,               -- month/message/annotation coverage
+        monthly_series_json TEXT          -- {signal: [[month, value], ...]} (<= 36 mo)
+    );
+    """)
+
+
+# --- end feature: drift ---
 def create_schema(con: sqlite3.Connection):
     cols_before = {row[1]: row[2] for row in con.execute("PRAGMA table_info(handles)")}
     if cols_before.get("contact_id") == "TEXT":
@@ -286,6 +332,9 @@ def create_schema(con: sqlite3.Connection):
 
     con.executescript(SCHEMA)
     con.executescript(FTS_SCHEMA)
+    # --- feature: drift ---
+    _create_drift_tables(con)
+    # --- end feature: drift ---
 
     # --- feature: nudges ---
     _create_nudges_tables(con)

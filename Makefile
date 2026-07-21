@@ -270,10 +270,16 @@ topics:  ## Cluster embedded chunks into topics and label them
 # run these concurrently, and concurrent runs deadlock on the SQLite write
 # lock (each holds it across many LLM calls) while gaining nothing -- Ollama
 # serializes the inference anyway. Recipe lines run in order under any -j.
-pipeline:  ## ingest -> annotate -> topics, in order (stays serial under -j)
+pipeline:  ## ingest -> annotate -> nudges -> drift -> topics, in order (stays serial under -j)
 	$(MAKE) ingest
 	$(MAKE) annotate
 	$(MAKE) nudges          # --- feature: nudges (runs after annotate) ---
+# feature: drift >>> (additive fence; kept off "# --- " so it isn't parsed as a
+# help section) -- drift runs after annotate (its affective-cooling signal
+# reads chunk_annotations) and, like the others, is a recipe line so it stays
+# serial under -j. DRIFT_ENABLED (default false) decides inside drift.py.
+	$(MAKE) drift
+# feature: drift <<<
 	$(MAKE) topics
 
 # --- feature: nudges ---
@@ -285,6 +291,15 @@ nudges:  ## Detect loose threads (nudges) -- run after annotate
 	@$(REQUIRE_OLLAMA)
 	.venv/bin/python3 loose_ends.py
 # --- end feature: nudges ---
+
+# feature: drift >>> (additive fence)
+# Deterministic drift scoring: no Ollama gate (drift.py makes no LLM calls; it
+# reads the annotations annotate.py already produced). DRIFT_ENABLED gates the
+# build inside, so `make drift` with the flag off just prints a notice.
+.PHONY: drift
+drift:  ## Score relationship drift into dyad_drift (opt-in: DRIFT_ENABLED=true)
+	.venv/bin/python3 drift.py
+# feature: drift <<<
 
 # --- Running -----------------------------------------------------------------
 # ARGS passes flags through, e.g.:

@@ -40,6 +40,12 @@ TABLES = [
     # rebuilds.
     "loose_threads",
     # --- end feature: nudges ---
+    # --- feature: drift ---
+    # dyad_drift is a full-rebuild derived artifact; clearing ingest_state above
+    # already wipes its drift_max_message_id / drift_params_hash guard keys, so
+    # the next drift.py run rebuilds from scratch.
+    "dyad_drift",
+    # --- end feature: drift ---
 ]
 
 # Dropped outright rather than emptied: their declared vector dimension is
