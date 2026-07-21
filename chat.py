@@ -59,6 +59,11 @@ SYSTEM_PROMPT = (
     "given, reactions received by type -- group-chat rankings)\n"
     "- get_word_frequency (most frequent words/phrases with counts, for a sender "
     "or chat -- 'what words do I overuse')\n"
+    # --- feature: persona ---
+    "- get_voiceprint (how a person texts: message length, casing, bursts, "
+    "function-word rates, signature openers/closers, tone -- your voice, a "
+    "person's voice, or your voice with them; scope='group' for group chats)\n"
+    # --- end feature: persona ---
     "- search_contacts_by_name (name/org -> contact + their handle_ids)\n"
     "- list_chats (name/participant -> chat_id, or label a chat_id)\n"
     "- search_contact_by_handle (a phone/email/handle_id -> contact name)\n"
