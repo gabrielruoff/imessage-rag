@@ -620,5 +620,214 @@ class DormantTieConfigTest(unittest.TestCase):
         self.assertIn("dormant_tie", kinds)
 
 
+# ---------------------------------------------------------------------------
+# unanswered_question detector (RES-56 / N3)
+# ---------------------------------------------------------------------------
+
+def _build_unanswered_fixture(db_path):
+    """Direct dyads for the unanswered_question detector; corpus-now is Carol's
+    late self-reply (the global max date):
+      Alice (100)  genuine question, never answered           -> fires
+      Bob   (200)  genuine question, answered 90 min later     -> Stage-1b suppresses
+      Carol (300)  genuine question, answered 10 days later     -> fires (late reply kept)
+      Dave  (400)  rhetorical last question ("How are you?")    -> stoplist excludes
+      Eve   (500)  short last question ("you around?", 11 ch)   -> length excludes
+      group (600)  genuine question but is_group = 1            -> direct-chat filter excludes
+    """
+    con = sqlite3.connect(db_path)
+    try:
+        schema.create_schema(con)
+        con.executemany(
+            "INSERT INTO contacts(id, source_uniqueid, first_name) VALUES (?, ?, ?)",
+            [(1, "u1", "Alice"), (2, "u2", "Bob"), (3, "u3", "Carol"),
+             (4, "u4", "Dave"), (5, "u5", "Eve"), (6, "u6", "Grace")],
+        )
+        con.executemany(
+            "INSERT INTO handles(id, handle_identifier, contact_id, service) "
+            "VALUES (?, ?, ?, 'iMessage')",
+            [(10, "+10", 1), (20, "+20", 2), (30, "+30", 3),
+             (40, "+40", 4), (50, "+50", 5), (60, "+60", 6)],
+        )
+        con.executemany(
+            "INSERT INTO chats(id, chat_identifier, display_name, is_group, service) "
+            "VALUES (?, ?, NULL, ?, 'iMessage')",
+            [(100, "c100", 0), (200, "c200", 0), (300, "c300", 0),
+             (400, "c400", 0), (500, "c500", 0), (600, "c600", 1)],
+        )
+        con.executemany(
+            "INSERT INTO chat_participants(chat_id, handle_id) VALUES (?, ?)",
+            [(100, 10), (200, 20), (300, 30), (400, 40), (500, 50), (600, 60)],
+        )
+        # is_from_me=1 rows carry handle_id 0 (matching the other fixtures).
+        msgs = [
+            # Alice: genuine question, never answered.
+            (1000, "g1000", 100, 0, 1, "hey how was your trip", "2026-05-01T10:00:00"),
+            (1001, "g1001", 100, 10, 0, "it was great thanks", "2026-05-01T10:30:00"),
+            (1002, "g1002", 100, 10, 0,
+             "Do you want to grab dinner this weekend?", "2026-05-05T09:00:00"),
+            # Bob: genuine question, answered 90 minutes later (a new session).
+            (2000, "g2000", 200, 0, 1, "hey", "2026-05-01T10:00:00"),
+            (2001, "g2001", 200, 20, 0,
+             "Are we still on for lunch tomorrow?", "2026-05-02T10:00:00"),
+            (2002, "g2002", 200, 0, 1, "yes definitely", "2026-05-02T11:30:00"),
+            # Dave: rhetorical last question (12 chars -> passes length, stoplist drops).
+            (4000, "g4000", 400, 0, 1, "hey", "2026-05-01T10:00:00"),
+            (4001, "g4001", 400, 40, 0, "How are you?", "2026-05-03T10:00:00"),
+            # Eve: short last question (11 chars -> length drops).
+            (5000, "g5000", 500, 0, 1, "yo", "2026-05-01T10:00:00"),
+            (5001, "g5001", 500, 50, 0, "you around?", "2026-05-04T10:00:00"),
+            # Group: a genuine question, but is_group -> filtered.
+            (6000, "g6000", 600, 60, 0,
+             "Are we all set for the group trip?", "2026-05-05T10:00:00"),
+        ]
+        # Carol: 20 dense messages 1h apart (keeps p90 ~ 1h, under the 72h
+        # floor), then the question, then a self-reply 10 days later (past the
+        # deadline). The late reply is the global max date -> corpus-now.
+        base = datetime.datetime(2026, 5, 10, 9, 0, 0)
+        for i in range(20):
+            dt = base + datetime.timedelta(hours=i)
+            is_me = 1 if i % 2 == 0 else 0
+            msgs.append((3000 + i, f"g{3000 + i}", 300, 0 if is_me else 30, is_me,
+                         "chatting", dt.strftime("%Y-%m-%dT%H:%M:%S")))
+        q_dt = base + datetime.timedelta(hours=20)
+        reply_dt = q_dt + datetime.timedelta(days=10)
+        msgs.append((3020, "g3020", 300, 30, 0,
+                     "What did you think of the movie we saw?",
+                     q_dt.strftime("%Y-%m-%dT%H:%M:%S")))
+        msgs.append((3021, "g3021", 300, 0, 1, "sorry just saw this, loved it",
+                     reply_dt.strftime("%Y-%m-%dT%H:%M:%S")))
+        con.executemany(
+            "INSERT INTO messages(id, guid, chat_id, handle_id, is_from_me, text, date) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            msgs,
+        )
+        # One session per chat, ending on the question. Carol's late reply (3021)
+        # sits in a later session the detector never treats as a candidate.
+        con.executemany(
+            "INSERT INTO sessions(chat_id, first_message_id, last_message_id, "
+            "first_date, last_date, n_messages, n_from_me) "
+            "VALUES (?, ?, ?, '2026-05-01T00:00:00', '2026-05-11T05:00:00', 2, 1)",
+            [(100, 1000, 1002), (200, 2000, 2001), (300, 3000, 3020),
+             (400, 4000, 4001), (500, 5000, 5001), (600, 6000, 6000)],
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+class _UnansweredFixtureTest(unittest.TestCase):
+    def setUp(self):
+        fd, self.db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.addCleanup(lambda: os.path.exists(self.db_path) and os.remove(self.db_path))
+        _build_unanswered_fixture(self.db_path)
+        for module in (loose_ends, query_tools):
+            patcher = mock.patch.object(module, "DB_PATH", self.db_path)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _open(self):
+        con = sqlite3.connect(self.db_path)
+        con.row_factory = sqlite3.Row
+        self.addCleanup(con.close)
+        return con
+
+
+class UnansweredQuestionDetectorTest(_UnansweredFixtureTest):
+    def test_trailing_length_and_stoplist_filter(self):
+        con = self._open()
+        cfg = loose_ends._build_cfg(con)
+        cands = {c.chat_id: c for c in loose_ends.detect_unanswered_question(con, cfg)}
+        # Alice (genuine, unanswered) + Carol (answered only after the deadline)
+        # fire; Bob is answered inside the deadline, Dave is rhetorical, Eve is
+        # under the length floor, the group chat is filtered out.
+        self.assertEqual(set(cands), {100, 300})
+        self.assertNotIn(200, cands)   # answered within the deadline
+        self.assertNotIn(400, cands)   # rhetorical ("How are you?")
+        self.assertNotIn(500, cands)   # short ("you around?", 11 chars)
+        self.assertNotIn(600, cands)   # group chat
+        alice = cands[100]
+        self.assertEqual(alice.kind, "unanswered_question")
+        self.assertEqual(alice.handle_id, 10)
+        self.assertEqual(alice.anchor_message_id, 1002)
+        self.assertEqual(alice.anchor_date, "2026-05-05T09:00:00")
+        self.assertTrue(alice.evidence["question"].startswith("Do you want"))
+        self.assertFalse(alice.evidence["answered_late"])
+        self.assertNotIn("late_reply_date", alice.evidence)
+
+    def test_stage1b_suppresses_reply_within_deadline(self):
+        # Bob's question is answered 90 minutes later (a new session) -- well
+        # inside the 72h deadline -- so Stage-1b suppresses it: no candidate.
+        con = self._open()
+        cfg = loose_ends._build_cfg(con)
+        chats = {c.chat_id for c in loose_ends.detect_unanswered_question(con, cfg)}
+        self.assertNotIn(200, chats)
+
+    def test_stage1b_keeps_reply_after_deadline_and_records_it(self):
+        # Carol's question is answered 10 days later, past the 72h deadline
+        # (dense history -> p90 ~ 1h, so the floor sets the deadline). It still
+        # fires, and the late reply is recorded for narration.
+        con = self._open()
+        cfg = loose_ends._build_cfg(con)
+        carol = next(c for c in loose_ends.detect_unanswered_question(con, cfg)
+                     if c.chat_id == 300)
+        self.assertTrue(carol.evidence["answered_late"])
+        self.assertEqual(carol.evidence["late_reply_days_later"], 10.0)
+        self.assertEqual(carol.evidence["grace_hours"], 72.0)
+        self.assertIn("late_reply_date", carol.evidence)
+
+    def test_grace_floor_beats_a_tiny_p90(self):
+        # With the dense history Carol's p90 is well under the 72h floor, so the
+        # deadline is anchor + 72h (the floor), not anchor + p90.
+        con = self._open()
+        p90 = loose_ends._dyad_gap_p90(con, 300)
+        self.assertIsNotNone(p90)
+        self.assertLess(p90, 72 * 3600)
+
+    def test_full_run_writes_only_the_unanswered_dyads(self):
+        loose_ends.main(["--no-llm"])
+        con = sqlite3.connect(self.db_path)
+        try:
+            rows = [r[0] for r in con.execute(
+                "SELECT chat_id FROM loose_threads "
+                "WHERE kind = 'unanswered_question' AND status = 'open' "
+                "ORDER BY chat_id")]
+        finally:
+            con.close()
+        self.assertEqual(rows, [100, 300])
+
+
+class RhetoricalQuestionTest(unittest.TestCase):
+    def test_pleasantries_and_single_tokens_are_rhetorical(self):
+        for q in ("How are you?", "how r u?", "hru?", "You know?", "Right?",
+                  "ok?", "really?", "seriously?", "u up?", "What?", "Huh?",
+                  "Hey! How are you?", "wanna bet?"):
+            self.assertTrue(loose_ends._is_rhetorical_question(q), q)
+
+    def test_genuine_questions_are_not_rhetorical(self):
+        for q in ("Do you want to grab dinner this weekend?",
+                  "Are we still on for lunch tomorrow?",
+                  "What did you think of the movie we saw?",
+                  "Can you send me the address when you get a chance?"):
+            self.assertFalse(loose_ends._is_rhetorical_question(q), q)
+
+
+class UnansweredQuestionConfigTest(unittest.TestCase):
+    def test_knobs_are_named_config_vars(self):
+        self.assertEqual(config.NUDGE_QUESTION_MIN_CHARS, 12)
+        self.assertEqual(config.NUDGE_QUESTION_GRACE_HOURS, 72.0)
+
+    def test_unanswered_question_is_registered(self):
+        kinds = [k for k, _ in loose_ends.DETECTORS]
+        self.assertIn("unanswered_question", kinds)
+
+    def test_lexicon_build_question_test_is_untouched(self):
+        # The DoD: N3 must NOT change lexicon_build's bare `"?" in text` question
+        # test (it feeds person_period_lexicon.question_count / the LSM tools).
+        import lexicon_build
+        src = Path(lexicon_build.__file__).read_text()
+        self.assertIn('if "?" in text:', src)
+
+
 if __name__ == "__main__":
     unittest.main()

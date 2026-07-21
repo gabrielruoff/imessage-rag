@@ -77,6 +77,17 @@ from config import (
 from query_tools.analytics_language import lsm_score
 # --- end detector: dormant_tie ---
 
+# --- detector: unanswered_question ---
+# Additive per-detector imports (RES-56 / N3), fenced so concurrent N-wave
+# detectors never contend for the shared import block. `re` powers the
+# final-sentence split in the rhetorical test; TEXT_PREVIEW_CHARS caps the
+# question text stored in evidence_json for narration.
+import re
+
+from config import NUDGE_QUESTION_GRACE_HOURS, NUDGE_QUESTION_MIN_CHARS
+from query_tools._shared import TEXT_PREVIEW_CHARS
+# --- end detector: unanswered_question ---
+
 # Module attribute so tests can patch it; _connect() reads it at call time.
 DB_PATH = TARGET_DB
 
@@ -403,6 +414,172 @@ DETECTORS.append(("dormant_tie", detect_dormant_tie))
 
 
 # ---------------------------------------------------------------------------
+# Detector: unanswered_question (RES-56 / N3)
+# ---------------------------------------------------------------------------
+# --- detector: unanswered_question ---
+# A 1:1 session that ended on the OTHER person's genuine, unanswered question.
+# Two stages, both PURE detection (the shared driver runs the Stage-0 exclusion
+# gate and urgency scoring OUTSIDE this function, exactly as for every
+# detector, so an excluded / negative-valence / zero-outbound contact never
+# reaches here):
+#   Stage 1  -- candidate = a session whose LAST message is a TRAILING,
+#               length-gated, non-rhetorical question the counterparty sent.
+#   Stage 1b -- MANDATORY cross-session answered-check: the question is a loose
+#               end only if it went unanswered for longer than the dyad's own
+#               cadence. Suppress iff any is_from_me real message lands in
+#               (anchor, deadline], where deadline = anchor + max(the dyad's p90
+#               inter-message gap via _dyad_gap_p90, NUDGE_QUESTION_GRACE_HOURS).
+#               A self-reply AFTER the deadline does NOT suppress -- the question
+#               sat past the pair's own rhythm, which is the signal -- and that
+#               late reply is recorded in evidence for narration.
+#
+# The question test here is deliberately UNLIKE lexicon_build's bare `"?" in
+# text` (which powers person_period_lexicon.question_count and MUST NOT change):
+# it requires a trailing '?', a length floor, and a rhetorical/pleasantry
+# stoplist, so "lol?" / "u up?" / "how are you?" never become a nudge.
+
+# PINNED module-level stoplist of rhetorical / pleasantry questions, matched
+# against the lowercased final sentence of the message (both with and without a
+# trailing '?', so an entry may be spelled either way). Extending it is expected
+# -- it lives here, next to the detector, on purpose.
+_RHETORICAL_STOPLIST = frozenset({
+    "how are you", "how r u", "hru", "how are you doing", "how's it going",
+    "hows it going", "how you doing", "you know?", "right?", "ok?", "okay?",
+    "k?", "lol?", "yeah?", "really?", "seriously?", "wanna bet?", "u up?",
+    "you up?", "make sense?", "sound good?", "you know what i mean?",
+    "isn't it?", "or what?", "guess what?", "wyd?", "sup?", "wassup?",
+})
+
+# Single-token questions whose entire content is one filler / pleasantry word
+# are rhetorical regardless of the phrase list above (e.g. "really?", "huh?").
+_QUESTION_STOPWORDS = frozenset({
+    "really", "seriously", "srsly", "huh", "what", "ok", "okay", "k", "sure",
+    "yeah", "yep", "yup", "lol", "lmao", "right", "oh", "hm", "hmm", "wait",
+    "no", "yes", "nah", "meh", "eh", "sup",
+})
+
+
+def _final_sentence(text):
+    """The message's final sentence, lowercased and stripped, keeping its
+    trailing terminator (so 'right?' matches the stoplist form). Splits on a
+    sentence terminator followed by whitespace, so 'Hey. How are you?' -> 'how
+    are you?'."""
+    parts = re.split(r"(?<=[.!?])\s+", text.strip())
+    return parts[-1].strip().lower() if parts else ""
+
+
+def _is_rhetorical_question(text):
+    """True when a trailing-question message is a rhetorical / pleasantry
+    verdict rather than a genuine ask -- matched on the lowercased final
+    sentence against _RHETORICAL_STOPLIST (with and without the '?') plus the
+    single-stopword-token rule. Length gating is the detector's job, not this."""
+    final = _final_sentence(text)
+    if not final:
+        return True
+    bare = final.rstrip("?!. ").strip()
+    if final in _RHETORICAL_STOPLIST or bare in _RHETORICAL_STOPLIST:
+        return True
+    tokens = bare.split()
+    return len(tokens) == 1 and tokens[0] in _QUESTION_STOPWORDS
+
+
+def _self_reply_in_window(con, chat_id, after, until):
+    """True iff any is_from_me real message lands in the window (after, until]
+    -- the Stage-1b suppression predicate. Plain UTC-ISO string compares."""
+    row = con.execute(
+        f"SELECT 1 FROM messages m "
+        f"WHERE m.chat_id = ? AND m.is_from_me = 1 AND m.date IS NOT NULL "
+        f"AND m.date > ? AND m.date <= ? AND {_REAL} LIMIT 1",
+        (chat_id, after, until),
+    ).fetchone()
+    return row is not None
+
+
+def _first_self_reply_after(con, chat_id, after):
+    """(id, date) of the earliest is_from_me real message strictly after the ISO
+    bound `after`, or (None, None) -- the late reply recorded past the deadline
+    when the question went unanswered within the dyad's cadence."""
+    row = con.execute(
+        f"SELECT m.id, m.date FROM messages m "
+        f"WHERE m.chat_id = ? AND m.is_from_me = 1 AND m.date IS NOT NULL "
+        f"AND m.date > ? AND {_REAL} ORDER BY m.date, m.id LIMIT 1",
+        (chat_id, after),
+    ).fetchone()
+    return (row[0], row[1]) if row else (None, None)
+
+
+def detect_unanswered_question(con, cfg) -> Iterable[CandidateRow]:
+    """Fire for a 1:1 session that ended on the counterparty's genuine,
+    unanswered question (see the fence header for the two stages). One candidate
+    per chat: the MOST RECENT session-ending question owns the verdict -- if it
+    is short/rhetorical the chat yields nothing, and an older question never
+    resurrects a chat whose latest ask was a pleasantry or was answered in time.
+    Ranked by how out-of-character the silence is (silence / p90), recorded in
+    evidence for the driver's urgency pass."""
+    now = cfg["now"]
+    min_chars = cfg["question_min_chars"]
+    grace_seconds = cfg["question_grace_hours"] * 3600
+    rows = con.execute(
+        f"SELECT s.chat_id AS chat_id, s.last_message_id AS mid, "
+        f"m.text AS text, m.date AS date "
+        f"FROM sessions s JOIN messages m ON m.id = s.last_message_id "
+        f"WHERE m.is_from_me = 0 AND m.date IS NOT NULL AND m.text IS NOT NULL "
+        f"AND TRIM(m.text) LIKE '%?' AND {_REAL} "
+        f"ORDER BY m.date DESC, m.id DESC"
+    ).fetchall()
+    if not rows:
+        return
+    direct = set(_restrict_to_direct_chats(con, list({r["chat_id"] for r in rows})))
+    seen = set()
+    for r in rows:
+        chat_id = r["chat_id"]
+        if chat_id in seen or chat_id not in direct:
+            continue
+        # The most-recent session-ending question owns this chat's verdict,
+        # whether or not it survives the filters below.
+        seen.add(chat_id)
+        text = (r["text"] or "").strip()
+        if len(text) < min_chars or _is_rhetorical_question(text):
+            continue
+        anchor_date = r["date"]
+        anchor_dt = datetime.datetime.fromisoformat(anchor_date)
+        p90 = _dyad_gap_p90(con, chat_id)
+        grace = max(p90 or 0.0, grace_seconds)
+        deadline = (anchor_dt + datetime.timedelta(seconds=grace)).isoformat()
+        if _self_reply_in_window(con, chat_id, anchor_date, deadline):
+            continue  # answered within the dyad's own cadence -- not a loose end
+        late_id, late_date = _first_self_reply_after(con, chat_id, deadline)
+        silence_days = max(0.0, (now - anchor_dt).total_seconds()) / 86400
+        p90_days = (p90 / 86400) if p90 else None
+        evidence = {
+            "question": text[:TEXT_PREVIEW_CHARS],
+            "silence_days": round(silence_days, 1),
+            "p90_gap_days": round(p90_days, 1) if p90_days is not None else None,
+            "silence_ratio": round(silence_days / p90_days, 2) if p90_days else None,
+            "grace_hours": round(grace / 3600, 1),
+            "deadline": deadline,
+            "answered_late": late_date is not None,
+        }
+        if late_date is not None:
+            late_dt = datetime.datetime.fromisoformat(late_date)
+            evidence["late_reply_date"] = late_date
+            evidence["late_reply_days_later"] = round(
+                (late_dt - anchor_dt).total_seconds() / 86400, 1)
+        yield CandidateRow(
+            kind="unanswered_question",
+            chat_id=chat_id,
+            handle_id=_counterparty_handle(con, chat_id),
+            anchor_message_id=r["mid"],
+            anchor_date=anchor_date,
+            evidence=evidence,
+        )
+
+
+DETECTORS.append(("unanswered_question", detect_unanswered_question))
+# --- end detector: unanswered_question ---
+
+
+# ---------------------------------------------------------------------------
 # Stage 0: exclusion gate
 # ---------------------------------------------------------------------------
 
@@ -536,6 +713,10 @@ def _build_cfg(con):
         "dormant_min_messages": NUDGE_DORMANT_MIN_MESSAGES,
         "dormant_min_gap_days": NUDGE_DORMANT_MIN_GAP_DAYS,
         # --- end detector: dormant_tie ---
+        # --- detector: unanswered_question ---
+        "question_min_chars": NUDGE_QUESTION_MIN_CHARS,
+        "question_grace_hours": NUDGE_QUESTION_GRACE_HOURS,
+        # --- end detector: unanswered_question ---
     }
 
 
