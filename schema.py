@@ -347,6 +347,13 @@ def create_schema(con: sqlite3.Connection):
     _create_persona_tables(con)
     # --- end feature: persona ---
 
+    # --- feature: conflict ---
+    # Per-feature DDL function (RES-46 / C1): net-new tables live in their own
+    # adjacent def with a single call here, so a feature's schema never edits
+    # the shared SCHEMA blob (keeps concurrent-worktree merges clean).
+    _create_conflict_tables(con)
+    # --- end feature: conflict ---
+
     # Reactions used to be stored with chat.db's raw associated_message_guid,
     # which carries a message-part prefix ('p:0/<guid>' -- tapback on part N
     # -- or 'bp:<guid>' for balloon parts) that messages.guid never has, so
@@ -465,3 +472,49 @@ CREATE TABLE IF NOT EXISTS person_voiceprint (
 def _create_persona_tables(con: sqlite3.Connection):
     con.executescript(_PERSONA_SCHEMA)
 # --- end feature: persona ---
+
+
+# --- feature: conflict ---
+def _create_conflict_tables(con: sqlite3.Connection):
+    """Conflict core (RES-46 / C1): the deterministic tense-stretch finder's
+    output tables. Idempotent (CREATE ... IF NOT EXISTS), so re-running
+    create_schema is a no-op; guarded against model mixing by the
+    ingest_state `conflict_model` key the way chunk_annotations is by
+    `annotate_model` (enforced in conflict_detect.py, not here).
+
+    `conflicts` carries NO status/my-role/aggressor/who-won field on purpose:
+    the domestic-violence posture and role attribution live in a separate
+    issue (C2) and must not be pre-empted by a column here.
+    """
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS conflicts (
+        -- AUTOINCREMENT: rebuilt per chat, ids must never be reused (a stale
+        -- conflict_signals row could otherwise alias onto a different episode)
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER,
+        first_date TEXT,                 -- unlabeled-UTC ISO; plain-string compares only
+        last_date TEXT,
+        start_session_id INTEGER,        -- sessions.id at the episode's start
+        end_session_id INTEGER,          -- sessions.id at the episode's end
+        topic TEXT,                      -- dominant surviving label_class, or NULL
+        peak_signal_json TEXT,           -- deterministic evidence + receipts (JSON)
+        corroboration TEXT,              -- 'none' | 'weak' | 'llm' (valence, source='llm' only)
+        off_text_flag INTEGER DEFAULT 0, -- large intra-window gap: forbids a resolution verdict
+        source TEXT DEFAULT 'llm'        -- pipeline provenance; guarded by conflict_model
+    );
+    CREATE INDEX IF NOT EXISTS idx_conflicts_chat ON conflicts(chat_id, first_date);
+
+    CREATE TABLE IF NOT EXISTS conflict_signals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conflict_id INTEGER,
+        message_id INTEGER,
+        actor_is_me INTEGER,
+        label_class TEXT,                -- Gottman horseman / repair / 'abstain'
+        top2_labels_json TEXT,           -- the model's top-2 candidate classes
+        band TEXT,                       -- 'tentative' | 'likely' (never a raw float)
+        excerpt TEXT                     -- verbatim, <= 200 chars
+    );
+    CREATE INDEX IF NOT EXISTS idx_conflict_signals_conflict
+        ON conflict_signals(conflict_id);
+    """)
+# --- end feature: conflict ---

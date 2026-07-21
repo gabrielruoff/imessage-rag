@@ -270,7 +270,7 @@ topics:  ## Cluster embedded chunks into topics and label them
 # run these concurrently, and concurrent runs deadlock on the SQLite write
 # lock (each holds it across many LLM calls) while gaining nothing -- Ollama
 # serializes the inference anyway. Recipe lines run in order under any -j.
-pipeline:  ## ingest -> annotate -> nudges -> drift -> voiceprint -> topics, in order (stays serial under -j)
+pipeline:  ## ingest -> annotate -> nudges -> drift -> voiceprint -> conflict -> topics, in order (stays serial under -j)
 	$(MAKE) ingest
 	$(MAKE) annotate
 	$(MAKE) nudges          # --- feature: nudges (runs after annotate) ---
@@ -284,6 +284,10 @@ pipeline:  ## ingest -> annotate -> nudges -> drift -> voiceprint -> topics, in 
 # chunk_annotations); zero-LLM, so it stays a serial recipe line like the others.
 	$(MAKE) voiceprint
 # feature: persona <<<
+# feature: conflict >>> conflict detection runs after annotate (its valence
+# corroboration reads chunk_annotations); Ollama only for the label pass.
+	$(MAKE) conflict
+# feature: conflict <<<
 	$(MAKE) topics
 
 # --- feature: nudges ---
@@ -312,6 +316,17 @@ drift:  ## Score relationship drift into dyad_drift (opt-in: DRIFT_ENABLED=true)
 voiceprint:  ## Build deterministic per-person voiceprints (person_voiceprint)
 	.venv/bin/python3 voiceprint.py
 # feature: persona <<<
+
+# feature: conflict >>>
+# Deterministic conflict finder + eval-gated escalation labels (RES-46 / C1).
+# Consumes chunk_annotations (for valence corroboration), so it slots into
+# `pipeline` AFTER annotate. Needs Ollama for the per-turn label pass; the
+# deterministic finding itself does not, and never refuses on a distilled corpus.
+.PHONY: conflict
+conflict:  ## Detect conflict windows (deterministic) + eval-gated labels
+	@$(REQUIRE_OLLAMA)
+	.venv/bin/python3 conflict_detect.py
+# feature: conflict <<<
 
 # --- Running -----------------------------------------------------------------
 # ARGS passes flags through, e.g.:

@@ -402,3 +402,49 @@ VOICEPRINT_SCAN_MAX_MESSAGES = int(os.getenv("VOICEPRINT_SCAN_MAX_MESSAGES") or 
 # extend the same burst (double-text run) rather than start a new one.
 VOICEPRINT_BURST_GAP_SECONDS = int(os.getenv("VOICEPRINT_BURST_GAP_SECONDS") or "120")
 # --- end feature: persona ---
+
+# --- feature: conflict ---
+# --- Conflict core (conflict_detect.py; RES-46 / C1) ------------------------
+# Deterministic tense-stretch finder + eval-gated escalation labels. Per-
+# pipeline model knobs follow the STANDARD inherit-from-CHAT rule (CONFLICT_
+# THINK is a plain *_THINK via _think, NOT annotate's empty-means-preset
+# carve-out). Empty CONFLICT_MODEL inherits CHAT_MODEL; recorded in
+# ingest_state as `conflict_model` and mixing models in one conflicts table is
+# refused (same guard shape as chunk_annotations' annotate_model).
+CONFLICT_MODEL = os.getenv("CONFLICT_MODEL", "") or CHAT_MODEL
+CONFLICT_THINK = _think("CONFLICT_THINK", CHAT_THINK)
+_conflict_timeout = os.getenv("CONFLICT_TIMEOUT", "").strip()
+CONFLICT_TIMEOUT = int(_conflict_timeout) if _conflict_timeout else CHAT_TIMEOUT
+# Latency-withdrawal gate (F2 survival estimator over RAW reply gaps, with
+# right-censoring): a window qualifies on latency when P(reply gap > Q hours)
+# in-window >= FRAC AND that fraction is >= 3x the dyad's trailing-90-day
+# baseline fraction. This is a deterministic ORIGINATING signal.
+CONFLICT_LATENCY_Q_HOURS = float(os.getenv("CONFLICT_LATENCY_Q_HOURS") or "9")
+CONFLICT_LATENCY_FRAC = float(os.getenv("CONFLICT_LATENCY_FRAC") or "0.5")
+# Message-volume collapse: window daily rate <= (1 - X) * the dyad's trailing-
+# 8-week median daily rate.
+CONFLICT_VOLUME_COLLAPSE = float(os.getenv("CONFLICT_VOLUME_COLLAPSE") or "0.6")
+# A gap this large (hours) inside a conflict window sets off_text_flag (the
+# conversation likely moved off-channel -- a call, in person): it forbids any
+# resolution verdict downstream (C4).
+CONFLICT_OFF_TEXT_GAP_HOURS = float(os.getenv("CONFLICT_OFF_TEXT_GAP_HOURS") or "6")
+# Minimum drop of window mean valence below the chat all-time mean (both from
+# chunk_annotations.source='llm' ONLY) before valence corroboration boosts a
+# window's RANK. Gates ranking, never detection -- an all-distilled corpus
+# still detects (corroboration='none'), it just gets no valence boost.
+CONFLICT_MIN_VALENCE_DROP = float(os.getenv("CONFLICT_MIN_VALENCE_DROP") or "0.4")
+# Floor applied to the model's self-reported per-turn label confidence
+# (documented UNCALIBRATED -- an ordering heuristic, not a probability): below
+# it the label row is dropped at write time.
+CONFLICT_LABEL_CONF_FLOOR = float(os.getenv("CONFLICT_LABEL_CONF_FLOOR") or "0.7")
+# Cosine-similarity threshold consumed later by C3 (conflict tracing) -- just
+# declared here so the knob lives with its siblings.
+CONFLICT_TRACE_SIM_THRESHOLD = float(os.getenv("CONFLICT_TRACE_SIM_THRESHOLD") or "0.65")
+# Internal detection thresholds (beyond the pinned starter set above).
+# CONFLICT_MIN_SIGNALS: distinct deterministic signals a window must trip to
+# be written (latency_withdrawal / one_sided_session / dislike_run /
+# volume_collapse). CONFLICT_MAX_LABEL_TURNS: per-conflict cap on LLM-labeled
+# turns (cost + prompt-size safety).
+CONFLICT_MIN_SIGNALS = int(os.getenv("CONFLICT_MIN_SIGNALS") or "2")
+CONFLICT_MAX_LABEL_TURNS = int(os.getenv("CONFLICT_MAX_LABEL_TURNS") or "12")
+# --- end feature: conflict ---

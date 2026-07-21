@@ -52,7 +52,10 @@ TASKS = {
             "WHERE c.n_messages >= 4 ORDER BY RANDOM() LIMIT ?"
         ),
         "seed": True,
-        "classifier": None,
+        # RES-46 / C1: the conflict consumer pipeline landed. A dotted-path
+        # STRING (not a callable) so importing gates stays Ollama-free --
+        # labeling._resolve_classifier imports it lazily only on `gate`.
+        "classifier": "conflict_detect.gate_classifier",
         "description": "conflict-escalation labeling (Gottman-style types + repair)",
     },
     "dropped_plan": {
