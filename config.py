@@ -466,4 +466,14 @@ CONFLICT_TRACE_SIM_THRESHOLD = float(os.getenv("CONFLICT_TRACE_SIM_THRESHOLD") o
 # turns (cost + prompt-size safety).
 CONFLICT_MIN_SIGNALS = int(os.getenv("CONFLICT_MIN_SIGNALS") or "2")
 CONFLICT_MAX_LABEL_TURNS = int(os.getenv("CONFLICT_MAX_LABEL_TURNS") or "12")
+# DV-suppression floor for diagnose_conflict (C2 / Master Spec A10, SOFTENED,
+# code-enforced). 'on' (the default) screens the FULL text of every message in
+# a conflict window for high-risk power-and-control markers and, on a hit,
+# suppresses ONLY the aggressor/role-assignment output (the mechanical
+# scorecard still returns) and appends a fixed hotline resource footer. 'off'
+# restores the role analysis but STILL appends the footer on a hit. A per-run
+# chat.py --no-dv-screen flag overrides this to 'off' transiently. The hit is
+# never persisted anywhere. Accepts on/off/true/false/1/0/yes/no.
+CONFLICT_DV_SCREEN = os.getenv("CONFLICT_DV_SCREEN", "on").strip().lower() not in (
+    "0", "off", "false", "no")
 # --- end feature: conflict ---

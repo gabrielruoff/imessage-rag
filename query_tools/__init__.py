@@ -59,8 +59,10 @@ from .chunks import (
 )
 # --- feature: conflict ---
 from .conflict import (
+    diagnose_conflict,
     find_conflicts,
     get_conflict,
+    set_dv_screen_bypass,
 )
 # --- end feature: conflict ---
 from .directory import (
@@ -93,8 +95,10 @@ __all__ = [
     "embed_texts",
     "find_similar_conversations",
     # --- feature: conflict ---
+    "diagnose_conflict",
     "find_conflicts",
     "get_conflict",
+    "set_dv_screen_bypass",
     # --- end feature: conflict ---
     "get_activity_patterns",
     "get_chat_participant_stats",

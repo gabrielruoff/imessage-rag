@@ -677,5 +677,26 @@ TOOL_DEFINITIONS = [
             "required": ["conflict_id"],
         },
     },
+    {
+        "name": "diagnose_conflict",
+        "description": "A DETERMINISTIC scorecard for one conflict episode (by "
+                        "conflict_id from find_conflicts): per-side I-vs-you and "
+                        "we-talk language ratios, style-matching (LSM), who opened "
+                        "the episode and who had the last word, reply-latency and "
+                        "message-volume-collapse read off the stored evidence, and "
+                        "a non-blame demand-withdraw read (who withdrew vs kept "
+                        "reaching out). It carries NO aggressor/who-won verdict -- "
+                        "present it as mechanical description, not a ruling on who "
+                        "was right. A built-in safety screen may withhold the "
+                        "withdraw/pursue read and append a support-resource footer; "
+                        "if a resource_footer is present, include it verbatim.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "conflict_id": {"type": "integer"},
+            },
+            "required": ["conflict_id"],
+        },
+    },
     # --- end feature: conflict ---
 ]

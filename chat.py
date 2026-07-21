@@ -69,6 +69,9 @@ SYSTEM_PROMPT = (
     "person -- deterministic signals with receipts, ranked; labels are gated bands)\n"
     "- get_conflict (one conflict_id -> its evidence and up to 15 labeled signal "
     "turns as tentative/likely bands)\n"
+    "- diagnose_conflict (one conflict_id -> a deterministic scorecard: I-vs-you/"
+    "we-talk ratios, style-matching, session roles, latency/volume -- no "
+    "aggressor verdict; surface any resource_footer verbatim)\n"
     # --- end feature: conflict ---
     "- search_contacts_by_name (name/org -> contact + their handle_ids)\n"
     "- list_chats (name/participant -> chat_id, or label a chat_id)\n"
@@ -371,7 +374,22 @@ def main():
         help="override the chat model for this run (default: CHAT_MODEL from .env, "
         "currently %(default)s)",
     )
+    # --- feature: conflict ---
+    parser.add_argument(
+        "--no-dv-screen",
+        action="store_true",
+        help="C2 DV floor: restore diagnose_conflict's role/aggressor read for "
+        "this run only (the safety resource footer is still appended on a marker "
+        "hit). Overrides CONFLICT_DV_SCREEN transiently.",
+    )
+    # --- end feature: conflict ---
     args = parser.parse_args()
+
+    # --- feature: conflict ---
+    # Transient per-run bypass of the DV-suppression floor (never persisted).
+    if getattr(args, "no_dv_screen", False):
+        query_tools.set_dv_screen_bypass(True)
+    # --- end feature: conflict ---
 
     if args.prompt is not None:
         prompt = args.prompt.strip()

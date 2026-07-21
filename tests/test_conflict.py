@@ -13,10 +13,12 @@ import tempfile
 import unittest
 
 import conflict_detect
+import lexicon_build
 import query_tools
 import schema
 import sessions
 from eval.evalkit import gates, labeling
+from query_tools import conflict as conflict_mod
 
 # A stub label classifier: signature classify_fn(text) -> validated turn dict,
 # the same shape conflict_detect._classify_turn returns. Confident 'criticism'
@@ -26,10 +28,16 @@ def _stub_criticism(text):
 
 
 def _build_fixture(db_path, *, classify_fn, owner_verdict=None, distilled=False,
-                   model="test-model"):
+                   model="test-model", dv=False, build_lexicon=False):
     """Build a one-dyad corpus with an injected conflict episode (latency
     withdrawal + one-sided session + dislike-tapback run), then run the
-    detector. Returns nothing -- the DB file is left populated and committed."""
+    detector. Returns nothing -- the DB file is left populated and committed.
+
+    dv=True swaps Session A's texts for DV power-and-control markers (a threat
+    token+phrase, an isolation PHRASE-ONLY line, a fear token+phrase) WITHOUT
+    changing ids/dates/structure, so detection is identical and only the C2 DV
+    screen sees the difference. build_lexicon=True also runs the F1 lexicon
+    build so the scorecard's lexicon/LSM sections have data."""
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
     schema.create_schema(con)
@@ -43,12 +51,21 @@ def _build_fixture(db_path, *, classify_fn, owner_verdict=None, distilled=False,
     # Session Z (fires latency_withdrawal via the 25h inter-session gap that
     # answers my '...sure') then Session A a day later (one-sided burst from
     # them: fires one_sided_session; the dislike run fires dislike_run).
+    a_texts = (
+        ("if you ever leave i'll kill you",      # threat: token 'kill' + phrase
+         "you can't see your friends anymore",   # isolation: PHRASE ONLY (no token)
+         "i'm scared of you")                     # fear: token 'scared' + phrase
+        if dv else
+        ("you never listen to me",
+         "seriously this is a pattern",
+         "hello?? are you even there")
+    )
     msgs = [
         (10, "g-10", 1, 50, 0, "hey can we talk", "2026-03-01T09:00:00"),
         (11, "g-11", 1, 0, 1, "sure", "2026-03-01T09:01:00"),
-        (12, "g-12", 1, 50, 0, "you never listen to me", "2026-03-02T10:00:00"),
-        (13, "g-13", 1, 50, 0, "seriously this is a pattern", "2026-03-02T10:02:00"),
-        (14, "g-14", 1, 50, 0, "hello?? are you even there", "2026-03-02T10:04:00"),
+        (12, "g-12", 1, 50, 0, a_texts[0], "2026-03-02T10:00:00"),
+        (13, "g-13", 1, 50, 0, a_texts[1], "2026-03-02T10:02:00"),
+        (14, "g-14", 1, 50, 0, a_texts[2], "2026-03-02T10:04:00"),
     ]
     con.executemany(
         "INSERT INTO messages(id, guid, chat_id, handle_id, is_from_me, text, date, "
@@ -78,6 +95,8 @@ def _build_fixture(db_path, *, classify_fn, owner_verdict=None, distilled=False,
 
     sessions.build_sessions(con)
     conflict_detect.detect_conflicts(con, model, classify_fn=classify_fn)
+    if build_lexicon:
+        lexicon_build.build_person_period_lexicon(con)
     con.commit()
     con.close()
 
@@ -287,6 +306,159 @@ class GateWiringTest(unittest.TestCase):
     def test_label_classes_match_gate_task(self):
         self.assertEqual(set(conflict_detect.GATE_CLASSES),
                          set(gates.TASKS["conflict_labels"]["classes"]))
+
+
+# --- C2: diagnose_conflict scorecard + softened DV-suppression floor ---------
+
+
+def _all_keys(obj):
+    """Every dict key anywhere in a nested result (for verdict-field checks)."""
+    keys = set()
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            keys.add(k)
+            keys |= _all_keys(v)
+    elif isinstance(obj, list):
+        for it in obj:
+            keys |= _all_keys(it)
+    return keys
+
+
+_VERDICT_KEYS = {"aggressor", "who_won", "whowon", "winner", "verdict",
+                 "at_fault", "fault", "blame", "guilty"}
+
+
+class DiagnoseScorecardTest(_TempDBTest):
+    def _conflict_id(self):
+        return self._con().execute("SELECT id FROM conflicts").fetchone()[0]
+
+    def test_clean_fixture_full_scorecard_no_footer(self):
+        _build_fixture(self.db_path, classify_fn=_stub_criticism, build_lexicon=True)
+        out = query_tools.diagnose_conflict(self._conflict_id())
+        self.assertEqual(out["dv_screen"], "clean")
+        self.assertNotIn("resource_footer", out)  # clean fixture -> no footer
+        # Deterministic sections all present.
+        for k in ("lexicon", "lsm", "session_roles", "latency", "volume"):
+            if k == "lsm":
+                self.assertIn("lsm", out["lexicon"])
+            else:
+                self.assertIn(k, out)
+        # Role read is present (not withheld) and is the mechanical pattern.
+        self.assertNotIn("withheld", out["interaction_pattern"])
+        self.assertIn("pursuer", out["interaction_pattern"])
+        # No aggressor / who-won verdict field anywhere.
+        self.assertEqual(_all_keys(out) & _VERDICT_KEYS, set())
+
+    def test_lexicon_and_lsm_sections_compute(self):
+        _build_fixture(self.db_path, classify_fn=_stub_criticism, build_lexicon=True)
+        out = query_tools.diagnose_conflict(self._conflict_id())
+        lex = out["lexicon"]
+        self.assertTrue(lex["available"])
+        for side in ("me", "them"):
+            self.assertIsInstance(lex[side]["i_rate"], float)
+            self.assertIsInstance(lex[side]["you_rate"], float)
+            self.assertIsInstance(lex[side]["we_per_100_msgs"], float)
+        self.assertIsInstance(lex["lsm"], float)  # style matching computed
+
+    def test_result_capped_well_under_limit(self):
+        from config import TOOL_RESULT_MAX_CHARS
+        _build_fixture(self.db_path, classify_fn=_stub_criticism, build_lexicon=True)
+        out = query_tools.diagnose_conflict(self._conflict_id())
+        self.assertLess(len(json.dumps(out)), TOOL_RESULT_MAX_CHARS // 4)
+
+    def test_dv_marker_role_suppress(self):
+        _build_fixture(self.db_path, classify_fn=_stub_criticism, dv=True,
+                       build_lexicon=True)
+        out = query_tools.diagnose_conflict(self._conflict_id())
+        self.assertEqual(out["dv_screen"], "role-suppress")
+        # Role/aggressor read withheld...
+        self.assertTrue(out["interaction_pattern"].get("withheld"))
+        self.assertNotIn("pursuer", out["interaction_pattern"])
+        # ...but the mechanical scorecard STILL returns...
+        for k in ("lexicon", "session_roles", "latency", "volume"):
+            self.assertIn(k, out)
+        self.assertTrue(out["lexicon"]["available"])
+        # ...and the fixed resource footer is appended.
+        self.assertIn("resource_footer", out)
+        self.assertIn("1-800-799-7233", out["resource_footer"])
+        self.assertIn("thehotline.org", out["resource_footer"])
+        # Still no verdict field.
+        self.assertEqual(_all_keys(out) & _VERDICT_KEYS, set())
+
+    def test_dv_screen_helper_returns_status_with_all_categories(self):
+        # incl. the isolation PHRASE-ONLY case ("you can't see ...", no token).
+        _build_fixture(self.db_path, classify_fn=_stub_criticism, dv=True)
+        cid = self._conflict_id()
+        screen = conflict_mod._dv_screen(self._con(), cid)
+        self.assertEqual(screen["status"], "role-suppress")  # not a bare bool
+        self.assertTrue(screen["suppress_role"])
+        self.assertEqual(set(screen["markers"]), {"threat", "isolation", "fear"})
+        self.assertIsNotNone(screen["footer"])
+
+    def test_dv_screen_full_text_not_excerpt(self):
+        # The screen must read full message text, not the stored 200-char
+        # excerpts: a marker only present past 200 chars must still fire.
+        _build_fixture(self.db_path, classify_fn=_stub_criticism)
+        cid = self._conflict_id()
+        con = self._con()
+        con.execute(
+            "INSERT INTO messages(id, guid, chat_id, handle_id, is_from_me, text, "
+            "date, item_type, is_emote, has_attachment) VALUES "
+            "(15, 'g-15', 1, 50, 0, ?, '2026-03-02T10:03:30', 0, 0, 0)",
+            (("padding " * 40) + "i'll kill you",))
+        con.commit()
+        screen = conflict_mod._dv_screen(self._con(), cid)
+        self.assertIn("threat", screen["markers"])
+
+    def test_clean_fixture_screen_clean_no_suppress(self):
+        _build_fixture(self.db_path, classify_fn=_stub_criticism)
+        screen = conflict_mod._dv_screen(self._con(), self._conflict_id())
+        self.assertEqual(screen["status"], "clean")
+        self.assertFalse(screen["suppress_role"])
+        self.assertIsNone(screen["footer"])
+        self.assertEqual(screen["markers"], [])
+
+    def test_config_off_bypass_restores_role_but_keeps_footer(self):
+        import config
+        _build_fixture(self.db_path, classify_fn=_stub_criticism, dv=True,
+                       build_lexicon=True)
+        cid = self._conflict_id()
+        saved = config.CONFLICT_DV_SCREEN
+        config.CONFLICT_DV_SCREEN = False
+        self.addCleanup(setattr, config, "CONFLICT_DV_SCREEN", saved)
+        out = query_tools.diagnose_conflict(cid)
+        self.assertEqual(out["dv_screen"], "bypassed-with-footer")
+        # Role analysis restored...
+        self.assertNotIn("withheld", out["interaction_pattern"])
+        self.assertIn("pursuer", out["interaction_pattern"])
+        # ...but the footer is STILL appended on a marker hit.
+        self.assertIn("resource_footer", out)
+
+    def test_transient_flag_overrides_config_on(self):
+        # Config default is 'on'; the transient per-run bypass must still win.
+        _build_fixture(self.db_path, classify_fn=_stub_criticism, dv=True)
+        cid = self._conflict_id()
+        conflict_mod.set_dv_screen_bypass(True)
+        self.addCleanup(conflict_mod.set_dv_screen_bypass, False)
+        out = query_tools.diagnose_conflict(cid)
+        self.assertEqual(out["dv_screen"], "bypassed-with-footer")
+        self.assertNotIn("withheld", out["interaction_pattern"])
+        self.assertIn("resource_footer", out)
+
+    def test_diagnose_errors_gracefully(self):
+        _build_fixture(self.db_path, classify_fn=_stub_criticism)
+        self.assertIn("error", query_tools.diagnose_conflict(999999))
+
+
+class DiagnoseRegistrationTest(unittest.TestCase):
+    def test_three_place_registration_in_sync(self):
+        import chat
+        import tool_schemas
+        names = {t["name"] for t in tool_schemas.TOOL_DEFINITIONS}
+        self.assertIn("diagnose_conflict", names)          # schema
+        self.assertIn("diagnose_conflict", chat.TOOL_FUNCTIONS)  # dispatch
+        self.assertTrue(callable(query_tools.diagnose_conflict))  # re-export
+        self.assertIn("diagnose_conflict", chat.SYSTEM_PROMPT)    # prompt line
 
 
 if __name__ == "__main__":
