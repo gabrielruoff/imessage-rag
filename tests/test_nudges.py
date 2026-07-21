@@ -749,10 +749,12 @@ class UnansweredQuestionDetectorTest(_UnansweredFixtureTest):
         con = self._open()
         cfg = loose_ends._build_cfg(con)
         cands = {c.chat_id: c for c in loose_ends.detect_unanswered_question(con, cfg)}
-        # Alice (genuine, unanswered) + Carol (answered only after the deadline)
-        # fire; Bob is answered inside the deadline, Dave is rhetorical, Eve is
-        # under the length floor, the group chat is filtered out.
-        self.assertEqual(set(cands), {100, 300})
+        # Alice (genuine, unanswered) fires. Carol was answered after the
+        # deadline (just late) -> RESOLVED, suppressed by default. Bob is
+        # answered inside the deadline, Dave is rhetorical, Eve is under the
+        # length floor, the group chat is filtered out.
+        self.assertEqual(set(cands), {100})
+        self.assertNotIn(300, cands)   # answered late -> resolved, not open
         self.assertNotIn(200, cands)   # answered within the deadline
         self.assertNotIn(400, cands)   # rhetorical ("How are you?")
         self.assertNotIn(500, cands)   # short ("you around?", 11 chars)
@@ -774,12 +776,21 @@ class UnansweredQuestionDetectorTest(_UnansweredFixtureTest):
         chats = {c.chat_id for c in loose_ends.detect_unanswered_question(con, cfg)}
         self.assertNotIn(200, chats)
 
-    def test_stage1b_keeps_reply_after_deadline_and_records_it(self):
-        # Carol's question is answered 10 days later, past the 72h deadline
-        # (dense history -> p90 ~ 1h, so the floor sets the deadline). It still
-        # fires, and the late reply is recorded for narration.
+    def test_answered_late_suppressed_by_default(self):
+        # Carol's question is answered 10 days later, past the 72h deadline. A
+        # late reply still RESOLVES the question, so by default it is not an open
+        # loose end (surfacing it as "unanswered" would mislead).
         con = self._open()
         cfg = loose_ends._build_cfg(con)
+        chats = {c.chat_id for c in loose_ends.detect_unanswered_question(con, cfg)}
+        self.assertNotIn(300, chats)
+
+    def test_answered_late_fires_and_records_when_flag_set(self):
+        # Opt-in NUDGE_QUESTION_INCLUDE_ANSWERED_LATE restores the "you replied
+        # slowly" signal: Carol fires and the late reply is recorded.
+        con = self._open()
+        cfg = loose_ends._build_cfg(con)
+        cfg["question_include_answered_late"] = True
         carol = next(c for c in loose_ends.detect_unanswered_question(con, cfg)
                      if c.chat_id == 300)
         self.assertTrue(carol.evidence["answered_late"])
@@ -796,6 +807,8 @@ class UnansweredQuestionDetectorTest(_UnansweredFixtureTest):
         self.assertLess(p90, 72 * 3600)
 
     def test_full_run_writes_only_the_unanswered_dyads(self):
+        # Only Alice (100) is a genuinely open loose end; Carol (300) was
+        # answered late and is resolved (suppressed by default).
         loose_ends.main(["--no-llm"])
         con = sqlite3.connect(self.db_path)
         try:
@@ -805,7 +818,7 @@ class UnansweredQuestionDetectorTest(_UnansweredFixtureTest):
                 "ORDER BY chat_id")]
         finally:
             con.close()
-        self.assertEqual(rows, [100, 300])
+        self.assertEqual(rows, [100])
 
 
 class RhetoricalQuestionTest(unittest.TestCase):

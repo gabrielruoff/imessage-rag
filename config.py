@@ -585,10 +585,15 @@ NUDGE_QUESTION_MIN_CHARS = int(os.getenv("NUDGE_QUESTION_MIN_CHARS") or "12")
 # only if it went unanswered for longer than the dyad's own cadence. The
 # deadline is anchor + max(the dyad's p90 inter-message gap via
 # loose_ends._dyad_gap_p90, this floor in hours); a self-reply inside the
-# deadline suppresses the candidate, a reply after it does NOT (that late reply
-# is recorded in evidence for narration). The 72h floor keeps a naturally
+# deadline suppresses the candidate. The 72h floor keeps a naturally
 # fast-cadence pair from firing on a single afternoon's silence.
 NUDGE_QUESTION_GRACE_HOURS = float(os.getenv("NUDGE_QUESTION_GRACE_HOURS") or "72")
+# A question ANSWERED after the deadline (just late) is resolved, not an open
+# loose end -- surfacing it as "unanswered" misleads (the reader is told they
+# never replied when they did). Default: drop it. Set true to keep the old
+# "you replied slowly" signal, which then rides evidence.answered_late.
+NUDGE_QUESTION_INCLUDE_ANSWERED_LATE = os.getenv(
+    "NUDGE_QUESTION_INCLUDE_ANSWERED_LATE", "").strip().lower() in ("1", "true", "yes", "on")
 # --- end feature: nudges ---
 # --- feature: nudges ---
 # --- N4 nudges: dropped_plan + unreciprocated_goodnews (loose_ends.py; RES-57) ---

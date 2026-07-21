@@ -84,7 +84,11 @@ from query_tools.analytics_language import lsm_score
 # question text stored in evidence_json for narration.
 import re
 
-from config import NUDGE_QUESTION_GRACE_HOURS, NUDGE_QUESTION_MIN_CHARS
+from config import (
+    NUDGE_QUESTION_GRACE_HOURS,
+    NUDGE_QUESTION_INCLUDE_ANSWERED_LATE,
+    NUDGE_QUESTION_MIN_CHARS,
+)
 # --- detector: inferred_occasion ---
 # Additive per-detector imports (RES-58 / N5), fenced so concurrent N-wave
 # detectors never contend for the shared import block. defaultdict powers the
@@ -575,6 +579,8 @@ def detect_unanswered_question(con, cfg) -> Iterable[CandidateRow]:
         if _self_reply_in_window(con, chat_id, anchor_date, deadline):
             continue  # answered within the dyad's own cadence -- not a loose end
         late_id, late_date = _first_self_reply_after(con, chat_id, deadline)
+        if late_date is not None and not cfg["question_include_answered_late"]:
+            continue  # answered, just late -- resolved, not an open loose end
         silence_days = max(0.0, (now - anchor_dt).total_seconds()) / 86400
         p90_days = (p90 / 86400) if p90 else None
         evidence = {
@@ -1179,6 +1185,7 @@ def _build_cfg(con):
         # --- detector: unanswered_question ---
         "question_min_chars": NUDGE_QUESTION_MIN_CHARS,
         "question_grace_hours": NUDGE_QUESTION_GRACE_HOURS,
+        "question_include_answered_late": NUDGE_QUESTION_INCLUDE_ANSWERED_LATE,
         # --- end detector: unanswered_question ---
         # --- detector: inferred_occasion ---
         "occasion_min_years": NUDGE_OCCASION_MIN_YEARS,
