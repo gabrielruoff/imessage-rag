@@ -19,6 +19,9 @@ PROBE_TYPES = (
     "negative_control",
     "thin_data",
     "open_ended",
+    # --- feature: wellbeing (W3) ---
+    "wellbeing_narration",  # deterministic transcript scan in checks.probe_block
+    # --- end feature: wellbeing (W3) ---
 )
 LEVERS = ("desc", "steer", "args", "shape", "size", "confab", "pipeline", "judge-batch")
 AXES = ("routing", "accuracy", "faithfulness", "communication")
@@ -34,6 +37,27 @@ ANALYTICS_TOOLS = (
     "get_chat_participant_stats",
     "get_word_frequency",
 )
+# Wave-1+ feature tools now shipped unconditionally in tool_schemas
+# (persona / conflict / nudges / wellbeing). ALL_TOOLS must mirror the schema
+# names exactly -- selfcheck fails on any drift -- so they are reconciled here.
+# Fenced by feature so the PM can dedupe if a sibling worktree adds the same
+# names. (DRIFT_ENABLED-gated tools are intentionally absent from both sides.)
+_FEATURE_TOOLS = (
+    # --- feature: persona ---
+    "get_voiceprint",
+    "draft_reply",
+    "check_style_match",
+    # --- feature: conflict ---
+    "find_conflicts",
+    "get_conflict",
+    "diagnose_conflict",
+    # --- feature: wellbeing ---
+    "get_language_trajectory",
+    # --- feature: nudges ---
+    "get_loose_threads",
+    "resolve_loose_thread",
+    "mute_contact_from_nudges",
+)
 ALL_TOOLS = (
     "search_messages_hybrid",
     "search_conversations",
@@ -47,7 +71,7 @@ ALL_TOOLS = (
     "search_contact_by_handle",
     "get_message_reactions",
     "get_full_messages",
-) + ANALYTICS_TOOLS
+) + ANALYTICS_TOOLS + _FEATURE_TOOLS
 # Superseded tool names that must never resurface anywhere in a transcript.
 # checks.py scans EVERY transcript for these (a hit is a run-level flag);
 # a case's banned_anywhere list adds case-specific strings on top.
