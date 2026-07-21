@@ -1365,6 +1365,111 @@ class NextOccurrenceTest(unittest.TestCase):
         self.assertEqual(loose_ends._next_occurrence(now, "02-29"), "2027-02-28")
 
 
+def _build_two_occasion_fixture(db_path):
+    """A single direct dyad (chat 700, Zoe) that congratulates on TWO recurring
+    dates -- a birthday (03-15) and an anniversary (09-20), each across two
+    years -- so the detector must collapse them to one candidate."""
+    con = sqlite3.connect(db_path)
+    try:
+        schema.create_schema(con)
+        con.execute("INSERT INTO contacts(id, source_uniqueid, first_name) "
+                    "VALUES (6, 'u6', 'Zoe')")
+        con.execute("INSERT INTO handles(id, handle_identifier, contact_id, service) "
+                    "VALUES (70, '+70', 6, 'iMessage')")
+        con.execute("INSERT INTO chats(id, chat_identifier, display_name, is_group, "
+                    "service) VALUES (700, 'c700', NULL, 0, 'iMessage')")
+        con.execute("INSERT INTO chat_participants(chat_id, handle_id) VALUES (700, 70)")
+        spec = []
+        for y in ("2024", "2025"):
+            spec.append((700, 0, 1, "Happy Birthday!!", f"{y}-03-15T09:00:00"))
+            spec.append((700, 0, 1, "Happy anniversary love", f"{y}-09-20T09:00:00"))
+        spec.append((700, 0, 1, "hey", "2026-06-01T08:00:00"))  # corpus-now anchor
+        con.executemany(
+            "INSERT INTO messages(id, guid, chat_id, handle_id, is_from_me, text, date) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [(2000 + i, f"g{2000 + i}", c, 0 if me else 70, me, t, d)
+             for i, (c, h, me, t, d) in enumerate(spec)],
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+class InferredOccasionMultiOccasionTest(unittest.TestCase):
+    def setUp(self):
+        fd, self.db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.addCleanup(lambda: os.path.exists(self.db_path) and os.remove(self.db_path))
+        _build_two_occasion_fixture(self.db_path)
+        for module in (loose_ends, query_tools):
+            patcher = mock.patch.object(module, "DB_PATH", self.db_path)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _open(self):
+        con = sqlite3.connect(self.db_path)
+        con.row_factory = sqlite3.Row
+        self.addCleanup(con.close)
+        return con
+
+    def test_collapses_to_single_soonest_candidate(self):
+        con = self._open()
+        cfg = loose_ends._build_cfg(con)
+        cfg["today"] = datetime.datetime(2026, 8, 1)  # 09-20 nearer than next 03-15
+        cands = [c for c in loose_ends.detect_inferred_occasion(con, cfg)
+                 if c.chat_id == 700]
+        # Exactly one candidate despite two recurring occasions.
+        self.assertEqual(len(cands), 1)
+        cand = cands[0]
+        # The soonest upcoming occasion (anniversary) is primary; the birthday
+        # rides along in evidence rather than being silently overwritten.
+        self.assertEqual(cand.evidence["month_day"], "09-20")
+        self.assertEqual(cand.due_by, "2026-09-20")
+        others = {o["month_day"]: o["next_occurrence"]
+                  for o in cand.evidence["other_occasions"]}
+        self.assertEqual(others, {"03-15": "2027-03-15"})
+
+    def test_driver_persists_exactly_one_row(self):
+        con = self._open()
+        cfg = loose_ends._build_cfg(con)
+        loose_ends.detect_all(con, cfg, "2026-08-01T00:00:00+00:00")
+        rows = con.execute(
+            "SELECT chat_id, due_by FROM loose_threads "
+            "WHERE kind = 'inferred_occasion' AND status = 'open'"
+        ).fetchall()
+        self.assertEqual([(r[0], r[1]) for r in rows], [(700, "2026-09-20")])
+
+
+class InferredOccasionUrgencyTest(unittest.TestCase):
+    def _cfg(self, today):
+        return {"kind_weights": config.NUDGE_KIND_WEIGHTS,
+                "halflife_days": max(config.NUDGE_URGENCY_HALFLIFE_DAYS, 1e-9),
+                "today": today}
+
+    def test_proximity_beats_stale_anchor_and_far_dates(self):
+        today = datetime.datetime(2026, 8, 1)
+        cfg = self._cfg(today)
+        anchor = "2025-09-20T09:00:00"  # ~10 months old -> would score ~0.0002 on age
+        near = loose_ends._score_urgency("inferred_occasion", anchor, today, cfg,
+                                         due_by="2026-08-08")   # 7 days out
+        far = loose_ends._score_urgency("inferred_occasion", anchor, today, cfg,
+                                        due_by="2027-05-01")    # ~9 months out
+        # A due-soon occasion scores near full weight (0.8), far above the old
+        # anchor-age floor, and ranks above a far-future one.
+        self.assertGreater(near, 0.5)
+        self.assertGreater(near, far)
+
+    def test_non_occasion_kinds_keep_age_formula(self):
+        # A kind without a due_by is unaffected: score decays on anchor age.
+        today = datetime.datetime(2026, 8, 1)
+        cfg = self._cfg(today)
+        fresh = loose_ends._score_urgency("faded_initiator", "2026-07-31T09:00:00",
+                                          today, cfg)
+        stale = loose_ends._score_urgency("faded_initiator", "2026-01-01T09:00:00",
+                                          today, cfg)
+        self.assertGreater(fresh, stale)
+
+
 class InferredOccasionConfigTest(unittest.TestCase):
     def test_knobs_and_weight(self):
         self.assertEqual(config.NUDGE_OCCASION_MIN_YEARS, 2)

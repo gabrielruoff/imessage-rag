@@ -653,7 +653,9 @@ def detect_inferred_occasion(con, cfg) -> Iterable[CandidateRow]:
     a date function in WHERE); their (month, day)/year are sliced in Python, and
     a (month, day) seen in >= cfg['occasion_min_years'] distinct years becomes
     an occasion. The most recent occurrence is the anchor; due_by is the next
-    upcoming date, so the nudge lands ahead of it."""
+    upcoming date, so the nudge lands ahead of it. A dyad emits at most one
+    candidate (the soonest-due occasion); any others ride in
+    evidence['other_occasions']."""
     min_years = cfg["occasion_min_years"]
     like = " OR ".join("LOWER(m.text) LIKE ?" for _ in _OCCASION_PHRASES)
     params = [f"%{p}%" for p in _OCCASION_PHRASES]
@@ -676,28 +678,54 @@ def detect_inferred_occasion(con, cfg) -> Iterable[CandidateRow]:
             continue
         d = r["date"]
         buckets[cid][d[5:10]][d[:4]] = (r["id"], d, r["text"])
+    # loose_threads holds one open row per (kind, chat_id) -- the upsert keys on
+    # exactly that -- so a dyad with several recurring occasions must collapse to
+    # ONE candidate; picking the soonest due_by surfaces the most imminent one
+    # (which the proximity urgency in _score_urgency then ranks up), while the
+    # runners-up are preserved in evidence rather than silently dropped. due_by
+    # rolls off real today (cfg['today'], injected by detect_all) when present,
+    # falling back to corpus-now for direct-call determinism.
+    today = cfg.get("today") or cfg["now"]
     for cid, by_md in buckets.items():
+        occasions = []
         for month_day, by_year in by_md.items():
             if len(by_year) < min_years:
                 continue
             years = sorted(by_year)
             anchor_id, anchor_date, sample = by_year[years[-1]]
-            due_by = _next_occurrence(cfg["now"], month_day)
-            yield CandidateRow(
-                kind="inferred_occasion",
-                chat_id=cid,
-                handle_id=_counterparty_handle(con, cid),
-                anchor_message_id=anchor_id,
-                anchor_date=anchor_date,
-                due_by=due_by,
-                evidence={
-                    "month_day": month_day,
-                    "observed_years": years,
-                    "n_years": len(by_year),
-                    "next_occurrence": due_by,
-                    "sample_message": (sample or "")[:TEXT_PREVIEW_CHARS],
-                },
-            )
+            occasions.append({
+                "month_day": month_day,
+                "years": years,
+                "anchor_id": anchor_id,
+                "anchor_date": anchor_date,
+                "sample": sample,
+                "due_by": _next_occurrence(today, month_day),
+            })
+        if not occasions:
+            continue
+        # Soonest due_by wins; tie-break most years observed, then month_day. A
+        # None due_by (neither this nor next year resolved) sorts last.
+        occasions.sort(key=lambda o: (o["due_by"] or "9999-99-99",
+                                      -len(o["years"]), o["month_day"]))
+        primary = occasions[0]
+        others = [{"month_day": o["month_day"], "next_occurrence": o["due_by"],
+                   "n_years": len(o["years"])} for o in occasions[1:]]
+        yield CandidateRow(
+            kind="inferred_occasion",
+            chat_id=cid,
+            handle_id=_counterparty_handle(con, cid),
+            anchor_message_id=primary["anchor_id"],
+            anchor_date=primary["anchor_date"],
+            due_by=primary["due_by"],
+            evidence={
+                "month_day": primary["month_day"],
+                "observed_years": primary["years"],
+                "n_years": len(primary["years"]),
+                "next_occurrence": primary["due_by"],
+                "sample_message": (primary["sample"] or "")[:TEXT_PREVIEW_CHARS],
+                "other_occasions": others,
+            },
+        )
 
 
 DETECTORS.append(("inferred_occasion", detect_inferred_occasion))
@@ -1065,10 +1093,19 @@ def run_exclusion_gate(con, cfg, now, dry_run=False):
 # Stage 3: urgency + row persistence
 # ---------------------------------------------------------------------------
 
-def _score_urgency(kind, anchor_date, ref_now, cfg):
+def _score_urgency(kind, anchor_date, ref_now, cfg, due_by=None):
     """urgency = kind_weight * exp(-age_days/halflife * ln 2); age from ref_now
-    (the corpus's latest message). A missing anchor scores the bare weight."""
+    (the corpus's latest message). A missing anchor scores the bare weight.
+
+    inferred_occasion is forward-looking, not backward: its anchor is a past
+    occurrence up to ~365d old, so the age formula would bury it (~0.0002). With
+    a due_by it instead decays on days-*until*-due from real today, so a due-soon
+    occasion scores near full weight and ranks up the digest ahead of the date."""
     weight = cfg["kind_weights"].get(kind, _DEFAULT_KIND_WEIGHT)
+    if kind == "inferred_occasion" and due_by:
+        today = (cfg.get("today") or ref_now).date()
+        days_until = max(0.0, (datetime.date.fromisoformat(due_by) - today).days)
+        return round(weight * math.exp(-days_until / cfg["halflife_days"] * math.log(2)), 6)
     if not anchor_date:
         return round(weight, 6)
     age_days = max(
@@ -1152,6 +1189,12 @@ def detect_all(con, cfg, event_now, dry_run=False):
     exclusion gate and urgency scoring applied OUTSIDE the detectors. Returns a
     summary dict (and the written thread ids)."""
     cfg["dry_run"] = dry_run  # rides cfg so detectors (uniform detect_fn(con, cfg)) can read it
+    # Real wall-clock "today" for forward-looking reads (inferred_occasion's
+    # due_by / proximity urgency); backward age scoring keeps using corpus-now.
+    try:
+        cfg["today"] = datetime.datetime.fromisoformat(event_now.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        cfg["today"] = None
     excluded_handles, excluded_contacts, n_auto = run_exclusion_gate(
         con, cfg, event_now, dry_run=dry_run)
     n_candidates = n_written = n_suppressed = 0
@@ -1164,7 +1207,8 @@ def detect_all(con, cfg, event_now, dry_run=False):
                             excluded_handles, excluded_contacts):
                 n_suppressed += 1
                 continue
-            urgency = _score_urgency(cand.kind, cand.anchor_date, cfg["now"], cfg)
+            urgency = _score_urgency(cand.kind, cand.anchor_date, cfg["now"], cfg,
+                                     due_by=cand.due_by)
             if dry_run:
                 n_written += 1
                 continue
