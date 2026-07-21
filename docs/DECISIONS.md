@@ -806,6 +806,128 @@ Two smaller things the profile exposed:
   `NUM_PARALLEL` back, so there is nothing to assert afterwards; making the
   restart unconditional is the only fix.
 
+## 2026-07-20: the analytical suite (Wave 0 + Wave 1)
+
+A wave of self-insight features from the Linear project *Close Read —
+imessage-rag Analytical Suite*, specified in its canonical
+**00 — Master Spec & Parallel-Work Contract** (and the per-feature design docs
+below). Every feature turns a person's own complete iMessage history into
+private insight — 100% offline, local-LLM only, the corpus never leaving the
+machine or entering a prompt wholesale — the same retrieval-not-context-stuffing
+posture as the rest of the app. The *parallel-work contract* is why each
+feature's schema lands in its own `_create_*_tables` function called from
+`create_schema` (never an edit to the shared `SCHEMA` blob), its config behind a
+`# --- feature: X ---` fence, its tools behind matching fences in
+`tool_schemas.py` / `query_tools/__init__.py` / `chat.py`, and its pipeline step
+as a recipe line in `make pipeline`: the issues were built in parallel worktrees
+and had to merge additively. Pipeline order is now
+`ingest → annotate → nudges → drift → voiceprint → conflict → topics`; the four
+new stages each read `chunk_annotations`, so they slot in after `annotate`, and
+each is also a standalone `make` target.
+
+**Foundations (Wave 0).** Shared machinery the features build on:
+
+- `stats.py` (F2) — dependency-free robust statistics: Theil-Sen trend +
+  bootstrap CI, Kaplan-Meier survival / ECDF placement, modified-z (MAD) outlier
+  scoring, CUSUM change-point. Pure stdlib, no `config`/Ollama/sqlite, and every
+  function is total (returns `None`/`[]` on degenerate input, never raises), so
+  drift, conflict, and wellbeing all import one tested implementation. A
+  load-bearing modeling note lives in the module: do NOT reuse
+  `get_response_dynamics`'s censored-latency path — it drops gaps
+  `>= INITIATION_GAP_HOURS`, biasing a dying tie's latency *downward* (the
+  longest silences, exactly the fading signal, are thrown away); model absent
+  replies as right-censored observations instead.
+- Eval gates (F4, RES-70) — `eval/evalkit/{gates,agreement,labeling}.py` plus the
+  `label` / `gate` subcommands. A measurement gate decides whether a modest local
+  model is good enough to *ship* a class of labels: the owner hand-labels a
+  sample (`eval/labels/<task>.jsonl`, gitignored, owner-only, agents never write
+  there), `gate` runs the production classifier and scores Cohen's kappa
+  (`conflict_labels`, floor 0.6) or detector precision (`dropped_plan`, floor
+  0.85), and persists a pass/fail verdict. Clearance is default-closed: an absent
+  verdict suppresses the class (Master Spec A2). `conflict_labels` ships a
+  committed seed verdict (`eval/seed_gates/`), so conflict labels are pre-cleared
+  out of the box and survive `reset_db` (the seed is in the repo, not the
+  per-user DB).
+- `consent.py` (F5) — default-closed, tolerant, config-free opt-in id parsing;
+  landed as a shared primitive ahead of the features that will gate on explicit
+  per-contact consent.
+- Lexicon split (F1) — `person_period_lexicon` gained
+  `i_count` / `you_count` / `absolutist_count` (raw PRONOUN_I / PRONOUN_YOU /
+  ABSOLUTIST token counts), the speaker-attributable markers the wellbeing
+  baseline and the voiceprint read; nullable until the next full rebuild.
+
+**Clearing the Air — conflict (01, RES-46 / C1).** `conflict_detect.py` finds
+"tense stretches" in 1:1 chats from **deterministic signals only** — reply-latency
+withdrawal (survival over raw right-censored gaps vs a trailing-90-day baseline),
+one-sided sessions, dislike-tapback runs, message-volume collapse — writing a
+`conflicts` window when `>= CONFLICT_MIN_SIGNALS` fire, plus `conflict_signals`
+for per-turn escalation labels. The LLM never *originates* a conflict; it only
+attaches Gottman-style escalation / `repair` labels, and only for classes the F4
+gate has cleared — surfaced as `tentative`/`likely` bands, never raw scores.
+Valence corroborates *ranking* (source='llm' chunks only) but never detection,
+so the finder is never dead on a default all-distilled corpus (a window with no
+llm chunks is written `corroboration='none'`). A large intra-window gap sets
+`off_text_flag` (the fight likely moved off-channel), which forbids any
+resolution verdict downstream. Deliberately carries no role/aggressor/status
+column — that posture is a later issue (C2). Read via `find_conflicts` /
+`get_conflict`; guarded in `ingest_state` by `conflict_model`.
+
+**Loose Ends — nudges (02, N1).** `loose_ends.py` mines the history for open
+interpersonal loops and writes `loose_threads` to nudge about later. Shape:
+Stage 0 is an exclusion gate that always runs first (durable `nudge_exclusions`
+mutes + auto-mute of dyads whose most-recent llm-annotated exchange is negative,
+`NUDGE_VALENCE_EXCLUDE`) — no candidate is ever generated for an excluded
+contact; then pure-SQL detectors (N1 ships `faded_initiator` over the derived
+`sessions` table); then Python urgency scoring
+(`kind_weight * exp(-age/halflife)`, age from the corpus's latest message).
+The one LLM touch is a one-line `nudge_text` narration, guarded by
+`loose_ends_model`, which never blocks or deletes the SQL-detected rows.
+`nudge_exclusions` is durable user intent — PRESERVED across `reset_db` — while
+`loose_threads` is derived. Dismissals set `dismissed_at` and never delete (a
+reused id could re-open a dismissed thread, hence AUTOINCREMENT). Read/act via
+`get_loose_threads` / `resolve_loose_thread` / `mute_contact_from_nudges`.
+
+**Fadeout Radar — drift (03, D1).** `drift.py` scores how each 1:1 relationship
+is trending over time into `dyad_drift`, aggregated by **resolved counterparty**
+(`member_key`, so a contact's several handles/chats fold into one relationship
+before scoring; a full rebuild self-heals a `handle:N → contact:M` key flip).
+Seven monthly signals (volume, reciprocity, latency, silence, valence, depth,
+initiation), each turned into a 0..1 contribution by a Theil-Sen trend with a
+bootstrap CI — a CI still spanning 0 contributes 0 — then combined into a
+weight-renormalized composite `drift_score` and a `phase` label. Deterministic
+and LLM-free; it consumes messages, the `sessions` table, and
+`chunk_annotations`. **Opt-in: `DRIFT_ENABLED` defaults false**, so the pipeline
+step is a no-op and `dyad_drift` never builds out of the box. This is enforced
+inside `drift.py`, not by withholding the step — an enable-flag gates the BUILD,
+not a prompt. Guarded by `drift_max_message_id` + `drift_params_hash` (a
+skip-if-unchanged full rebuild). The read tools are a *separate* future issue's
+`query_tools/drift.py` — a deliberate name-twin that shares nothing with this
+compute pipeline; not yet landed, so nothing exposes drift to the LLM yet.
+
+**Baseline — wellbeing (04, RES-49 / W1).** `wellbeing.py` is the deterministic,
+hermetically testable core that decides whether a single conversational
+identity's recent language + behavior shows a *sustained, cross-family*
+departure from its own history. False positives are the enemy: gates stack
+multiplicatively (per-marker winsorizing, family capping below the z-threshold
+so no lone marker carries a family, and a concordance requirement across a
+lexical and a behavioral family against a leave-window-out baseline). W1 is the
+core only — no `config` wiring, no SQL, no delivery (those are W2/W3), and no
+tool — so nothing surfaces wellbeing to the LLM yet; it is documented here as a
+landed foundation, not a live feature.
+
+**Voiceprint — persona (05, V1).** `voiceprint.py` builds a deterministic,
+zero-LLM per-person voice profile into `person_voiceprint`: per-message style
+(avg length, lowercase ratio, exclaim/ellipsis rates, burst size), the nine
+function-word rates (n_words-weighted from `person_period_lexicon`), signature
+openers/closers, and a **LOW-TRUST** emotional tone read from source='llm'
+chunks only (NULL when there are none). Keyed by `member_key` × `counterpart_key`
+× scope (`dyad`/`group`/`all`), so "my voice with Mom" and "Mom's voice with me"
+are distinct rows; a confidence flag reads `high` only when a row clears all
+three volume/engagement/breadth floors. Full rebuild, guarded by
+`voiceprint_max_message_id`; read via `get_voiceprint` (which can also recompute
+over a date window, capped). Later persona issues (draft-reply, style-match,
+simulate) will extend `query_tools/persona.py`, which stays a thin read layer.
+
 ## Linting
 
 `ruff check .` (config in `pyproject.toml`: `line-length = 100`,
