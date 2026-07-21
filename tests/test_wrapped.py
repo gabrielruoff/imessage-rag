@@ -31,6 +31,7 @@ _TOOL_NAMES = (
     "get_group_dynamics",
     "get_word_frequency",
     "search_contacts_by_name",
+    "get_voiceprint",
 )
 
 _HEATMAP = [[0] * 24 for _ in range(7)]
@@ -61,6 +62,15 @@ _DEFAULT_RESULTS = {
     "get_group_dynamics": {"members": [{"name": "A", "share": 0.5}]},
     "get_word_frequency": [{"word": "zamboni", "count": 4}],
     "search_contacts_by_name": [],
+    # Default self voiceprint card ("me","*","all"): every main()-driven test
+    # renders a self-only Your Voiceprint section (empty consent -> no game).
+    "get_voiceprint": {
+        "member": "Me", "counterpart": "everyone", "scope": "all",
+        "confidence": "high",
+        "features": {"avg_msg_len": 42.0, "lowercase_ratio": 0.8, "burst_size": 2.0},
+        "openers": [{"phrase": "yo", "count": 30}],
+        "closers": [{"phrase": "night", "count": 10}],
+    },
 }
 
 
@@ -696,6 +706,126 @@ class TestDriftSection(WrappedTestCase):
             excluded = wrapped_sections._sec_drifting(self.con, excluded_names={"zoe"})
         self.assertIsNotNone(shown)                 # the tie renders when kept
         self.assertIsNone(excluded)                 # ...and is omitted when excluded
+
+
+def _vp_card(member, opener, closer="bye"):
+    """A minimal but valid voiceprint card (has 'features', so _sec_voiceprint
+    accepts it) with a distinctive opener/closer phrase for grep assertions."""
+    return {
+        "member": member, "counterpart": "everyone", "scope": "all",
+        "confidence": "high",
+        "features": {"avg_msg_len": 30.0, "lowercase_ratio": 0.6, "burst_size": 2.0},
+        "openers": [{"phrase": opener, "count": 7}],
+        "closers": [{"phrase": closer, "count": 3}],
+    }
+
+
+def _vp_side_effect(self_card, by_contact_id):
+    """A get_voiceprint mock: no contact_id -> the self card; a named contact ->
+    that contact's card (or a not-found note), matching persona.get_voiceprint's
+    subject='them'/scope='all' call shape from _sec_voiceprint."""
+    def vp(contact_id=None, handle_id=None, name=None, subject="me",
+           scope=None, chat_id=None, date_from=None, date_to=None):
+        if contact_id is None:
+            return self_card
+        return by_contact_id.get(contact_id, {"found": False, "note": "none"})
+    return vp
+
+
+class TestVoiceprintSection(WrappedTestCase):
+    """RES-64 / V4: self voiceprint card + consent-gated guess-who game."""
+
+    _SELF = _vp_card("Me", "selfopenZZZ", "selfcloseZZZ")
+
+    def _seed_two_featured(self):
+        """Alice (contact 1) and Bob (contact 2), both featured on 2025 volume."""
+        seed_contact(self.con, 1, "Alice")
+        seed_contact(self.con, 2, "Bob")
+        seed_handle(self.con, 1, "+15550001", 1)
+        seed_handle(self.con, 2, "+15550002", 2)
+        seed_chat(self.con, 1, "c1")
+        seed_chat(self.con, 2, "c2")
+        seed_msgs(self.con, 1, 1, [f"2025-05-{d:02d}T12:00:00" for d in range(1, 11)])
+        seed_msgs(self.con, 2, 2, [f"2025-05-{d:02d}T12:00:00" for d in range(1, 8)])
+        self.con.commit()
+
+    def test_self_only_when_consent_empty(self):
+        """Default empty consent: the self card renders, but NO third-party
+        verbatim phrase or game card is anywhere in the emitted HTML."""
+        self._seed_two_featured()
+        vp = mock.Mock(side_effect=_vp_side_effect(
+            self._SELF, {1: _vp_card("Alice", "wubbaZZZ"),
+                         2: _vp_card("Bob", "bobbleZZZ")}))
+        self.patch_tools(get_voiceprint=vp)
+        self.patch_llm()
+        out = self.out_path("vp-self.html")
+        with mock.patch.object(config, "WRAPPED_VOICEPRINT_CONSENT_IDS", ""):
+            code, _ = self.run_main(["--year", "2025", "--yes", "--no-llm", "--out", out])
+        self.assertEqual(code, 0)
+        with open(out, encoding="utf-8") as f:
+            page = f.read()
+        self.assertIn("<h2>Your Voiceprint</h2>", page)
+        self.assertIn("This is you", page)
+        self.assertIn("selfopenZZZ", page)  # the reader's own phrase renders
+        # Default redaction: no third-party card, phrase, or game anywhere.
+        self.assertNotIn("Guess Who Texts Like This?", page)
+        self.assertNotIn("wubbaZZZ", page)
+        self.assertNotIn("bobbleZZZ", page)
+        self.assertNotIn("It’s Alice.", page)
+
+    def test_consent_enables_exactly_that_contact(self):
+        """Adding one id opts in exactly that contact: their card and reveal
+        appear; a non-consented featured contact's card stays out of the file."""
+        self._seed_two_featured()
+        vp = mock.Mock(side_effect=_vp_side_effect(
+            self._SELF, {1: _vp_card("Alice", "wubbaZZZ"),
+                         2: _vp_card("Bob", "bobbleZZZ")}))
+        self.patch_tools(get_voiceprint=vp)
+        self.patch_llm()
+        out = self.out_path("vp-consent.html")
+        with mock.patch.object(config, "WRAPPED_VOICEPRINT_CONSENT_IDS", "1"):
+            code, _ = self.run_main(["--year", "2025", "--yes", "--no-llm", "--out", out])
+        self.assertEqual(code, 0)
+        with open(out, encoding="utf-8") as f:
+            page = f.read()
+        self.assertIn("Guess Who Texts Like This?", page)
+        self.assertIn("wubbaZZZ", page)      # consented contact opted in
+        self.assertIn("It’s Alice.", page)   # reveal carries the name
+        self.assertNotIn("bobbleZZZ", page)  # Bob not consented -> redacted
+
+    def test_consent_never_overrides_exclusion(self):
+        """A silence-excluded contact who is ALSO consented must not appear:
+        consent adds, it never resurfaces an excluded contact."""
+        seed_contact(self.con, 1, "Alice")
+        seed_contact(self.con, 2, "Bob")
+        seed_handle(self.con, 1, "+15550001", 1)
+        seed_handle(self.con, 2, "+15550002", 2)
+        seed_chat(self.con, 1, "c1")
+        # Alice active through corpus end (defines MAX(date)); Bob goes quiet
+        # 2025-01 after clearing the lifetime floor -> silence-excluded.
+        seed_msgs(self.con, 1, 1, [f"2025-{m:02d}-01T12:00:00" for m in range(1, 13)])
+        seed_msgs(self.con, 2, 2, ["2024-10-01T12:00:00", "2024-11-01T12:00:00",
+                                   "2024-12-01T12:00:00", "2025-01-01T12:00:00",
+                                   "2025-01-02T12:00:00"])
+        self.con.commit()
+        vp = mock.Mock(side_effect=_vp_side_effect(
+            self._SELF, {1: _vp_card("Alice", "wubbaZZZ"),
+                         2: _vp_card("Bob", "bobbleZZZ")}))
+        self.patch_tools(get_voiceprint=vp)
+        self.patch_llm()
+        out = self.out_path("vp-excluded.html")
+        # Both consented, but Bob is excluded by the silent-contact guard.
+        with mock.patch.object(config, "WRAPPED_VOICEPRINT_CONSENT_IDS", "1,2"), \
+                mock.patch.object(config, "WRAPPED_SILENT_MIN_MESSAGES", 5), \
+                mock.patch.object(config, "WRAPPED_SILENT_MONTHS", 6):
+            code, stdout = self.run_main(["--yes", "--no-llm", "--out", out])
+        self.assertEqual(code, 0)
+        self.assertIn("excluded (went quiet 2025-01): Bob", stdout)
+        with open(out, encoding="utf-8") as f:
+            page = f.read()
+        self.assertIn("wubbaZZZ", page)       # Alice: featured + consented
+        self.assertNotIn("bobbleZZZ", page)   # Bob: excluded despite consent
+        self.assertNotIn("It’s Bob.", page)
 
 
 if __name__ == "__main__":

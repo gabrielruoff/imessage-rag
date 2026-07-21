@@ -1436,3 +1436,40 @@ def render_window_chips(rows, label_key="contact", days_key="days_until_dormant"
         return ""
     return '<div class="chips">' + "".join(chips) + "</div>"
 # --- end feature: drift ---
+# --- feature: persona ---
+def _voiceprint_phrases(entries, limit=3):
+    """Signature phrases out of an openers/closers list ([{phrase, count}, ...],
+    as get_voiceprint returns them): up to `limit` non-empty phrase strings, in
+    order. Tolerant of a bare list of strings too."""
+    out = []
+    for entry in entries or []:
+        phrase = entry.get("phrase") if isinstance(entry, dict) else entry
+        phrase = str(phrase or "").strip()
+        if phrase:
+            out.append(phrase)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def render_voiceprint_card(openers, closers, outgoing=True, reveal=None):
+    """A voiceprint's signature phrases as iMessage bubbles: opening phrases then
+    closing phrases, outgoing (send-blue) for the reader's own voice or incoming
+    for a mystery 'guess who' card. `reveal`, when set, appends a collapsed answer
+    -- the ONLY place a mystery texter's name is written, so the card carries no
+    name until the reader opens it. Returns None when there are no phrases (so an
+    empty voiceprint renders nothing rather than an empty shell)."""
+    side = "out" if outgoing else "inc"
+    bubbles = [
+        f'<figure class="msg {side}"><div class="bubble">'
+        f"{format_scalar(phrase)}</div></figure>"
+        for phrase in _voiceprint_phrases(openers) + _voiceprint_phrases(closers)
+    ]
+    if not bubbles:
+        return None
+    body = '<div class="bubbles">' + "".join(bubbles) + "</div>"
+    if reveal:
+        body += ("<details><summary>Reveal</summary>"
+                 f'<p class="scalar">It’s {esc(reveal)}.</p></details>')
+    return body
+# --- end feature: persona ---
