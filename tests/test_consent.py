@@ -82,6 +82,13 @@ class TestConfigFree(unittest.TestCase):
     def test_importing_consent_does_not_pull_in_config(self):
         # F5 is a pure net-new helper: importing it must not drag in config
         # (nor sqlite/Ollama). Assert config stays absent from sys.modules.
+        # Popping config leaks across the discover run (a later import gets a
+        # FRESH config with defaults) unless we put the original object back --
+        # restore it after asserting so no sibling test inherits the hole.
+        saved_config = sys.modules.get("config")
+        self.addCleanup(
+            lambda: sys.modules.__setitem__("config", saved_config)
+            if saved_config is not None else None)
         sys.modules.pop("config", None)
         import importlib
         importlib.reload(consent)

@@ -96,6 +96,15 @@ from .nudges import (
 # --- feature: wellbeing ---
 from .analytics_wellbeing import get_language_trajectory
 # --- end feature: wellbeing ---
+# --- feature: drift ---
+# Re-exported UNCONDITIONALLY (the functions always exist); DRIFT_ENABLED gates
+# only whether their SCHEMAS are registered in tool_schemas/chat, which is the
+# repo's one reliable way to keep the model from calling a tool.
+from .drift import (
+    get_fadeout_watchlist,
+    get_relationship_drift,
+)
+# --- end feature: drift ---
 
 __all__ = [
     "DB_PATH",
@@ -144,4 +153,8 @@ __all__ = [
     # --- feature: wellbeing ---
     "get_language_trajectory",
     # --- end feature: wellbeing ---
+    # --- feature: drift ---
+    "get_fadeout_watchlist",
+    "get_relationship_drift",
+    # --- end feature: drift ---
 ]
