@@ -666,5 +666,152 @@ class TraceRegistrationGateTest(unittest.TestCase):
         self.assertIn(self.NAME, chat.SYSTEM_PROMPT)
 
 
+# --- C4 (RES-53): draft_apology scaffold (Lewicki-6, never ghostwrites) -------
+
+
+class DraftApologyTest(_TempDBTest):
+    def _conflict_id(self):
+        return self._con().execute("SELECT id FROM conflicts").fetchone()[0]
+
+    def test_clean_returns_checklist_excerpts_no_footer(self):
+        _build_fixture(self.db_path, classify_fn=_stub_criticism)
+        out = query_tools.draft_apology(self._conflict_id())
+        self.assertEqual(out["dv_screen"], "clean")
+        self.assertNotIn("resource_footer", out)          # clean -> no footer
+        self.assertNotIn("withheld", out)                 # scaffold NOT withheld
+        # Emits no finished apology prose.
+        self.assertFalse(out["emits_prose"])
+        # Ranked Lewicki-6: acknowledge highest, offer-repair second, forgiveness
+        # lowest and flagged skippable.
+        ranks = {c["component"]: c["rank"] for c in out["checklist"]}
+        self.assertEqual(ranks["acknowledge_responsibility"], 1)
+        self.assertEqual(ranks["offer_of_repair"], 2)
+        forg = next(c for c in out["checklist"]
+                    if c["component"] == "request_for_forgiveness")
+        self.assertEqual(forg["rank"], 6)
+        self.assertTrue(forg["skippable"])
+        # REAL grievance excerpts (verbatim, capped) are surfaced.
+        self.assertTrue(out["grievances"])
+        for g in out["grievances"]:
+            self.assertLessEqual(len(g["excerpt"]), 200)
+            self.assertIn(g["actor"], ("me", "them"))
+
+    def test_repair_component_present_when_cleared(self):
+        # Seed clears `repair` out of the box -> the component is present.
+        _build_fixture(self.db_path, classify_fn=_stub_criticism)
+        out = query_tools.draft_apology(self._conflict_id())
+        self.assertEqual(out["repair_attempts"]["status"], "available")
+        self.assertIn("attempts", out["repair_attempts"])
+
+    def test_repair_attempts_surface_when_present(self):
+        # A repair-labeled corpus (them's repair bids) with `repair` cleared:
+        # the ignored repair attempts surface verbatim, attributed to `them`.
+        repair = lambda t: {"class": "repair", "top2": ["repair"], "confidence": 0.9}  # noqa: E731
+        _build_fixture(self.db_path, classify_fn=repair)
+        out = query_tools.draft_apology(self._conflict_id())
+        self.assertEqual(out["repair_attempts"]["status"], "available")
+        attempts = out["repair_attempts"]["attempts"]
+        self.assertTrue(attempts)
+        for a in attempts:
+            self.assertEqual(a["actor"], "them")
+            self.assertLessEqual(len(a["excerpt"]), 200)
+
+    def test_repair_unavailable_when_not_eval_cleared(self):
+        # Owner verdict clearing `criticism` but NOT `repair` -> the repair
+        # component is OMITTED and marked unavailable; checklist + excerpts stay.
+        owner = {"passed": ["criticism"],
+                 "failed": ["contempt", "defensiveness", "stonewalling", "repair"],
+                 "metric": "kappa", "values": {}, "n_labels": 60,
+                 "labeled_at": "T", "source": "owner"}
+        _build_fixture(self.db_path, classify_fn=_stub_criticism, owner_verdict=owner)
+        out = query_tools.draft_apology(self._conflict_id())
+        self.assertEqual(out["repair_attempts"]["status"], "unavailable")
+        self.assertEqual(out["repair_attempts"]["reason"], "label class not eval-cleared")
+        self.assertNotIn("attempts", out["repair_attempts"])  # never guessed
+        # The checklist + real excerpts still return.
+        self.assertIn("checklist", out)
+        self.assertTrue(out["grievances"])
+
+    def test_dv_role_suppress_withholds_scaffold_entirely(self):
+        # High-risk DV fixture, screening ON -> _dv_screen role-suppress. UNLIKE
+        # diagnose_conflict there is NO partial scaffold: the whole thing is
+        # withheld and ONLY the resource pointer returns.
+        _build_fixture(self.db_path, classify_fn=_stub_criticism, dv=True,
+                       build_lexicon=True)
+        out = query_tools.draft_apology(self._conflict_id())
+        self.assertEqual(out["dv_screen"], "role-suppress")
+        self.assertTrue(out["withheld"])
+        for k in ("checklist", "grievances", "repair_attempts"):
+            self.assertNotIn(k, out)                  # scaffold withheld ENTIRELY
+        self.assertIn("resource_footer", out)         # pointer ONLY
+        self.assertIn("1-800-799-7233", out["resource_footer"])
+        self.assertIn("thehotline.org", out["resource_footer"])
+
+    def test_dv_bypass_returns_scaffold_with_footer(self):
+        # Screening bypassed -> bypassed-with-footer: full checklist + excerpts
+        # return WITH the resource footer appended (pointer never fully removed).
+        import config
+        _build_fixture(self.db_path, classify_fn=_stub_criticism, dv=True)
+        cid = self._conflict_id()
+        saved = config.CONFLICT_DV_SCREEN
+        config.CONFLICT_DV_SCREEN = False
+        self.addCleanup(setattr, config, "CONFLICT_DV_SCREEN", saved)
+        out = query_tools.draft_apology(cid)
+        self.assertEqual(out["dv_screen"], "bypassed-with-footer")
+        self.assertNotIn("withheld", out)
+        self.assertIn("checklist", out)               # scaffold returns
+        self.assertIn("grievances", out)
+        self.assertIn("resource_footer", out)         # footer STILL appended
+        self.assertIn("1-800-799-7233", out["resource_footer"])
+
+    def test_transient_bypass_overrides_config_on(self):
+        # Config default 'on'; the transient per-run bypass still wins.
+        _build_fixture(self.db_path, classify_fn=_stub_criticism, dv=True)
+        cid = self._conflict_id()
+        conflict_mod.set_dv_screen_bypass(True)
+        self.addCleanup(conflict_mod.set_dv_screen_bypass, False)
+        out = query_tools.draft_apology(cid)
+        self.assertEqual(out["dv_screen"], "bypassed-with-footer")
+        self.assertIn("checklist", out)
+        self.assertIn("resource_footer", out)
+
+    def test_never_emits_finished_prose(self):
+        _build_fixture(self.db_path, classify_fn=_stub_criticism)
+        out = query_tools.draft_apology(self._conflict_id())
+        self.assertIs(out["emits_prose"], False)
+        # No verdict/blame field leaks in either.
+        self.assertEqual(_all_keys(out) & _VERDICT_KEYS, set())
+
+    def test_result_capped_well_under_limit(self):
+        from config import TOOL_RESULT_MAX_CHARS
+        _build_fixture(self.db_path, classify_fn=_stub_criticism)
+        out = query_tools.draft_apology(self._conflict_id())
+        self.assertLess(len(json.dumps(out)), TOOL_RESULT_MAX_CHARS // 4)
+
+    def test_errors_gracefully_on_missing_conflict(self):
+        _build_fixture(self.db_path, classify_fn=_stub_criticism)
+        self.assertIn("error", query_tools.draft_apology(999999))
+
+    def test_empty_when_no_conflict_tables(self):
+        con = sqlite3.connect(self.db_path)
+        con.execute("CREATE TABLE chats(id INTEGER PRIMARY KEY, is_group INTEGER)")
+        con.commit()
+        con.close()
+        self.assertIn("error", query_tools.draft_apology(1))
+
+
+class DraftApologyRegistrationTest(unittest.TestCase):
+    def test_three_place_registration_in_sync(self):
+        import chat
+        import tool_schemas
+        names = {t["name"] for t in tool_schemas.TOOL_DEFINITIONS}
+        self.assertIn("draft_apology", names)                     # schema
+        self.assertIn("draft_apology", chat.TOOL_FUNCTIONS)       # dispatch
+        self.assertTrue(callable(query_tools.draft_apology))      # re-export
+        self.assertIn("draft_apology", chat.SYSTEM_PROMPT)        # prompt line
+        ollama_names = {t["function"]["name"] for t in chat.OLLAMA_TOOLS}
+        self.assertIn("draft_apology", ollama_names)
+
+
 if __name__ == "__main__":
     unittest.main()

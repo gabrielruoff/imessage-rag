@@ -120,6 +120,13 @@ from .drift import get_reconnection_candidates
 from .conflict import trace_conflict_across_chats
 # --- end feature: conflict (C3 trace) ---
 
+# --- feature: conflict (C4 apology) ---
+# draft_apology is unconditional (no config gate; the DV floor is enforced in
+# the function). Separate appended fence so C4 stays a clean additive edit
+# alongside the concurrent conflict worktrees.
+from .conflict import draft_apology
+# --- end feature: conflict (C4 apology) ---
+
 __all__ = [
     "DB_PATH",
     "embed_texts",
@@ -178,4 +185,7 @@ __all__ = [
     # --- feature: conflict (C3 trace) ---
     "trace_conflict_across_chats",
     # --- end feature: conflict (C3 trace) ---
+    # --- feature: conflict (C4 apology) ---
+    "draft_apology",
+    # --- end feature: conflict (C4 apology) ---
 ]
