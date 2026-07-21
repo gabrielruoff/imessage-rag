@@ -239,6 +239,16 @@ WRAPPED_TOP_CONTACTS = int(os.getenv("WRAPPED_TOP_CONTACTS", "8"))
 # classic nostalgia-product failure. --include overrides per name.
 WRAPPED_SILENT_MONTHS = int(os.getenv("WRAPPED_SILENT_MONTHS", "6"))
 WRAPPED_SILENT_MIN_MESSAGES = int(os.getenv("WRAPPED_SILENT_MIN_MESSAGES", "200"))
+# --- feature: persona ---
+# Third-party "Your Voiceprint" game consent (RES-64 / V4): a comma/space-
+# separated list of `contacts.id` values the user marked "OK to include" in the
+# Wrapped voiceprint section's guess-who game. Empty (the default) = self-only:
+# NO third-party verbatim text or stylometric card appears in the generated file
+# (default redaction). Parsed via consent.parse_consent_ids (tolerant; non-
+# positive/non-integer tokens skipped). Consent ADDS a contact; it never
+# overrides a roster exclusion (silent-contact guard / --contact / --exclude).
+WRAPPED_VOICEPRINT_CONSENT_IDS = os.getenv("WRAPPED_VOICEPRINT_CONSENT_IDS", "")
+# --- end feature: persona ---
 
 # --- Conversation chunking ------------------------------------------------------
 # Messages are embedded as conversation chunks, not individually: contiguous

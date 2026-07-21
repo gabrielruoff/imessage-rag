@@ -951,6 +951,7 @@ def build_sections(con, roster, contact_entry=None, year=None,
         if drifting is not None:
             sections.append(drifting)
     # --- end feature: drift ---
+    sections.append(_sec_voiceprint(roster, contact_entry))  # feature: persona
     return sections
 
 
@@ -1063,3 +1064,97 @@ def _sec_drifting(con, excluded_names=frozenset(), limit=8):
                  "numbers exactly as given."),
     }
 # --- end feature: drift ---
+
+
+# --- feature: persona ---
+def _sec_voiceprint(roster, contact_entry=None):
+    """"Your Voiceprint" (RES-64 / V4): the reader's OWN deterministic style
+    voiceprint -- the ("me", "*", "all") card from get_voiceprint -- rendered in
+    iMessage bubbles, plus a consent-gated "guess who texts like this" game.
+
+    PRIVACY (third-party content is default-redacted): a contact's verbatim
+    signature phrases and stylometric card enter the generated file ONLY when
+    that contact's `contacts.id` is in WRAPPED_VOICEPRINT_CONSENT_IDS (parsed by
+    consent.py -- never re-implemented here). With the default empty list the
+    section is self-only and the game is ABSENT. Consent ADDS a contact; it never
+    overrides a roster exclusion -- the game iterates the already-exclusion-
+    filtered featured roster (the silent-contact guard, --contact, and --exclude
+    have all run before build_sections), so a consented-but-excluded contact is
+    simply not present to feature. Nothing is ever sent; this only renders."""
+    import consent
+
+    me_card, note = wrapped._tool("get_voiceprint")  # ("me", "*", "all")
+    if not (isinstance(me_card, dict) and "features" in me_card):
+        reason = note or (me_card.get("note") if isinstance(me_card, dict) else None)
+        return {"title": "Your Voiceprint", "stats": None,
+                "note": reason or "no voiceprint on file yet -- run `make voiceprint`"}
+
+    feats = me_card.get("features") or {}
+    stats = {}
+    if feats.get("avg_msg_len") is not None:
+        stats["typical_message_length"] = f"{round(feats['avg_msg_len']):,} chars"
+    if feats.get("lowercase_ratio") is not None:
+        stats["lowercase_share"] = feats["lowercase_ratio"]  # 'share' -> percent
+    if feats.get("burst_size") is not None:
+        stats["typical_burst"] = f"{round(feats['burst_size']):,} messages"
+    if me_card.get("confidence"):
+        stats["confidence"] = me_card["confidence"]
+
+    narrate = {"you": {
+        "openers": wrapped_html._voiceprint_phrases(me_card.get("openers")),
+        "closers": wrapped_html._voiceprint_phrases(me_card.get("closers")),
+        "typical_message_length_chars": (round(feats["avg_msg_len"])
+                                         if feats.get("avg_msg_len") is not None else None),
+    }}
+
+    visuals = []
+    you = wrapped_html.render_voiceprint_card(
+        me_card.get("openers"), me_card.get("closers"), outgoing=True)
+    if you:
+        visuals.append(wrapped_html.block("This is you", you))
+
+    # Consent-gated third-party game. Default-redacted: a contact's card is
+    # rendered ONLY when opted in AND present in the featured roster (which the
+    # exclusions already filtered), so consent can never resurface an excluded
+    # contact. Empty consent list -> the loop bodies never run -> no game.
+    consent_raw = getattr(config, "WRAPPED_VOICEPRINT_CONSENT_IDS", "")
+    mystery = []
+    for entry in roster:
+        cid = entry.get("contact_id")
+        if cid is None or not consent.is_consented(cid, consent_raw):
+            continue
+        card, _card_note = wrapped._tool("get_voiceprint", contact_id=cid,
+                                         subject="them", scope="all")
+        if not (isinstance(card, dict) and "features" in card):
+            continue
+        clue = wrapped_html.render_voiceprint_card(
+            card.get("openers"), card.get("closers"),
+            outgoing=False, reveal=entry.get("name"))
+        if clue:
+            mystery.append(wrapped_html.block(f"Mystery #{len(mystery) + 1}",
+                                              clue, depth=1))
+    if mystery:
+        visuals.append(wrapped_html.block("Guess Who Texts Like This?",
+                                          "".join(mystery)))
+        narrate["guess_who"] = {"players": len(mystery)}
+
+    if not (stats or visuals):
+        return {"title": "Your Voiceprint", "stats": None,
+                "note": "no voiceprint on file yet"}
+    caption = ("Your voiceprint is a deterministic fingerprint of how you text -- "
+               "message length, casing, and the phrases you open and close with.")
+    if mystery:
+        caption += (" The guess-who game features only friends who explicitly "
+                    "opted in; open a card to reveal who it is.")
+    return {
+        "title": "Your Voiceprint",
+        "stats": stats,
+        "narrate_stats": narrate,
+        "extra_html": "".join(visuals),
+        "caption": caption,
+        "hint": ("This is the reader's own texting style -- mention a couple of "
+                 "signature traits (a favorite opener, message length, a lowercase "
+                 "habit) warmly. If there is a guess-who game, tease it WITHOUT "
+                 "naming any of the players."),
+    }
+# --- end feature: persona ---
