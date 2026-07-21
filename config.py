@@ -543,3 +543,22 @@ CONFLICT_TRACE_ENABLED = os.getenv("CONFLICT_TRACE_ENABLED", "").strip().lower()
 # via db.iso_to_day -- the same converter the metadata writer uses).
 CONFLICT_TRACE_BUFFER_DAYS = int(os.getenv("CONFLICT_TRACE_BUFFER_DAYS") or "2")
 # --- end feature: conflict ---
+# --- feature: nudges ---
+# --- Unanswered-question nudges (loose_ends.py unanswered_question detector; RES-56 / N3) ---
+# A 1:1 session that ended on the OTHER person's genuine, unanswered question.
+# "Genuine" = the last message ends with '?', its trimmed text is at least
+# NUDGE_QUESTION_MIN_CHARS long, and its final sentence misses the pinned
+# rhetorical/pleasantry stoplist (loose_ends._RHETORICAL_STOPLIST): a short
+# "u up?" or a bare "right?" is a pleasantry, not a loose end. This length/
+# stoplist test is deliberately UNLIKE lexicon_build's bare `"?" in text`
+# (which powers person_period_lexicon.question_count and must not change).
+NUDGE_QUESTION_MIN_CHARS = int(os.getenv("NUDGE_QUESTION_MIN_CHARS") or "12")
+# The MANDATORY cross-session answered-check grace: the question is a loose end
+# only if it went unanswered for longer than the dyad's own cadence. The
+# deadline is anchor + max(the dyad's p90 inter-message gap via
+# loose_ends._dyad_gap_p90, this floor in hours); a self-reply inside the
+# deadline suppresses the candidate, a reply after it does NOT (that late reply
+# is recorded in evidence for narration). The 72h floor keeps a naturally
+# fast-cadence pair from firing on a single afternoon's silence.
+NUDGE_QUESTION_GRACE_HOURS = float(os.getenv("NUDGE_QUESTION_GRACE_HOURS") or "72")
+# --- end feature: nudges ---
