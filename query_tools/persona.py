@@ -1249,6 +1249,14 @@ def _simulate_them(con, message, contact_id, handle_id, name, acknowledged):
     exemplars = _public_exemplars(pairs)
     reply = ollama.chat_once(_sim_prompt(style, exemplars, message, label, label))
     raw_text = (reply.get("content") or "").strip()
+    if not raw_text:
+        # Empty generation: decline honestly rather than relay a blank estimate.
+        base.update({
+            "confidence": "low", "simulation": None, "exemplars": exemplars,
+            "notes": [f"The model returned no text for {label}; no estimate was "
+                      "generated."],
+        })
+        return base
     label_tag = f"ESTIMATE of {label}'s voice — not their real words"
     base.update({
         "confidence": "high", "generated": True,
@@ -1330,6 +1338,14 @@ def _simulate_past_self(con, message, contact_id, handle_id, name, as_of_date):
     persona_label = f"your past self (as of {as_of_date})"
     reply = ollama.chat_once(_sim_prompt(style, pairs, message, persona_label, "YOU"))
     raw_text = (reply.get("content") or "").strip()
+    if not raw_text:
+        # Empty generation: decline honestly rather than relay a blank estimate.
+        base.update({
+            "confidence": "low", "simulation": None, "exemplars": pairs,
+            "notes": [f"The model returned no text up to {as_of_date}; no estimate "
+                      "was generated."],
+        })
+        return base
     label_tag = f"ESTIMATE of your past self as of {as_of_date} — not a real message"
     base.update({
         "confidence": "high", "generated": True,

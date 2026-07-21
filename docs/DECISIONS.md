@@ -936,10 +936,12 @@ mile on each feature — the LLM-facing read tools the compute pipelines were
 built for, the generative tools that speak in the user's own material, and the
 Wrapped surfaces — each still additive behind its `# --- feature: X ---`
 fences. Default LLM tool count rose from 27 to **32**
-(`len(tool_schemas.TOOL_DEFINITIONS)`); four more register only behind flags
+(`len(tool_schemas.TOOL_DEFINITIONS)`); five more register only behind flags
 (three drift tools + D3 behind `DRIFT_ENABLED`, `trace_conflict_across_chats`
-behind `CONFLICT_TRACE_ENABLED`). No new tables landed — every Wave 2–4 tool
-and detector reads the six derived tables Wave 0+1 already built.
+behind `CONFLICT_TRACE_ENABLED`, and `simulate_contact` behind
+`PERSONA_SIM_ENABLED` — the last added in V5 below). No new tables landed —
+every Wave 2–4 tool and detector reads the six derived tables Wave 0+1 already
+built.
 
 **Clearing the Air — conflict (C2–C5).** `diagnose_conflict` (RES-51) is a
 DETERMINISTIC scorecard over one episode — per-side I/you and we-talk ratios,
@@ -1021,6 +1023,39 @@ reader's own ("me", "\*", "all") card, plus a consent-gated "guess who texts
 like this" game that is default-redacted: with an empty
 `WRAPPED_VOICEPRINT_CONSENT_IDS` no third-party card appears, and consent only
 adds a contact — it never overrides a roster exclusion.
+
+## 2026-07-21: persona V5 — `simulate_contact` + past-self (RES-69)
+
+`simulate_contact` extends `query_tools/persona.py` (still a thin read layer plus
+this one in-tool generator) with an ESTIMATE of how a named contact might reply in
+their voice, or a "talk to your past self" mode as of a date. It follows the
+persona-V2 `draft_reply` architecture (in-tool `ollama.chat_once`, structural
+decline below `VOICEPRINT_MIN_CONTEXT_PAIRS`) and the established registration
+gate (`DRIFT_ENABLED` / `CONFLICT_TRACE_ENABLED`): the schema is withheld from
+`TOOL_DEFINITIONS` + `SYSTEM_PROMPT` unless `PERSONA_SIM_ENABLED` (default false),
+while the function stays unconditionally importable/re-exported — so the default
+tool count stays **32** and rises to 33 only when the flag is on. This is the
+fifth flag-gated tool (see the Waves 2–4 count above).
+
+Guardrails, all in code (prompting is not a control here): (1) the returned
+`simulation` is wrapped POST-generation — every non-empty line prefixed with an
+`[ESTIMATE …]` label by `_wrap_simulation` — so the outer chat loop only ever
+relays a pre-labeled artifact, never an unlabeled draft it could strip;
+(2) a hard deceased/grief denylist `PERSONA_SIM_BLOCK_IDS` (parsed via the shared
+`consent.is_consented`, membership = blocked) hard-refuses in code with no
+generation — only a resolved contact id can be listed, since a bare handle can't
+be marked; (3) a soft, fail-open dormant/deceased warning
+(`PERSONA_SIM_DORMANT_DAYS` + `PERSONA_SIM_ONESIDED_MIN_MSGS`) rides in the
+acknowledgment payload so it is seen before acknowledging — it warns, never
+blocks; (4) a living-contact `acknowledged=true` UX flow (documented as a flow,
+NOT the boundary — the registration gate is); (5) past-self is bounded by
+`VOICEPRINT_MIN_RANGE_MESSAGES` / `VOICEPRINT_SCAN_MAX_MESSAGES` over a
+date-scoped raw rescan; (6) the payload also carries a tapback base-rate
+prediction computed over a FULL-MESSAGE denominator (every real message received
+from the contact, NOT only messages that drew a reaction — that denominator
+conditions on a reaction and overstates every rate). An empty generation is
+treated as a low-confidence decline, never emitted as `generated: true` with a
+blank `simulation`. Nothing sends, nothing is persisted.
 
 ## Linting
 

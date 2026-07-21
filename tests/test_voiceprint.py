@@ -877,6 +877,17 @@ class SimulateContactTest(_DBCase):
             self.assertIn("ESTIMATE", ln)
         self.assertIn("disclaimer", res)
 
+    def test_empty_generation_declines_instead_of_blank_estimate(self):
+        # An empty model reply must degrade to a low-confidence decline, never a
+        # generated:true / confidence:high payload carrying a blank simulation.
+        with mock.patch.object(ollama, "chat_once", return_value={"content": "   "}):
+            res = query_tools.simulate_contact(
+                "want to grab dinner tonight", contact_id=12, acknowledged=True)
+        self.assertFalse(res["generated"])
+        self.assertEqual(res["confidence"], "low")
+        self.assertIsNone(res["simulation"])
+        self.assertTrue(res["notes"])
+
     def test_blocked_contact_hard_refuses_without_generating(self):
         saved = config.PERSONA_SIM_BLOCK_IDS
         config.PERSONA_SIM_BLOCK_IDS = "12"
