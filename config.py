@@ -263,3 +263,66 @@ EVAL_GATE_MIN_LABELS = int(os.getenv("EVAL_GATE_MIN_LABELS") or "50")
 # its precision may clear the gate. Pinned at 40 (precision stabilizes with
 # fewer examples than a full kappa needs).
 EVAL_GATE_MIN_PRECISION_POSITIVES = int(os.getenv("EVAL_GATE_MIN_PRECISION_POSITIVES") or "40")
+# --- feature: nudges ---
+# --- Loose Ends / nudges (loose_ends.py) --------------------------------------
+# Standalone loose-thread detector. NUDGES_MODEL/THINK/TIMEOUT follow the usual
+# inherit-from-CHAT rule and are used ONLY for the one-line nudge_text
+# narration -- the detectors themselves are model-free SQL. Empty NUDGES_MODEL =
+# CHAT_MODEL; NUDGES_THINK inherits CHAT_THINK (tri-state: unset omits the flag,
+# which some models require); NUDGES_TIMEOUT inherits CHAT_TIMEOUT.
+NUDGES_MODEL = os.getenv("NUDGES_MODEL", "") or CHAT_MODEL
+NUDGES_THINK = _think("NUDGES_THINK", CHAT_THINK)
+_nudges_timeout = os.getenv("NUDGES_TIMEOUT", "").strip()
+NUDGES_TIMEOUT = int(_nudges_timeout) if _nudges_timeout else CHAT_TIMEOUT
+# Stage-0 auto-exclusion: a dyad whose most-recent llm-annotated exchange has
+# mean valence <= this is dropped (a negative sign-off is not a nudge). Only
+# chunk_annotations rows with source='llm' count; no llm rows = no valence
+# exclusion on that dyad.
+NUDGE_VALENCE_EXCLUDE = float(os.getenv("NUDGE_VALENCE_EXCLUDE") or "-0.5")
+# faded_initiator fires when the counterparty's trailing-window session
+# initiation share falls to <= this fraction of their all-time share...
+NUDGE_FADED_INIT_DROP = float(os.getenv("NUDGE_FADED_INIT_DROP") or "0.5")
+# ...and only for dyads with at least this many lifetime sessions...
+NUDGE_FADED_INIT_MIN_SESSIONS = int(os.getenv("NUDGE_FADED_INIT_MIN_SESSIONS") or "10")
+# ...measuring "trailing" over this many days back from the corpus's latest
+# message (the data's "now").
+NUDGE_FADED_INIT_WINDOW_DAYS = int(os.getenv("NUDGE_FADED_INIT_WINDOW_DAYS") or "90")
+# Urgency = kind_weight * exp(-age_days / halflife * ln 2); age is measured from
+# the corpus's latest message so the freshest loose threads score highest.
+NUDGE_URGENCY_HALFLIFE_DAYS = float(os.getenv("NUDGE_URGENCY_HALFLIFE_DAYS") or "30")
+# Hard cap on get_loose_threads rows (a nudge digest is a handful, not a feed).
+NUDGE_MAX_RESULTS = int(os.getenv("NUDGE_MAX_RESULTS") or "5")
+
+
+def _nudge_kind_weights():
+    """Per-kind urgency weights, with a JSON env override merged over the
+    defaults (a partial override keeps the other defaults). Malformed JSON or a
+    non-object falls back to the defaults rather than raising at import time."""
+    import json
+    default = {
+        "unanswered_question": 1.0,
+        "faded_initiator": 0.7,
+        "dormant_tie": 0.6,
+        "dropped_plan": 0.9,
+        "unreciprocated_goodnews": 0.5,
+    }
+    raw = os.getenv("NUDGE_KIND_WEIGHTS", "").strip()
+    if not raw:
+        return default
+    try:
+        override = json.loads(raw)
+    except (ValueError, TypeError):
+        return default
+    if not isinstance(override, dict):
+        return default
+    merged = dict(default)
+    for key, value in override.items():
+        try:
+            merged[key] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return merged
+
+
+NUDGE_KIND_WEIGHTS = _nudge_kind_weights()
+# --- end feature: nudges ---

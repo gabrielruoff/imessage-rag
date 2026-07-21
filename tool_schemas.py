@@ -533,4 +533,61 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    # --- feature: nudges ---
+    {
+        "name": "get_loose_threads",
+        "description": "The user's current 'loose ends' digest: relationships "
+                        "that have drifted (e.g. someone who used to reach out "
+                        "and has gone quiet), detected offline and ranked by "
+                        "urgency. Use for 'who should I reach back out to', "
+                        "'any loose ends', 'who have I been neglecting'. Returns "
+                        "at most 5 rows, each with a resolved contact name, the "
+                        "detector `kind`, `urgency`, the anchor message/date, the "
+                        "`evidence`, and a one-line `nudge_text`. status defaults "
+                        "to 'open'; kind optionally narrows to one detector.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "enum": ["open", "dismissed"],
+                           "default": "open"},
+                "kind": {"type": "string",
+                         "description": "narrow to one detector, e.g. 'faded_initiator'"},
+                "limit": {"type": "integer", "default": 5,
+                          "description": "hard-capped at 5"},
+            },
+        },
+    },
+    {
+        "name": "resolve_loose_thread",
+        "description": "Dismiss one loose thread (nudge) by its id -- the user "
+                        "has handled it or wants it gone. Sets it to dismissed "
+                        "(never deletes), so it stops resurfacing. Pass the `id` "
+                        "from a get_loose_threads row.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "thread_id": {"type": "integer",
+                              "description": "the loose thread id to dismiss"},
+            },
+            "required": ["thread_id"],
+        },
+    },
+    {
+        "name": "mute_contact_from_nudges",
+        "description": "Permanently exclude a contact from future nudges AND "
+                        "dismiss their currently-open loose threads -- use when "
+                        "the user says to stop nudging about someone. Prefer "
+                        "contact_id (covers every handle they own; get it from "
+                        "search_contacts_by_name); handle_id also accepted. "
+                        "Muting twice never stacks duplicate rows.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "contact_id": {"type": "integer"},
+                "handle_id": {"type": "integer"},
+                "reason": {"type": "string", "default": "muted"},
+            },
+        },
+    },
+    # --- end feature: nudges ---
 ]

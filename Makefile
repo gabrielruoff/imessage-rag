@@ -273,7 +273,18 @@ topics:  ## Cluster embedded chunks into topics and label them
 pipeline:  ## ingest -> annotate -> topics, in order (stays serial under -j)
 	$(MAKE) ingest
 	$(MAKE) annotate
+	$(MAKE) nudges          # --- feature: nudges (runs after annotate) ---
 	$(MAKE) topics
+
+# --- feature: nudges ---
+# Standalone loose-ends detector pass. Runs AFTER annotate in `pipeline` because
+# its Stage-0 exclusion gate reads chunk_annotations, which annotate populates.
+# Needs Ollama only for the one-line nudge_text narration.
+.PHONY: nudges
+nudges:  ## Detect loose threads (nudges) -- run after annotate
+	@$(REQUIRE_OLLAMA)
+	.venv/bin/python3 loose_ends.py
+# --- end feature: nudges ---
 
 # --- Running -----------------------------------------------------------------
 # ARGS passes flags through, e.g.:

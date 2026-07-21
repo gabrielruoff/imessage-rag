@@ -287,6 +287,10 @@ def create_schema(con: sqlite3.Connection):
     con.executescript(SCHEMA)
     con.executescript(FTS_SCHEMA)
 
+    # --- feature: nudges ---
+    _create_nudges_tables(con)
+    # --- end feature: nudges ---
+
     # Reactions used to be stored with chat.db's raw associated_message_guid,
     # which carries a message-part prefix ('p:0/<guid>' -- tapback on part N
     # -- or 'bp:<guid>' for balloon parts) that messages.guid never has, so
@@ -304,3 +308,56 @@ def create_schema(con: sqlite3.Connection):
          if (stripped := strip_reaction_guid_prefix(guid)) != guid],
     )
     con.commit()
+
+
+# --- feature: nudges ---
+# Loose Ends / nudges tables (loose_ends.py + query_tools/nudges.py). Kept in a
+# separate function, called once from create_schema, so the feature's DDL never
+# touches the SCHEMA string. Pure CREATE ... IF NOT EXISTS -- idempotent, and
+# these are derived artifacts (reset_db clears loose_threads), except
+# nudge_exclusions, which is durable user intent and is PRESERVED across resets.
+_NUDGES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS loose_threads (
+    -- AUTOINCREMENT: dismissed rows are never deleted, so ids must never be
+    -- reused (a reused id could re-open a thread the user dismissed).
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,              -- detector name (e.g. 'faded_initiator')
+    chat_id INTEGER,
+    handle_id INTEGER,               -- counterparty handle (NULL = me/degenerate)
+    anchor_message_id INTEGER,       -- the message the nudge points back at
+    anchor_date TEXT,                -- unlabeled-UTC ISO; plain-string compares only
+    due_by TEXT,                     -- NULL until N5 (scheduled follow-ups)
+    urgency REAL,                    -- computed in Python (kind weight * half-life decay)
+    status TEXT NOT NULL DEFAULT 'open',
+                                     -- v1: 'open' | 'dismissed'. 'snoozed' is
+                                     -- RESERVED (no v1 writer): N5 owns it.
+    evidence_json TEXT,              -- JSON detector evidence
+    llm_verdict TEXT,                -- LLM-derived; guarded by loose_ends_model
+    llm_reason TEXT,                 -- LLM-derived; guarded by loose_ends_model
+    nudge_text TEXT,                 -- LLM one-line narration; guarded by loose_ends_model
+    source TEXT NOT NULL DEFAULT 'sql',   -- detector provenance
+    detected_at TEXT,                -- when the detector last wrote this row
+    dismissed_at TEXT                -- set on dismissal; the row is never deleted
+);
+CREATE INDEX IF NOT EXISTS idx_loose_threads_status ON loose_threads(status, urgency);
+CREATE INDEX IF NOT EXISTS idx_loose_threads_kind_chat ON loose_threads(kind, chat_id);
+
+CREATE TABLE IF NOT EXISTS nudge_exclusions (
+    handle_id INTEGER,               -- handles.id (source PK; stable for same source DB)
+    contact_id INTEGER,              -- contacts.id (source PK); NULL when unresolved
+    reason TEXT,                     -- why muted (user mute, or auto:* Stage-0 gate)
+    created_at TEXT,
+    -- UNIQUE keeps duplicate mutes from stacking rows. NULLs compare distinct
+    -- in a UNIQUE constraint, so writers additionally do a NULL-safe existence
+    -- check before inserting (see query_tools/nudges._add_exclusion).
+    UNIQUE(handle_id, contact_id, reason)
+);
+"""
+
+
+def _create_nudges_tables(con: sqlite3.Connection):
+    """Create the loose_threads / nudge_exclusions tables (idempotent). New
+    tables only -- no in-place migration needed, so this is a bare executescript
+    of CREATE ... IF NOT EXISTS."""
+    con.executescript(_NUDGES_SCHEMA)
+# --- end feature: nudges ---
