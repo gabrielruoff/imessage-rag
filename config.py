@@ -251,3 +251,15 @@ CHUNK_GAP_MINUTES = int(os.getenv("CHUNK_GAP_MINUTES", "60"))
 CHUNK_MAX_CHARS = int(os.getenv("CHUNK_MAX_CHARS", "2000"))
 CHUNK_MIN_CHARS = int(os.getenv("CHUNK_MIN_CHARS", "10"))
 CHUNK_OVERLAP_MESSAGES = int(os.getenv("CHUNK_OVERLAP_MESSAGES", "2"))
+
+# --- Eval gates (eval/evalkit label/gate; RES-70 / F4) ----------------------
+# Minimum hand labels a measurement gate needs before it may mark a class
+# passed. Per-class support floor for kappa tasks (conflict_labels): a class
+# with fewer than this many gold labels scores None rather than a kappa from
+# too few examples, and can never be cleared. Pinned at 50.
+EVAL_GATE_MIN_LABELS = int(os.getenv("EVAL_GATE_MIN_LABELS") or "50")
+# The analogous floor for precision (detector) tasks (dropped_plan): a positive
+# class needs at least this many gold positives in the labeled sample before
+# its precision may clear the gate. Pinned at 40 (precision stabilizes with
+# fewer examples than a full kappa needs).
+EVAL_GATE_MIN_PRECISION_POSITIVES = int(os.getenv("EVAL_GATE_MIN_PRECISION_POSITIVES") or "40")

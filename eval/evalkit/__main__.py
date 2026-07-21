@@ -59,6 +59,14 @@ def main(argv=None):
         "selfcheck", help="validate suite files, recipe registry, roster placeholders"
     )
     sc.set_defaults(func=cmd_selfcheck)
+    # --- RES-70 (F4): eval-gate harness subcommands (label + gate) ----------
+    # Additive registration -- the labeling module owns both `label` and
+    # `gate`; kept out of the tuple loop above so this block stays a clean,
+    # self-contained diff.
+    from . import labeling
+
+    labeling.add_parser(subparsers)
+    # --- end RES-70 ---------------------------------------------------------
     args = parser.parse_args(argv)
     return args.func(args)
 
