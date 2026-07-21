@@ -80,6 +80,7 @@ from .messages import (
 )
 # --- feature: persona ---
 from .persona import (
+    check_style_match,
     draft_reply,
     get_voiceprint,
 )
@@ -128,6 +129,7 @@ __all__ = [
     "get_reaction_stats",
     "get_response_dynamics",
     # --- feature: persona ---
+    "check_style_match",
     "draft_reply",
     "get_voiceprint",
     # --- end feature: persona ---

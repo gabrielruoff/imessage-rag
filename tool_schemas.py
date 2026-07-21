@@ -656,6 +656,44 @@ TOOL_DEFINITIONS = [
             "required": ["incoming"],
         },
     },
+    {
+        "name": "check_style_match",
+        "description": "Score how closely a user-written DRAFT matches a person's "
+                        "voiceprint, DETERMINISTICALLY (no model judges it). Pass "
+                        "the `draft` text and name the person "
+                        "(contact_id/handle_id/name). Computes the draft's own "
+                        "style features (message length, capitalization, "
+                        "exclamation/ellipsis use, function-word rates) and returns "
+                        "a `distance` (mean absolute z-difference vs the stored "
+                        "voiceprint; 0 = identical voice, higher = more divergent) "
+                        "plus the TOP-3 diverging features, each with a rule-based "
+                        "explanation. Defaults to YOUR voice with that person "
+                        "(subject='me'); subject='them' checks whether the draft "
+                        "imitates the named person. Reads the stored voiceprint "
+                        "only -- never rescans the corpus.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "draft": {"type": "string",
+                          "description": "the user-written draft message to score"},
+                "contact_id": {"type": "integer",
+                               "description": "the person (from search_contacts_by_name)"},
+                "handle_id": {"type": "integer"},
+                "name": {"type": "string",
+                         "description": "person name to resolve (contact_id is exact)"},
+                "subject": {"type": "string", "enum": ["me", "them"],
+                            "default": "me",
+                            "description": "match against YOUR voice with the person "
+                                           "(default) or the person's own voice"},
+                "scope": {"type": "string", "enum": ["dyad", "group", "all"],
+                          "description": "dyad (default when a person is named), all, "
+                                         "or group (needs a group chat_id)"},
+                "chat_id": {"type": "integer",
+                            "description": "group chat id, required for scope='group'"},
+            },
+            "required": ["draft"],
+        },
+    },
     # --- end feature: persona ---
     # --- feature: conflict ---
     {

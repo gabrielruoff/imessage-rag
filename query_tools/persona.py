@@ -656,4 +656,246 @@ def draft_reply(incoming, contact_id=None, handle_id=None, name=None):
             "notes": notes,
         })
         return base
+
+
+# V3: check_style_match -- turn a user-written DRAFT into a DETERMINISTIC style
+# report against a target person_voiceprint row. No model is in the loop (the
+# optional token-logprob score was cut as unverified): the draft's own features
+# are computed with V1's EXACT definitions (reusing voiceprint._msg_style +
+# function_words), then compared to the stored card. Distance is the mean
+# absolute z-difference over the card's numeric features, EACH normalized by the
+# corpus-wide std V1 already stored on the row (feature_std_json). The tool
+# NEVER rescans the corpus, and features whose std was 0 (omitted from
+# feature_std_json) are skipped -- no divide-by-zero, and a constant feature
+# carries no matchable signal. The top-3 divergences get a RULE-BASED
+# explanation (capitalization, punctuation, formality...), never an LLM critique.
+
+# Per-feature rule-based framing: (human aspect, phrase when the draft sits
+# HIGHER than the typical value, phrase when LOWER). Deterministic.
+_FEATURE_ASPECT = {
+    "avg_msg_len": ("message length", "longer messages", "shorter messages"),
+    "lowercase_ratio": ("capitalization", "more lowercase text",
+                        "more capitalized text"),
+    "exclaim_rate": ("exclamation marks", "more exclamation marks",
+                     "fewer exclamation marks"),
+    "ellipsis_rate": ("ellipses", "more ellipses (...)", "fewer ellipses"),
+    "burst_size": ("burst size", "more messages per burst",
+                   "fewer messages per burst"),
+    "fw_pronoun_rate": ("personal pronouns", "more personal pronouns",
+                        "fewer personal pronouns"),
+    "fw_ipron_rate": ("impersonal pronouns", "more impersonal pronouns",
+                      "fewer impersonal pronouns"),
+    "fw_article_rate": ("articles / formality", "more articles (a/an/the)",
+                        "fewer articles (a/an/the)"),
+    "fw_conj_rate": ("conjunctions", "more conjunctions", "fewer conjunctions"),
+    "fw_prep_rate": ("prepositions / formality", "more prepositions",
+                     "fewer prepositions"),
+    "fw_aux_rate": ("auxiliary verbs / contractions", "more auxiliary verbs",
+                    "fewer auxiliary verbs"),
+    "fw_adverb_rate": ("adverbs / hedging", "more adverbs", "fewer adverbs"),
+    "fw_negation_rate": ("negations", "more negations", "fewer negations"),
+    "fw_quant_rate": ("quantifiers", "more quantifiers", "fewer quantifiers"),
+}
+
+
+def _draft_messages(draft):
+    """Split a user-written draft into the 'messages' the voiceprint scan sees:
+    one per non-empty line (a multi-text draft is several messages), falling
+    back to the whole draft as a single message. Purely deterministic."""
+    lines = [ln.strip() for ln in str(draft).splitlines()]
+    lines = [ln for ln in lines if ln]
+    return lines or [str(draft).strip()]
+
+
+def _draft_features(draft):
+    """The draft's numeric style + function-word features, computed with V1's
+    EXACT definitions so each value is directly comparable to its
+    person_voiceprint column: per-message style via voiceprint._msg_style, fw_*
+    rates as category-hit / total-word counts (function_words), and burst_size
+    as the message count (all draft lines are one same-sender burst)."""
+    import voiceprint  # lazy: avoids a query_tools <-> voiceprint import cycle
+    from function_words import tokenize
+
+    msgs = _draft_messages(draft)
+    n = len(msgs)
+    sum_len = n_lower = n_exclaim = n_ellipsis = 0
+    sum_lower = 0.0
+    fw_hits = {cat: 0 for cat in FUNCTION_WORDS}
+    total_words = 0
+    for text in msgs:
+        ln, lower, has_exclaim, has_ellipsis = voiceprint._msg_style(text)
+        sum_len += ln
+        if lower is not None:
+            sum_lower += lower
+            n_lower += 1
+        n_exclaim += has_exclaim
+        n_ellipsis += has_ellipsis
+        toks = tokenize(text)
+        total_words += len(toks)
+        for tok in toks:
+            for cat in FUNCTION_WORDS:
+                if tok in FUNCTION_WORDS[cat]:
+                    fw_hits[cat] += 1
+
+    feats = {
+        "avg_msg_len": sum_len / n if n else 0.0,
+        "lowercase_ratio": sum_lower / n_lower if n_lower else 0.0,
+        "exclaim_rate": n_exclaim / n if n else 0.0,
+        "ellipsis_rate": n_ellipsis / n if n else 0.0,
+        "burst_size": float(n),  # every line is one same-sender burst
+    }
+    for cat in FUNCTION_WORDS:
+        feats[f"fw_{cat}_rate"] = fw_hits[cat] / total_words if total_words else 0.0
+    return feats
+
+
+def _voice_label(card):
+    """A readable name for whose voice the target card is, for the rule-based
+    explanations ('your voice with Mom', "Al's voice")."""
+    member = card.get("member") or "the target"
+    counterpart = card.get("counterpart")
+    base = "your voice" if member == "Me" else f"{member}'s voice"
+    if card.get("scope") == "dyad" and counterpart:
+        return f"{base} with {'you' if counterpart == 'Me' else counterpart}"
+    return base
+
+
+def _divergence_explanation(feature, card_val, draft_val, voice_label):
+    """A deterministic, rule-based sentence for one diverging feature -- no LLM
+    critique. Names the aspect and the direction of the gap."""
+    aspect, higher, lower = _FEATURE_ASPECT.get(
+        feature, (feature, f"a higher {feature}", f"a lower {feature}"))
+    phrase = higher if draft_val > card_val else lower
+    return (f"{aspect}: this draft uses {phrase} than {voice_label} "
+            f"(draft {draft_val:.3g} vs typical {card_val:.3g})")
+
+
+def _style_distance(card_features, draft_features, feature_std, voice_label):
+    """(distance, divergences): the mean absolute z-difference over every
+    numeric feature that has a NON-ZERO stored std, each gap normalized by that
+    stored corpus std (feature_std) -- no rescan. Features absent from
+    feature_std (std was 0, so omitted) are skipped. divergences are the
+    per-feature records, sorted by z descending (stable: fixed feature order
+    breaks ties). distance is None when nothing was comparable."""
+    divergences = []
+    for feature in _STYLE_FEATURES + _FW_COLUMNS:
+        std = feature_std.get(feature)
+        if not std:  # 0, None, or absent -> no signal / no divide-by-zero
+            continue
+        card_val = card_features.get(feature)
+        draft_val = draft_features.get(feature)
+        if card_val is None or draft_val is None:
+            continue
+        z = abs(card_val - draft_val) / std
+        divergences.append({
+            "feature": feature,
+            "z": round(z, 4),
+            "draft_value": round(draft_val, 6),
+            "typical_value": round(card_val, 6),
+            "corpus_std": std,
+            "explanation": _divergence_explanation(
+                feature, card_val, draft_val, voice_label),
+        })
+    divergences.sort(key=lambda d: d["z"], reverse=True)
+    distance = (round(sum(d["z"] for d in divergences) / len(divergences), 4)
+                if divergences else None)
+    return distance, divergences
+
+
+def check_style_match(draft, contact_id=None, handle_id=None, name=None,
+                      subject="me", scope=None, chat_id=None):
+    """Deterministically score how closely a user-written DRAFT matches a
+    target voiceprint -- 'does this sound like me (or them)?'.
+
+    Pass the `draft` text and name the person (contact_id/handle_id/name).
+    Defaults to YOUR voice with that person (subject='me', scope='dyad');
+    subject='them' checks whether the draft imitates the named person, and
+    scope='all'/'group' target the overall/group voiceprint instead. The draft's
+    own features are computed with the SAME definitions the voiceprint uses, then
+    each numeric feature's gap is z-normalized by the corpus std stored on the
+    row (feature_std) -- the corpus is NEVER rescanned, and features whose std
+    was 0 are skipped. Returns {distance (mean absolute z-difference; 0 =
+    identical voice, higher = more divergent), top_divergences (the 3 features
+    the draft is furthest off on, each with a rule-based explanation),
+    divergences (all compared features), draft_features}. No model in the loop."""
+    if not draft or not str(draft).strip():
+        return {"error": "check_style_match needs the draft text"}
+    subject = (subject or "me").lower()
+    if subject not in ("me", "them"):
+        return {"error": "subject must be 'me' or 'them'"}
+
+    with contextlib.closing(_connect()) as con:
+        person_key, _label, err = _resolve_person(con, contact_id, handle_id, name)
+        if err:
+            return err
+
+        if scope is None:
+            scope = "dyad" if person_key is not None else "all"
+        scope = str(scope).lower()
+        if scope not in ("dyad", "group", "all"):
+            return {"error": f"scope must be dyad, group, or all (got {scope!r})"}
+
+        if scope == "dyad":
+            if person_key is None:
+                return {"error": "scope='dyad' needs a person "
+                                 "(contact_id/handle_id/name)"}
+            member_key_str, counterpart_key = (
+                ("me", person_key) if subject == "me" else (person_key, "me"))
+        elif scope == "all":
+            counterpart_key = "*"
+            if subject == "me":
+                member_key_str = "me"
+            elif person_key is None:
+                return {"error": "scope='all' with subject='them' needs a person"}
+            else:
+                member_key_str = person_key
+        else:  # group
+            if chat_id is None:
+                return {"error": "scope='group' needs a group chat_id"}
+            counterpart_key = f"chat:{chat_id}"
+            if subject == "me":
+                member_key_str = "me"
+            elif person_key is None:
+                return {"error": "scope='group' with subject='them' needs a person"}
+            else:
+                member_key_str = person_key
+
+        card = _lookup(con, member_key_str, counterpart_key, scope)
+        if not isinstance(card, dict) or "features" not in card:
+            return card  # the not-found / not-built note, returned verbatim
+
+        from ._shared import TEXT_PREVIEW_CHARS
+
+        feature_std = card.get("feature_std") or {}
+        draft_features = _draft_features(draft)
+        distance, divergences = _style_distance(
+            card["features"], draft_features, feature_std, _voice_label(card))
+
+        result = {
+            "member_key": card["member_key"],
+            "counterpart_key": card["counterpart_key"],
+            "scope": card["scope"],
+            "member": card["member"],
+            "counterpart": card["counterpart"],
+            "voiceprint_confidence": card.get("confidence"),
+            "draft": _clip(str(draft), TEXT_PREVIEW_CHARS),
+            "draft_messages": len(_draft_messages(draft)),
+            "distance": distance,
+            "n_features_compared": len(divergences),
+            "top_divergences": divergences[:3],
+            "divergences": divergences,
+            "draft_features": {k: round(v, 6) for k, v in draft_features.items()},
+        }
+        if distance is None:
+            result["note"] = (
+                "No per-feature corpus std on this voiceprint (feature_std_json "
+                "empty -- corpus too uniform, or a single-row scope), so a "
+                "deterministic style distance could not be computed.")
+        else:
+            result["note"] = (
+                "distance is the mean absolute z-difference across the compared "
+                "features (0 = identical to the stored voice, higher = more "
+                "divergent); each gap is normalized by the corpus std stored on "
+                "the voiceprint row -- no rescan, and std==0 features are skipped.")
+        return result
 # --- end feature: persona ---
