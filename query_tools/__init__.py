@@ -31,7 +31,12 @@ on this package, and the internals resolve both through it at call time.
 
 from embeddings import embed_texts
 
-from ._shared import DB_PATH, _date_bound_step, _normalize_date_bound
+from ._shared import (
+    DB_PATH,
+    _date_bound_step,
+    _normalize_date_bound,
+    _restrict_to_direct_chats,
+)
 from .analytics import (
     get_chat_participant_stats,
     get_word_frequency,
@@ -93,4 +98,6 @@ __all__ = [
     # private date helpers, re-exported because tests import them by name
     "_date_bound_step",
     "_normalize_date_bound",
+    # shared query helper for the dyad-scoped features (1:1-only restriction)
+    "_restrict_to_direct_chats",
 ]
