@@ -14,6 +14,7 @@ from unittest import mock
 
 import config
 import db
+import loose_ends
 import wellbeing
 import ollama
 import query_tools
@@ -187,6 +188,13 @@ class WrappedTestCase(unittest.TestCase):
         patcher = mock.patch.object(wrapped, "DB_PATH", self.db_path)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # The Open Loops section (N5) composes from the real get_loose_threads,
+        # which resolves query_tools.DB_PATH at call time -- point it at the temp
+        # DB so the section reads the (empty, unless seeded) loose_threads table
+        # here instead of the developer's real analysis DB.
+        qt_patcher = mock.patch.object(query_tools, "DB_PATH", self.db_path)
+        qt_patcher.start()
+        self.addCleanup(qt_patcher.stop)
 
     def patch_tools(self, **overrides):
         """Patch every composed tool onto query_tools (create=True keeps this
@@ -1148,6 +1156,76 @@ class TestWellbeingSection(WrappedTestCase):
         self.assertIn(wellbeing._CONDITION_FALLBACK, page)       # replaced sentence
         self.assertIn('class="wb-support"', page)                # footer still present
         os.unlink(out)
+
+
+class TestOpenLoopsSection(WrappedTestCase):
+    """The Open Loops board (N5): composes from get_loose_threads and drops
+    both muted contacts (Stage-0, upstream) and Wrapped-excluded contacts."""
+
+    def test_filters_name_exclusion_and_batch_hide_notice(self):
+        # Mocked get_loose_threads: an occasion (kept), a faded thread for a
+        # name-excluded contact (dropped), and the dormant-tie batch-hide notice
+        # marker (never a board item).
+        threads = [
+            {"kind": "inferred_occasion", "chat_id": 100, "handle_id": 10,
+             "contact": "Alice", "anchor_date": "2025-03-15T00:00:00",
+             "due_by": "2027-03-15", "nudge_text": "Alice's birthday is coming up",
+             "urgency": 0.4, "status": "open", "evidence": {}},
+            {"kind": "faded_initiator", "chat_id": 200, "handle_id": 20,
+             "contact": "Nate", "anchor_date": "2025-01-01T00:00:00",
+             "due_by": None, "nudge_text": "Reach out to Nate", "urgency": 0.3,
+             "status": "open", "evidence": {}},
+            {"notice": "1 dormant-tie reconnect nudge(s) hidden.",
+             "kind": "dormant_tie", "hidden": 1},
+        ]
+        with mock.patch.object(query_tools, "get_loose_threads",
+                               mock.Mock(return_value=threads)):
+            sec = wrapped_sections._sec_open_loops(excluded_names={"nate"})
+        html = sec["extra_html"]
+        self.assertEqual(sec["stats"]["open_loops"], 1)
+        self.assertIn("Alice", html)
+        self.assertNotIn("Nate", html)                 # name-excluded
+        self.assertNotIn("dormant-tie reconnect", html)  # notice is not an item
+        self.assertIn("2027", html)                    # occasion due date shown
+
+    def test_muted_and_wrapped_excluded_absent_from_rendered_board(self):
+        # End-to-end through the REAL detector + get_loose_threads. Alice is
+        # kept; Mia is MUTED (Stage-0 writes no row); Wes has a row but is
+        # WRAPPED-excluded (his 1:1 chat 300 is in exclude_chat_ids, as
+        # wrapped.main would expand it). Both must be absent from the board.
+        for cid, name in ((1, "Alice"), (2, "Mia"), (3, "Wes")):
+            seed_contact(self.con, cid, name)
+            seed_handle(self.con, 10 * cid, f"+{cid}", cid)
+            seed_chat(self.con, 100 * cid, f"c{cid}")
+            self.con.execute(
+                "INSERT INTO chat_participants(chat_id, handle_id) VALUES (?, ?)",
+                (100 * cid, 10 * cid))
+        for cid in (1, 2, 3):
+            for y in ("2024", "2025"):
+                seed_msg(self.con, 100 * cid, 0, f"{y}-03-15T09:00:00",
+                         is_from_me=1, text="Happy Birthday!!")
+        # Mute Mia before the run so Stage-0 suppresses her occasion entirely.
+        self.con.execute(
+            "INSERT INTO nudge_exclusions(handle_id, contact_id, reason) "
+            "VALUES (20, 2, 'muted')")
+        self.con.commit()
+
+        with mock.patch.object(loose_ends, "DB_PATH", self.db_path):
+            con2 = sqlite3.connect(self.db_path)
+            con2.row_factory = sqlite3.Row
+            try:
+                cfg = loose_ends._build_cfg(con2)
+                loose_ends.detect_all(con2, cfg, "2026-07-01T00:00:00+00:00")
+            finally:
+                con2.close()
+
+        # Wes's 1:1 chat (300) is Wrapped-excluded, exactly as wrapped.main
+        # expands an excluded/silent contact into their direct chats.
+        sec = wrapped_sections._sec_open_loops(exclude_chat_ids={300})
+        html = sec.get("extra_html") or ""
+        self.assertIn("Alice", html)
+        self.assertNotIn("Wes", html)   # wrapped-excluded (exclude_chat_ids)
+        self.assertNotIn("Mia", html)   # muted (Stage-0: no row ever written)
 
 
 if __name__ == "__main__":

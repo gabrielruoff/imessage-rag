@@ -962,6 +962,10 @@ def build_sections(con, roster, contact_entry=None, year=None,
         if wb is not None:
             sections.append(wb)
     # --- end feature: wellbeing ---
+    # --- feature: nudges ---
+    if contact_entry is None:
+        sections.append(_sec_open_loops(exclude_chat_ids, excluded_names))
+    # --- end feature: nudges ---
     return sections
 
 
@@ -1530,3 +1534,65 @@ def _sec_wellbeing():
             "information is shown separately below your blurb."),
     }
 # --- end feature: wellbeing ---
+
+
+# --- feature: nudges ---
+# Human-facing labels for each loose-thread kind, so the board reads as a
+# keepsake and never leaks a detector's snake_case name. Unknown kinds fall
+# back to a de-underscored form.
+_OPEN_LOOP_LABELS = {
+    "faded_initiator": "they used to reach out first",
+    "dormant_tie": "gone quiet",
+    "unanswered_question": "a question left hanging",
+    "inferred_occasion": "a date coming back around",
+    "dropped_plan": "a plan that fizzled",
+    "unreciprocated_goodnews": "good news that went unanswered",
+}
+
+
+def _sec_open_loops(exclude_chat_ids=(), excluded_names=frozenset()):
+    """Open Loops board: the current loose-thread nudge digest rendered as a
+    keepsake. Composes from get_loose_threads (already post-Stage-0, so muted
+    nudge_exclusions contacts never appear) and ADDITIONALLY drops any contact
+    Wrapped itself excluded -- the silent-contact roster guard or --exclude,
+    expanded to their 1:1 chats in wrapped.main, plus the lowercase-name
+    fallback for unsaved handles -- so an excluded person can never resurface
+    here. The dormant-tie batch-hide notice (a non-thread marker) is skipped."""
+    threads, note = wrapped._tool("get_loose_threads", status="open",
+                                  limit=config.NUDGE_MAX_RESULTS)
+    if threads is None:
+        return {"title": "Open Loops", "stats": None, "note": note}
+    exclude_chat_ids = set(exclude_chat_ids)
+    rows = []
+    for t in threads:
+        if not isinstance(t, dict) or "notice" in t:
+            continue  # the dormant-tie batch-hide notice is not a board item
+        if t.get("chat_id") in exclude_chat_ids:
+            continue
+        name = t.get("contact")
+        if name and str(name).lower() in excluded_names:
+            continue
+        rows.append({
+            "who": name or "Someone",
+            "kind": _OPEN_LOOP_LABELS.get(
+                t.get("kind"), str(t.get("kind") or "").replace("_", " ")),
+            "nudge": t.get("nudge_text"),
+            "since": t.get("anchor_date"),
+            "due": t.get("due_by"),
+        })
+    if not rows:
+        return {"title": "Open Loops", "stats": None,
+                "note": "no open loops in scope"}
+    return {
+        "title": "Open Loops",
+        "stats": {"open_loops": len(rows)},
+        "narrate_stats": {"open_loops": rows},
+        "extra_html": wrapped_html.render_open_loops(rows),
+        "caption": ("Threads you let drift -- someone who went quiet, a question "
+                    "left hanging, a birthday coming back around. Muted contacts "
+                    "and anyone kept out of this report never appear here."),
+        "hint": ("Each item is one open loop: the person, why it's open, and for "
+                 "a recurring occasion when it next comes up. Nudge gently toward "
+                 "one or two; never scold, and don't list them all."),
+    }
+# --- end feature: nudges ---

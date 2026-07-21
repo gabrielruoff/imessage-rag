@@ -1198,5 +1198,160 @@ class UnreciprocatedGoodnewsDetectorTest(_GoodnewsFixtureTest):
         self.assertEqual([r[0] for r in rows], [100])
 
 
+# ---------------------------------------------------------------------------
+# inferred_occasion detector (RES-58 / N5)
+# ---------------------------------------------------------------------------
+
+def _build_occasion_fixture(db_path):
+    """Direct dyads for the inferred_occasion detector; corpus-now is Alice's
+    recent 'hey' (the global max date). Every congratulatory message is
+    outbound so no dyad trips the Stage-0 zero-outbound gate:
+      Alice (100)  'Happy Birthday' on 03-15 across 2024/25/26 -> fires (3 yrs)
+      Mia   (200)  'happy birthday' on 07-04 across 2024/25 but MUTED -> Stage-0
+      Wes   (300)  'Happy anniversary' on 09-20 across 2024/25 -> fires (2 yrs)
+      Bob   (400)  'happy birthday' once (2025-11-11) -> single year, no fire
+      group (600)  recurring 01-05 but is_group = 1 -> direct-chat filter drops
+    """
+    con = sqlite3.connect(db_path)
+    try:
+        schema.create_schema(con)
+        con.executemany(
+            "INSERT INTO contacts(id, source_uniqueid, first_name) VALUES (?, ?, ?)",
+            [(1, "u1", "Alice"), (2, "u2", "Mia"), (3, "u3", "Wes"),
+             (4, "u4", "Bob"), (5, "u5", "Grace")],
+        )
+        con.executemany(
+            "INSERT INTO handles(id, handle_identifier, contact_id, service) "
+            "VALUES (?, ?, ?, 'iMessage')",
+            [(10, "+10", 1), (20, "+20", 2), (30, "+30", 3),
+             (40, "+40", 4), (50, "+50", 5)],
+        )
+        con.executemany(
+            "INSERT INTO chats(id, chat_identifier, display_name, is_group, service) "
+            "VALUES (?, ?, NULL, ?, 'iMessage')",
+            [(100, "c100", 0), (200, "c200", 0), (300, "c300", 0),
+             (400, "c400", 0), (600, "c600", 1)],
+        )
+        con.executemany(
+            "INSERT INTO chat_participants(chat_id, handle_id) VALUES (?, ?)",
+            [(100, 10), (200, 20), (300, 30), (400, 40), (600, 50)],
+        )
+        # (chat_id, handle_id, is_from_me, text, date) rows; ids assigned below.
+        spec = []
+        for y in ("2024", "2025", "2026"):
+            spec.append((100, 0, 1, "Happy Birthday!!", f"{y}-03-15T09:00:00"))
+        spec.append((100, 0, 1, "hey", "2026-06-01T08:00:00"))
+        for y in ("2024", "2025"):
+            spec.append((200, 0, 1, "happy birthday", f"{y}-07-04T09:00:00"))
+        for y in ("2024", "2025"):
+            spec.append((300, 0, 1, "Happy anniversary love", f"{y}-09-20T09:00:00"))
+        spec.append((400, 0, 1, "happy birthday", "2025-11-11T09:00:00"))
+        for y in ("2024", "2025"):
+            spec.append((600, 50, 0, "happy birthday", f"{y}-01-05T09:00:00"))
+        con.executemany(
+            "INSERT INTO messages(id, guid, chat_id, handle_id, is_from_me, text, date) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [(1000 + i, f"g{1000 + i}", c, h, me, t, d)
+             for i, (c, h, me, t, d) in enumerate(spec)],
+        )
+        # Mia is muted before any run -> Stage-0 must suppress her occasion.
+        con.execute(
+            "INSERT INTO nudge_exclusions(handle_id, contact_id, reason, created_at) "
+            "VALUES (20, 2, 'muted', '2026-01-01T00:00:00')"
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+class _OccasionFixtureTest(unittest.TestCase):
+    def setUp(self):
+        fd, self.db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.addCleanup(lambda: os.path.exists(self.db_path) and os.remove(self.db_path))
+        _build_occasion_fixture(self.db_path)
+        for module in (loose_ends, query_tools):
+            patcher = mock.patch.object(module, "DB_PATH", self.db_path)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _open(self):
+        con = sqlite3.connect(self.db_path)
+        con.row_factory = sqlite3.Row
+        self.addCleanup(con.close)
+        return con
+
+
+class InferredOccasionDetectorTest(_OccasionFixtureTest):
+    def test_fires_on_multiyear_recurrence_only(self):
+        con = self._open()
+        cfg = loose_ends._build_cfg(con)
+        cands = {c.chat_id: c for c in loose_ends.detect_inferred_occasion(con, cfg)}
+        # Recurring direct dyads fire (Stage-0 is applied by the driver, not the
+        # detector, so muted Mia is still a candidate HERE); single-year Bob and
+        # the group chat never do.
+        self.assertEqual(set(cands), {100, 200, 300})
+        self.assertNotIn(400, cands)   # single year
+        self.assertNotIn(600, cands)   # group chat
+        alice = cands[100]
+        self.assertEqual(alice.kind, "inferred_occasion")
+        self.assertEqual(alice.handle_id, 10)
+        self.assertEqual(alice.evidence["month_day"], "03-15")
+        self.assertEqual(alice.evidence["observed_years"], ["2024", "2025", "2026"])
+        self.assertEqual(alice.evidence["n_years"], 3)
+
+    def test_sets_due_by_to_next_upcoming_occurrence(self):
+        con = self._open()
+        cfg = loose_ends._build_cfg(con)
+        cands = {c.chat_id: c for c in loose_ends.detect_inferred_occasion(con, cfg)}
+        # corpus-now is 2026-06-01: Alice's 03-15 has passed this year (-> 2027),
+        # Wes's 09-20 is still ahead (-> 2026).
+        self.assertEqual(cands[100].due_by, "2027-03-15")
+        self.assertEqual(cands[300].due_by, "2026-09-20")
+
+    def test_no_sql_date_functions_in_where(self):
+        import inspect
+        src = inspect.getsource(loose_ends.detect_inferred_occasion).lower()
+        # The load-bearing rule: no date function ever wraps the date column.
+        self.assertNotIn("strftime", src)
+        self.assertNotIn("julianday", src)
+        self.assertNotIn("date(m.date", src)
+        # The month-day/year are sliced off the ISO string in Python instead.
+        self.assertIn("d[5:10]", inspect.getsource(loose_ends.detect_inferred_occasion))
+
+    def test_driver_persists_due_by_and_stage0_suppresses_muted(self):
+        con = self._open()
+        cfg = loose_ends._build_cfg(con)
+        loose_ends.detect_all(con, cfg, "2026-07-01T00:00:00+00:00")
+        rows = con.execute(
+            "SELECT chat_id, due_by FROM loose_threads "
+            "WHERE kind = 'inferred_occasion' AND status = 'open' ORDER BY chat_id"
+        ).fetchall()
+        # Muted Mia (200) is gone; Alice (100) and Wes (300) survive with due_by.
+        self.assertEqual([r[0] for r in rows], [100, 300])
+        self.assertEqual({r[0]: r[1] for r in rows},
+                         {100: "2027-03-15", 300: "2026-09-20"})
+
+
+class NextOccurrenceTest(unittest.TestCase):
+    def test_rolls_forward_and_handles_leap_day(self):
+        now = datetime.datetime(2026, 6, 1, 12, 0, 0)
+        # A past date rolls to next year; a future date stays this year.
+        self.assertEqual(loose_ends._next_occurrence(now, "03-15"), "2027-03-15")
+        self.assertEqual(loose_ends._next_occurrence(now, "09-20"), "2026-09-20")
+        # Feb 29 in the non-leap target year 2027 falls back to Feb 28.
+        self.assertEqual(loose_ends._next_occurrence(now, "02-29"), "2027-02-28")
+
+
+class InferredOccasionConfigTest(unittest.TestCase):
+    def test_knobs_and_weight(self):
+        self.assertEqual(config.NUDGE_OCCASION_MIN_YEARS, 2)
+        self.assertIn("inferred_occasion", config.NUDGE_KIND_WEIGHTS)
+
+    def test_inferred_occasion_is_registered(self):
+        kinds = [k for k, _ in loose_ends.DETECTORS]
+        self.assertIn("inferred_occasion", kinds)
+
+
 if __name__ == "__main__":
     unittest.main()
