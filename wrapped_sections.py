@@ -900,7 +900,7 @@ def _sec_eras(con, scope, dates, contact_entry=None, year=None,
 
 def build_sections(con, roster, contact_entry=None, year=None,
                    exclude_chat_ids=(), exclude_ranges=(),
-                   excluded_names=frozenset()):
+                   excluded_names=frozenset(), wellbeing=False):
     """Build the ordered list of report sections. roster drives the default
     multi-contact report; contact_entry switches to the single-relationship
     deep-dive (people/groups sections are dropped -- they describe the whole
@@ -956,6 +956,12 @@ def build_sections(con, roster, contact_entry=None, year=None,
     sections += [s for s in [_sec_repair_report(
         con, contact_entry, year, exclude_chat_ids)] if s is not None]
     # --- end feature: conflict ---
+    # --- feature: wellbeing ---
+    if wellbeing:  # opt-in only (RES-68 / W4); omitted unless a window fires
+        wb = _sec_wellbeing()
+        if wb is not None:
+            sections.append(wb)
+    # --- end feature: wellbeing ---
     return sections
 
 
@@ -1433,3 +1439,94 @@ def _sec_repair_report(con, contact_entry=None, year=None, exclude_chat_ids=()):
                  "it warm and non-judgmental, and name at most one relationship."),
     }
 # --- end feature: conflict ---
+
+
+# --- feature: wellbeing ---
+# W4 (RES-68): the opt-in wellbeing trajectory section. Built ONLY when
+# build_sections is called with wellbeing=True (wrapped.py resolves the
+# --wellbeing flag / WRAPPED_WELLBEING config), and even then it renders only
+# when get_language_trajectory reports a flagged, sustained cross-family shift
+# in the user's OWN language -- otherwise it returns None and the section is
+# dropped. It is deliberately self-scoped (the user's history, pooled across
+# chats): per-contact trajectories are consent-gated and are not surfaced in a
+# shareable keepsake. Two safety invariants, both owned by CODE not the model:
+#   * the fixed support footer (wellbeing.support_block) is rendered into the
+#     section HTML, so it ships on every flagged window regardless of narration;
+#   * every builder-authored string here passes wellbeing.sanitize_condition_names
+#     before it can render, and the LLM blurb is scrubbed the same way in
+#     wrapped.compose_report (via the sanitize_narrative flag below).
+
+# Internal marker name -> a plain, non-clinical reader label. Never names a
+# condition; describes the behavior a marker measures.
+_WELLBEING_MARKER_LABELS = {
+    "i_count": "“I” focus",
+    "absolutist_count": "Absolute words",
+    "fw_negation_rate": "Negations",
+    "late_night_share": "Late-night messaging",
+    "initiation_share": "Reaching out first",
+    "laugh_rate": "Laughing",
+    "emoji_rate": "Emoji",
+}
+
+
+def _sec_wellbeing():
+    """Self trajectory with the flagged window shaded, plus the code-emitted
+    support footer. Returns None (section omitted) when the tool is unavailable,
+    below the data floor, or reports no sustained departure."""
+    import wellbeing  # dependency-free; imported locally to keep the top clean
+
+    result, _note = wrapped._tool("get_language_trajectory")
+    if result is None:
+        return None
+    windows = result.get("windows") or []
+    if not windows:  # no sustained cross-family shift -> nothing to shade
+        return None
+    window = windows[0]
+    start, end = window.get("start"), window.get("end")
+    if not (start and end):
+        return None
+
+    series_map = result.get("series") or {}
+    departed = set(window.get("departed_families") or [])
+    ordered = list(wellbeing.MARKERS)
+    # Prefer the markers whose families actually departed; fall back to whatever
+    # series exist so the chart is never empty when a window fired.
+    chosen = [name for name in ordered
+              if wellbeing.MARKERS[name][0] in departed and series_map.get(name)]
+    if not chosen:
+        chosen = [name for name in ordered if series_map.get(name)]
+    markers = [{"label": _WELLBEING_MARKER_LABELS.get(name, name),
+                "points": series_map[name]} for name in chosen]
+
+    def clean(text):
+        return wellbeing.sanitize_condition_names(text or "")[0]
+
+    span = f"{wrapped_html.display_scalar(start)} to {wrapped_html.display_scalar(end)}"
+    framing = clean(window.get("framing")
+                    or "A stretch where several of your own signals moved together.")
+    caption = clean(
+        "This looks back at how your own texting shifted over your history; the "
+        "shaded stretch is where several signals moved together at once. It is a "
+        "gentle heads-up, never a diagnosis.")
+    support = wellbeing.support_block()  # fixed, code-emitted, never the model's
+
+    return {
+        "title": "A Gentle Check-In",
+        "stats": {},
+        "narrate_stats": {
+            "the_stretch": span,
+            "what_this_is": framing,
+            "signals_that_shifted": [m["label"] for m in markers],
+        },
+        "extra_html": wrapped_html.render_wellbeing(markers, (start, end), support),
+        "caption": caption,
+        "sanitize_narrative": True,  # wrapped.compose_report scrubs the LLM blurb
+        "hint": clean(
+            "This is a sensitive, opt-in section about the reader's own texting "
+            "over time. Write two or three warm, plain second-person sentences. "
+            "Name the stretch (the_stretch) and that a few signals shifted "
+            "together -- never diagnose, never name any condition, never give "
+            "medical advice, and stay gentle and non-alarming. Support "
+            "information is shown separately below your blurb."),
+    }
+# --- end feature: wellbeing ---

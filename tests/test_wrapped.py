@@ -14,6 +14,7 @@ from unittest import mock
 
 import config
 import db
+import wellbeing
 import ollama
 import query_tools
 import schema
@@ -33,6 +34,7 @@ _TOOL_NAMES = (
     "get_word_frequency",
     "search_contacts_by_name",
     "get_voiceprint",
+    "get_language_trajectory",
 )
 
 _HEATMAP = [[0] * 24 for _ in range(7)]
@@ -49,6 +51,45 @@ _PATTERNS = {
     "busiest_days": [{"day": "2025-01-05", "n": 12}],
     "streaks": {"longest_streak_days": 9},
 }
+
+# Un-flagged trajectory envelope (the default): no window fired, so the opt-in
+# wellbeing section returns None and is omitted even when enabled.
+_TRAJECTORY_UNFLAGGED = {
+    "scope": "self",
+    "markers_available": ["i_count"],
+    "dropped_markers": {},
+    "baseline": {"total_words": 40000, "n_history_months": 24, "baseline_months": 24},
+    "series": {"i_count": [["2023-01", 0.02], ["2023-02", 0.021]]},
+    "windows": [],
+    "examples": [],
+    "note": "no sustained cross-family departure detected",
+    "support_block": None,
+}
+
+# A flagged trajectory envelope: one sustained cross-family window. The section
+# shades 2023-03..2023-04 and renders the code-emitted support footer.
+_TRAJECTORY_FLAGGED = {
+    "scope": "self",
+    "markers_available": ["i_count", "late_night_share"],
+    "dropped_markers": {},
+    "baseline": {"total_words": 60000, "n_history_months": 30, "baseline_months": 27},
+    "series": {
+        "i_count": [["2023-01", 0.02], ["2023-02", 0.022], ["2023-03", 0.05],
+                    ["2023-04", 0.06], ["2023-05", 0.03]],
+        "late_night_share": [["2023-01", 0.10], ["2023-02", 0.12], ["2023-03", 0.40],
+                             ["2023-04", 0.45], ["2023-05", 0.20]],
+    },
+    "windows": [{
+        "start": "2023-03", "end": "2023-04", "peak_z": 4.1,
+        "baseline_months": 27,
+        "departed_families": ["self_focus", "behavioral"],
+        "framing": "A sustained shift in your language from 2023-03 to 2023-04.",
+    }],
+    "examples": [],
+    "note": "reply-latency is intentionally not a v1 marker",
+    "support_block": wellbeing.support_block(),
+}
+
 
 _DEFAULT_RESULTS = {
     "get_activity_patterns": _PATTERNS,
@@ -72,6 +113,7 @@ _DEFAULT_RESULTS = {
         "openers": [{"phrase": "yo", "count": 30}],
         "closers": [{"phrase": "night", "count": 10}],
     },
+    "get_language_trajectory": _TRAJECTORY_UNFLAGGED,
 }
 
 
@@ -1004,6 +1046,107 @@ class TestRepairReport(WrappedTestCase):
         # No JSON reaches the page.
         self.assertNotIn("peak_signal_json", page)
         self.assertNotIn('"conflict_windows"', page)
+        os.unlink(out)
+
+
+class TestWellbeingSection(WrappedTestCase):
+    """The opt-in W4 wellbeing trajectory section: off by default, enabled by
+    --wellbeing or WRAPPED_WELLBEING, code-emitted support footer, and sanitized
+    narration."""
+
+    def _seed_basic(self):
+        seed_contact(self.con, 1, "Alice")
+        seed_handle(self.con, 1, "+15550001", 1)
+        seed_chat(self.con, 1, "c1")
+        seed_msgs(self.con, 1, 1, [f"2025-05-{d:02d}T12:00:00" for d in range(1, 6)])
+        self.con.commit()
+
+    def test_off_by_default_not_invoked(self):
+        self._seed_basic()
+        mocks = self.patch_tools()
+        self.patch_llm()
+        out = self.out_path("wb-off.html")
+        with mock.patch.object(config, "WRAPPED_WELLBEING", False):
+            code, stdout = self.run_main(["--yes", "--no-llm", "--out", out])
+        self.assertEqual(code, 0)
+        # Section builder never runs, so the tool is never called.
+        mocks["get_language_trajectory"].assert_not_called()
+        self.assertIn("available but off", stdout)  # discoverable in the preview
+        with open(out, encoding="utf-8") as f:
+            page = f.read()
+        self.assertNotIn("A Gentle Check-In", page)
+        os.unlink(out)
+
+    def test_flag_enables_and_renders_support_footer(self):
+        self._seed_basic()
+        mocks = self.patch_tools(get_language_trajectory=_TRAJECTORY_FLAGGED)
+        self.patch_llm()
+        out = self.out_path("wb-flag.html")
+        with mock.patch.object(config, "WRAPPED_WELLBEING", False):
+            code, stdout = self.run_main(["--yes", "--no-llm", "--wellbeing", "--out", out])
+        self.assertEqual(code, 0)
+        mocks["get_language_trajectory"].assert_called()
+        self.assertNotIn("available but off", stdout)  # flag flips discoverability off
+        with open(out, encoding="utf-8") as f:
+            page = f.read()
+        self.assertIn("<h2>A Gentle Check-In</h2>", page)
+        self.assertIn('class="wb-traj"', page)          # trajectory chart rendered
+        self.assertIn('class="wb-col in"', page)          # the flagged window shaded
+        self.assertIn('class="wb-support"', page)         # code-emitted support footer
+        self.assertIn("988", page)                        # its crisis-line content
+        self.assertIn("741741", page)
+        self.assertIn("findahelpline.com", page)
+        os.unlink(out)
+
+    def test_config_true_enables_without_flag(self):
+        self._seed_basic()
+        self.patch_tools(get_language_trajectory=_TRAJECTORY_FLAGGED)
+        self.patch_llm()
+        out = self.out_path("wb-config.html")
+        with mock.patch.object(config, "WRAPPED_WELLBEING", True):
+            code, stdout = self.run_main(["--yes", "--no-llm", "--out", out])
+        self.assertEqual(code, 0)
+        self.assertNotIn("available but off", stdout)
+        with open(out, encoding="utf-8") as f:
+            self.assertIn("<h2>A Gentle Check-In</h2>", f.read())
+        os.unlink(out)
+
+    def test_unflagged_window_omits_section(self):
+        self._seed_basic()
+        self.patch_tools(get_language_trajectory=_TRAJECTORY_UNFLAGGED)
+        self.patch_llm()
+        out = self.out_path("wb-unflagged.html")
+        code, _ = self.run_main(["--yes", "--no-llm", "--wellbeing", "--out", out])
+        self.assertEqual(code, 0)
+        with open(out, encoding="utf-8") as f:
+            page = f.read()
+        self.assertNotIn("A Gentle Check-In", page)   # nothing to shade -> omitted
+        self.assertNotIn('class="wb-support"', page)  # no footer without a window
+        os.unlink(out)
+
+    def test_narration_is_sanitized(self):
+        self._seed_basic()
+        self.patch_tools(get_language_trajectory=_TRAJECTORY_FLAGGED)
+
+        # Only the wellbeing section's blurb names a condition; every other
+        # section narrates cleanly, so a residual "depression" anywhere on the
+        # page can only mean the sanitizer was skipped.
+        def narrate(messages, **kwargs):
+            user = messages[1]["content"] if len(messages) > 1 else ""
+            if "A Gentle Check-In" in user:
+                return {"content": "Honestly this stretch looks like depression."}
+            return {"content": "A fine narrative."}
+
+        self.patch_llm(side_effect=narrate)
+        out = self.out_path("wb-sanitize.html")
+        with mock.patch.object(config, "WRAPPED_WELLBEING", True):
+            code, _ = self.run_main(["--yes", "--out", out])
+        self.assertEqual(code, 0)
+        with open(out, encoding="utf-8") as f:
+            page = f.read()
+        self.assertNotIn("depression", page)                     # scrubbed
+        self.assertIn(wellbeing._CONDITION_FALLBACK, page)       # replaced sentence
+        self.assertIn('class="wb-support"', page)                # footer still present
         os.unlink(out)
 
 
