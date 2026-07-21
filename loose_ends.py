@@ -85,6 +85,15 @@ from query_tools.analytics_language import lsm_score
 import re
 
 from config import NUDGE_QUESTION_GRACE_HOURS, NUDGE_QUESTION_MIN_CHARS
+# --- detector: inferred_occasion ---
+# Additive per-detector imports (RES-58 / N5), fenced so concurrent N-wave
+# detectors never contend for the shared import block. defaultdict powers the
+# (month, day) -> {year: message} bucketing that turns recurring congratulatory
+# messages into an occasion; NUDGE_OCCASION_MIN_YEARS is the recurrence floor.
+from collections import defaultdict
+
+from config import NUDGE_OCCASION_MIN_YEARS
+# --- end detector: inferred_occasion ---
 from query_tools._shared import TEXT_PREVIEW_CHARS
 # --- end detector: unanswered_question ---
 
@@ -593,6 +602,106 @@ def detect_unanswered_question(con, cfg) -> Iterable[CandidateRow]:
 
 
 DETECTORS.append(("unanswered_question", detect_unanswered_question))
+
+
+# --- detector: inferred_occasion ---
+# A recurring annual occasion a 1:1 dyad marks -- a birthday or anniversary --
+# inferred from CONGRATULATORY messages that land on the SAME CALENDAR DATE
+# across multiple years. Alone among the detectors it also fills `due_by`: the
+# next upcoming occurrence of that month-day, so the digest can surface the
+# reminder BEFORE the date instead of nagging after it. Pure detection -- the
+# shared driver runs the Stage-0 gate first, so a muted / negative-valence /
+# zero-outbound counterparty never reaches here.
+#
+# LOAD-BEARING date rule: no SQL date function ever wraps the date column in a
+# WHERE clause. Candidate congratulatory messages are fetched with a plain text
+# LIKE filter (the date column is only ever compared, never wrapped); the
+# (month, day) and year are then sliced off the ISO string in PYTHON and
+# bucketed here -- the same discipline analytics.py uses.
+
+# Substrings (matched case-insensitively against message text) that mark a
+# congratulatory / milestone message. Deliberately permissive: a one-off
+# "congrats on the job" never fires on its own -- only the SAME (month, day)
+# recurring across NUDGE_OCCASION_MIN_YEARS distinct years becomes an occasion,
+# which a non-anniversary congratulation cannot satisfy.
+_OCCASION_PHRASES = (
+    "happy birthday", "happy bday", "hbd", "happy anniversary",
+    "happy anniv", "congrats", "congratulations",
+)
+
+
+def _next_occurrence(now, month_day):
+    """The next calendar date on or after `now` that falls on month_day
+    ('MM-DD'), as an ISO 'YYYY-MM-DD' string. Rolls to next year once this
+    year's date has already passed; a Feb 29 occasion in a non-leap target year
+    falls back to Feb 28 so the reminder never silently vanishes."""
+    month, day = int(month_day[:2]), int(month_day[3:5])
+    today = now.date()
+    for year in (today.year, today.year + 1):
+        try:
+            candidate = datetime.date(year, month, day)
+        except ValueError:  # Feb 29 in a non-leap year
+            candidate = datetime.date(year, month, 28)
+        if candidate >= today:
+            return candidate.isoformat()
+    return None
+
+
+def detect_inferred_occasion(con, cfg) -> Iterable[CandidateRow]:
+    """Fire once per 1:1 dyad that congratulates on a recurring calendar date.
+    Candidate congratulatory messages are pulled with a text LIKE filter (never
+    a date function in WHERE); their (month, day)/year are sliced in Python, and
+    a (month, day) seen in >= cfg['occasion_min_years'] distinct years becomes
+    an occasion. The most recent occurrence is the anchor; due_by is the next
+    upcoming date, so the nudge lands ahead of it."""
+    min_years = cfg["occasion_min_years"]
+    like = " OR ".join("LOWER(m.text) LIKE ?" for _ in _OCCASION_PHRASES)
+    params = [f"%{p}%" for p in _OCCASION_PHRASES]
+    rows = con.execute(
+        f"SELECT m.chat_id AS chat_id, m.id AS id, m.date AS date, m.text AS text "
+        f"FROM messages m "
+        f"WHERE m.text IS NOT NULL AND m.date IS NOT NULL AND ({like}) AND {_REAL} "
+        f"ORDER BY m.date, m.id",
+        params,
+    ).fetchall()
+    if not rows:
+        return
+    direct = set(_restrict_to_direct_chats(con, list({r["chat_id"] for r in rows})))
+    # chat_id -> 'MM-DD' -> {year: (message_id, date, text)}; the latest message
+    # per (chat, month-day, year) wins because rows arrive in ascending date.
+    buckets = defaultdict(lambda: defaultdict(dict))
+    for r in rows:
+        cid = r["chat_id"]
+        if cid not in direct:
+            continue
+        d = r["date"]
+        buckets[cid][d[5:10]][d[:4]] = (r["id"], d, r["text"])
+    for cid, by_md in buckets.items():
+        for month_day, by_year in by_md.items():
+            if len(by_year) < min_years:
+                continue
+            years = sorted(by_year)
+            anchor_id, anchor_date, sample = by_year[years[-1]]
+            due_by = _next_occurrence(cfg["now"], month_day)
+            yield CandidateRow(
+                kind="inferred_occasion",
+                chat_id=cid,
+                handle_id=_counterparty_handle(con, cid),
+                anchor_message_id=anchor_id,
+                anchor_date=anchor_date,
+                due_by=due_by,
+                evidence={
+                    "month_day": month_day,
+                    "observed_years": years,
+                    "n_years": len(by_year),
+                    "next_occurrence": due_by,
+                    "sample_message": (sample or "")[:TEXT_PREVIEW_CHARS],
+                },
+            )
+
+
+DETECTORS.append(("inferred_occasion", detect_inferred_occasion))
+# --- end detector: inferred_occasion ---
 # --- end detector: unanswered_question ---
 
 
@@ -1009,6 +1118,9 @@ def _build_cfg(con):
         "question_min_chars": NUDGE_QUESTION_MIN_CHARS,
         "question_grace_hours": NUDGE_QUESTION_GRACE_HOURS,
         # --- end detector: unanswered_question ---
+        # --- detector: inferred_occasion ---
+        "occasion_min_years": NUDGE_OCCASION_MIN_YEARS,
+        # --- end detector: inferred_occasion ---
         # --- detector: dropped_plan ---
         # HARD-GATED: dropped_plan_enabled is the default-OFF flag; the verifier
         # reuses the narration model/timeout and passes think=nudges_think per

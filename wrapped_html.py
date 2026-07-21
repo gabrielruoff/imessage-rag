@@ -610,6 +610,42 @@ def render_joke_cards(rows):
     return '<div class="jokes">' + "".join(cards) + "</div>"
 
 
+# --- feature: nudges ---
+def _open_loop_fallback(row):
+    """A plain one-line description of an open loop when no LLM nudge_text was
+    written -- so the board reads sensibly after a --no-llm detector run."""
+    who = row.get("who") or "someone"
+    if row.get("due"):
+        return f"{row.get('kind') or 'A date'} with {who} is coming up"
+    return f"{who}: {row.get('kind') or 'a loose end'}"
+
+
+def render_open_loops(rows):
+    """The Open Loops board (Wrapped N5): each drifting thread as an INCOMING
+    iMessage bubble -- the loop 'texting you back' -- captioned with who it's
+    about, why it's open, and, for a recurring occasion, the upcoming date as a
+    tapback pill. Reuses the bubble chrome (.bubbles/.msg.inc/.bubble/.tapback),
+    so it inherits light/dark and needs no network or new styles."""
+    out = []
+    for row in rows:
+        text = row.get("nudge") or _open_loop_fallback(row)
+        due = row.get("due")
+        tap = (f'<span class="tapback">📅 {esc(display_scalar(due, "date"))}</span>'
+               if due else "")
+        cap_bits = [f"with {row['who']}" if row.get("who") else "",
+                    str(row.get("kind") or "")]
+        if not due and row.get("since"):
+            cap_bits.append(f"since {display_scalar(row['since'], 'date')}")
+        caption = " · ".join(p for p in cap_bits if p)
+        out.append(
+            f'<figure class="msg inc"><div class="bubble">{tap}'
+            f'{format_scalar(text)}</div>'
+            f'<figcaption>{esc(caption)}</figcaption></figure>'
+        )
+    return '<div class="bubbles">' + "".join(out) + "</div>"
+# --- end feature: nudges ---
+
+
 # Bucket bounds are tuned to where corpus-average valence actually lives
 # (annotated chunk tones cluster within roughly ±0.15; a whole month past
 # ±0.08 is genuinely rough/glowing).

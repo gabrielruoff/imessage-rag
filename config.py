@@ -325,6 +325,7 @@ def _nudge_kind_weights():
         "dormant_tie": 0.6,
         "dropped_plan": 0.9,
         "unreciprocated_goodnews": 0.5,
+        "inferred_occasion": 0.8,
     }
     raw = os.getenv("NUDGE_KIND_WEIGHTS", "").strip()
     if not raw:
@@ -614,3 +615,16 @@ NUDGE_PLAN_CONTEXT_MSGS = int(os.getenv("NUDGE_PLAN_CONTEXT_MSGS") or "30")
 NUDGE_GOODNEWS_ENABLED = os.getenv(
     "NUDGE_GOODNEWS_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
 # --- end feature: nudges ---
+
+
+# --- Inferred-occasion nudges (loose_ends.py inferred_occasion detector; RES-58 / N5) ---
+# A recurring annual occasion a 1:1 dyad marks -- a birthday or anniversary --
+# inferred from CONGRATULATORY messages that land on the SAME CALENDAR DATE
+# across years. The (month, day) must recur in at least this many DISTINCT years
+# before it counts as an occasion (a one-off "congrats" can never satisfy this,
+# so the phrase list stays permissive). This is the one detector that fills the
+# loose_threads.due_by column: the next upcoming occurrence, so the digest can
+# surface the reminder BEFORE the date. The month-day/year are sliced off the
+# ISO date string in Python -- no SQL date function ever wraps the date column
+# in a WHERE clause (the load-bearing date-handling rule).
+NUDGE_OCCASION_MIN_YEARS = int(os.getenv("NUDGE_OCCASION_MIN_YEARS") or "2")
