@@ -3,14 +3,17 @@ schema + reset_db behavior, the faded_initiator detector, the Stage-0 exclusion
 spine, and the three query tools. Temp SQLite only -- no Ollama, no real chat.db
 (narration is never exercised here; the CLI runs with --no-llm)."""
 
+import datetime
 import os
 import sqlite3
+import statistics
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
+import config
 import loose_ends
 import query_tools
 import reset_db
@@ -370,6 +373,251 @@ class RegistrationSyncTest(unittest.TestCase):
             self.assertTrue(callable(getattr(query_tools, name)))
             self.assertIn(name, chat.TOOL_FUNCTIONS)
             self.assertIn(name, chat.SYSTEM_PROMPT)
+
+
+# ---------------------------------------------------------------------------
+# dormant_tie detector (RES-55 / N2)
+# ---------------------------------------------------------------------------
+
+def _dense(chat_id, handle_id, start_id, start_dt, n, step_hours, *, all_inbound=False):
+    """n messages alternating sender (or all inbound), spaced step_hours apart
+    from start_dt. is_from_me=1 rows carry handle_id 0 (matching the N1 fixture);
+    inbound rows carry the counterparty handle_id. Returns (rows, last_dt)."""
+    rows, last = [], start_dt
+    for i in range(n):
+        dt = start_dt + datetime.timedelta(hours=step_hours * i)
+        is_me = 0 if all_inbound else (i % 2)
+        hid = 0 if is_me else handle_id
+        rows.append((start_id + i, f"g{start_id + i}", chat_id, hid, is_me,
+                     "msg", dt.strftime("%Y-%m-%dT%H:%M:%S")))
+        last = dt
+    return rows, last
+
+
+_LEX_COLS = ("chat_id, handle_id, month, n_words, fw_pronoun_rate, fw_ipron_rate, "
+             "fw_article_rate, fw_conj_rate, fw_prep_rate, fw_aux_rate, "
+             "fw_adverb_rate, fw_negation_rate, fw_quant_rate")
+
+
+def _build_dormant_fixture(db_path):
+    """Direct dyads for the dormant_tie detector, anchored so corpus-now is
+    Carol's recent message:
+      Alice (100)  once-close (300 msgs, depth 5, LSM~1) + DORMANT + OVERDUE -> fires
+      Beth  (200)  eligible but less close (200 msgs, depth 2, LSM~0.4) + OVERDUE
+      Carol (300)  close (240 msgs) but RECENT -> not overdue (anchors corpus-now)
+      Bob   (400)  once-close + OVERDUE but NEGATIVE valence -> Stage-0 muted
+      Ed    (500)  once-close + OVERDUE but ZERO outbound   -> Stage-0 muted
+      Frank (600)  bursty history (15 msgs, months apart) -> the p90 fixture
+    """
+    con = sqlite3.connect(db_path)
+    try:
+        schema.create_schema(con)
+        con.executemany(
+            "INSERT INTO contacts(id, source_uniqueid, first_name) VALUES (?, ?, ?)",
+            [(i, f"u{i}", n) for i, n in
+             [(1, "Alice"), (2, "Beth"), (3, "Carol"), (4, "Bob"),
+              (5, "Ed"), (6, "Frank")]],
+        )
+        con.executemany(
+            "INSERT INTO handles(id, handle_identifier, contact_id, service) "
+            "VALUES (?, ?, ?, 'iMessage')",
+            [(10, "+10", 1), (20, "+20", 2), (30, "+30", 3),
+             (40, "+40", 4), (50, "+50", 5), (60, "+60", 6)],
+        )
+        con.executemany(
+            "INSERT INTO chats(id, chat_identifier, display_name, is_group, service) "
+            "VALUES (?, ?, NULL, 0, 'iMessage')",
+            [(c, f"c{c}") for c in (100, 200, 300, 400, 500, 600)],
+        )
+        con.executemany(
+            "INSERT INTO chat_participants(chat_id, handle_id) VALUES (?, ?)",
+            [(100, 10), (200, 20), (300, 30), (400, 40), (500, 50), (600, 60)],
+        )
+
+        d = datetime.datetime
+        msgs = []
+        msgs += _dense(100, 10, 1000, d(2025, 8, 1), 300, 8)[0]        # Alice dormant
+        msgs += _dense(200, 20, 2000, d(2025, 8, 1), 200, 8)[0]        # Beth dormant
+        msgs += _dense(300, 30, 3000, d(2026, 4, 1), 240, 8)[0]        # Carol recent (max)
+        msgs += _dense(400, 40, 4000, d(2025, 8, 1), 240, 8)[0]        # Bob dormant
+        msgs += _dense(500, 50, 5000, d(2025, 8, 1), 240, 8,
+                       all_inbound=True)[0]                            # Ed dormant, 0 out
+        # Frank: 5 bursts of 3 quick messages, 30 days apart (the p90 fixture).
+        mid = 6000
+        for b in range(5):
+            base = d(2025, 1, 1) + datetime.timedelta(days=30 * b)
+            for k in range(3):
+                t = base + datetime.timedelta(minutes=5 * k)
+                msgs.append((mid, f"g{mid}", 600, (0 if k % 2 else 60), k % 2,
+                             "hi", t.strftime("%Y-%m-%dT%H:%M:%S")))
+                mid += 1
+        con.executemany(
+            "INSERT INTO messages(id, guid, chat_id, handle_id, is_from_me, text, date) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            msgs,
+        )
+
+        # Depth chunks (source='distilled' -> depth counts, valence gate does not).
+        con.executemany(
+            "INSERT INTO chunks(id, chat_id, first_message_id, last_message_id, "
+            "first_date, last_date, n_messages, text) VALUES (?, ?, ?, ?, ?, ?, 2, 'x')",
+            [(900, 100, 1000, 1001, "2025-08-01T00:00:00", "2025-09-01T00:00:00"),
+             (901, 200, 2000, 2001, "2025-08-01T00:00:00", "2025-09-01T00:00:00"),
+             (902, 400, 4000, 4001, "2025-08-01T00:00:00", "2025-09-01T00:00:00")],
+        )
+        con.executemany(
+            "INSERT INTO chunk_annotations(chunk_id, valence, emotions_json, depth, "
+            "events_json, source) VALUES (?, ?, '[]', ?, '[]', ?)",
+            [(900, None, 5, "distilled"),   # Alice: high depth, no valence gate
+             (901, None, 2, "distilled"),   # Beth: lower depth
+             (902, -0.8, 3, "llm")],        # Bob: negative llm valence -> muted
+        )
+
+        # LSM lexicon: Alice near-identical both sides (~1.0), Beth divergent (~0.4).
+        same = (0.1,) * 9
+        beth_me = (0.2, 0.05, 0.2, 0.05, 0.2, 0.05, 0.2, 0.05, 0.2)
+        beth_them = (0.05, 0.2, 0.05, 0.2, 0.05, 0.2, 0.05, 0.2, 0.05)
+        con.executemany(
+            f"INSERT INTO person_period_lexicon({_LEX_COLS}) "
+            f"VALUES ({','.join('?' * 13)})",
+            [(100, None, "2025-09", 100, *same),
+             (100, 10, "2025-09", 100, *same),
+             (200, None, "2025-09", 100, *beth_me),
+             (200, 20, "2025-09", 100, *beth_them)],
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+class _DormantFixtureTest(unittest.TestCase):
+    def setUp(self):
+        fd, self.db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.addCleanup(lambda: os.path.exists(self.db_path) and os.remove(self.db_path))
+        _build_dormant_fixture(self.db_path)
+        for module in (loose_ends, query_tools):
+            patcher = mock.patch.object(module, "DB_PATH", self.db_path)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _open(self):
+        con = sqlite3.connect(self.db_path)
+        con.row_factory = sqlite3.Row
+        self.addCleanup(con.close)
+        return con
+
+    def _dormant_chats(self):
+        con = sqlite3.connect(self.db_path)
+        try:
+            return [r[0] for r in con.execute(
+                "SELECT chat_id FROM loose_threads WHERE kind = 'dormant_tie' "
+                "AND status = 'open' ORDER BY chat_id")]
+        finally:
+            con.close()
+
+
+class DormantTieDetectorTest(_DormantFixtureTest):
+    def test_p90_uses_full_gap_distribution_not_reply_latency(self):
+        # Frank (600) messages in bursts 30 days apart. The FULL-distribution p90
+        # reflects the long silences; a reply-latency median (within-burst gaps
+        # only) would be minutes and is circular -- it excludes the silences.
+        con = self._open()
+        p90 = loose_ends._dyad_gap_p90(con, 600)
+        dates = [datetime.datetime.fromisoformat(r[0]) for r in con.execute(
+            "SELECT date FROM messages WHERE chat_id = 600 ORDER BY date, id")]
+        gaps = [(b - a).total_seconds() for a, b in zip(dates, dates[1:])]
+        reply_latency_median = statistics.median(g for g in gaps if g < 86400)
+        self.assertLess(reply_latency_median, 3600)          # minutes
+        self.assertGreater(p90, 10 * 86400)                  # p90 is days, not minutes
+        self.assertGreater(p90, reply_latency_median * 100)  # not circular
+
+    def test_top_frac_selects_only_the_closest_overdue_dyad(self):
+        # Default top_frac (0.2) over 5 eligible dyads -> ceil = 1 slot. Alice is
+        # the closest (most messages + highest depth + highest LSM), so only she
+        # is a candidate even though Beth/Bob/Ed are also overdue and eligible.
+        con = self._open()
+        cfg = loose_ends._build_cfg(con)
+        cands = list(loose_ends.detect_dormant_tie(con, cfg))
+        self.assertEqual([c.chat_id for c in cands], [100])
+        ev = cands[0].evidence
+        self.assertEqual(ev["trailing_messages"], 300)
+        self.assertEqual(ev["mean_depth"], 5.0)
+        self.assertIsNotNone(ev["lsm"])
+        self.assertGreater(ev["current_gap_days"], ev["p90_gap_days"])
+        self.assertGreater(ev["current_gap_days"], 21)
+
+    def test_recent_and_thin_dyads_do_not_fire(self):
+        # With top_frac=1.0 every eligible dyad is "once-close"; the overdue gate
+        # must still drop Carol (recent) and never invent Frank (< min messages).
+        con = self._open()
+        cfg = loose_ends._build_cfg(con)
+        cfg["dormant_top_frac"] = 1.0
+        chats = {c.chat_id for c in loose_ends.detect_dormant_tie(con, cfg)}
+        self.assertIn(100, chats)
+        self.assertIn(200, chats)
+        self.assertNotIn(300, chats)   # Carol: recent -> not overdue
+        self.assertNotIn(600, chats)   # Frank: 15 msgs -> not eligible
+
+
+class DormantTieDriverExclusionTest(_DormantFixtureTest):
+    def test_excluded_contacts_never_surface_through_the_driver(self):
+        # top_frac=1.0 makes Bob (negative valence) and Ed (zero outbound)
+        # candidates; the Stage-0 gate must suppress them before any row lands.
+        con = self._open()
+        cfg = loose_ends._build_cfg(con)
+        cfg["dormant_top_frac"] = 1.0
+        summary = loose_ends.detect_all(con, cfg, "2026-07-01T00:00:00+00:00")
+        self.assertEqual(self._dormant_chats(), [100, 200])
+        self.assertGreaterEqual(summary["suppressed"], 2)   # Bob + Ed
+        reasons = dict(con.execute(
+            "SELECT chat_id, reason FROM nudge_exclusions ne "
+            "JOIN chat_participants cp ON cp.handle_id = ne.handle_id"))
+        self.assertEqual(reasons.get(400), "auto:negative_valence")
+        self.assertEqual(reasons.get(500), "auto:zero_outbound")
+
+
+class DormantTieBatchHideTest(_DormantFixtureTest):
+    def _write_dormant(self):
+        con = self._open()
+        cfg = loose_ends._build_cfg(con)
+        cfg["dormant_top_frac"] = 1.0
+        loose_ends.detect_all(con, cfg, "2026-07-01T00:00:00+00:00")
+
+    def test_hidden_until_acknowledged_then_visible(self):
+        self._write_dormant()
+        # Absent nudges_reconnect_ack: no dormant rows, plus the one-line notice.
+        rows = query_tools.get_loose_threads(kind="dormant_tie", limit=5)
+        self.assertTrue(all(r.get("kind") != "dormant_tie" or "notice" in r
+                            for r in rows))
+        self.assertFalse([r for r in rows if r.get("status") == "open"
+                          and "notice" not in r])
+        notices = [r for r in rows if "notice" in r]
+        self.assertEqual(len(notices), 1)
+        self.assertIn("--acknowledge-reconnect", notices[0]["notice"])
+
+        # The unscoped digest also hides dormant rows but still carries the notice.
+        allrows = query_tools.get_loose_threads(limit=5)
+        self.assertFalse([r for r in allrows if r.get("kind") == "dormant_tie"
+                          and "notice" not in r])
+        self.assertTrue(any("notice" in r for r in allrows))
+
+        # Opt in via the CLI flag, then the rows appear and the notice is gone.
+        loose_ends.main(["--acknowledge-reconnect"])
+        after = query_tools.get_loose_threads(kind="dormant_tie", limit=5)
+        self.assertEqual(sorted(r["chat_id"] for r in after), [100, 200])
+        self.assertFalse([r for r in after if "notice" in r])
+
+
+class DormantTieConfigTest(unittest.TestCase):
+    def test_knobs_are_named_config_vars(self):
+        self.assertEqual(config.NUDGE_DORMANT_TOP_FRAC, 0.2)
+        self.assertEqual(config.NUDGE_DORMANT_MIN_MESSAGES, 200)
+        self.assertEqual(config.NUDGE_DORMANT_MIN_GAP_DAYS, 21)
+
+    def test_dormant_tie_is_registered(self):
+        kinds = [k for k, _ in loose_ends.DETECTORS]
+        self.assertIn("dormant_tie", kinds)
 
 
 if __name__ == "__main__":
