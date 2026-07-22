@@ -10,6 +10,7 @@ in-memory SQLite databases. Covers the delicate bits of PR #1:
 Run from the repo root:  python3 -m unittest discover tests
 """
 
+import datetime
 import os
 import sqlite3
 import tempfile
@@ -505,6 +506,182 @@ class ReactionGuidNormalizationTest(unittest.TestCase):
         ingest.create_schema(con)  # re-running applies the idempotent migration
         got = {r[0] for r in con.execute("SELECT target_message_guid FROM reactions")}
         self.assertEqual(got, {"GUID-A", "GUID-B", "GUID-C", "GUID-D"})
+
+
+class LookbackParseTest(unittest.TestCase):
+    """The --lookback period grammar and calendar arithmetic (pure helpers)."""
+
+    def test_parse_accepts_all_units_and_is_lenient(self):
+        self.assertEqual(ingest._parse_lookback("1d"), (1, "d"))
+        self.assertEqual(ingest._parse_lookback("10w"), (10, "w"))
+        self.assertEqual(ingest._parse_lookback("3mo"), (3, "mo"))
+        self.assertEqual(ingest._parse_lookback("2y"), (2, "y"))
+        # Surrounding whitespace and case are tolerated.
+        self.assertEqual(ingest._parse_lookback(" 7D "), (7, "d"))
+        self.assertEqual(ingest._parse_lookback("4MO"), (4, "mo"))
+        # None is the "flag not given" sentinel -- passes straight through.
+        self.assertIsNone(ingest._parse_lookback(None))
+
+    def test_parse_rejects_malformed_periods(self):
+        # Bare 'm' is rejected on purpose (minutes/months ambiguity); junk,
+        # trailing text, and non-positive counts all raise a clean SystemExit.
+        for bad in ("abc", "3m", "5mos", "mo", "3", "", "0d", "-1d", "1.5y"):
+            with self.assertRaises(SystemExit):
+                ingest._parse_lookback(bad)
+
+    def test_subtract_period_days_and_weeks(self):
+        when = datetime.datetime(2026, 7, 22, 15, 30, 45)
+        self.assertEqual(ingest._subtract_period(when, 10, "d").date(),
+                         datetime.date(2026, 7, 12))
+        self.assertEqual(ingest._subtract_period(when, 1, "w").date(),
+                         datetime.date(2026, 7, 15))
+
+    def test_subtract_period_months_and_years_are_calendar_correct(self):
+        when = datetime.datetime(2026, 7, 22, 15, 30, 45)
+        self.assertEqual(ingest._subtract_period(when, 3, "mo").date(),
+                         datetime.date(2026, 4, 22))
+        self.assertEqual(ingest._subtract_period(when, 2, "y").date(),
+                         datetime.date(2024, 7, 22))
+        # Crossing a year boundary via months.
+        self.assertEqual(
+            ingest._subtract_period(datetime.datetime(2026, 1, 15), 3, "mo").date(),
+            datetime.date(2025, 10, 15))
+
+    def test_subtract_period_clamps_short_month_and_leap_day(self):
+        # Mar 31 - 1mo has no Feb 31; clamp to the last valid day of the target
+        # month (28 in a common year, 29 in a leap year).
+        self.assertEqual(
+            ingest._subtract_period(datetime.datetime(2026, 3, 31), 1, "mo").date(),
+            datetime.date(2026, 2, 28))
+        self.assertEqual(
+            ingest._subtract_period(datetime.datetime(2024, 3, 31), 1, "mo").date(),
+            datetime.date(2024, 2, 29))
+
+    def test_cutoff_ns_round_trips_and_preserves_time_of_day(self):
+        now = datetime.datetime(2026, 7, 22, 12, 0, 0)
+        ns = ingest._lookback_cutoff_ns((3, "mo"), now=now)
+        # The ns lower bound decodes back through the real ingest path to the
+        # exact cutoff instant (not just the date), so mid-day messages on the
+        # boundary day sort correctly against it.
+        self.assertTrue(ingest.apple_ns_to_iso(ns).startswith("2026-04-22T12:00:00"))
+        # No period -> no filter.
+        self.assertIsNone(ingest._lookback_cutoff_ns(None))
+
+
+class LookbackIngestTest(unittest.TestCase):
+    """--lookback threaded through the real source read (messages, reactions,
+    attachments), and its composition with the chat allowlist."""
+
+    def _apple_ns(self, iso):
+        """Naive-UTC ISO -> Apple-epoch ns, mirroring ingest's own math."""
+        delta = datetime.datetime.fromisoformat(iso) - ingest.APPLE_EPOCH
+        return (delta.days * 86400 + delta.seconds) * 1_000_000_000 \
+            + delta.microseconds * 1000
+
+    def _fake_src(self):
+        """A minimal chat.db-shaped source: message + chat_message_join, plus
+        the attachment join tables the attachment reader touches."""
+        src = sqlite3.connect(":memory:")
+        self.addCleanup(src.close)
+        src.executescript("""
+            CREATE TABLE message(
+                ROWID INTEGER PRIMARY KEY, guid TEXT, handle_id INT, is_from_me INT,
+                text TEXT, attributedBody BLOB, date INT, date_read INT,
+                date_delivered INT, item_type INT, is_emote INT,
+                cache_has_attachments INT, associated_message_type INT,
+                associated_message_guid TEXT);
+            CREATE TABLE chat_message_join(message_id INT, chat_id INT);
+            CREATE TABLE attachment(
+                ROWID INTEGER PRIMARY KEY, filename TEXT, mime_type TEXT,
+                transfer_name TEXT);
+            CREATE TABLE message_attachment_join(attachment_id INT, message_id INT);
+        """)
+        # (rowid, chat, date_iso|None, associated_message_type, target_guid)
+        rows = [
+            (1, 10, "2025-01-01T00:00:00", 0, "g1"),      # old message   -> drop
+            (2, 10, "2026-06-01T00:00:00", 0, "g2"),      # recent message-> keep
+            (3, 20, "2026-06-02T00:00:00", 0, "g3"),      # recent, chat 20-> keep
+            (4, 10, "2026-06-03T00:00:00", 2000, "g2"),   # recent reaction-> keep
+            (5, 10, "2024-01-01T00:00:00", 2000, "g1"),   # old reaction  -> drop
+            (6, 10, None, 0, "g6"),                       # dateless/system-> drop
+        ]
+        for rowid, chat, diso, atype, aguid in rows:
+            src.execute(
+                "INSERT INTO message(ROWID, guid, handle_id, is_from_me, text, "
+                "attributedBody, date, date_read, date_delivered, item_type, "
+                "is_emote, cache_has_attachments, associated_message_type, "
+                "associated_message_guid) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (rowid, f"guid{rowid}", 1, 0, f"msg{rowid}", None,
+                 self._apple_ns(diso) if diso else None, 0, 0, 0, 0, 0, atype, aguid),
+            )
+            src.execute("INSERT INTO chat_message_join(message_id, chat_id) "
+                        "VALUES (?, ?)", (rowid, chat))
+        # One attachment on the old message (should drop) and one on a recent
+        # message (should survive) under a lookback window.
+        src.executemany(
+            "INSERT INTO attachment(ROWID, filename, mime_type, transfer_name) "
+            "VALUES (?, ?, ?, ?)",
+            [(1, "a1", "x", "a1"), (2, "a2", "x", "a2")],
+        )
+        src.executemany(
+            "INSERT INTO message_attachment_join(attachment_id, message_id) "
+            "VALUES (?, ?)", [(1, 1), (2, 2)],
+        )
+        src.commit()
+        return src
+
+    def _fresh_tgt(self):
+        tgt = sqlite3.connect(":memory:")
+        self.addCleanup(tgt.close)
+        ingest.create_schema(tgt)
+        return tgt
+
+    # Fixed "now" so the window boundary is deterministic regardless of run date.
+    _NOW = datetime.datetime(2026, 7, 22)
+
+    def test_lookback_drops_old_rows_reactions_and_attachments(self):
+        src, tgt = self._fake_src(), self._fresh_tgt()
+        cutoff = ingest._lookback_cutoff_ns((3, "mo"), now=self._NOW)
+        ingest.ingest_messages_and_reactions(src, tgt, 0, None, cutoff)
+        ingest.ingest_attachments(src, tgt, 0, None, cutoff)
+        tgt.commit()
+        self.assertEqual({r[0] for r in tgt.execute("SELECT id FROM messages")},
+                         {2, 3})   # old msg 1 and dateless msg 6 excluded
+        self.assertEqual({r[0] for r in tgt.execute("SELECT id FROM reactions")},
+                         {4})      # old reaction 5 excluded
+        self.assertEqual({r[0] for r in tgt.execute("SELECT id FROM attachments")},
+                         {2})      # attachment on old msg 1 excluded
+
+    def test_lookback_composes_with_chat_allowlist(self):
+        src, tgt = self._fake_src(), self._fresh_tgt()
+        cutoff = ingest._lookback_cutoff_ns((3, "mo"), now=self._NOW)
+        # Allow only chat 10: recent-but-chat-20 msg 3 must fall away too, which
+        # also proves the SQL placeholder order (rowid, *chat_ids, date) is right.
+        ingest.ingest_messages_and_reactions(src, tgt, 0, {10}, cutoff)
+        tgt.commit()
+        self.assertEqual({r[0] for r in tgt.execute("SELECT id FROM messages")}, {2})
+
+    def test_lookback_attachments_compose_with_chat_allowlist(self):
+        src, tgt = self._fake_src(), self._fresh_tgt()
+        cutoff = ingest._lookback_cutoff_ns((3, "mo"), now=self._NOW)
+        # Exercise ingest_attachments with BOTH the chat allowlist and the date
+        # filter present -- the one branch the other attachment test skips
+        # (allowed_chat_ids=None) -- so its placeholder order (rowid, *chat_ids,
+        # date) is locked too. Attachment on old msg 1 drops on date; attachment
+        # on recent chat-10 msg 2 survives.
+        ingest.ingest_attachments(src, tgt, 0, {10}, cutoff)
+        tgt.commit()
+        self.assertEqual({r[0] for r in tgt.execute("SELECT id FROM attachments")},
+                         {2})
+
+    def test_no_lookback_ingests_everything_including_dateless(self):
+        src, tgt = self._fake_src(), self._fresh_tgt()
+        ingest.ingest_messages_and_reactions(src, tgt, 0, None, None)
+        tgt.commit()
+        # Unfiltered behaviour is unchanged: every non-reaction row lands,
+        # dateless system rows included.
+        self.assertEqual({r[0] for r in tgt.execute("SELECT id FROM messages")},
+                         {1, 2, 3, 6})
 
 
 if __name__ == "__main__":
