@@ -661,6 +661,19 @@ class LookbackIngestTest(unittest.TestCase):
         tgt.commit()
         self.assertEqual({r[0] for r in tgt.execute("SELECT id FROM messages")}, {2})
 
+    def test_lookback_attachments_compose_with_chat_allowlist(self):
+        src, tgt = self._fake_src(), self._fresh_tgt()
+        cutoff = ingest._lookback_cutoff_ns((3, "mo"), now=self._NOW)
+        # Exercise ingest_attachments with BOTH the chat allowlist and the date
+        # filter present -- the one branch the other attachment test skips
+        # (allowed_chat_ids=None) -- so its placeholder order (rowid, *chat_ids,
+        # date) is locked too. Attachment on old msg 1 drops on date; attachment
+        # on recent chat-10 msg 2 survives.
+        ingest.ingest_attachments(src, tgt, 0, {10}, cutoff)
+        tgt.commit()
+        self.assertEqual({r[0] for r in tgt.execute("SELECT id FROM attachments")},
+                         {2})
+
     def test_no_lookback_ingests_everything_including_dateless(self):
         src, tgt = self._fake_src(), self._fresh_tgt()
         ingest.ingest_messages_and_reactions(src, tgt, 0, None, None)

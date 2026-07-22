@@ -206,8 +206,16 @@ targeted retrieval.
   ROWID bound and the sender/exclude chat allowlist — and, like them, is purely
   additive: a later unfiltered run still backfills the older messages. Dateless
   system rows (`message.date` NULL/0) fall outside any window and are skipped
-  while `--lookback` is active; `last_message_rowid` still advances to the newest
-  message, so a subsequent `--since-last` stays correct.
+  while `--lookback` is active; `last_message_rowid` advances to the newest
+  *in-window* message, so a subsequent `--since-last` at worst re-scans a few
+  already-ingested rows (every write is idempotent `INSERT OR REPLACE`) and
+  never skips. One quirk to know: a fresh `--lookback` run can ingest a reaction
+  that falls inside the window while its target message (always older, since a
+  reaction post-dates what it reacts to) falls outside it, leaving
+  `reactions.target_message_guid` pointing at a message not yet in `messages`.
+  There's no FK — the target is a text GUID joined at query time — so this is
+  benign (the reaction just can't be resolved) and self-heals on a later full
+  backfill.
 - **`embed.py`** — the embedding step, called from `ingest.main` after the
   relational ingest: `build_vec_table` (creates the `message_vectors` vec0
   table) and `embed_messages` (thread-pooled batch embedding via
