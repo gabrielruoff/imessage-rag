@@ -106,7 +106,11 @@ snapshot copy — the live `chat.db` is never opened directly.
 
 `make ingest` needs Ollama up for the embedding step; run
 `make ingest INGEST_ARGS=--no-embed` instead to skip it and get a searchable
-DB without semantic search.
+DB without semantic search. To ingest only recent history, pass a lookback
+window — `make ingest INGEST_ARGS="--lookback 3mo"` (units `d`/`w`/`mo`/`y`,
+e.g. `7d`, `2y`) keeps only messages from the last _N_ back; it combines with
+`--since-last`/`--senders`/`--exclude` and, like them, never deletes what's
+already ingested.
 
 ## Running on-device, without Ollama (Apple Foundation Models)
 

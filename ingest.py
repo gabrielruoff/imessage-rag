@@ -21,11 +21,16 @@ Usage:
     python3 ingest.py --exclude="+12015551234,alice@example.com"
                                         # ingest everything EXCEPT chats (direct or group)
                                         # containing any of the given phone numbers/emails
+    python3 ingest.py --lookback=3mo    # only ingest messages from the last 3 months
+                                        # (units d/w/mo/y); an extra lower bound on
+                                        # message.date, combines with the flags above
 """
 
 import argparse
+import calendar
 import datetime
 import http.client
+import re
 import shutil
 import sqlite3
 import sys
@@ -60,6 +65,64 @@ def apple_ns_to_iso(ns):
     if ns is None or ns == 0:
         return None
     return (APPLE_EPOCH + datetime.timedelta(seconds=ns / 1e9)).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Lookback window (--lookback)
+# ---------------------------------------------------------------------------
+
+_PERIOD_RE = re.compile(r"^\s*(\d+)\s*(d|w|mo|y)\s*$", re.IGNORECASE)
+
+
+def _parse_lookback(value):
+    """'1d'/'3mo'/'2y' -> (amount, unit); None passes through as "no filter".
+    Units: d=days, w=weeks, mo=months, y=years (bare 'm' is rejected to avoid
+    the minutes/months ambiguity). Raises SystemExit on malformed input."""
+    if value is None:
+        return None
+    m = _PERIOD_RE.match(value)
+    if not m:
+        raise SystemExit(
+            f"error: --lookback expects a period like 7d, 3mo, or 2y "
+            f"(units: d=days, w=weeks, mo=months, y=years); got {value!r}"
+        )
+    amount = int(m.group(1))
+    if amount <= 0:
+        raise SystemExit("error: --lookback period must be a positive number")
+    return amount, m.group(2).lower()
+
+
+def _subtract_period(when, amount, unit):
+    """`when` minus (amount, unit). d/w use timedelta; mo/y use calendar math,
+    clamping the day to the target month's last valid day (so Mar 31 - 1mo ->
+    Feb 28/29 rather than an invalid date)."""
+    if unit == "d":
+        return when - datetime.timedelta(days=amount)
+    if unit == "w":
+        return when - datetime.timedelta(weeks=amount)
+    months = amount * (12 if unit == "y" else 1)
+    total = when.year * 12 + (when.month - 1) - months
+    year, month = divmod(total, 12)
+    month += 1
+    day = min(when.day, calendar.monthrange(year, month)[1])
+    return when.replace(year=year, month=month, day=day)
+
+
+def _now_utc_naive():
+    """Wall-clock UTC as a naive datetime -- the space APPLE_EPOCH and
+    apple_ns_to_iso live in (messages.date is unlabeled UTC)."""
+    return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+
+
+def _lookback_cutoff_ns(period, now=None):
+    """(amount, unit) -> Apple-epoch-ns lower bound for message.date; None ->
+    None. `now` defaults to wall-clock UTC; passed in only by tests."""
+    if period is None:
+        return None
+    cutoff = _subtract_period(now or _now_utc_naive(), *period)
+    delta = cutoff - APPLE_EPOCH
+    # Integer ns to avoid float rounding at the ~1e18 scale (>2**53).
+    return (delta.days * 86400 + delta.seconds) * 1_000_000_000 + delta.microseconds * 1000
 
 
 def decode_streamtyped(blob: bytes):
@@ -318,9 +381,16 @@ def ingest_handles(src, tgt, contacts, handle_to_contact):
     print(f"Ingested {len(rows)} handles ({matched} matched to a contact)")
 
 
-def ingest_messages_and_reactions(src, tgt, since_rowid=0, allowed_chat_ids=None):
+def ingest_messages_and_reactions(src, tgt, since_rowid=0, allowed_chat_ids=None,
+                                  since_date_ns=None):
     params = [since_rowid]
     chat_filter = _chat_id_filter_sql("cmj.chat_id", allowed_chat_ids, params)
+    # Appended AFTER the chat filter so the placeholder order stays
+    # [since_rowid, *chat_ids, since_date_ns] for both queries below.
+    date_filter = ""
+    if since_date_ns is not None:
+        date_filter = "AND m.date >= ?"
+        params.append(since_date_ns)
 
     query = f"""
         SELECT
@@ -330,7 +400,7 @@ def ingest_messages_and_reactions(src, tgt, since_rowid=0, allowed_chat_ids=None
             m.associated_message_type, m.associated_message_guid
         FROM message m
         LEFT JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
-        WHERE m.ROWID > ? {chat_filter}
+        WHERE m.ROWID > ? {chat_filter} {date_filter}
         ORDER BY m.ROWID
     """
     n_msg = 0
@@ -345,7 +415,7 @@ def ingest_messages_and_reactions(src, tgt, since_rowid=0, allowed_chat_ids=None
         SELECT COUNT(*)
         FROM message m
         LEFT JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
-        WHERE m.ROWID > ? {chat_filter}
+        WHERE m.ROWID > ? {chat_filter} {date_filter}
     """, params).fetchone()[0]
 
     with progress.track("Ingesting messages", total=n_total) as p:
@@ -389,19 +459,28 @@ def ingest_messages_and_reactions(src, tgt, since_rowid=0, allowed_chat_ids=None
     return n_msg
 
 
-def ingest_attachments(src, tgt, since_rowid=0, allowed_chat_ids=None):
+def ingest_attachments(src, tgt, since_rowid=0, allowed_chat_ids=None,
+                       since_date_ns=None):
     params = [since_rowid]
     join_clause = ""
     if allowed_chat_ids is not None:
         join_clause = "JOIN chat_message_join cmj ON cmj.message_id = maj.message_id"
     chat_filter = _chat_id_filter_sql("cmj.chat_id", allowed_chat_ids, params)
+    # Attachments carry no date of their own; join `message` to reach it so the
+    # attachment set stays aligned with the (date-filtered) message set.
+    date_join = date_filter = ""
+    if since_date_ns is not None:
+        date_join = "JOIN message m ON m.ROWID = maj.message_id"
+        date_filter = "AND m.date >= ?"
+        params.append(since_date_ns)
 
     rows = src.execute(f"""
         SELECT a.ROWID, maj.message_id, a.filename, a.mime_type, a.transfer_name
         FROM attachment a
         JOIN message_attachment_join maj ON maj.attachment_id = a.ROWID
         {join_clause}
-        WHERE maj.message_id > ? {chat_filter}
+        {date_join}
+        WHERE maj.message_id > ? {chat_filter} {date_filter}
     """, params).fetchall()
     for rowid, message_id, filename, mime_type, transfer_name in rows:
         tgt.execute(
@@ -436,10 +515,18 @@ def main():
     ap.add_argument("-x", "--exclude", default=None,
                      help="comma-separated list of phone numbers/emails; skip any "
                           "chat (direct or group) that includes at least one of them")
+    ap.add_argument("-l", "--lookback", default=None, metavar="PERIOD",
+                     help="only ingest messages from the last PERIOD, e.g. 7d, 3mo, 2y "
+                          "(units d=days/w=weeks/mo=months/y=years); an extra lower "
+                          "bound on message.date, combines with --since-last/--senders/"
+                          "--exclude")
     args = ap.parse_args()
 
     senders = _split_csv(args.senders)
     excluded = _split_csv(args.exclude)
+    # Parse-and-validate before the (potentially multi-GB) snapshot copy so a
+    # typo fails instantly rather than minutes in.
+    lookback = _parse_lookback(args.lookback)
 
     snapshot_source(SOURCE_DB, SNAPSHOT_DB)
 
@@ -461,6 +548,15 @@ def main():
             if args.since_last:
                 since_rowid = int(get_state(tgt, "last_message_rowid", 0))
                 print(f"Incremental run: ingesting messages with ROWID > {since_rowid}")
+
+            since_date_ns = None
+            if lookback:
+                # Sample "now" once so the printed date matches the applied cutoff.
+                now = _now_utc_naive()
+                since_date_ns = _lookback_cutoff_ns(lookback, now=now)
+                cutoff = _subtract_period(now, *lookback)
+                print(f"Lookback filter: ingesting messages on/after "
+                      f"{cutoff.date().isoformat()} (last {args.lookback})")
 
             allowed_chat_ids = resolve_allowed_chat_ids(src, senders)
             if senders is not None:
@@ -490,8 +586,9 @@ def main():
             contacts, handle_to_contact = build_contact_lookup()
             ingest_contacts(tgt, contacts)
             ingest_handles(src, tgt, contacts, handle_to_contact)
-            ingest_messages_and_reactions(src, tgt, since_rowid, allowed_chat_ids)
-            ingest_attachments(src, tgt, since_rowid, allowed_chat_ids)
+            ingest_messages_and_reactions(src, tgt, since_rowid, allowed_chat_ids,
+                                          since_date_ns)
+            ingest_attachments(src, tgt, since_rowid, allowed_chat_ids, since_date_ns)
             tgt.commit()
 
             # Chunk building is cheap and local -- always runs. Only the

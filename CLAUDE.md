@@ -28,7 +28,10 @@ Full design history, schema, rationale, and data forensics:
   Apple Silicon, Apple Intelligence enabled. Kept out of `make install` (same
   reason as `install-ollama`). Defaults are unchanged — apple is opt-in.
 - Ingest: `make ingest`, or `.venv/bin/python3 ingest.py [--no-embed]
-  [--since-last] [--senders=...] [--exclude=...]`
+  [--since-last] [--senders=...] [--exclude=...] [--lookback=PERIOD]`
+  (`--lookback`/`-l` takes a period like `7d`/`3mo`/`2y` — units d/w/mo/y,
+  calendar-correct — and adds a `message.date >= now-PERIOD` lower bound;
+  combines with the other flags, drops dateless/system rows for that run)
 - Chat CLI: `.venv/bin/python3 chat.py` (interactive REPL), or
   `chat.py -p "..."` for a one-shot answer (prints only the reply; exit 1 if
   Ollama is unreachable)

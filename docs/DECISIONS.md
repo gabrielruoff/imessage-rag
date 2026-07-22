@@ -197,7 +197,17 @@ targeted retrieval.
   already in `imessage_analysis.db`. Ingestion is purely additive (see
   "append-only store" below), so running with different filters accumulates
   the union of all matched chats across runs rather than replacing the DB
-  with just the latest filter's rows.
+  with just the latest filter's rows. `--lookback`/`-l` (a period like `7d`,
+  `3mo`, `2y` — units d=days/w=weeks/mo=months/y=years, with `mo`/`y`
+  calendar-correct and short-month/leap edges clamped) adds a
+  `message.date >= now - PERIOD` lower bound, computed once against wall-clock
+  UTC and applied inside the source read (messages, their reactions, and their
+  attachments). It's orthogonal to the other flags — ANDs with `--since-last`'s
+  ROWID bound and the sender/exclude chat allowlist — and, like them, is purely
+  additive: a later unfiltered run still backfills the older messages. Dateless
+  system rows (`message.date` NULL/0) fall outside any window and are skipped
+  while `--lookback` is active; `last_message_rowid` still advances to the newest
+  message, so a subsequent `--since-last` stays correct.
 - **`embed.py`** — the embedding step, called from `ingest.main` after the
   relational ingest: `build_vec_table` (creates the `message_vectors` vec0
   table) and `embed_messages` (thread-pooled batch embedding via
