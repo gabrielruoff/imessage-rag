@@ -187,6 +187,33 @@ class TestMessageFlattening(unittest.TestCase):
             applefm.chat_once([{"role": "user", "content": "x"}], think="high")
 
 
+class TestRespondMaxTokensPayload(unittest.TestCase):
+    """respond()'s max_tokens plumbing is purely additive: a positive value adds
+    "max_tokens" to the wire payload; anything falsy leaves the payload
+    byte-for-byte unchanged from before the cap was added."""
+
+    def test_positive_max_tokens_included_in_payload(self):
+        with mock.patch.object(applefm, "_transact",
+                               return_value={"content": ""}) as fake:
+            applefm.respond("sys", "prompt", max_tokens=12)
+        payload = fake.call_args[0][0]
+        self.assertEqual(payload["max_tokens"], 12)
+
+    def test_none_max_tokens_omitted_from_payload(self):
+        with mock.patch.object(applefm, "_transact",
+                               return_value={"content": ""}) as fake:
+            applefm.respond("sys", "prompt")
+        payload = fake.call_args[0][0]
+        self.assertNotIn("max_tokens", payload)
+
+    def test_zero_max_tokens_omitted_from_payload(self):
+        with mock.patch.object(applefm, "_transact",
+                               return_value={"content": ""}) as fake:
+            applefm.respond("sys", "prompt", max_tokens=0)
+        payload = fake.call_args[0][0]
+        self.assertNotIn("max_tokens", payload)
+
+
 # A tiny Python stand-in for the compiled Swift shim: reads JSON-line requests
 # and emits protocol responses. Behavior is driven off the request so tests can
 # provoke each path (errors, streaming, crashes) through the prompt/op. The
