@@ -7,6 +7,9 @@ imessage_analysis.db-wal
 imessage_analysis.db-shm
 .venv/
 
+# compiled Apple Foundation Models shim (build artifact of `make apple-shim`)
+bin/
+
 __pycache__/
 *.pyc
 .env
@@ -16,9 +19,10 @@ __pycache__/
 # local agent settings -- machine-specific, never shared
 .claude/settings.local.json
 
-# repo-leaner audit artifacts (local working files, never committed)
+# local working plan/audit artifacts (never committed)
 REPO_REVIEW.md
 REPO_FIX_PLAN.md
+APPLE_FM_PLAN.md
 
 # generated Wrapped reports -- they quote real messages verbatim
 wrapped_*.html

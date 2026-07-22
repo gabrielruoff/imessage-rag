@@ -40,6 +40,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import annotate_distill
+import config
 import ollama
 import progress
 import schema
@@ -75,6 +76,15 @@ QUALITY_PRESETS = {
     "fast": ("low", 8),
     "distilled": ("low", 1),
 }
+
+# Apple backend: batch by chunk-text chars, not a fixed row count. The FM
+# window is a fixed 4,096 tokens (~16k chars), and a request over it is
+# silently dropped, not rejected -- so the batched-annotation prompt has to be
+# packed under a char budget rather than the Ollama batch_size. ~12k chars of
+# chunk text leaves headroom for _ANNOTATE_SYSTEM + _BATCH_SYSTEM_SUFFIX and
+# the JSON reply inside the window. A module constant, not a config knob: it is
+# a property of the FM window, not something a user tunes.
+_APPLE_ANNOTATE_CHAR_BUDGET = 12000
 
 EVENT_KINDS = ("good_news", "gratitude")
 RESPONSE_CLASSES = (
@@ -338,6 +348,29 @@ def _write_annotation(con, chunk_id, data, source="llm"):
     )
 
 
+def _char_budget_groups(pending, budget):
+    """Greedily pack (chunk_id, text) rows into groups whose combined chunk
+    text stays under `budget` chars -- the apple backend's batching unit,
+    since its fixed window makes a row count the wrong measure. Accumulate
+    until the next row would exceed the budget, then start a new group; a
+    single chunk bigger than the budget still gets its own group (>=1 row
+    always), which _annotate_group sends as a singleton, exactly like
+    batch_size 1."""
+    groups = []
+    group = []
+    used = 0
+    for row in pending:
+        text_len = len(row[1] or "")
+        if group and used + text_len > budget:
+            groups.append(group)
+            group, used = [], 0
+        group.append(row)
+        used += text_len
+    if group:
+        groups.append(group)
+    return groups
+
+
 def annotate_chunks(con, model, all_chats=False, top_dyads=ANNOTATE_TOP_DYADS,
                     limit=None, dry_run=False, think=None, batch_size=1,
                     workers=1, upgrade_distilled=False):
@@ -362,7 +395,12 @@ def annotate_chunks(con, model, all_chats=False, top_dyads=ANNOTATE_TOP_DYADS,
         return 0
     _check_model_guard(con, model)
 
-    groups = [pending[i:i + batch_size] for i in range(0, len(pending), batch_size)]
+    # Apple packs by a char budget (its window makes a fixed row count the
+    # wrong unit); every other backend keeps the exact row-count batching.
+    groups = (_char_budget_groups(pending, _APPLE_ANNOTATE_CHAR_BUDGET)
+              if config.is_apple_model(model)
+              else [pending[i:i + batch_size]
+                    for i in range(0, len(pending), batch_size)])
     n_done = n_skipped = 0
     try:
         with progress.track("Annotating chunks", total=len(pending),

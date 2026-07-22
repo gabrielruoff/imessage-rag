@@ -30,6 +30,12 @@ _SCRATCH_TABLE = "_topic_centroids"
 _EARLY_STOP_FRACTION = 0.005  # stop when <0.5% of chunks changed cluster
 _LABEL_MAX_CHARS = 60
 _SAMPLE_TEXT_CHARS = 1200
+# Apple backend: cap the label prompt to this many chars. The FM window is a
+# fixed 4,096 tokens (~16k chars) and an oversized message is silently dropped,
+# so the centroid-ranked samples are packed under a budget instead of all
+# TOPIC_LABEL_SAMPLES going in. A module constant, not a config knob -- it is a
+# property of the FM window, not a user dial.
+_APPLE_LABEL_CHAR_BUDGET = 6000
 
 _LABEL_SYSTEM = """You name topics in a personal text-message archive. You are given a few
 sample conversation excerpts that all belong to one topic cluster. Respond
@@ -222,9 +228,30 @@ def label_clusters(con, relabel=False, samples=TOPIC_LABEL_SAMPLES, model=None):
                 p.advance()
                 continue
             placeholders = ",".join("?" * len(sample_ids))
-            texts = [r[0] for r in con.execute(
-                f"SELECT text FROM chunks WHERE id IN ({placeholders})", sample_ids)]
-            prompt = "\n\n---\n\n".join(t[:_SAMPLE_TEXT_CHARS] for t in texts if t)
+            if config.is_apple_model(model or config.TOPIC_MODEL):
+                # Clamp to the FM window while KEEPING centroid ranking: the
+                # IN (...) SELECT returns rows in an arbitrary order, so map
+                # id->text and walk sample_ids (centroid-nearest first),
+                # packing truncated snippets until the char budget. The most
+                # topical samples make it in even after the cut; the guard
+                # keeps at least the single nearest chunk.
+                id_text = dict(con.execute(
+                    f"SELECT id, text FROM chunks WHERE id IN ({placeholders})",
+                    sample_ids))
+                picked, used = [], 0
+                for cid in sample_ids:
+                    snippet = (id_text.get(cid) or "")[:_SAMPLE_TEXT_CHARS]
+                    if not snippet:
+                        continue
+                    if picked and used + len(snippet) > _APPLE_LABEL_CHAR_BUDGET:
+                        break
+                    picked.append(snippet)
+                    used += len(snippet)
+                prompt = "\n\n---\n\n".join(picked)
+            else:
+                texts = [r[0] for r in con.execute(
+                    f"SELECT text FROM chunks WHERE id IN ({placeholders})", sample_ids)]
+                prompt = "\n\n---\n\n".join(t[:_SAMPLE_TEXT_CHARS] for t in texts if t)
 
             # The TOPIC_* settings are resolved through config at call time,
             # so tests can patch that seam.

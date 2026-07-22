@@ -2,7 +2,7 @@
         ingest annotate annotate-all topics pipeline eval eval-dry \
         chat wrapped \
         lint test check reset-db \
-        install install-ollama ollama-start ollama-stop
+        install install-ollama ollama-start ollama-stop apple-shim
 
 # Without this, `make` runs the first target in the file. That used to be
 # `ingest`, so the most natural first command on a fresh clone was
@@ -399,3 +399,34 @@ ollama-start:  ## Start/restart Ollama with 4 parallel request slots
 ollama-stop:  ## Stop the Ollama service
 	@$(REQUIRE_BREW)
 	brew services stop ollama
+
+# --- Apple Foundation Models (opt-in) ----------------------------------------
+# The on-device alternative to Ollama: point any *_MODEL (or EMBED_MODEL) at the
+# `apple` sentinel and the app routes through this compiled Swift shim instead of
+# a pulled model. Command Line Tools alone suffice -- FoundationModels.framework
+# and NaturalLanguage.framework both ship in the CLT SDK, so no full Xcode. Kept
+# OUT of `make install` and a prerequisite of nothing, exactly like
+# install-ollama: install stays fast and offline, and the shim is dead weight
+# unless you actually opt into the apple backend.
+#
+# -parse-as-library because main.swift is an @main async entry point, not
+# top-level code. Compiling is the HARD requirement; the availability probe after
+# it is informational -- the shim builds on any Mac with CLT, but USING it needs
+# macOS 26+ Apple Silicon with Apple Intelligence enabled, and an "unavailable"
+# result there is a System Settings matter, not a build failure, so it never
+# fails the target.
+apple-shim:  ## Compile the Apple Foundation Models Swift shim (needs macOS 26+, Apple Silicon)
+	@mkdir -p bin
+	swiftc -O -parse-as-library -o bin/applefm-shim applefm_shim/main.swift
+	@echo ""
+	@echo ">>> availability self-check"
+	@avail=$$(printf '{"op":"availability","id":1}\n' | ./bin/applefm-shim); \
+	 echo "    $$avail"; \
+	 case "$$avail" in \
+	   *'"available":true'*) \
+	     echo "    Apple Intelligence is available -- the apple backend is ready to use.";; \
+	   *) \
+	     echo "    The shim compiled, but Apple Intelligence is NOT available here."; \
+	     echo "    Using the apple backend needs macOS 26+ on Apple Silicon with Apple"; \
+	     echo "    Intelligence enabled: System Settings -> Apple Intelligence & Siri.";; \
+	 esac

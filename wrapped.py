@@ -52,6 +52,13 @@ DB_PATH = str(config.TARGET_DB)
 # analytics tools -- see query_tools._shared._REAL_MESSAGE_CLAUSES).
 _REAL_MSG = "COALESCE(m.is_emote, 0) = 0 AND COALESCE(m.item_type, 0) = 0"
 
+# Apple backend: cap the stats-JSON prompt at this many chars. The FM window is
+# a fixed 4,096 tokens (~16k chars) and an oversized message is silently
+# dropped, so a big section's payload is truncated (with a marker so the
+# narrator knows it was cut) rather than lost whole. A module constant, not a
+# config knob -- it is a property of the FM window, not a user dial.
+_APPLE_NARRATE_CHAR_BUDGET = 6000
+
 _NARRATIVE_SYSTEM = (
     "You write the short blurb that opens each section of a personal year-in-review "
     "texting report (think Spotify Wrapped, for iMessage). You get one section's "
@@ -238,6 +245,12 @@ def narrate_section(title, stats, hint=None, report_title=""):
     report isn't narrated as "this year". Raises on LLM failure -- the
     caller falls back to stats-only."""
     payload = json.dumps(wrapped_html.humanized(stats), ensure_ascii=False, default=str)
+    if config.is_apple_model(config.WRAPPED_MODEL) and len(payload) > _APPLE_NARRATE_CHAR_BUDGET:
+        # The FM window can't take a full section's stats JSON; cut it and mark
+        # the cut -- payload is prompt text, so the marker just tells the
+        # narrator the numbers are partial (better a short, honest prompt than
+        # a whole message Ollama's apple path would silently drop).
+        payload = payload[:_APPLE_NARRATE_CHAR_BUDGET] + " ...(truncated)"
     content = ""
     if report_title:
         content += (f"Report: {report_title} (match your wording to this scope -- "

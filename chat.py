@@ -19,6 +19,7 @@ from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
 
+import config
 import ollama
 import query_tools
 from config import CHAT_MODEL, MAX_TOOL_ITERATIONS, TOOL_RESULT_MAX_CHARS
@@ -250,6 +251,13 @@ def run_turn(messages, show_model_header=True, model=None):
     content nor tool calls -- one final request is made with the tools
     withheld and a final-turn note folded into the system prompt, forcing an
     answer out of whatever was already gathered."""
+    if config.is_apple_model(model or CHAT_MODEL):
+        # The Apple Foundation Models window (a fixed 4,096 tokens) is far too
+        # small for this native tool loop; chat_apple stages the turn instead.
+        # Imported lazily to avoid an import cycle (chat_apple imports chat).
+        import chat_apple
+
+        return chat_apple.run_turn(messages, show_model_header=show_model_header, model=model)
     seen_calls = set()
     for _ in range(MAX_TOOL_ITERATIONS):
         try:
@@ -374,7 +382,8 @@ def main():
         return
 
     messages = [{"role": "system", "content": _build_system_prompt()}]
-    print(f"Chatting with your iMessage history ({args.model} via Ollama). Ctrl+C to quit.")
+    backend = "Apple Foundation Models" if config.is_apple_model(args.model) else "Ollama"
+    print(f"Chatting with your iMessage history ({args.model} via {backend}). Ctrl+C to quit.")
     print("Commands: /clear (reset conversation)\n")
     while True:
         try:
