@@ -48,7 +48,7 @@ class ScriptedRespond:
         self.prompts = []
         self.route_calls = self.fill_calls = self.digest_calls = self.answer_calls = 0
 
-    def __call__(self, system, prompt, schema=None, stream=False):
+    def __call__(self, system, prompt, schema=None, stream=False, max_tokens=None):
         self.prompts.append(prompt)
         if stream:
             self.answer_calls += 1
@@ -279,6 +279,79 @@ class SchemaConverterTest(unittest.TestCase):
             for req in simplified.get("required", []):
                 self.assertIn(req, simplified["properties"])  # required stays kept-only
 
+    def test_description_is_preserved_and_capped(self):
+        long_desc = "x" * (chat_apple._ARG_DESC_MAX + 50)
+        schema = {
+            "type": "object",
+            "properties": {
+                "chat_id": {"type": ["integer", "array"], "items": {"type": "integer"},
+                            "description": "  " + long_desc + "  "},
+                "granularity": {"type": "string", "enum": ["day", "month"],
+                                "description": "bucket size"},
+                "bare": {"type": "integer"},
+            },
+        }
+        out = chat_apple._simplify_schema(schema)["properties"]
+        # kept, stripped, and capped to _ARG_DESC_MAX
+        self.assertEqual(out["chat_id"]["description"], "x" * chat_apple._ARG_DESC_MAX)
+        # survives on an enum-bearing string property too
+        self.assertEqual(out["granularity"]["description"], "bucket size")
+        # a property with no description gets no description key
+        self.assertNotIn("description", out["bare"])
+
+    def test_real_schemas_carry_descriptions_through(self):
+        # The regression this fixes: the FILL model was blind to what each arg
+        # meant. get_activity_patterns.include's valid sections live only in its
+        # description; assert that guidance now reaches the simplified schema.
+        spec = chat_apple._TOOL_SPECS["get_activity_patterns"]
+        self.assertIn("heatmap", spec["schema"]["properties"]["include"]["description"])
+
+
+class GroundArgsTest(unittest.TestCase):
+    """The code guardrail behind ARG_SYSTEM's 'never invent an id or date' rule:
+    id/date filters not grounded in the gathered facts (or question) are dropped
+    before the tool runs."""
+
+    def test_empty_scratchpad_drops_every_id(self):
+        # First call of a turn: no facts -> filters stripped -> whole-corpus call.
+        out = chat_apple._ground_args({"chat_id": 1, "handle_id": 42}, "how many messages?", "", [])
+        self.assertEqual(out, {})
+
+    def test_grounded_id_survives_fabricated_dropped(self):
+        sp = ["[search_contacts_by_name] contact_id=168, chat_id=42 for Jill"]
+        out = chat_apple._ground_args(
+            {"chat_id": 42, "handle_id": 999}, "when did Jill and I first text?", "", sp)
+        self.assertEqual(out, {"chat_id": 42})  # 42 grounded, 999 fabricated
+
+    def test_word_boundary_not_substring(self):
+        # The prototype bug: "1" in "1234" matched. A word-boundary test must not.
+        out = chat_apple._ground_args({"chat_id": 1}, "q", "", ["chat with id=1234"])
+        self.assertEqual(out, {})
+
+    def test_list_valued_id_filters_to_grounded_members(self):
+        sp = ["chat_id=42 and chat_id=43 in the family thread"]
+        out = chat_apple._ground_args({"chat_id": [42, 999, 43]}, "q", "", sp)
+        self.assertEqual(out, {"chat_id": [42, 43]})
+
+    def test_date_year_grounding(self):
+        out = chat_apple._ground_args(
+            {"date_from": "2024-01-01", "date_to": "2019-05-01"},
+            "what did we say in 2024?", "", [])
+        self.assertEqual(out, {"date_from": "2024-01-01"})  # 2019 ungrounded
+
+    def test_non_id_date_keys_pass_untouched(self):
+        args = {"limit": 50, "granularity": "day", "include": ["heatmap"],
+                "is_from_me": True, "query": "beach"}
+        out = chat_apple._ground_args(dict(args), "q", "", [])
+        self.assertEqual(out, args)
+
+    def test_id_grounded_via_summary_or_question(self):
+        # Grounding corpus includes the prior-turn summary and the question.
+        out = chat_apple._ground_args({"contact_id": 7}, "tell me about contact 7", "", [])
+        self.assertEqual(out, {"contact_id": 7})
+        out = chat_apple._ground_args({"contact_id": 7}, "q", "earlier we found contact_id 7", [])
+        self.assertEqual(out, {"contact_id": 7})
+
 
 class CompactionTest(AppleChatTest):
     """The scratchpad is compacted back under _SCRATCHPAD_BUDGET so a later
@@ -293,7 +366,7 @@ class CompactionTest(AppleChatTest):
         self.assertEqual(called, [])  # no digest call when already under budget
 
     def test_over_budget_compacts_via_one_digest(self):
-        self.install(lambda system, prompt, schema=None, stream=False: "COMPACTED")
+        self.install(lambda system, prompt, schema=None, stream=False, max_tokens=None: "COMPACTED")
         sp = ["f" * 4000, "g" * 4000]  # 8000 > _SCRATCHPAD_BUDGET
         self.assertEqual(chat_apple._compact("q", sp), ["COMPACTED"])
 
@@ -312,7 +385,7 @@ class WindowOverflowTest(AppleChatTest):
     failure a hermetic fake can only reach by raising it deliberately."""
 
     def test_route_overflow_falls_through_to_answer(self):
-        def fake(system, prompt, schema=None, stream=False):
+        def fake(system, prompt, schema=None, stream=False, max_tokens=None):
             if stream:
                 return iter(("degraded answer",))
             if schema is not None and "action" in (schema.get("properties") or {}):
@@ -326,7 +399,7 @@ class WindowOverflowTest(AppleChatTest):
     def test_answer_overflow_retries_then_degrades(self):
         state = {"answer": 0}
 
-        def fake(system, prompt, schema=None, stream=False):
+        def fake(system, prompt, schema=None, stream=False, max_tokens=None):
             if stream:
                 state["answer"] += 1
                 if state["answer"] < 3:
@@ -350,7 +423,7 @@ class GenerationRejectedTest(AppleChatTest):
     raised out of run_turn. Mirrors WindowOverflowTest with the sibling error."""
 
     def test_route_rejection_falls_through_to_answer(self):
-        def fake(system, prompt, schema=None, stream=False):
+        def fake(system, prompt, schema=None, stream=False, max_tokens=None):
             if stream:
                 return iter(("degraded answer",))
             if schema is not None and "action" in (schema.get("properties") or {}):
@@ -364,7 +437,7 @@ class GenerationRejectedTest(AppleChatTest):
     def test_answer_rejection_retries_then_degrades(self):
         state = {"answer": 0}
 
-        def fake(system, prompt, schema=None, stream=False):
+        def fake(system, prompt, schema=None, stream=False, max_tokens=None):
             if stream:
                 state["answer"] += 1
                 if state["answer"] < 3:
@@ -452,7 +525,7 @@ class WellbeingFloorTest(AppleChatTest):
         # STILL print (resources must survive even a failed answer).
         self._stub_wb_tool()
 
-        def fake(system, prompt, schema=None, stream=False):
+        def fake(system, prompt, schema=None, stream=False, max_tokens=None):
             if stream:
                 def boom():
                     raise applefm.ContextOverflowError("too big")

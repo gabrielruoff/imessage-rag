@@ -23,6 +23,7 @@ config.is_apple_model(model) -- see chat.py.
 """
 
 import json
+import re
 
 import applefm
 import config
@@ -47,10 +48,11 @@ ROUTE_SYSTEM = (
 )
 ARG_SYSTEM = (
     "You produce the arguments for one tool call of an iMessage-history "
-    "assistant. Given the question and the facts gathered so far, fill in the "
-    "tool's JSON arguments. Reuse ids (chat_id, handle_id, contact_id) that "
-    "already appear in the facts rather than inventing them; leave out any "
-    "argument you do not need. Reply with only the JSON object."
+    "assistant. Most arguments are OPTIONAL filters -- read each argument's "
+    "description. Include an id (chat_id, handle_id, contact_id) or a date "
+    "(date_from, date_to) ONLY if its value appears in the question or the facts "
+    "gathered so far; NEVER invent one. To count or analyze the whole corpus, "
+    "pass no filters at all. Reply with only the JSON object."
 )
 DIGEST_SYSTEM = (
     "You extract the facts relevant to a question from one chunk of a tool "
@@ -78,6 +80,13 @@ _NOTHING_RELEVANT = "nothing relevant"
 # ["string","array"]->string, ["string","integer"]->string.
 _TYPE_PREFERENCE = ("string", "integer", "number", "boolean", "array")
 
+# Per-property descriptions are the shim's generation guides (main.swift threads
+# them into DynamicGenerationSchema.Property) and ride out-of-band as the
+# `schema` payload, so they cost nothing against the 4,096-token PROMPT budget --
+# but a cap keeps the constrained-decoding grammar small and keeps the first,
+# load-bearing sentence (e.g. the id/date-format and include-section guidance).
+_ARG_DESC_MAX = 200
+
 
 def _pick_type(type_field):
     """Collapse a JSON-Schema `type` (a bare string, or a union list) to the one
@@ -95,7 +104,11 @@ def _simplify_property(prop):
     """Map one JSON-Schema property to the shim's supported subset, or None to
     drop it. A union collapses to a single type (_pick_type); an enum survives
     only as an enum-of-strings on a string; an array keeps a scalar `items`
-    type (array-of-object / array-of-array are unsupported and dropped)."""
+    type (array-of-object / array-of-array are unsupported and dropped). The
+    property's `description` is preserved (capped at _ARG_DESC_MAX) -- the shim
+    forwards it to the model as a generation guide, and without it the arg-filler
+    is blind to what each id/date/enum field means (the classic fabricated-arg
+    failure)."""
     if not isinstance(prop, dict):
         return None
     t = _pick_type(prop.get("type"))
@@ -105,11 +118,15 @@ def _simplify_property(prop):
         item_t = _pick_type((prop.get("items") or {}).get("type"))
         if item_t is None or item_t == "array":
             return None
-        return {"type": "array", "items": {"type": item_t}}
-    out = {"type": t}
-    enum = prop.get("enum")
-    if t == "string" and isinstance(enum, list) and all(isinstance(e, str) for e in enum):
-        out["enum"] = list(enum)
+        out = {"type": "array", "items": {"type": item_t}}
+    else:
+        out = {"type": t}
+        enum = prop.get("enum")
+        if t == "string" and isinstance(enum, list) and all(isinstance(e, str) for e in enum):
+            out["enum"] = list(enum)
+    desc = prop.get("description")
+    if isinstance(desc, str) and desc.strip():
+        out["description"] = desc.strip()[:_ARG_DESC_MAX]
     return out
 
 
@@ -320,11 +337,53 @@ def _route(question, summary, scratchpad):
     return action if isinstance(action, str) else "answer"
 
 
+# Id / date filter args the small FM model fabricates most (see _ground_args).
+_ID_ARG_KEYS = ("chat_id", "handle_id", "contact_id")
+_DATE_ARG_KEYS = ("date_from", "date_to")
+
+
+def _ground_args(args, question, summary, scratchpad):
+    """Code enforcement of ARG_SYSTEM's "never invent an id or date" rule: drop
+    any id/date filter whose value is not grounded in the facts gathered so far
+    (or the question). The FM arg-filler routinely fabricates precise-looking
+    chat_id/handle_id/contact_id values and date windows that were never
+    retrieved, zeroing out the query; prompting alone does not stop it.
+
+    An id member survives only on a WORD-BOUNDARY match against the corpus -- a
+    substring test ("1" in "1234") matched everything and let bad ids through. A
+    date survives only if its leading 4-digit year appears in the corpus. Every
+    other argument (is_from_me, limit, granularity, include, query, ...) passes
+    untouched. On an empty scratchpad nothing grounds, so the first call runs
+    filter-free (the whole-corpus aggregate) and name->id resolution must precede
+    any filtering -- exactly the intended flow."""
+    if not isinstance(args, dict):
+        return {}
+    corpus = "\n".join(scratchpad) + "\n" + (summary or "") + "\n" + (question or "")
+    cleaned = {}
+    for key, value in args.items():
+        if key in _ID_ARG_KEYS:
+            members = value if isinstance(value, list) else [value]
+            kept = [x for x in members
+                    if re.search(rf"\b{re.escape(str(x))}\b", corpus)]
+            if not kept:
+                continue  # every id fabricated -- drop the filter
+            cleaned[key] = kept if isinstance(value, list) else kept[0]
+        elif key in _DATE_ARG_KEYS:
+            year = re.match(r"\s*(\d{4})", str(value))
+            if year and year.group(1) in corpus:
+                cleaned[key] = value
+            # else: fabricated date window -- drop it
+        else:
+            cleaned[key] = value
+    return cleaned
+
+
 def _fill_args(name, question, summary, scratchpad):
     """FILL stage: generate `name`'s arguments as JSON, guided against its
     simplified input schema, reusing ids already in the scratchpad. A malformed
     reply yields {} (the tool then runs with its defaults, or errors into a note
-    the next digest can read)."""
+    the next digest can read). Filled args pass through _ground_args, which drops
+    any id/date filter the model fabricated rather than took from the facts."""
     spec = _TOOL_SPECS[name]
     prompt = (
         _context_block(question, summary, scratchpad)
@@ -335,7 +394,8 @@ def _fill_args(name, question, summary, scratchpad):
                              max_tokens=config.APPLE_FILL_MAX_TOKENS)
     except (applefm.ContextOverflowError, applefm.GenerationRejectedError):
         return {}  # fall back to the tool's own argument defaults
-    return data if isinstance(data, dict) else {}
+    data = data if isinstance(data, dict) else {}
+    return _ground_args(data, question, summary, scratchpad)
 
 
 def _execute(chat, name, args, seen_calls, wb_state):
