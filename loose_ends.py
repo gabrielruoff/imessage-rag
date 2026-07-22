@@ -37,9 +37,6 @@ import argparse
 import datetime
 import json
 import math
-import statistics
-from dataclasses import dataclass, field
-from typing import Callable, Iterable
 
 import ollama
 import progress
@@ -61,7 +58,14 @@ from config import (
 )
 from consent import parse_consent_ids
 from db import CONTACT_LABEL_SQL, connect_default, get_state, run_cli, set_state
-from query_tools._shared import _REAL_MESSAGE_CLAUSES
+from nudge_shared import (  # noqa: F401 -- re-exported for tests / nudge_detectors
+    DETECTORS,
+    CandidateRow,
+    _REAL,
+    _counterparty_handle,
+    _dyad_gap_p90,
+    _last_message,
+)
 from query_tools.nudges import (
     _add_exclusion,
     _is_excluded,
@@ -122,9 +126,6 @@ from config import NUDGE_GOODNEWS_ENABLED, NUDGE_GOODNEWS_MAX_AGE_DAYS
 # Module attribute so tests can patch it; _connect() reads it at call time.
 DB_PATH = TARGET_DB
 
-# The shared real-message predicate, spelled once for the string joins below.
-_REAL = " AND ".join(_REAL_MESSAGE_CLAUSES)
-
 # Stage-0 auto-exclusion reasons (the 'auto:' prefix distinguishes them from a
 # user mute written by mute_contact_from_nudges).
 _REASON_NEGATIVE = "auto:negative_valence"
@@ -140,33 +141,6 @@ def _connect():
     return connect_default(DB_PATH, rows=True)
 
 
-# ---------------------------------------------------------------------------
-# Candidate rows + the detector registry
-# ---------------------------------------------------------------------------
-
-@dataclass
-class CandidateRow:
-    """A detector's output: the loose_threads column fields it is responsible
-    for (minus id/urgency/status, which the driver owns). A detector fills in
-    the detection-relevant fields; the driver computes urgency, sets
-    status='open'/detected_at, applies the Stage-0 exclusion gate, and later
-    narrates nudge_text. A detector never writes a row itself."""
-
-    kind: str
-    chat_id: int
-    handle_id: int | None = None
-    anchor_message_id: int | None = None
-    anchor_date: str | None = None
-    evidence: dict = field(default_factory=dict)
-    due_by: str | None = None
-    source: str = "sql"
-
-
-# Detector registry: (kind, detect_fn) pairs. N1 registers faded_initiator;
-# follow-ups append their own (kind, detect_fn) in a per-detector fence. The
-# driver loop below is the single place exclusion + urgency run.
-DETECTORS: list[tuple[str, Callable[[object, dict], Iterable[CandidateRow]]]] = []
-
 # Kinds whose detection re-runs a live, nondeterministic model verdict every
 # pass (dropped_plan is the only one -- the rest are deterministic SQL / read
 # precomputed annotations). Reconciliation auto-resolves any OPEN thread a run
@@ -180,51 +154,10 @@ NONDETERMINISTIC_KINDS = frozenset({"dropped_plan"})
 
 
 # ---------------------------------------------------------------------------
-# Shared dyad primitives (consumed by detectors here and in N2/N3)
+# Shared dyad primitives (_dyad_gap_p90/_counterparty_handle/_last_message) live
+# in nudge_shared, imported at the top of this module so loose_ends.<name> and
+# nudge_detectors both resolve them from one home.
 # ---------------------------------------------------------------------------
-
-def _dyad_gap_p90(con, chat_id):
-    """p90 of inter-message gaps (seconds) between consecutive real messages of
-    a dyad, or None when the chat has fewer than two such messages. Single home
-    for this primitive: N2/N3 detectors consume it (e.g. to decide a current
-    silence is anomalously long for how this pair normally paces)."""
-    dates = [
-        datetime.datetime.fromisoformat(r[0])
-        for r in con.execute(
-            f"SELECT m.date FROM messages m "
-            f"WHERE m.chat_id = ? AND m.date IS NOT NULL AND {_REAL} "
-            f"ORDER BY m.date, m.id",
-            (chat_id,),
-        ).fetchall()
-    ]
-    if len(dates) < 2:
-        return None
-    gaps = [(b - a).total_seconds() for a, b in zip(dates, dates[1:])]
-    if len(gaps) < 2:
-        return gaps[0]
-    return statistics.quantiles(gaps, n=10)[8]
-
-
-def _counterparty_handle(con, chat_id):
-    """The 1:1 chat's counterparty handle_id (the participant that is not me)."""
-    row = con.execute(
-        "SELECT handle_id FROM chat_participants WHERE chat_id = ? "
-        "ORDER BY handle_id LIMIT 1",
-        (chat_id,),
-    ).fetchone()
-    return row[0] if row else None
-
-
-def _last_message(con, chat_id):
-    """(id, date) of the most recent real message in a chat -- the nudge anchor."""
-    row = con.execute(
-        f"SELECT m.id, m.date FROM messages m "
-        f"WHERE m.chat_id = ? AND m.date IS NOT NULL AND {_REAL} "
-        f"ORDER BY m.date DESC, m.id DESC LIMIT 1",
-        (chat_id,),
-    ).fetchone()
-    return (row[0], row[1]) if row else (None, None)
-
 
 def _handle_contact(con, handle_id):
     """contact_id owning a handle (NULL when the handle is unlinked)."""

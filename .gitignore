@@ -31,3 +31,10 @@ analytical_audit.txt
 wrapped_*.html
 wrapped_*.md
 wrapped_*.txt
+
+# PyInstaller packaging output
+packaging/build/
+packaging/dist/
+build/
+dist/
+*.spec

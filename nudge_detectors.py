@@ -1,9 +1,10 @@
 """Loose Ends / nudge detectors (the six "# --- detector: X ---" families).
 
 Split out of loose_ends.py: the deterministic (plus one eval-gated LLM)
-detectors that yield CandidateRow objects. Each registers itself into
-loose_ends.DETECTORS on import. Reads the shared dyad primitives, CandidateRow,
-and the DETECTORS registry from loose_ends; loose_ends imports this module
+detectors that yield CandidateRow objects. Each registers itself into the shared
+DETECTORS registry on import. Reads the shared dyad primitives, CandidateRow, and
+the DETECTORS registry from nudge_shared (a neutral module both this file and
+loose_ends import, so there is no import cycle); loose_ends imports this module
 (running the registrations) and re-exports the detectors. Thresholds arrive via
 the cfg dict (built by loose_ends._build_cfg), so no config vars are read here.
 """
@@ -21,7 +22,7 @@ from eval.evalkit.gates import eval_gate_passed
 from query_tools._shared import TEXT_PREVIEW_CHARS, _restrict_to_direct_chats
 from query_tools.analytics_language import lsm_score
 
-from loose_ends import (
+from nudge_shared import (
     DETECTORS,
     CandidateRow,
     _REAL,
