@@ -143,7 +143,7 @@ and set only `CHAT_MODEL=apple`, say). Two things worth knowing:
   guards this and refuses to silently mix spaces.
 - **The on-device window is small (4,096 tokens)**, so the chat path retrieves
   in small staged steps under the hood, and a ~3B on-device model routes less
-  precisely across the 21 analytics tools than the 26B default — a great
+  precisely across the ~30 retrieval tools than the 26B default — a great
   zero-setup, fully-private option, at some cost in multi-hop accuracy.
   Everything still stays on your machine, exactly as with Ollama.
 
@@ -188,9 +188,9 @@ Run them one at a time. They can't run in parallel — each holds a SQLite write
 lock across many LLM calls, so a concurrent run dies with `database is locked`.
 (Within one job, LLM requests do fan out: `make ollama-start` runs Ollama with
 4 parallel slots and `annotate.py` keeps `ANNOTATE_WORKERS` requests in flight,
-worth ~2x on the LLM passes.) `make pipeline` runs ingest, annotation, and
-topics back to back in the right order (and stays sequential even under
-`make -j`).
+worth ~2x on the LLM passes.) `make pipeline` runs ingest, annotation, the
+analytical suite (nudges → drift → voiceprint → conflict), and topics back to
+back in the right order (and stays sequential even under `make -j`).
 
 **`annotate.py`** has two modes, and one run only does one of them:
 

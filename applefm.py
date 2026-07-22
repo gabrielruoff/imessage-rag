@@ -59,6 +59,7 @@ import subprocess
 import threading
 
 import config
+import ollama
 
 # The shim binary path, exposed as a module attribute so tests can patch it
 # (mirrors the DB_PATH convention in annotate.py/topics.py); the persistent
@@ -383,17 +384,11 @@ def chat_once_json(messages, model=None, retry_nudge=_JSON_RETRY_NUDGE,
     for _ in range(2):
         reply = chat_once(messages, model=model, format="json",
                           timeout=timeout, think=think)
-        content = reply.get("content") or ""
-        try:
-            data = json.loads(content)
-        except json.JSONDecodeError:
-            data = None
-        if isinstance(data, dict):
+        # Shared with ollama.chat_once_json -- one source for the parse/retry
+        # shape (see ollama._extract_reply).
+        data, messages = ollama._extract_reply(reply, messages, retry_nudge)
+        if data is not None:
             return data
-        messages = messages + [
-            {"role": "assistant", "content": content},
-            {"role": "user", "content": retry_nudge},
-        ]
     return None
 
 

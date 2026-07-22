@@ -8,8 +8,6 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
-
 # Anchor DB paths so they're independent of the current working directory:
 # relative paths (defaults or relative env overrides) resolve against this
 # file's directory (the repo root), while absolute env values are used as-is.
@@ -18,6 +16,13 @@ load_dotenv()
 # dev-sandbox workaround must copy the scripts alongside the data, or set an
 # absolute SOURCE_DB/TARGET_DB env override.)
 _ROOT = Path(__file__).resolve().parent
+
+# Load .env from the repo root ONLY. A bare load_dotenv() walks UP the tree, so
+# a checkout under .claude/worktrees/<name>/ would silently inherit the parent
+# checkout's .env (feature flags, models, DB paths) instead of repo defaults.
+# Pinning to _ROOT keeps each worktree isolated; a normal single clone is
+# unaffected (its .env already lives at _ROOT).
+load_dotenv(_ROOT / ".env")
 
 
 def _resolve(value: str) -> Path:

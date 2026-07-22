@@ -79,10 +79,10 @@ from .messages import (
     search_messages_sql,
 )
 # --- feature: persona ---
-from .persona import (
+from .persona import get_voiceprint
+from .persona_draft import (
     check_style_match,
     draft_reply,
-    get_voiceprint,
 )
 # --- end feature: persona ---
 
@@ -124,7 +124,7 @@ from .conflict import trace_conflict_across_chats
 # draft_apology is unconditional (no config gate; the DV floor is enforced in
 # the function). Separate appended fence so C4 stays a clean additive edit
 # alongside the concurrent conflict worktrees.
-from .conflict import draft_apology
+from .conflict_apology import draft_apology
 # --- end feature: conflict (C4 apology) ---
 
 # --- feature: persona (V5 simulate) ---
@@ -132,7 +132,7 @@ from .conflict import draft_apology
 # gates only whether its SCHEMA is registered (tool_schemas/chat), the repo's one
 # reliable way to keep the model from calling it. Separate appended fence so V5
 # stays a clean additive edit alongside the V1-V3 persona re-exports above.
-from .persona import simulate_contact
+from .persona_sim import simulate_contact
 # --- end feature: persona (V5 simulate) ---
 
 __all__ = [

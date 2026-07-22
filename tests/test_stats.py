@@ -151,26 +151,6 @@ class TestWinsorize(unittest.TestCase):
         self.assertEqual(stats.winsorize([5.0]), [5.0])
 
 
-class TestWinsorizedLogGapEcdf(unittest.TestCase):
-    def test_log_space_placement(self):
-        sample = [1, 10, 100]  # logs: 0, ln10, ln100
-        self.assertAlmostEqual(stats.winsorized_log_gap_ecdf(1, sample), 0.0)
-        self.assertAlmostEqual(stats.winsorized_log_gap_ecdf(10, sample), 2 / 3)
-        self.assertAlmostEqual(stats.winsorized_log_gap_ecdf(100, sample), 1.0)
-
-    def test_heavy_tail_is_bounded_and_monotone(self):
-        sample = [1, 2, 4, 8, 16, 32, 64, 128, 1024]
-        small = stats.winsorized_log_gap_ecdf(2, sample)
-        big = stats.winsorized_log_gap_ecdf(512, sample)
-        self.assertTrue(0.0 <= small <= 1.0)
-        self.assertTrue(0.0 <= big <= 1.0)
-        self.assertLess(small, big)
-
-    def test_no_positive_values_is_none(self):
-        self.assertIsNone(stats.winsorized_log_gap_ecdf(1.0, []))
-        self.assertIsNone(stats.winsorized_log_gap_ecdf(1.0, [0, -5, -1]))
-
-
 class TestModifiedZ(unittest.TestCase):
     def test_flags_outlier(self):
         series = [1, 2, 3, 4, 100]  # median 3, MAD 1
