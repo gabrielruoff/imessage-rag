@@ -398,7 +398,10 @@ struct ApplefmShim {
         // throwaway session warms the process-global model that every later
         // fresh session shares.
         if case .available = generationModel.availability {
+            FileHandle.standardError.write("applefm-shim: prewarming model\n".data(using: .utf8)!)
             LanguageModelSession(model: generationModel).prewarm()
+        } else {
+            FileHandle.standardError.write("applefm-shim: skipping prewarm (Apple Intelligence unavailable)\n".data(using: .utf8)!)
         }
         while let line = readLine(strippingNewline: true) {
             if line.isEmpty { continue }

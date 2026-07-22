@@ -102,6 +102,9 @@ APPLE_TOOL_RESULT_MAX_CHARS = int(os.getenv("APPLE_TOOL_RESULT_MAX_CHARS", "5000
 # -- the biggest previously-uncapped generation, and where the cap pays off
 # most. ANSWER stays uncapped by default (0): it is the user-facing reply and
 # must not be clipped mid-sentence.
+# Note: APPLE_DIGEST_MAX_TOKENS caps tokens, not characters -- it can bind
+# below chat_apple._SCRATCHPAD_BUDGET, silently clipping a digested fact
+# before the budget would. Raise it if digest output looks truncated.
 APPLE_ROUTE_MAX_TOKENS = int(os.getenv("APPLE_ROUTE_MAX_TOKENS", "128"))
 APPLE_FILL_MAX_TOKENS = int(os.getenv("APPLE_FILL_MAX_TOKENS", "256"))
 APPLE_DIGEST_MAX_TOKENS = int(os.getenv("APPLE_DIGEST_MAX_TOKENS", "512"))
