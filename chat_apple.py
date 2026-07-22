@@ -57,9 +57,11 @@ ARG_SYSTEM = (
 DIGEST_SYSTEM = (
     "You extract the facts relevant to a question from one chunk of a tool "
     "result. Reply with a terse plain-text list of only the specific facts that "
-    "bear on the question -- names, ids, dates, counts, exact message text. Omit "
-    "everything else. If nothing in the chunk is relevant, reply exactly "
-    "\"nothing relevant\". Add no commentary."
+    "bear on the question -- names, ids, dates, counts, exact message text. "
+    "Preserve every id with its field name exactly as written (chat_id=42, "
+    "handle_id=5, contact_id=168) so it can be reused -- never merge or relabel "
+    "them. Omit everything else. If nothing in the chunk is relevant, reply "
+    "exactly \"nothing relevant\". Add no commentary."
 )
 ANSWER_SYSTEM = (
     "You answer a question about the user's iMessage history using ONLY the "
@@ -622,18 +624,106 @@ def _emit_epilogues(chat, reply, epilogues):
     return f"{reply}\n\n{block}" if reply else block
 
 
+# --- Deterministic name->id pre-resolution (before the staged loop) ----------
+# Question words / imperative verbs that a capitalized-token scan picks up but
+# that must never be looked up as a contact.
+_NAME_STOPWORDS = frozenset({
+    "who", "what", "when", "where", "why", "how", "which", "whose", "whom",
+    "did", "do", "does", "is", "are", "was", "were", "has", "have", "had",
+    "draft", "find", "break", "based", "help", "looking", "if", "the", "a",
+    "an", "and", "or", "but", "my", "me", "i", "you", "we", "us", "show",
+    "tell", "give", "list", "count", "compare",
+})
+_NAME_CANDIDATE_RE = re.compile(r"[A-Z][a-zA-Z'’]+(?:\s+[A-Z][a-zA-Z'’]+)*")
+_MAX_PRERESOLVE_NAMES = 4
+_MAX_PRERESOLVE_CONTACTS = 2
+_MAX_PRERESOLVE_CHATS = 3
+
+
+def _extract_candidate_names(question):
+    """Pull the capitalized name-shaped spans out of the question (single or
+    multi-word), dropping the sentence-initial question words / verbs a naive
+    scan also catches. Deterministic and model-free -- a false candidate simply
+    resolves to no contact and is skipped. Order-preserving, de-duplicated."""
+    out, seen = [], set()
+    for span in _NAME_CANDIDATE_RE.findall(question or ""):
+        # Trim leading/trailing question-words the scan swept in ("And Kyle" ->
+        # "Kyle", "Who" -> "") so a real name is kept clean and dedups with its
+        # bare form; an all-stopword span trims to nothing and is dropped.
+        words = span.split()
+        while words and words[0].lower() in _NAME_STOPWORDS:
+            words.pop(0)
+        while words and words[-1].lower() in _NAME_STOPWORDS:
+            words.pop()
+        name = " ".join(words)
+        if len(name) < 2:
+            continue
+        key = name.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(name)
+    return out[:_MAX_PRERESOLVE_NAMES]
+
+
+def _preresolve_entities(chat, question):
+    """Resolve person names in the question to labeled id facts BEFORE the staged
+    loop, using only the public directory tools. This hands the FM model the
+    chat_id / handle_id / contact_id it otherwise fabricates (or resolves
+    unreliably across several loop turns), each clearly labeled so it cannot
+    conflate a contact_id with a chat_id. Best-effort: any failure degrades to no
+    seed. Deterministic infra, so it does not consume MAX_TOOL_ITERATIONS and is
+    not offered to the _recorder (which counts model-initiated calls)."""
+    find_contacts = chat.TOOL_FUNCTIONS.get("search_contacts_by_name")
+    find_chats = chat.TOOL_FUNCTIONS.get("list_chats")
+    if find_contacts is None:
+        return []
+    facts = []
+    for name in _extract_candidate_names(question):
+        try:
+            contacts = find_contacts(name=name, limit=5)
+        except Exception:
+            continue
+        if not isinstance(contacts, list):
+            continue
+        for c in contacts[:_MAX_PRERESOLVE_CONTACTS]:
+            if not isinstance(c, dict) or c.get("id") is None:
+                continue
+            cid = c["id"]
+            handle_ids = [h.get("id") for h in (c.get("handles") or [])
+                          if isinstance(h, dict) and h.get("id") is not None]
+            label = " ".join(str(c.get(k) or "").strip()
+                             for k in ("first_name", "last_name")).strip() or name
+            direct_chats = []
+            if find_chats is not None:
+                try:
+                    rows = find_chats(contact_id=cid, limit=50)
+                    direct_chats = [r["id"] for r in (rows or [])
+                                    if isinstance(r, dict) and not r.get("is_group")
+                                    and r.get("id") is not None][:_MAX_PRERESOLVE_CHATS]
+                except Exception:
+                    direct_chats = []
+            fact = (f'"{name}" -> {label}: contact_id={cid}'
+                    + (f", handle_id={handle_ids}" if handle_ids else "")
+                    + (f", 1:1 chat_id={direct_chats}" if direct_chats else ""))
+            facts.append(f"[resolved] {fact}")
+            chat.console.print(f"  [resolve] {fact}", style="dim cyan", markup=False)
+    return facts
+
+
 def run_turn(messages, show_model_header=True, model=None):
     """Run one user turn to a final answer via staged FM sessions, mirroring
     chat.run_turn's signature and contract: the final reply is returned AND
     appended to `messages` (so the REPL, `chat.py -p`, and evalkit all see it).
     Earlier turns in `messages` fold into a compressed summary; the last user
-    message is the current question. Up to config.MAX_TOOL_ITERATIONS
-    route/fill/exec/digest cycles run before the loop falls through to answer."""
+    message is the current question. Named people in the question are resolved to
+    labeled id facts up front (_preresolve_entities), then up to
+    config.MAX_TOOL_ITERATIONS route/fill/exec/digest cycles run before the loop
+    falls through to answer."""
     import chat  # lazy: chat.py imports this module lazily in its dispatch
 
     question = _current_question(messages)
     summary = _prior_turns_summary(messages)
-    scratchpad = []
+    scratchpad = _preresolve_entities(chat, question)
     seen_calls = set()
     # Per-turn wellbeing floor, carried through _execute (parity with
     # chat.run_turn): `sanitize` arms the whole-reply condition-name scrub once

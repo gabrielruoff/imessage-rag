@@ -108,7 +108,9 @@ class HappyPathTest(AppleChatTest):
 
         self.assertEqual(reply, "Alice is contact 7.")
         self.assertEqual(messages[-1], {"role": "assistant", "content": reply})
-        self.assertEqual(executed, [{"name": "Alice"}])  # ran once, with filled args
+        # Deterministic pre-resolution queries the name first (limit=5), then the
+        # routed loop runs it again with the model-filled args.
+        self.assertEqual(executed, [{"name": "Alice", "limit": 5}, {"name": "Alice"}])
         self.assertEqual(fake.route_calls, 2)  # a tool, then answer
         self.assertEqual(fake.fill_calls, 1)
         self.assertEqual(fake.answer_calls, 1)
@@ -351,6 +353,99 @@ class GroundArgsTest(unittest.TestCase):
         self.assertEqual(out, {"contact_id": 7})
         out = chat_apple._ground_args({"contact_id": 7}, "q", "earlier we found contact_id 7", [])
         self.assertEqual(out, {"contact_id": 7})
+
+
+class ExtractNamesTest(unittest.TestCase):
+    """The model-free capitalized-name scan feeding pre-resolution."""
+
+    def test_drops_question_words_keeps_names(self):
+        self.assertEqual(
+            chat_apple._extract_candidate_names("When did Jill and I first text?"),
+            ["Jill"])
+        self.assertEqual(
+            chat_apple._extract_candidate_names("Who is Jill Handrahan?"),
+            ["Jill Handrahan"])
+
+    def test_dedup_and_multiple_names(self):
+        self.assertEqual(
+            chat_apple._extract_candidate_names("Who replies faster, me or Kyle? And Kyle again"),
+            ["Kyle"])
+
+    def test_no_names_returns_empty(self):
+        self.assertEqual(
+            chat_apple._extract_candidate_names("what hour of the day do i text the most?"), [])
+
+    def test_caps_candidate_count(self):
+        q = "A B C D E F G"  # single letters are dropped (len < 2); use real tokens
+        many = "Al Bo Cy Di El Fo Gu"
+        self.assertLessEqual(len(chat_apple._extract_candidate_names(many)),
+                             chat_apple._MAX_PRERESOLVE_NAMES)
+        self.assertEqual(chat_apple._extract_candidate_names(q), [])
+
+
+class PreresolveTest(AppleChatTest):
+    """Deterministic name->id seeding runs before the loop, using only the public
+    directory tools, and emits clearly-labeled id facts."""
+
+    def _fake_chat(self, contacts_fn, chats_fn=None):
+        class _C:
+            TOOL_FUNCTIONS = {"search_contacts_by_name": contacts_fn}
+            console = chat.console
+        if chats_fn is not None:
+            _C.TOOL_FUNCTIONS["list_chats"] = chats_fn
+        return _C
+
+    def test_seeds_labeled_ids_with_direct_chat(self):
+        calls = {"contacts": [], "chats": []}
+
+        def contacts_fn(**kw):
+            calls["contacts"].append(kw)
+            return [{"id": 168, "first_name": "Jill", "last_name": "Handrahan",
+                     "handles": [{"id": 5}]}]
+
+        def chats_fn(**kw):
+            calls["chats"].append(kw)
+            return [{"id": 42, "is_group": 0}, {"id": 99, "is_group": 1}]
+
+        facts = chat_apple._preresolve_entities(
+            self._fake_chat(contacts_fn, chats_fn), "When did Jill and I first text?")
+        self.assertEqual(len(facts), 1)
+        f = facts[0]
+        self.assertIn("contact_id=168", f)
+        self.assertIn("handle_id=[5]", f)
+        self.assertIn("1:1 chat_id=[42]", f)   # only the is_group=0 chat
+        self.assertNotIn("99", f)              # the group chat is excluded
+        self.assertEqual(calls["contacts"], [{"name": "Jill", "limit": 5}])
+        self.assertEqual(calls["chats"], [{"contact_id": 168, "limit": 50}])
+
+    def test_no_name_no_tool_calls(self):
+        called = []
+        facts = chat_apple._preresolve_entities(
+            self._fake_chat(lambda **kw: called.append(kw) or []),
+            "what hour of the day do i text the most?")
+        self.assertEqual(facts, [])
+        self.assertEqual(called, [])  # never queried the directory
+
+    def test_unresolved_name_is_skipped(self):
+        facts = chat_apple._preresolve_entities(
+            self._fake_chat(lambda **kw: []), "Who is Nobody Here?")
+        self.assertEqual(facts, [])
+
+    def test_tool_exception_degrades_to_no_seed(self):
+        def boom(**kw):
+            raise RuntimeError("db down")
+        facts = chat_apple._preresolve_entities(self._fake_chat(boom), "Who is Jill?")
+        self.assertEqual(facts, [])
+
+    def test_seed_grounds_a_filled_chat_id(self):
+        # End-to-end: the seeded chat_id survives _ground_args on the next fill.
+        facts = chat_apple._preresolve_entities(
+            self._fake_chat(
+                lambda **kw: [{"id": 168, "first_name": "Jill", "handles": []}],
+                lambda **kw: [{"id": 42, "is_group": 0}]),
+            "Who is Jill?")
+        out = chat_apple._ground_args({"chat_id": 42}, "Who is Jill?", "", facts)
+        self.assertEqual(out, {"chat_id": 42})  # grounded by the seed
 
 
 class CompactionTest(AppleChatTest):
