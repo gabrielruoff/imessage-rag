@@ -207,13 +207,25 @@ func handleRespond(id: Any, request: [String: Any]) async {
     // the permissive content-transformation guardrails (see its definition).
     let session = LanguageModelSession(model: generationModel, instructions: system)
 
+    // Optional output-token cap (Python's per-stage APPLE_*_MAX_TOKENS). Bounding
+    // generation is the FM's one per-call speed lever; a positive value caps the
+    // stage's output, absent/<=0 leaves it unbounded (the default GenerationOptions
+    // pass nil for maximumResponseTokens). Everything else stays at model default.
+    let options: GenerationOptions
+    if let cap = (request["max_tokens"] as? NSNumber)?.intValue, cap > 0 {
+        options = GenerationOptions(maximumResponseTokens: cap)
+    } else {
+        options = GenerationOptions()
+    }
+
     do {
         if let schemaNode = request["schema"] as? [String: Any] {
             // Guided generation: constrained decoding produces output that IS
             // valid JSON, serialized back out via GeneratedContent.jsonString.
             let root = buildSchema(schemaNode, name: "Root")
             let schema = try GenerationSchema(root: root, dependencies: [])
-            let content = try await session.respond(to: prompt, schema: schema).content.jsonString
+            let content = try await session.respond(
+                to: prompt, schema: schema, options: options).content.jsonString
             if stream {
                 emit(["id": id, "type": "chunk", "content": content])
                 emit(["id": id, "type": "done"])
@@ -224,7 +236,7 @@ func handleRespond(id: Any, request: [String: Any]) async {
             // streamResponse yields CUMULATIVE snapshots; the wire wants deltas,
             // so emit only the suffix grown since the previous snapshot.
             var previous = ""
-            for try await snapshot in session.streamResponse(to: prompt) {
+            for try await snapshot in session.streamResponse(to: prompt, options: options) {
                 let current = snapshot.content
                 let delta = current.hasPrefix(previous)
                     ? String(current.dropFirst(previous.count))
@@ -236,7 +248,7 @@ func handleRespond(id: Any, request: [String: Any]) async {
             }
             emit(["id": id, "type": "done"])
         } else {
-            let content = try await session.respond(to: prompt).content
+            let content = try await session.respond(to: prompt, options: options).content
             emit(["id": id, "type": "done", "content": content])
         }
     } catch {
@@ -378,6 +390,16 @@ struct ApplefmShim {
     // every response-ordering hazard without needing a task pool. Loop ends when
     // stdin closes (readLine returns nil), at which point the process exits 0.
     static func main() async {
+        // Prewarm the model at startup so the first real `respond` doesn't eat the
+        // cold-load latency: the shim is a persistent process, so this one-time
+        // warm-up amortizes across the whole session. Best-effort and gated on
+        // availability -- prewarm() is non-throwing, but skipping it when Apple
+        // Intelligence is off avoids loading assets we can't use. A prewarmed
+        // throwaway session warms the process-global model that every later
+        // fresh session shares.
+        if case .available = generationModel.availability {
+            LanguageModelSession(model: generationModel).prewarm()
+        }
         while let line = readLine(strippingNewline: true) {
             if line.isEmpty { continue }
             await handleLine(line)

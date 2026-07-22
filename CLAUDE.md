@@ -536,7 +536,16 @@ chunk_vectors                     -- sqlite-vec vec0 table: chunk_id ->
   `applefm.respond(..., schema=...)` directly — that path gets real guided
   generation (chat_apple's route/fill stages use it).
 - Apple `think` is ignored (Foundation Models has no reasoning-effort flag):
-  accepted and dropped at the seam, never forwarded. The `chunk_annotations`
+  accepted and dropped at the seam, never forwarded. The one per-call speed
+  lever the FM *does* expose is `GenerationOptions.maximumResponseTokens`:
+  `applefm.respond` takes `max_tokens` (omitted from the wire request when
+  None/<=0), and `chat_apple.py` caps its intermediate stages with the
+  `APPLE_ROUTE_MAX_TOKENS`/`APPLE_FILL_MAX_TOKENS`/`APPLE_DIGEST_MAX_TOKENS`
+  config vars while leaving ANSWER uncapped (`APPLE_ANSWER_MAX_TOKENS=0`) so the
+  user-facing reply is never clipped. The shim also `prewarm()`s the model at
+  startup (gated on availability), so the first `respond` skips the cold-load
+  latency; because the shim is one persistent process this warm-up amortizes
+  across the whole session. The `chunk_annotations`
   `annotate_model` guard and the `embed_model`/`embed_dim` guard apply to apple
   exactly as to Ollama models (switching `ANNOTATE_MODEL`/`EMBED_MODEL` to/from
   apple is the usual empty-the-table / `reset_db.py` + re-ingest step). Batch

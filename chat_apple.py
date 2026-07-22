@@ -168,20 +168,21 @@ _ROUTE_SCHEMA = {
 
 
 # --- The one model seam ------------------------------------------------------
-def _respond(system, prompt, schema=None, stream=False):
+def _respond(system, prompt, schema=None, stream=False, max_tokens=None):
     """The single model entry point -- every ROUTE/FILL/DIGEST/ANSWER call goes
     through here, so the tests and evalkit patch exactly this one function.
     Delegates to the FM transport; importing applefm at module load does not
-    spawn the shim (that happens lazily on the first real call)."""
+    spawn the shim (that happens lazily on the first real call). `max_tokens`
+    (per-stage APPLE_*_MAX_TOKENS; 0/None = uncapped) caps the reply length."""
     return applefm.respond(system, prompt, schema=schema, stream=stream,
-                           timeout=config.CHAT_TIMEOUT)
+                           timeout=config.CHAT_TIMEOUT, max_tokens=max_tokens)
 
 
-def _respond_json(system, prompt, schema):
+def _respond_json(system, prompt, schema, max_tokens=None):
     """A guided _respond call whose `content` is a JSON string (the ROUTE/FILL
     stages), parsed to a dict. A missing or malformed reply yields None so the
     caller can fall back rather than raise."""
-    raw = _respond(system, prompt, schema=schema)
+    raw = _respond(system, prompt, schema=schema, max_tokens=max_tokens)
     if not raw:
         return None
     try:
@@ -288,6 +289,7 @@ def _compact(question, scratchpad):
         reply = _respond(
             DIGEST_SYSTEM,
             f"Extract facts relevant to this question:\n{question}\n\nFrom:\n{joined}",
+            max_tokens=config.APPLE_DIGEST_MAX_TOKENS,
         )
     except (applefm.ContextOverflowError, applefm.GenerationRejectedError):
         return _tail_under_budget(scratchpad)
@@ -310,7 +312,8 @@ def _route(question, summary, scratchpad):
           "are already enough to answer the question."
     )
     try:
-        data = _respond_json(ROUTE_SYSTEM, prompt, _ROUTE_SCHEMA)
+        data = _respond_json(ROUTE_SYSTEM, prompt, _ROUTE_SCHEMA,
+                             max_tokens=config.APPLE_ROUTE_MAX_TOKENS)
     except (applefm.ContextOverflowError, applefm.GenerationRejectedError):
         return "answer"  # can't fit/generate the router step -- answer from facts
     action = (data or {}).get("action")
@@ -328,7 +331,8 @@ def _fill_args(name, question, summary, scratchpad):
         + f"\n\nProduce the JSON arguments for `{name}` -- {spec['summary']}."
     )
     try:
-        data = _respond_json(ARG_SYSTEM, prompt, spec["schema"])
+        data = _respond_json(ARG_SYSTEM, prompt, spec["schema"],
+                             max_tokens=config.APPLE_FILL_MAX_TOKENS)
     except (applefm.ContextOverflowError, applefm.GenerationRejectedError):
         return {}  # fall back to the tool's own argument defaults
     return data if isinstance(data, dict) else {}
@@ -456,6 +460,7 @@ def _digest(question, name, result):
             reply = _respond(
                 DIGEST_SYSTEM,
                 f"Extract facts relevant to this question:\n{question}\n\nFrom:\n{window}",
+                max_tokens=config.APPLE_DIGEST_MAX_TOKENS,
             )
         except (applefm.ContextOverflowError, applefm.GenerationRejectedError):
             continue  # a stubborn/rejected window -- skip it, don't crash the turn
@@ -534,7 +539,8 @@ def _answer(chat, question, summary, scratchpad, show_model_header, model,
     for summ, sp in attempts:
         try:
             prompt = _context_block(question, summ, sp)
-            stream = _respond(ANSWER_SYSTEM, prompt, stream=True)
+            stream = _respond(ANSWER_SYSTEM, prompt, stream=True,
+                              max_tokens=config.APPLE_ANSWER_MAX_TOKENS)
             return _render_stream(chat, stream, show_model_header, model,
                                   sanitize=sanitize)
         except (applefm.ContextOverflowError, applefm.GenerationRejectedError):
