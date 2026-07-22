@@ -24,4 +24,7 @@ from . import (  # noqa: E402,F401  (imported for their @recipe side effects)
     s9_retrieval,
     s11_conflict,
     s12_nudges,
+    s13_drift,
+    s14_voiceprint,
+    s15_persona,
 )

@@ -84,6 +84,22 @@ REMOVED_TOOLS = (
     "get_conversation_dynamics",
     "get_top_reacted_messages",
 )
+# Flag-gated tools (tool_schemas.GATED_TOOLS): registered only when their
+# feature flag is on, so they are deliberately OUT of ALL_TOOLS (which selfcheck
+# diffs against the UNCONDITIONAL schema names). A hardcoded mirror -- like
+# _FEATURE_TOOLS -- kept so cases.py stays import-light. A case MAY name these in
+# expect.tools (routing is only assertable when the flag is on; the owning suite
+# must document the flag it requires), but they never enter the ALL_TOOLS sync.
+GATED_TOOLS = (
+    # --- DRIFT_ENABLED ---
+    "get_relationship_drift",
+    "get_fadeout_watchlist",
+    "get_reconnection_candidates",
+    # --- CONFLICT_TRACE_ENABLED ---
+    "trace_conflict_across_chats",
+    # --- PERSONA_SIM_ENABLED ---
+    "simulate_contact",
+)
 
 _EXPECT_KEYS = {"tools", "banned_tools", "banned_anywhere"}
 _TOOL_EXPECT_KEYS = {"name", "alternates", "args_contains", "turn"}
@@ -149,7 +165,7 @@ def validate_case(case, roster_defs, suite_id=""):
     if unknown:
         fail(f"unknown expect keys {sorted(unknown)}")
     for tool in expect.get("banned_tools", []):
-        if tool not in ALL_TOOLS:
+        if tool not in ALL_TOOLS and tool not in GATED_TOOLS:
             fail(f"banned_tools entry {tool!r} is not a known tool")
     if not all(isinstance(s, str) for s in expect.get("banned_anywhere", [])):
         fail("banned_anywhere must be strings")
@@ -159,7 +175,7 @@ def validate_case(case, roster_defs, suite_id=""):
             fail(f"unknown ToolExpect keys {sorted(unknown)}")
         names = [te.get("name")] + list(te.get("alternates", []))
         for name in names:
-            if name not in ALL_TOOLS:
+            if name not in ALL_TOOLS and name not in GATED_TOOLS:
                 fail(f"ToolExpect tool {name!r} is not a known tool")
         if not isinstance(te.get("args_contains", {}), dict):
             fail("args_contains must be a dict")
