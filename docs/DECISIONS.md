@@ -1064,6 +1064,114 @@ conditions on a reaction and overstates every rate). An empty generation is
 treated as a low-confidence decline, never emitted as `generated: true` with a
 blank `simulation`. Nothing sends, nothing is persisted.
 
+## 2026-07-21: Apple Foundation Models backend (chat + embeddings, no-Ollama capable)
+
+Goal: make Apple's on-device Foundation Model (Apple Intelligence, Apple
+Silicon, macOS 26+) a selectable backend through the *existing* model env vars,
+so the app can ship and run with **no Ollama models installed**. Opt in per
+pipeline: `CHAT_MODEL=apple`, `EMBED_MODEL=apple`, `ANNOTATE_MODEL=apple`,
+`TOPIC_MODEL=apple`, `WRAPPED_MODEL=apple`. Defaults are unchanged (gemma4 for
+chat, nomic-embed-text for embeddings), so apple is never on unless asked for.
+
+### Transport: a compiled Swift shim, not a pip or a server
+
+- **`apple-fm-sdk` (the official pip)** — alpha, and Python ≤3.12 only. This
+  repo runs 3.13/3.14 (`requires-python`), and the pip needs a full Xcode.
+  Rejected.
+- **`fm serve` (an OpenAI-compatible local server)** — macOS 27 only; the
+  target is macOS 26. Rejected.
+- **A local Swift shim, compiled with Command Line Tools** — chosen.
+  `FoundationModels.framework` and `NaturalLanguage.framework` ship in the CLT
+  SDK (`/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk`), so
+  `swiftc -O -parse-as-library` builds `bin/applefm-shim` with **no Xcode**
+  (verified: macOS 26.5.2 / CLT Swift 6.3.3 / arm64). `make apple-shim`
+  compiles it and runs an availability self-check; kept out of `make install`
+  (same philosophy as `install-ollama` — a slow, platform-specific step).
+
+The shim is one persistent subprocess speaking JSON-lines over stdio
+(`applefm.py` ↔ `bin/applefm-shim`), `id`-correlated, one request in flight
+behind a lock, respawn-and-retry-once on a crash. Three ops: `availability`,
+`respond` (fresh `LanguageModelSession` per call; guided generation from a
+`DynamicGenerationSchema` built out of a small JSON-Schema subset), and `embed`
+(`NLContextualEmbedding`). Selection is the `apple` sentinel
+(`config.is_apple_model`); `ollama.py` and `embeddings.py` dispatch on it so
+every other caller stays backend-agnostic.
+
+### The 4,096-token window drives the whole chat design
+
+The FM context window is a **fixed 4,096 tokens** (Apple TN3193; unchanged as
+of the 26.4 SDK). The Ollama chat setup does not remotely fit: system prompt
+~1,023 tok + the 21 tool schemas ~7,272 tok = **~8.3K tok of overhead, 2× the
+window, before the user types anything**. Native tool-calling is impossible.
+
+So the apple chat path (`chat_apple.py`) stages many small, fresh,
+single-purpose sessions per turn and carries state in Python: **ROUTE** (pick
+the next tool or `answer` from a compact first-sentence catalog, guided against
+an enum) → **FILL** (generate that tool's args, guided against its simplified
+`input_schema`) → **EXEC** (run the `query_tools` fn locally, reusing
+`chat.py`'s registry + dedup guard) → **DIGEST** (compress the result to
+question-relevant facts, slicing at row boundaries so a result bigger than the
+window is still read whole — the raw result never re-enters a prompt) →
+**ANSWER** (from the accumulated facts alone, streamed).
+
+Two findings surfaced only against the real windowed model (the hermetic fake
+shim can't reproduce them):
+
+1. **`format="json"` cannot be a guided schema.** Ollama's `format="json"` is
+   grammar-constrained-to-*some*-JSON; `DynamicGenerationSchema` has no "any
+   object" — a schema with empty `properties` pins the reply to literally
+   `{}`, which silently returned an empty object for every batch caller
+   (annotate/topics). The fix mirrors what Ollama's mode actually leans on:
+   JSON mode folds a directive into the system message and generates **free
+   text**, and `chat_once_json` parses + nudge-retries. The batch callers spell
+   out their exact JSON shape in their own system prompts, so it works —
+   measured live: topics returns `{"label": "Pizza Friday"}`, annotate returns
+   `{"valence": 1.0, "depth": 4}`.
+2. **The scratchpad, not just each tool result, must be bounded.** Each result
+   is capped (`APPLE_TOOL_RESULT_MAX_CHARS`, 5000), but several verbatim
+   results *stack up* past the window, and a later ROUTE prompt (which also
+   carries the ~2.8K-char catalog) then overflowed and crashed the turn. Fix:
+   after every tool the scratchpad is **compacted** back under a char budget by
+   one digest pass, and every stage catches the shim's `ContextOverflowError`
+   and degrades (route → answer, fill → defaults, answer → compact-and-retry,
+   finally the question alone) rather than raising out of the turn.
+
+Verified end-to-end on the target machine: a total-count analytics question and
+a find-and-read question both complete and answer without a crash.
+
+### Embeddings: NLContextualEmbedding, 512-dim, retrieval quality unproven
+
+`EMBED_MODEL=apple` embeds via `NLContextualEmbedding` (latin-script model) in
+the shim: per-token vectors mean-pooled + L2-normalized, long texts segmented
+and segment-pooled. Measured **512-dim, ‖v‖=1.0** through the full Python path
+(`embed_texts` / `detect_embed_dim`), including a multi-segment ~8K-char text.
+Task prefixes are NOT applied (nomic's `search_document:` / `search_query:` are
+model-specific). Switching `EMBED_MODEL` is always `reset_db.py` + re-ingest —
+the `ingest_state` embed guard already enforces it; nothing new was added.
+
+Caveat, stated so it can be measured rather than assumed: `NLContextualEmbedding`
+is a general contextual encoder, **not contrastively trained for retrieval** the
+way nomic-embed-text is. Whether 512-dim NL embeddings retrieve as well as nomic
+on this corpus is unproven; ship it measurable, never as the default.
+
+### Known limits
+
+- **Routing across 21 tools is the quality ceiling.** The on-device model is
+  small; live runs show it inventing narrow date filters and occasionally a
+  wrong scope. The staging is correct and never crashes, but multi-hop
+  analytics accuracy is bounded by 3B-class routing. `eval/evalkit` records the
+  apple path through a parallel recorder hook (`chat_apple._recorder`) so the
+  sweep works under `CHAT_MODEL=apple`; quantifying the scorecard vs the gemma4
+  baseline is a follow-up.
+- **`think` is ignored** on apple (Foundation Models has no reasoning-effort
+  flag): accepted and dropped at the seam, never forwarded.
+- **Batch `--terms`** is left unclamped: a default `ANNOTATE_TERMS_BATCH_SIZE=25`
+  batch can exceed the window on apple (it degrades to skipped-and-retried
+  rows, not a crash). Set a small `ANNOTATE_TERMS_BATCH_SIZE` for apple runs.
+- **The `chunk_annotations` model guard applies to apple too**: switching
+  `ANNOTATE_MODEL` to/from apple against a non-empty table is refused (mixing
+  annotation models skews every downstream aggregate).
+
 ## Linting
 
 `ruff check .` (config in `pyproject.toml`: `line-length = 100`,

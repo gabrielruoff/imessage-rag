@@ -108,7 +108,14 @@ def _resolve_turns(case, roster):
 def _install_recorder(chat_mod):
     """Wrap chat.ollama_chat_stream (a module global resolved at call time by
     run_turn) to time round trips, record per-round tool calls, and enforce
-    the per-case wall budget between round trips."""
+    the per-case wall budget between round trips.
+
+    Under CHAT_MODEL=apple that function is never called -- chat.run_turn
+    dispatches into chat_apple's staged orchestration, which round-trips the FM
+    shim directly. So ALSO install chat_apple's _recorder hook: it fires at each
+    executed tool, appending a round trip in the SAME shape to state["rounds"]
+    (so checks.extract_tool_calls reads it identically) and enforcing the same
+    wall budget. The ollama_chat_stream wrap stays for the non-apple path."""
     state = {"rounds": [], "turn": 1, "deadline": None}
     real = chat_mod.ollama_chat_stream
 
@@ -129,6 +136,25 @@ def _install_recorder(chat_mod):
         return msg
 
     chat_mod.ollama_chat_stream = recording_stream
+
+    # Apple path: chat_apple executes tools itself, so record at its hook. Each
+    # executed tool becomes one round trip carrying that single call; duration
+    # is not one wall span there (a tool spans route+fill+exec+digest sessions)
+    # and is diagnostics-only, so it stays 0.0. Raising CaseTimeout from the
+    # hook (before the tool runs) propagates out of chat_apple.run_turn exactly
+    # like the stream wrap's does, so _run_case closes the boundary the same way.
+    import chat_apple
+
+    def apple_recorder(name, arguments):
+        if state["deadline"] is not None and time.monotonic() > state["deadline"]:
+            raise CaseTimeout("per-case wall budget exceeded")
+        state["rounds"].append({
+            "turn": state["turn"],
+            "duration_s": 0.0,
+            "tool_calls": [{"name": name, "arguments": arguments}],
+        })
+
+    chat_apple._recorder = apple_recorder
     return state
 
 

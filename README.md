@@ -108,6 +108,40 @@ snapshot copy — the live `chat.db` is never opened directly.
 `make ingest INGEST_ARGS=--no-embed` instead to skip it and get a searchable
 DB without semantic search.
 
+## Running on-device, without Ollama (Apple Foundation Models)
+
+On Apple Silicon with **macOS 26+ and Apple Intelligence enabled**, you can run
+the whole thing on Apple's built-in on-device model instead of Ollama — no
+~15 GB of model downloads, no background service. Build the shim once (it
+compiles a small Swift helper with the Command Line Tools; no Xcode):
+
+```sh
+make apple-shim
+```
+
+Then point any pipeline at the `apple` sentinel in `.env`. A full no-Ollama
+setup:
+
+```sh
+CHAT_MODEL=apple
+EMBED_MODEL=apple
+ANNOTATE_MODEL=apple
+TOPIC_MODEL=apple
+WRAPPED_MODEL=apple
+```
+
+Each is independent, so you can mix and match (keep `EMBED_MODEL=nomic-embed-text`
+and set only `CHAT_MODEL=apple`, say). Two things worth knowing:
+
+- **Switching `EMBED_MODEL` changes the embedding space**, so it needs a
+  `make reset-db` + re-ingest (Apple embeddings are 512-dimensional). The DB
+  guards this and refuses to silently mix spaces.
+- **The on-device window is small (4,096 tokens)**, so the chat path retrieves
+  in small staged steps under the hood, and a ~3B on-device model routes less
+  precisely across the 21 analytics tools than the 26B default — a great
+  zero-setup, fully-private option, at some cost in multi-hop accuracy.
+  Everything still stays on your machine, exactly as with Ollama.
+
 ## Analytics
 
 `ingest.py` builds derived analytics tables after chunking, so the six

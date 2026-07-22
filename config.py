@@ -64,6 +64,34 @@ def _think(name, default=None):
 
 CHAT_THINK = _think("CHAT_THINK")
 
+# --- Apple Foundation Models backend (opt-in) --------------------------------
+# On-device backend via Apple Intelligence (Apple Silicon, macOS 26+), routed
+# through a local Swift shim (`make apple-shim`). Opt in by setting any of the
+# *_MODEL vars -- CHAT_MODEL, ANNOTATE_MODEL, TOPIC_MODEL, WRAPPED_MODEL,
+# EMBED_MODEL -- to the "apple" sentinel; the defaults above stay gemma4/nomic,
+# so apple is never on unless asked for. The shim's context window is a fixed
+# 4,096 tokens, so the apple chat path stages many small sessions and digests
+# oversized tool results rather than context-stuffing (see chat_apple.py and
+# docs/DECISIONS.md).
+
+
+def is_apple_model(name) -> bool:
+    """True when a *_MODEL value selects the Apple Foundation Models backend:
+    the bare "apple" sentinel, or an "apple:<variant>" form reserved for future
+    model variants. Every dispatch seam (ollama.py, embeddings.py, chat.py)
+    gates on this so all other callers stay backend-agnostic."""
+    return isinstance(name, str) and (name == "apple" or name.startswith("apple:"))
+
+
+# The compiled Swift shim, built by `make apple-shim`; resolved relative to
+# this file's directory like the DB paths, so it is independent of the CWD.
+APPLE_SHIM_PATH = _resolve(os.getenv("APPLE_SHIM_PATH", "bin/applefm-shim"))
+# Per-tool-result char cap for the apple chat orchestrator. Far below
+# TOOL_RESULT_MAX_CHARS (sized for gemma4's 32k window): the FM window is a
+# fixed 4,096 tokens, so a result over this is digested down to
+# question-relevant facts, never truncated blind.
+APPLE_TOOL_RESULT_MAX_CHARS = int(os.getenv("APPLE_TOOL_RESULT_MAX_CHARS", "5000"))
+
 # --- CLI progress -------------------------------------------------------------
 # How the batch CLIs report progress. 'auto' (the default) draws a live rich
 # progress bar when stdout is a terminal and falls back to periodic plain

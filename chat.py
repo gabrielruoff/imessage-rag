@@ -19,6 +19,8 @@ from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
 
+import applefm
+import config
 import ollama
 import query_tools
 import wellbeing  # feature: wellbeing — dependency-free (stats + re), no config/Ollama pulled
@@ -447,7 +449,14 @@ def run_turn(messages, show_model_header=True, model=None):
     content nor tool calls -- one final request is made with the tools
     withheld and a final-turn note folded into the system prompt, forcing an
     answer out of whatever was already gathered."""
-    global _SANITIZE_REPLY
+    global _SANITIZE_REPLY  # feature: wellbeing
+    if config.is_apple_model(model or CHAT_MODEL):
+        # The Apple Foundation Models window (a fixed 4,096 tokens) is far too
+        # small for this native tool loop; chat_apple stages the turn instead.
+        # Imported lazily to avoid an import cycle (chat_apple imports chat).
+        import chat_apple
+
+        return chat_apple.run_turn(messages, show_model_header=show_model_header, model=model)
     seen_calls = set()
     # --- feature: wellbeing ---
     # Generic out-of-band epilogue channel (any tool may return a reserved
@@ -576,7 +585,7 @@ def run_turn(messages, show_model_header=True, model=None):
     return _emit_epilogues(message.get("content", ""))  # feature: wellbeing
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Chat with your iMessage history via a local Ollama model."
     )
@@ -601,7 +610,7 @@ def main():
         "hit). Overrides CONFLICT_DV_SCREEN transiently.",
     )
     # --- end feature: conflict ---
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # --- feature: conflict ---
     # Transient per-run bypass of the DV-suppression floor (never persisted).
@@ -619,8 +628,11 @@ def main():
         ]
         try:
             reply = run_turn(messages, show_model_header=False, model=args.model)
-        except (http.client.HTTPException, OSError, ollama.OllamaResponseError) as e:
-            print(f"[error contacting Ollama: {e}]")
+        except (http.client.HTTPException, OSError, ollama.OllamaResponseError,
+                applefm.AppleFMError) as e:
+            backend = ("Apple Foundation Models"
+                       if config.is_apple_model(args.model) else "Ollama")
+            print(f"[error contacting {backend}: {e}]")
             sys.exit(1)
         # A non-empty reply was already streamed live by ollama_chat_stream.
         if not reply:
@@ -628,7 +640,8 @@ def main():
         return
 
     messages = [{"role": "system", "content": _build_system_prompt()}]
-    print(f"Chatting with your iMessage history ({args.model} via Ollama). Ctrl+C to quit.")
+    backend = "Apple Foundation Models" if config.is_apple_model(args.model) else "Ollama"
+    print(f"Chatting with your iMessage history ({args.model} via {backend}). Ctrl+C to quit.")
     print("Commands: /clear (reset conversation)\n")
     while True:
         try:
@@ -646,8 +659,10 @@ def main():
         n_before = len(messages)
         try:
             reply = run_turn(messages, model=args.model)
-        except (http.client.HTTPException, OSError, ollama.OllamaResponseError) as e:
-            print(f"[error contacting Ollama: {e}]")
+        except (http.client.HTTPException, OSError, ollama.OllamaResponseError,
+                applefm.AppleFMError) as e:
+            # `backend` was resolved above for the banner and stays in scope.
+            print(f"[error contacting {backend}: {e}]")
             # Drop the failed user turn plus any partial assistant/tool
             # messages run_turn appended before the error.
             del messages[n_before - 1:]

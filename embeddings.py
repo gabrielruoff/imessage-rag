@@ -19,6 +19,7 @@ from config import (
     OLLAMA_HOST,
     OLLAMA_PORT,
     OLLAMA_TIMEOUT,
+    is_apple_model,
 )
 
 _thread_local = threading.local()
@@ -57,6 +58,13 @@ def embed_texts(texts: list, kind: str = "document") -> list:
     are nomic-embed-text's trained prefixes ('search_document: ' /
     'search_query: '); set both to '' in .env for models without task
     prefixes."""
+    if is_apple_model(EMBED_MODEL):
+        # Apple's NLContextualEmbedding takes raw text -- nomic's task prefixes
+        # are model-specific, so we skip them entirely (see applefm.embed_texts_apple)
+        # and hand `kind` straight through. Import lazily so the Ollama-only path
+        # never touches the shim client. _fit_dim/EMBED_DIM still apply, identically.
+        import applefm
+        return [_fit_dim(v) for v in applefm.embed_texts_apple(texts, kind)]
     prefix = EMBED_QUERY_PREFIX if kind == "query" else EMBED_DOC_PREFIX
     if prefix:
         texts = [prefix + t for t in texts]
@@ -82,5 +90,8 @@ def detect_embed_dim() -> int:
     """The effective embedding dimension: EMBED_MODEL's native output size,
     reduced by the EMBED_DIM override if one is set. Determined empirically
     from a probe request -- generation models served by Ollama (like gemma4)
-    embed at their hidden size, which isn't documented anywhere queryable."""
+    embed at their hidden size, which isn't documented anywhere queryable. The
+    apple backend auto-detects the same way (embed_texts routes the probe
+    through embed_texts_apple): NLContextualEmbedding is expected to be 512-dim,
+    but the probe measures the true dim rather than assuming it."""
     return len(embed_texts(["dimension probe"], kind="document")[0])

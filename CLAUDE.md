@@ -19,6 +19,14 @@ Full design history, schema, rationale, and data forensics:
   then pulls every model `config.py` names, so it honors `.env`). Kept out of
   `make install` on purpose: that target is fast and offline, this one pulls
   ~15GB and installs a background service.
+- Apple Foundation Models backend (optional, runs with NO Ollama models):
+  `make apple-shim` compiles the on-device Swift shim (`bin/applefm-shim`) with
+  Command Line Tools and runs an availability self-check. Opt in by pointing any
+  `*_MODEL` var at the `apple` sentinel (`CHAT_MODEL=apple`, `EMBED_MODEL=apple`,
+  `ANNOTATE_MODEL=apple`, …); dispatch happens inside `ollama.py` /
+  `embeddings.py`, and the chat path routes to `chat_apple.py`. Needs macOS 26+,
+  Apple Silicon, Apple Intelligence enabled. Kept out of `make install` (same
+  reason as `install-ollama`). Defaults are unchanged — apple is opt-in.
 - Ingest: `make ingest`, or `.venv/bin/python3 ingest.py [--no-embed]
   [--since-last] [--senders=...] [--exclude=...]`
 - Chat CLI: `.venv/bin/python3 chat.py` (interactive REPL), or
@@ -123,6 +131,15 @@ prefixes (`search_document: ` / `search_query: `) are applied by default and
 the embedding dimension is auto-detected at ingest time, so switching
 embedders is a `.env` change + `reset_db.py` + re-ingest.
 
+Optional Apple Foundation Models backend (opt-in, `apple` sentinel in any
+`*_MODEL` var; `config.is_apple_model`): the on-device model reached through a
+compiled Swift shim (`applefm.py` ↔ `bin/applefm-shim`, JSON-lines/stdio).
+`ollama.py` / `embeddings.py` dispatch on the sentinel, so callers stay
+backend-agnostic; the chat path is a separate staged orchestrator
+(`chat_apple.py`) because the FM window is a fixed 4,096 tokens — native
+tool-calling doesn't fit. `EMBED_MODEL=apple` is 512-dim `NLContextualEmbedding`
+(no task prefixes). Defaults stay gemma4/nomic; apple is never on unless asked.
+
 Each LLM pipeline picks its own generation model: `CHAT_MODEL` (chat.py, plus
 `--model`), `ANNOTATE_MODEL` (annotate.py, `--model`), `TOPIC_MODEL`
 (topics.py, `--model`), `WRAPPED_MODEL` (wrapped.py). Empty = inherit
@@ -183,8 +200,11 @@ participant-identity merging), all
 re-exported from `__init__.py` so `import query_tools` is the only import
 callers need (`DB_PATH`/`embed_texts` are patchable package attributes,
 resolved through the package at call time); `tool_schemas.py` their JSON
-schemas; `chat.py` the CLI tool-calling loop over Ollama; `ollama.py` the
-Ollama chat-streaming HTTP; `embeddings.py` the shared embedding client
+schemas; `chat.py` the CLI tool-calling loop over Ollama (dispatches to
+`chat_apple.py`, the staged route→fill→exec→digest→answer Apple-FM
+orchestrator, when the model is the `apple` sentinel); `ollama.py` the
+Ollama chat-streaming HTTP (dispatches to `applefm.py`, the persistent Swift-shim
+transport + Ollama-shape API, on the `apple` sentinel); `embeddings.py` the shared embedding client
 (doc/query prefixes, `EMBED_DIM` override, `detect_embed_dim`) used by both
 ingest (documents) and query_tools (queries) so both sides embed identically;
 `config.py` all env-driven settings (defaults work with no `.env`; see
@@ -498,6 +518,28 @@ chunk_vectors                     -- sqlite-vec vec0 table: chunk_id ->
   tail chunk when new messages extend it — that never touches
   `messages`/`chats`/`handles`.
 - DB paths resolve relative to `config.py`'s directory, not the CWD.
+- Apple FM (the `apple` sentinel) has a **fixed 4,096-token window**, so the
+  chat path can't do native tool-calling (system + 21 tool schemas ≈ 8.3K tok
+  alone). `chat_apple.py` stages small route→fill→exec→digest→answer sessions
+  and carries a Python scratchpad. The scratchpad — the *accumulated* facts, not
+  just one result — is what busts the window, so it is compacted back under a
+  char budget after every tool and every stage catches
+  `applefm.ContextOverflowError` and degrades rather than crashing the turn.
+- Apple `format="json"` is NOT a guided schema: a `DynamicGenerationSchema` with
+  empty `properties` pins the reply to literally `{}`. So `applefm.chat_once`'s
+  JSON mode folds a directive into the system message and generates *free text*
+  (`chat_once_json` parses + nudge-retries, like Ollama's `format=json`). A
+  caller needing constrained decoding to a SPECIFIC shape calls
+  `applefm.respond(..., schema=...)` directly — that path gets real guided
+  generation (chat_apple's route/fill stages use it).
+- Apple `think` is ignored (Foundation Models has no reasoning-effort flag):
+  accepted and dropped at the seam, never forwarded. The `chunk_annotations`
+  `annotate_model` guard and the `embed_model`/`embed_dim` guard apply to apple
+  exactly as to Ollama models (switching `ANNOTATE_MODEL`/`EMBED_MODEL` to/from
+  apple is the usual empty-the-table / `reset_db.py` + re-ingest step). Batch
+  `--terms` is unclamped on apple — a default `ANNOTATE_TERMS_BATCH_SIZE=25`
+  batch can overflow the window (degrades to skipped-and-retried rows); set a
+  small `ANNOTATE_TERMS_BATCH_SIZE` for apple runs.
 - Don't modify or read files in `tests/` unless the task is about tests.
 
 ## Conventions

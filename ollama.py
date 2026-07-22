@@ -12,6 +12,7 @@ from config import (
     OLLAMA_CHAT_PATH,
     OLLAMA_HOST,
     OLLAMA_PORT,
+    is_apple_model,
 )
 
 
@@ -47,6 +48,12 @@ def chat_once(messages, model=None, format=None, timeout=None, think=_UNSET):
     omitted uses CHAT_THINK. Per-call because the batch pipelines want it
     low/off (it is pure latency on a short JSON answer) while interactive
     chat may want it on."""
+    # apple sentinel -> Foundation Models backend; imported lazily so
+    # Ollama-only users never pay the import. Forward every arg unchanged.
+    if is_apple_model(model or CHAT_MODEL):
+        import applefm
+        return applefm.chat_once(messages, model=model, format=format,
+                                 timeout=timeout, think=think)
     conn = http.client.HTTPConnection(
         OLLAMA_HOST, OLLAMA_PORT, timeout=timeout or CHAT_TIMEOUT
     )
@@ -109,6 +116,23 @@ def chat_once_json(messages, model=None, retry_nudge=_JSON_RETRY_NUDGE,
     can't take the `think` value we send -- by rejecting it, or by answering
     think=false with empty content -- degrade to no reasoning control for the
     rest of the process instead of failing every request."""
+    # apple sentinel -> Foundation Models backend (no _think_unsupported logic
+    # there; FM has no think flag). Dispatch before any think handling.
+    if is_apple_model(model or CHAT_MODEL):
+        import applefm
+        try:
+            return applefm.chat_once_json(messages, model=model,
+                                          retry_nudge=retry_nudge,
+                                          timeout=timeout, think=think)
+        except (applefm.GenerationRejectedError,
+                applefm.ContextOverflowError) as exc:
+            # A per-request Apple rejection (unsupported language, guardrail, an
+            # over-long single input) degrades to this function's documented None
+            # contract -- the batch caller skips the row and retries next run --
+            # instead of aborting the whole run. A fatal AppleFMError
+            # (unavailable, or a bad_request protocol bug) still propagates.
+            print(f"  Apple FM skipped an input ({exc}); retried next run")
+            return None
     global _think_unsupported
     for _ in range(2):
         send_think = None if _think_unsupported else think
@@ -158,6 +182,14 @@ def chat_stream(messages, tools=None, model=None, timeout=None, think=_UNSET):
     Pass tools=None to withhold the tool schemas entirely, which is the only
     reliable way to stop the model from calling one. model=None uses
     CHAT_MODEL from config; think= behaves as in chat_once."""
+    # apple sentinel -> Foundation Models backend. This is a generator, so we
+    # `yield from` the delegate (a bare `return applefm.chat_stream(...)` would
+    # set StopIteration.value and yield the caller NOTHING) then stop.
+    if is_apple_model(model or CHAT_MODEL):
+        import applefm
+        yield from applefm.chat_stream(messages, tools=tools, model=model,
+                                       timeout=timeout, think=think)
+        return
     conn = http.client.HTTPConnection(
         OLLAMA_HOST, OLLAMA_PORT, timeout=timeout or CHAT_TIMEOUT
     )
