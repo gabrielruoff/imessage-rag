@@ -1089,3 +1089,42 @@ or real `chat.db` needed).
    reachable Ollama and hours, while ingest must stay runnable offline.
 4. **`.txt` parser** — not built; only needed if `chat.db` access isn't
    available for some future conversation/export.
+
+## 2026-07-21: review follow-ups — drift rebuild guard + nudge reconciliation
+
+Two correctness fixes from the PR #32 ("Close Read") review.
+
+**Drift rebuild guard widened (`drift.py`).** `build_drift` skips when neither
+the corpus high-water mark nor a params hash changed. Two scoring inputs weren't
+covered, so a change to either silently served stale scores until `--force`:
+
+- `_params_hash()` hashed only `DRIFT_WEIGHTS` + `DRIFT_PHASE_THRESHOLDS`, but
+  scoring also consumes `alpha` (`DRIFT_SLOPE_CI`) and the four `DRIFT_MIN_*`
+  gates — `alpha` drives every signal's CI/significance and thus `drift_score`,
+  the per-signal gates, `phase`, and `confidence_tier`. It now hashes the full
+  `_current_config()`, so retuning any scoring param forces a rebuild.
+- The guard was blind to `chunk_annotations`. `annotate.py --upgrade-distilled`
+  rewrites existing rows in place (`INSERT OR REPLACE`, same `chunk_id` PK):
+  `source` flips `distilled → llm` and `valence`/`depth` change with **no new
+  messages**, so both the message-id and params guards stayed identical while the
+  valence signal + `confidence_tier` should have moved. A new
+  `drift_annotations_hash` guard key fingerprints exactly the rows
+  `_load_annotations` consumes — `COUNT` plus `SUM(source='llm')`,
+  `SUM(valence)`, `SUM(depth)` (a plain `COUNT` can't detect an in-place
+  upgrade). `purge_drift`/`make drift-purge` clears all three keys.
+
+**Nudge reconciliation exempts degraded nondeterministic detectors
+(`loose_ends.py`).** `_resolve_stale_threads` auto-resolves any open thread a run
+did not re-detect — sound for the deterministic SQL detectors, wrong for
+`dropped_plan`, the one detector that re-verifies via Ollama each run. When
+`_verify_plan` returns `None` (unparseable/empty JSON after retry) or `""` (dict
+missing `verdict`), the candidate is suppressed and the thread would flip to
+`resolved` — a transient model hiccup silently closing a real loose end. Fix: a
+module-level `NONDETERMINISTIC_KINDS = {"dropped_plan"}`; `detect_dropped_plan`
+sets `cfg["dropped_plan_degraded"]` on a no-usable-verdict verify; `detect_all`
+builds the degraded-kind set and `_resolve_stale_threads` skips those kinds
+(`AND kind NOT IN (...)`). A clean `fulfilled`/`unknown` verdict is a legitimate
+resolve and does NOT set the flag, so genuine closes still reconcile — the
+exemption only defers to the next clean run, never resolves wrongly. (A hard
+socket timeout instead raises and crashes the run before the reconcile/commit
+step, so it can't silently over-resolve; left as-is.)

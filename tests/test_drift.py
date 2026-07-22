@@ -324,6 +324,45 @@ class DriftBuildTest(unittest.TestCase):
         self.addCleanup(setattr, config, "DRIFT_WEIGHTS", saved)
         self.assertGreater(drift.build_drift(self.con), 0)
 
+    def test_params_hash_covers_alpha_and_min_gates(self):
+        # Regression: the params hash must cover EVERY scoring input in
+        # _current_config(), not just weights/thresholds -- retuning alpha
+        # (DRIFT_SLOPE_CI) or a min_* gate previously left the hash unchanged, so
+        # build_drift skipped and silently served stale scores.
+        base = drift._params_hash()
+        for name, delta in (("DRIFT_SLOPE_CI", 0.01), ("DRIFT_MIN_MESSAGES", 1),
+                            ("DRIFT_MIN_MONTHS", 1), ("DRIFT_MIN_VALID_MONTHS", 1),
+                            ("DRIFT_MIN_SESSIONS", 1)):
+            saved = getattr(config, name)
+            setattr(config, name, saved + delta)
+            try:
+                self.assertNotEqual(
+                    drift._params_hash(), base,
+                    f"changing {name} must change the params hash (else stale skip)")
+            finally:
+                setattr(config, name, saved)
+
+    def test_annotation_upgrade_forces_rebuild(self):
+        # Regression: an in-place re-annotation (--upgrade-distilled flips
+        # source distilled->llm and rewrites valence) adds NO new messages, so
+        # the message-id + params guard can't see it. The annotation fingerprint
+        # must force a rebuild anyway.
+        self.con.execute(
+            "INSERT INTO chunks(id, chat_id, first_date) VALUES (1, 100, '2023-03-15')")
+        self.con.execute(
+            "INSERT INTO chunk_annotations(chunk_id, valence, depth, source) "
+            "VALUES (1, 0.0, 1, 'distilled')")
+        self.con.commit()
+        self.assertGreater(drift.build_drift(self.con), 0)   # writes the annotation hash
+        self.assertEqual(drift.build_drift(self.con), 0)     # unchanged -> skip
+        # In-place upgrade: same chunk_id (row COUNT unchanged), no new messages.
+        self.con.execute(
+            "UPDATE chunk_annotations SET source='llm', valence=0.5 WHERE chunk_id=1")
+        self.con.commit()
+        self.assertGreater(
+            drift.build_drift(self.con), 0,
+            "re-annotation with no new messages must still force a rebuild")
+
     def test_force_rebuild_is_idempotent(self):
         drift.build_drift(self.con, force=True)
         first = self._rows()
@@ -670,7 +709,7 @@ class TestMonthlySeriesShape(unittest.TestCase):
 
 
 class DriftPurgeTest(unittest.TestCase):
-    """--purge wipes dyad_drift + its two ingest_state guard keys, leaves other
+    """--purge wipes dyad_drift + its three ingest_state guard keys, leaves other
     keys alone, never errors on a fresh DB, and runs regardless of the flag."""
 
     def _fresh_db(self):
@@ -686,6 +725,7 @@ class DriftPurgeTest(unittest.TestCase):
                     "VALUES ('contact:1', 0.7), ('handle:9', 0.2)")
         drift.set_state(con, "drift_max_message_id", 1234)
         drift.set_state(con, "drift_params_hash", "deadbeef")
+        drift.set_state(con, "drift_annotations_hash", "cafef00d")
         con.commit()
 
     def test_purge_drift_wipes_rows_and_guard_keys(self):
@@ -697,6 +737,7 @@ class DriftPurgeTest(unittest.TestCase):
             con.execute("SELECT COUNT(*) FROM dyad_drift").fetchone()[0], 0)
         self.assertIsNone(drift.get_state(con, "drift_max_message_id"))
         self.assertIsNone(drift.get_state(con, "drift_params_hash"))
+        self.assertIsNone(drift.get_state(con, "drift_annotations_hash"))
 
     def test_purge_preserves_unrelated_ingest_state(self):
         _db, con = self._fresh_db()
@@ -733,7 +774,8 @@ class DriftPurgeTest(unittest.TestCase):
             n_rows = con.execute("SELECT COUNT(*) FROM dyad_drift").fetchone()[0]
             keys = [r[0] for r in con.execute(
                 "SELECT key FROM ingest_state WHERE key IN "
-                "('drift_max_message_id', 'drift_params_hash')")]
+                "('drift_max_message_id', 'drift_params_hash', "
+                "'drift_annotations_hash')")]
         finally:
             con.close()
         self.assertEqual(n_rows, 0)

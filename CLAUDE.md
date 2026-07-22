@@ -275,7 +275,8 @@ ingest_state(key, value)          -- last_message_rowid for --since-last, plus
                                   -- annotate_model, topic_model_k, the
                                   -- suite guards: loose_ends_model,
                                   -- conflict_model, drift_max_message_id +
-                                  -- drift_params_hash, voiceprint_max_message_id,
+                                  -- drift_params_hash + drift_annotations_hash,
+                                  -- voiceprint_max_message_id,
                                   -- eval_gate:<task> (F4 gate verdicts), and
                                   -- nudges_reconnect_ack (durable dormant-tie
                                   -- reconnect opt-in; unset hides those rows)
@@ -326,7 +327,9 @@ dyad_drift(contact_key, label, n_messages, n_months, first_month, last_month,
                                   -- per-counterparty relationship drift (drift.py;
                                   -- one row per member_key, opt-in DRIFT_ENABLED);
                                   -- full rebuild, guarded by drift_max_message_id +
-                                  -- drift_params_hash
+                                  -- drift_params_hash + drift_annotations_hash
+                                  -- (the last re-fingerprints chunk_annotations so
+                                  -- an --upgrade-distilled re-annotation rebuilds)
 person_voiceprint(member_key, counterpart_key, scope, avg_msg_len,
          lowercase_ratio, exclaim_rate, ellipsis_rate, burst_size,
          ...9 fw_*_rate cols..., openers_json, closers_json, tone_valence,

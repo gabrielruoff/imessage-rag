@@ -171,6 +171,17 @@ class CandidateRow:
 # driver loop below is the single place exclusion + urgency run.
 DETECTORS: list[tuple[str, Callable[[object, dict], Iterable[CandidateRow]]]] = []
 
+# Kinds whose detection re-runs a live, nondeterministic model verdict every
+# pass (dropped_plan is the only one -- the rest are deterministic SQL / read
+# precomputed annotations). Reconciliation auto-resolves any OPEN thread a run
+# does NOT re-detect, which is sound for deterministic detectors but wrong for
+# these: a degraded verify (model unreachable / unparseable JSON) suppresses the
+# candidate and would silently resolve a still-open thread. When such a detector
+# reports it "ran degraded" this pass (cfg['<kind>_degraded']), the driver
+# exempts that kind from absence-based auto-resolve -- a delayed close on the
+# next clean run, never a wrongful one.
+NONDETERMINISTIC_KINDS = frozenset({"dropped_plan"})
+
 
 # ---------------------------------------------------------------------------
 # Shared dyad primitives (consumed by detectors here and in N2/N3)
@@ -898,8 +909,15 @@ def detect_dropped_plan(con, cfg) -> Iterable[CandidateRow]:
         following = _plan_following_context(
             con, chat_id, r["id"], r["date"], cfg["plan_context_msgs"])
         verdict = _verify_plan(r["text"], r["is_from_me"], following, cfg)
+        if verdict in (None, ""):
+            # Verify ran but produced no usable verdict (unparseable/empty JSON
+            # after retry, or a dict missing 'verdict'). Mark the run degraded so
+            # the driver skips auto-resolving dropped_plan threads this pass. A
+            # clean 'fulfilled'/'unknown' below is a legitimate resolve, NOT this.
+            cfg["dropped_plan_degraded"] = True
+            continue
         if verdict != "unfulfilled":
-            continue  # UNKNOWN / fulfilled / unparseable -> SUPPRESS
+            continue  # clean UNKNOWN / fulfilled -> legitimate SUPPRESS
         yield CandidateRow(
             kind="dropped_plan",
             chat_id=chat_id,
@@ -1296,26 +1314,38 @@ def detect_all(con, cfg, event_now, dry_run=False):
                 n_written += 1
     n_resolved = 0
     if not dry_run:
-        n_resolved = _resolve_stale_threads(con, thread_ids, event_now)
+        # A nondeterministic detector that ran degraded this pass (e.g. the
+        # model was unreachable for dropped_plan) is exempted from absence-based
+        # auto-resolve -- otherwise a transient verify failure silently closes a
+        # still-open thread.
+        degraded_kinds = {k for k in NONDETERMINISTIC_KINDS
+                          if cfg.get(f"{k}_degraded")}
+        n_resolved = _resolve_stale_threads(
+            con, thread_ids, event_now, skip_kinds=degraded_kinds)
         con.commit()
     return {"auto_excluded": n_auto, "candidates": n_candidates,
             "suppressed": n_suppressed, "written": n_written,
             "resolved": n_resolved, "thread_ids": thread_ids}
 
 
-def _resolve_stale_threads(con, written_ids, now):
+def _resolve_stale_threads(con, written_ids, now, skip_kinds=None):
     """Reconciliation: auto-close every OPEN thread this run did NOT re-detect --
     the loose end resolved (question answered, tie reconnected, occasion passed).
     Sets status='resolved' (distinct from a user 'dismissed'; hidden from both the
     open and the 'already dealt with' digests). Detectors run corpus-wide, so a
-    thread absent from this run's candidates is genuinely no longer a loose end.
+    thread absent from this run's candidates is genuinely no longer a loose end --
+    EXCEPT for a kind in skip_kinds, whose (nondeterministic) detector ran
+    degraded this pass and whose absence therefore proves nothing.
     Returns the number closed. Does NOT commit -- the caller owns the transaction."""
-    placeholders = ",".join("?" * len(written_ids)) if written_ids else ""
-    keep = f" AND id NOT IN ({placeholders})" if written_ids else ""
+    skip_kinds = sorted(skip_kinds or ())
+    keep_ph = ",".join("?" * len(written_ids))
+    keep = f" AND id NOT IN ({keep_ph})" if written_ids else ""
+    skip_ph = ",".join("?" * len(skip_kinds))
+    skip = f" AND kind NOT IN ({skip_ph})" if skip_kinds else ""
     cur = con.execute(
         f"UPDATE loose_threads SET status = 'resolved', dismissed_at = ? "
-        f"WHERE status = 'open'{keep}",
-        [now, *written_ids],
+        f"WHERE status = 'open'{keep}{skip}",
+        [now, *written_ids, *skip_kinds],
     )
     return cur.rowcount
 

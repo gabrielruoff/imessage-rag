@@ -1182,6 +1182,53 @@ class DroppedPlanDriverTest(_DroppedPlanFixtureTest):
         m.assert_not_called()
         self.assertEqual(self._dropped_rows(), [])
 
+    def _status_map(self):
+        con = sqlite3.connect(self.db_path)
+        try:
+            return {(k, c): s for k, c, s in con.execute(
+                "SELECT kind, chat_id, status FROM loose_threads")}
+        finally:
+            con.close()
+
+    def test_degraded_verify_does_not_auto_resolve_dropped_plan(self):
+        # Regression: a degraded verify (model unreachable -> None) must NOT let
+        # reconciliation silently close a still-open dropped_plan thread. A stale
+        # deterministic thread in the same run still resolves normally.
+        self._pass_gate()
+        con = sqlite3.connect(self.db_path)
+        con.execute("INSERT INTO loose_threads(kind, chat_id, status, detected_at) "
+                    "VALUES ('dropped_plan', 100, 'open', '2020-01-01')")
+        con.execute("INSERT INTO loose_threads(kind, chat_id, status, detected_at) "
+                    "VALUES ('faded_initiator', 555, 'open', '2020-01-01')")
+        con.commit()
+        con.close()
+        con = self._open()
+        cfg = self._cfg(con, enabled=True)
+        with mock.patch.object(loose_ends.ollama, "chat_once_json", return_value=None):
+            loose_ends.detect_all(con, cfg, "2026-07-01T00:00:00+00:00")
+        status = self._status_map()
+        # dropped_plan verify ran degraded -> its kind is exempted from auto-resolve.
+        self.assertEqual(status[("dropped_plan", 100)], "open")
+        # A deterministic detector's stale thread still resolves as before.
+        self.assertEqual(status[("faded_initiator", 555)], "resolved")
+
+    def test_clean_run_still_auto_resolves_dropped_plan(self):
+        # The exemption fires ONLY on a degraded verify: a clean 'fulfilled'
+        # verdict (no degraded flag) leaves dropped_plan reconcilable, so a stale
+        # thread the run does not re-detect is resolved normally.
+        self._pass_gate()
+        con = sqlite3.connect(self.db_path)
+        con.execute("INSERT INTO loose_threads(kind, chat_id, status, detected_at) "
+                    "VALUES ('dropped_plan', 100, 'open', '2020-01-01')")
+        con.commit()
+        con.close()
+        con = self._open()
+        cfg = self._cfg(con, enabled=True)
+        with mock.patch.object(loose_ends.ollama, "chat_once_json",
+                               return_value={"verdict": "fulfilled"}):
+            loose_ends.detect_all(con, cfg, "2026-07-01T00:00:00+00:00")
+        self.assertEqual(self._status_map()[("dropped_plan", 100)], "resolved")
+
 
 class DroppedPlanConfigTest(unittest.TestCase):
     def test_pinned_config_defaults(self):

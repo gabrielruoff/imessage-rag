@@ -633,12 +633,12 @@ _INSERT_COLUMNS = (
 # ---------------------------------------------------------------------------
 
 def _params_hash():
-    """Stable hash of the two structured params. A change forces a rebuild even
-    when no new messages arrived, so re-weighting takes effect immediately."""
-    payload = json.dumps(
-        {"weights": config.DRIFT_WEIGHTS, "thresholds": config.DRIFT_PHASE_THRESHOLDS},
-        sort_keys=True,
-    )
+    """Stable hash of *every* scoring input in _current_config() -- the weights
+    and thresholds plus alpha (DRIFT_SLOPE_CI) and the four min_* gates. Any
+    change forces a rebuild even when no new messages arrived, so re-tuning any
+    of them takes effect immediately (previously only weights/thresholds were
+    covered, so retuning alpha or a min_* gate silently served stale scores)."""
+    payload = json.dumps(_current_config(), sort_keys=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -662,6 +662,25 @@ def _current_config():
     }
 
 
+def _annotations_hash(con):
+    """Fingerprint of the chunk_annotations rows _load_annotations consumes, so
+    an in-place re-annotation (e.g. `annotate.py --upgrade-distilled`, which
+    flips source distilled->llm and rewrites valence/depth with no new messages)
+    forces a rebuild. Aggregates over the *same* join _load_annotations uses; a
+    plain COUNT can't detect an INSERT OR REPLACE (row count unchanged), so the
+    source/valence/depth sums carry the signal. Hashed as text to keep the
+    float-repr stable across runs."""
+    row = con.execute(
+        "SELECT COUNT(*), "
+        "COALESCE(SUM(CASE WHEN a.source='llm' THEN 1 ELSE 0 END), 0), "
+        "COALESCE(SUM(a.valence), 0.0), COALESCE(SUM(a.depth), 0) "
+        "FROM chunks ck JOIN chunk_annotations a ON a.chunk_id = ck.id "
+        "JOIN chats ch ON ch.id = ck.chat_id AND ch.is_group = 0 "
+        "WHERE ck.first_date IS NOT NULL"
+    ).fetchone()
+    return hashlib.sha256(repr(tuple(row)).encode("utf-8")).hexdigest()
+
+
 def build_drift(con, *, force=False, dry_run=False):
     """Full rebuild of dyad_drift, skipping when neither the corpus high-water
     mark nor the params hash changed. Returns the number of rows written (0 on a
@@ -670,10 +689,12 @@ def build_drift(con, *, force=False, dry_run=False):
 
     cur_max = _max_message_id(con)
     cur_hash = _params_hash()
+    cur_ann = _annotations_hash(con)
     prev_max = get_state(con, "drift_max_message_id")
     prev_hash = get_state(con, "drift_params_hash")
+    prev_ann = get_state(con, "drift_annotations_hash")
     unchanged = (prev_max is not None and int(prev_max) == cur_max
-                 and prev_hash == cur_hash)
+                 and prev_hash == cur_hash and prev_ann == cur_ann)
     if unchanged and not force and not dry_run:
         print("dyad_drift up to date (skipped)")
         return 0
@@ -726,6 +747,7 @@ def build_drift(con, *, force=False, dry_run=False):
     )
     set_state(con, "drift_max_message_id", cur_max)
     set_state(con, "drift_params_hash", cur_hash)
+    set_state(con, "drift_annotations_hash", cur_ann)
     con.commit()
     print(f"Built dyad_drift: {len(rows)} dyads scored "
           f"(of {len(messages)} resolved 1:1 relationships)")
@@ -737,9 +759,10 @@ def build_drift(con, *, force=False, dry_run=False):
 # ---------------------------------------------------------------------------
 
 def purge_drift(con):
-    """Tear down the drift artifact: delete every dyad_drift row and the two
-    ingest_state guard keys (drift_max_message_id, drift_params_hash) so a later
-    rerun starts clean, then print the one manual step this process cannot do.
+    """Tear down the drift artifact: delete every dyad_drift row and the three
+    ingest_state guard keys (drift_max_message_id, drift_params_hash,
+    drift_annotations_hash) so a later rerun starts clean, then print the one
+    manual step this process cannot do.
 
     A Python process cannot durably unset an env var, so flipping
     DRIFT_ENABLED=false in .env stays the user's job -- and that flip is what
@@ -751,10 +774,11 @@ def purge_drift(con):
     n = con.execute("SELECT COUNT(*) FROM dyad_drift").fetchone()[0]
     con.execute("DELETE FROM dyad_drift")
     con.execute("DELETE FROM ingest_state "
-                "WHERE key IN ('drift_max_message_id', 'drift_params_hash')")
+                "WHERE key IN ('drift_max_message_id', 'drift_params_hash', "
+                "'drift_annotations_hash')")
     con.commit()
     print(f"Purged dyad_drift: {n} rows deleted; cleared ingest_state guard keys "
-          "drift_max_message_id and drift_params_hash.")
+          "drift_max_message_id, drift_params_hash and drift_annotations_hash.")
     print("Now set DRIFT_ENABLED=false in .env to keep drift off -- a process "
           "cannot unset an env var for you, so this flag flip is the one manual "
           "step. Until DRIFT_ENABLED=true again AND new messages arrive, nothing "
