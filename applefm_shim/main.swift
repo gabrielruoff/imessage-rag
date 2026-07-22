@@ -60,12 +60,19 @@ func emitError(id: Any, _ error: Error) {
     let kind: String
     let message: String
     if let gen = error as? LanguageModelSession.GenerationError {
-        // The one distinction the Python side acts on: a blown context window is
-        // recoverable (retry with less), everything else is not.
+        // Three distinctions the Python side acts on. Two are fatal-ish:
+        // exceededContextWindowSize is recoverable by retrying with less
+        // (context_overflow), assetsUnavailable means the model is down
+        // (unavailable, fatal). Every other GenerationError is a per-request,
+        // content-driven rejection (unsupported language/locale, guardrail,
+        // decoding failure, ...): recoverable by SKIPPING this input, so it maps
+        // to generation_error rather than bad_request. bad_request stays
+        // reserved for our own protocol/framing bugs (the NSError branch below
+        // and ShimError.badRequest), which must remain fatal.
         switch gen {
         case .exceededContextWindowSize: kind = "context_overflow"
         case .assetsUnavailable: kind = "unavailable"
-        default: kind = "bad_request"
+        default: kind = "generation_error"
         }
         message = gen.errorDescription ?? String(describing: gen)
     } else if let shim = error as? ShimError {
@@ -78,11 +85,23 @@ func emitError(id: Any, _ error: Error) {
     emit(["id": id, "type": "error", "message": message, "kind": kind])
 }
 
+// The one model instance every respond call uses, configured with permissive
+// content-transformation guardrails. This app transforms the user's OWN
+// on-device messages (labeling, summarizing, term curation, answering questions
+// about them) -- the exact use case Apple documents permissiveContentTransformations
+// for -- and the default guardrail rejects a large fraction of real personal
+// content (self-harm/violence/sexual message text) with .guardrailViolation,
+// which would otherwise skip that content everywhere. Guardrails do not affect
+// availability, so handleAvailability reads it off this same instance too. A
+// file-scope `let` initializes lazily and thread-safely on first use, and is
+// safe to construct even when Apple Intelligence is unavailable.
+let generationModel = SystemLanguageModel(guardrails: .permissiveContentTransformations)
+
 // ---------------------------------------------------------------------------
 // availability
 // ---------------------------------------------------------------------------
 func handleAvailability(id: Any) {
-    switch SystemLanguageModel.default.availability {
+    switch generationModel.availability {
     case .available:
         emit(["id": id, "type": "availability", "available": true, "reason": "available"])
     case .unavailable(let reason):
@@ -184,8 +203,9 @@ func handleRespond(id: Any, request: [String: Any]) async {
     let stream = request["stream"] as? Bool ?? false
     // Fresh session every call: the Python orchestrator carries all state
     // between turns itself, so history here would only burn the 4,096-token
-    // window. `instructions` is the system message.
-    let session = LanguageModelSession(instructions: system)
+    // window. `instructions` is the system message. `generationModel` carries
+    // the permissive content-transformation guardrails (see its definition).
+    let session = LanguageModelSession(model: generationModel, instructions: system)
 
     do {
         if let schemaNode = request["schema"] as? [String: Any] {

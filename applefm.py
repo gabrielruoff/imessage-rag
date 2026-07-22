@@ -70,12 +70,32 @@ _JSON_RETRY_NUDGE = (
     "no prose, no code fences, nothing else."
 )
 
-class ContextOverflowError(RuntimeError):
+class AppleFMError(RuntimeError):
+    """Base for every caller-facing error raised by the Apple FM transport
+    (missing shim, unavailable, timeout, crash, bad_request, and -- via the
+    subclass below -- context overflow). A RuntimeError subclass so existing
+    `except RuntimeError` handlers still catch it, but a distinct type so
+    chat.py can catch it precisely and surface a clean, backend-labeled message
+    instead of letting a raw traceback escape the turn."""
+
+
+class ContextOverflowError(AppleFMError):
     """A respond() call whose prompt exceeded the FM's fixed 4,096-token window
-    (mapped from the shim's exceededContextWindowSize). A RuntimeError subclass,
+    (mapped from the shim's exceededContextWindowSize). An AppleFMError subclass,
     so existing `except RuntimeError` handlers still catch it, but a distinct
     type so chat_apple can catch it precisely and shrink its prompt (compact the
     scratchpad, drop the catalog) rather than let the whole turn crash."""
+
+
+class GenerationRejectedError(AppleFMError):
+    """A per-request, content-driven rejection from the on-device model (mapped
+    from the shim's generation_error kind: an unsupported language/locale, a
+    guardrail violation, a decoding failure, ...). Recoverable by SKIPPING this
+    input -- unlike ContextOverflowError, shrinking the prompt won't help. A
+    sibling of ContextOverflowError and still an AppleFMError/RuntimeError, so
+    broad handlers keep working, but a distinct type so batch callers (e.g.
+    ollama.chat_once_json) can degrade one bad row to a skip instead of aborting
+    the whole run, while a fatal bad_request/unavailable still propagates."""
 
 
 # --- Transport state ---------------------------------------------------------
@@ -130,10 +150,10 @@ def _spawn():
     """Launch the persistent shim subprocess from SHIM_PATH. A missing binary
     is the common first-run failure (the shim is built by `make apple-shim`,
     deliberately kept out of `make install`), so it raises an actionable
-    RuntimeError rather than surfacing a bare FileNotFoundError from Popen.
+    AppleFMError rather than surfacing a bare FileNotFoundError from Popen.
     Caller holds _lock."""
     if not SHIM_PATH.exists():
-        raise RuntimeError(
+        raise AppleFMError(
             f"Apple FM shim not found at {SHIM_PATH}. Build it with "
             "'make apple-shim' (needs macOS 26+, Apple Silicon, and Apple "
             "Intelligence enabled in System Settings)."
@@ -254,20 +274,23 @@ def _reader_stream(proc, want_id, timeout):
 
 
 def _raise_shim_error(resp):
-    """Turn a shim {"type":"error"} response into a RuntimeError carrying both
-    kind and message. Two kinds are actionable and phrased to stand out:
+    """Turn a shim {"type":"error"} response into an AppleFMError carrying both
+    kind and message. Three kinds are actionable and phrased to stand out:
     'unavailable' (Apple Intelligence off/unsupported -- the reason string IS
-    the fix) and 'context_overflow' (the fixed 4,096-token window was
-    exceeded); anything else is a generic bad_request."""
+    the fix), 'context_overflow' (the fixed 4,096-token window was exceeded),
+    and 'generation_error' (a per-request content rejection -- recoverable by
+    skipping this input); anything else is a generic, fatal bad_request."""
     kind = resp.get("kind", "error")
     message = resp.get("message", "")
     if kind == "unavailable":
-        raise RuntimeError(f"Apple Foundation Models unavailable: {message}")
+        raise AppleFMError(f"Apple Foundation Models unavailable: {message}")
     if kind == "context_overflow":
         raise ContextOverflowError(
             f"Apple FM context_overflow (4,096-token window exceeded): {message}"
         )
-    raise RuntimeError(f"Apple FM shim error [{kind}]: {message}")
+    if kind == "generation_error":
+        raise GenerationRejectedError(f"Apple FM rejected the request: {message}")
+    raise AppleFMError(f"Apple FM shim error [{kind}]: {message}")
 
 
 def _transact(payload, timeout, reader):
@@ -292,7 +315,7 @@ def _transact(payload, timeout, reader):
                 return reader(proc, payload["id"], timeout)
             except _ShimTimeout:
                 _kill_proc()
-                raise RuntimeError(
+                raise AppleFMError(
                     f"Apple FM shim timed out after {timeout}s (killed)"
                 ) from None
             except (BrokenPipeError, _ShimCrashed):
@@ -302,7 +325,7 @@ def _transact(payload, timeout, reader):
                 _kill_proc()
                 if attempt == 0:
                     continue
-                raise RuntimeError(
+                raise AppleFMError(
                     "Apple FM shim crashed without answering"
                 ) from None
 

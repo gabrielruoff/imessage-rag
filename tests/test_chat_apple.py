@@ -152,6 +152,36 @@ class DigestOverflowTest(AppleChatTest):
         # The digested facts feed the answer prompt.
         self.assertIn("found 400 messages", fake.prompts[-1])
 
+    def test_oversized_envelope_preserves_population_metadata(self):
+        # An oversized search envelope: _slice_result walks `rows` only, so
+        # total_matching/returned/order/truncated must be prepended verbatim as
+        # a fact -- otherwise the answerer can't report the true total or that
+        # the sample was capped (exactly the case where it matters most).
+        envelope = {
+            "rows": [{"id": i, "text": "x" * 120} for i in range(400)],
+            "total_matching": 9999, "returned": 50,
+            "order": "newest-first", "truncated": True,
+        }
+        big_json = json.dumps(envelope, default=str)
+        self.assertGreater(len(big_json), config.APPLE_TOOL_RESULT_MAX_CHARS)
+        self.stub_tool("search_messages_sql", lambda **kw: envelope)
+
+        fake = self.install(ScriptedRespond(
+            route_actions=["search_messages_sql", "answer"],
+            digest_reply="a matching message",
+            answer_chunks=("done",),
+        ))
+        chat_apple.run_turn([{"role": "user", "content": "how many total?"}])
+
+        # The raw envelope JSON never reaches any prompt whole...
+        for prompt in fake.prompts:
+            self.assertNotIn(big_json, prompt)
+        # ...but the population metadata does, verbatim, in the answer prompt.
+        answer_prompt = fake.prompts[-1]
+        self.assertIn("9999", answer_prompt)  # true total, not the 400-row sample
+        self.assertIn("total_matching", answer_prompt)
+        self.assertIn("truncated", answer_prompt)
+
 
 class IterationBoundTest(AppleChatTest):
     def test_loop_stops_at_max_iterations_and_answers(self):
@@ -307,6 +337,44 @@ class WindowOverflowTest(AppleChatTest):
         reply = chat_apple.run_turn([{"role": "user", "content": "hi"}])
         self.assertEqual(reply, "final degraded")
         self.assertEqual(state["answer"], 3)  # two overflows, then a reply
+
+
+class GenerationRejectedTest(AppleChatTest):
+    """A per-request content rejection (applefm.GenerationRejectedError -- the
+    permissive guardrail still occasionally refuses, or an unsupported-locale
+    input) must degrade exactly like a window overflow: skipped/answered, never
+    raised out of run_turn. Mirrors WindowOverflowTest with the sibling error."""
+
+    def test_route_rejection_falls_through_to_answer(self):
+        def fake(system, prompt, schema=None, stream=False):
+            if stream:
+                return iter(("degraded answer",))
+            if schema is not None and "action" in (schema.get("properties") or {}):
+                raise applefm.GenerationRejectedError("Apple FM rejected the request")
+            return json.dumps({})
+
+        self.install(fake)
+        reply = chat_apple.run_turn([{"role": "user", "content": "hi"}])
+        self.assertEqual(reply, "degraded answer")  # answered, did not crash
+
+    def test_answer_rejection_retries_then_degrades(self):
+        state = {"answer": 0}
+
+        def fake(system, prompt, schema=None, stream=False):
+            if stream:
+                state["answer"] += 1
+                if state["answer"] < 3:
+                    def boom():
+                        raise applefm.GenerationRejectedError("still refused")
+                        yield  # unreachable -- makes boom a generator
+                    return boom()
+                return iter(("final degraded",))
+            return json.dumps({"action": "answer"})  # route -> answer immediately
+
+        self.install(fake)
+        reply = chat_apple.run_turn([{"role": "user", "content": "hi"}])
+        self.assertEqual(reply, "final degraded")
+        self.assertEqual(state["answer"], 3)  # two rejections, then a reply
 
 
 class RunTurnSignatureTest(unittest.TestCase):

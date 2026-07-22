@@ -12,6 +12,7 @@ load-bearing behaviors of the fallback, both of which regress silently:
 Run from the repo root:  python3 -m unittest discover tests
 """
 
+import contextlib
 import copy
 import io
 import json
@@ -19,6 +20,7 @@ import unittest
 
 from rich.console import Console
 
+import applefm
 import chat
 
 # An unknown tool name on purpose: it routes run_turn into its "unknown tool"
@@ -283,6 +285,58 @@ class CapToolResultTest(unittest.TestCase):
         self.assertEqual(capped["order"], "newest-first")
         self.assertEqual(capped["returned"], capped["rows_returned"])
         self.assertLessEqual(len(json.dumps(capped)), 500)
+
+
+class MainPromptBackendErrorTest(unittest.TestCase):
+    """chat.main's -p one-shot surfaces a backend failure as a clean, labeled
+    message and exits 1 -- never a traceback. The Apple FM transport raises
+    applefm.AppleFMError (missing shim, unavailable, timeout, crash), so the
+    handler must catch it exactly like an Ollama connection error and pick the
+    label from the selected backend."""
+
+    def setUp(self):
+        # A constant system prompt so main() never touches query_tools/the DB.
+        self._saved_bsp = chat._build_system_prompt
+        chat._build_system_prompt = lambda: "SYS"
+        self.addCleanup(setattr, chat, "_build_system_prompt", self._saved_bsp)
+
+        self._saved_run_turn = chat.run_turn
+        self.addCleanup(setattr, chat, "run_turn", self._saved_run_turn)
+
+    def _run_p(self, model, exc):
+        """Drive `chat.main` down the -p path with run_turn stubbed to raise
+        `exc`; return (exit_code, captured_stdout)."""
+        def boom(*a, **k):
+            raise exc
+
+        chat.run_turn = boom
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), self.assertRaises(SystemExit) as ctx:
+            chat.main(["-p", "hi", "-m", model])
+        return ctx.exception.code, buf.getvalue()
+
+    def test_apple_error_is_clean_labeled_and_exits_1(self):
+        code, out = self._run_p(
+            "apple",
+            applefm.AppleFMError(
+                "Apple FM shim not found at bin/applefm-shim. Build it with "
+                "'make apple-shim' (needs macOS 26+, Apple Silicon, and Apple "
+                "Intelligence enabled in System Settings)."
+            ),
+        )
+        self.assertEqual(code, 1)  # exit 1, not an uncaught traceback
+        self.assertIn("Apple Foundation Models", out)  # backend-aware label
+        self.assertIn("make apple-shim", out)  # the actionable message survives
+        self.assertNotIn("Ollama", out)
+
+    def test_non_apple_error_keeps_the_ollama_label(self):
+        # Regression guard: the Ollama path is byte-for-byte unchanged -- an
+        # OSError still yields the "Ollama" label and exit 1.
+        code, out = self._run_p("gemma4:26b-a4b-it-qat", OSError("connection refused"))
+        self.assertEqual(code, 1)
+        self.assertIn("Ollama", out)
+        self.assertIn("connection refused", out)
+        self.assertNotIn("Apple Foundation Models", out)
 
 
 if __name__ == "__main__":

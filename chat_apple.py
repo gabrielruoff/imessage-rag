@@ -287,7 +287,7 @@ def _compact(question, scratchpad):
             DIGEST_SYSTEM,
             f"Extract facts relevant to this question:\n{question}\n\nFrom:\n{joined}",
         )
-    except applefm.ContextOverflowError:
+    except (applefm.ContextOverflowError, applefm.GenerationRejectedError):
         return _tail_under_budget(scratchpad)
     reply = (reply or "").strip()
     if reply and reply.lower() != _NOTHING_RELEVANT:
@@ -309,8 +309,8 @@ def _route(question, summary, scratchpad):
     )
     try:
         data = _respond_json(ROUTE_SYSTEM, prompt, _ROUTE_SCHEMA)
-    except applefm.ContextOverflowError:
-        return "answer"  # can't fit even the router prompt -- answer from facts
+    except (applefm.ContextOverflowError, applefm.GenerationRejectedError):
+        return "answer"  # can't fit/generate the router step -- answer from facts
     action = (data or {}).get("action")
     return action if isinstance(action, str) else "answer"
 
@@ -327,7 +327,7 @@ def _fill_args(name, question, summary, scratchpad):
     )
     try:
         data = _respond_json(ARG_SYSTEM, prompt, spec["schema"])
-    except applefm.ContextOverflowError:
+    except (applefm.ContextOverflowError, applefm.GenerationRejectedError):
         return {}  # fall back to the tool's own argument defaults
     return data if isinstance(data, dict) else {}
 
@@ -421,14 +421,23 @@ def _digest(question, name, result):
     if len(result_json) <= budget:
         return result_json
     facts = []
+    # _slice_result walks an envelope's `rows` only, so its scalar metadata
+    # (total_matching / returned / order / truncated) would be lost on exactly
+    # the large/truncated results where "how many matched" matters most. Keep it
+    # verbatim as the first fact -- a handful of scalars, safely under budget --
+    # so the ANSWER stage can still report the true total and the capped flag.
+    if isinstance(result, dict) and isinstance(result.get("rows"), list):
+        meta = {k: v for k, v in result.items() if k != "rows"}
+        if meta:
+            facts.append(json.dumps(meta, default=str))
     for window in _slice_result(result, result_json, budget):
         try:
             reply = _respond(
                 DIGEST_SYSTEM,
                 f"Extract facts relevant to this question:\n{question}\n\nFrom:\n{window}",
             )
-        except applefm.ContextOverflowError:
-            continue  # a stubborn window -- skip it rather than crash the turn
+        except (applefm.ContextOverflowError, applefm.GenerationRejectedError):
+            continue  # a stubborn/rejected window -- skip it, don't crash the turn
         reply = (reply or "").strip()
         if reply and reply.lower() != _NOTHING_RELEVANT:
             facts.append(reply)
@@ -492,7 +501,7 @@ def _answer(chat, question, summary, scratchpad, show_model_header, model):
             prompt = _context_block(question, summ, sp)
             stream = _respond(ANSWER_SYSTEM, prompt, stream=True)
             return _render_stream(chat, stream, show_model_header, model)
-        except applefm.ContextOverflowError:
+        except (applefm.ContextOverflowError, applefm.GenerationRejectedError):
             continue
     return ""
 

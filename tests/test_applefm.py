@@ -80,6 +80,27 @@ class TestDispatchRouting(unittest.TestCase):
         self.assertEqual(fake.call_args.kwargs["retry_nudge"], "NUDGE")
         self.assertEqual(out, {"ok": 1})
 
+    def test_chat_once_json_skips_apple_generation_rejection(self):
+        # A per-request Apple rejection degrades to the documented None contract
+        # (caller skips the row, retries next run) rather than propagating and
+        # aborting a whole batch run -- the bug that killed `make annotate`.
+        for exc in (applefm.GenerationRejectedError("unsupported language"),
+                    applefm.ContextOverflowError("window exceeded")):
+            with self.subTest(exc=type(exc).__name__), \
+                 mock.patch.object(applefm, "chat_once_json", side_effect=exc):
+                out = ollama.chat_once_json([{"role": "user", "content": "hi"}],
+                                            model="apple")
+            self.assertIsNone(out)
+
+    def test_chat_once_json_propagates_fatal_apple_error(self):
+        # A non-recoverable AppleFMError (unavailable / a bad_request protocol
+        # bug) must still abort -- it is NOT swallowed into a None skip.
+        with mock.patch.object(applefm, "chat_once_json",
+                               side_effect=applefm.AppleFMError("unavailable")):
+            with self.assertRaises(applefm.AppleFMError):
+                ollama.chat_once_json([{"role": "user", "content": "hi"}],
+                                      model="apple")
+
     def test_chat_once_json_non_apple_stays_on_ollama(self):
         with mock.patch.object(ollama, "chat_once",
                                return_value={"content": '{"a": 1}'}), \
@@ -211,6 +232,12 @@ for line in iter(sys.stdin.readline, ""):
         elif "ERR_UNAVAIL" in prompt:
             emit({"id": rid, "type": "error", "kind": "unavailable",
                   "message": "Apple Intelligence is not enabled"})
+        elif "ERR_GENREJECT" in prompt:
+            emit({"id": rid, "type": "error", "kind": "generation_error",
+                  "message": "An unsupported language or locale was used"})
+        elif "ERR_BADREQ" in prompt:
+            emit({"id": rid, "type": "error", "kind": "bad_request",
+                  "message": "missing 'op'"})
         elif req.get("stream"):
             for piece in ("hello ", "world"):
                 emit({"id": rid, "type": "chunk", "content": piece})
@@ -296,14 +323,35 @@ class TestShimProtocol(unittest.TestCase):
         self.assertEqual(data, {"echo": "User: give json"})
 
     def test_context_overflow_error_is_distinguishable(self):
-        with self.assertRaises(RuntimeError) as ctx:
+        # A ContextOverflowError (an AppleFMError, itself a RuntimeError) so
+        # chat_apple can catch it precisely to shrink its prompt.
+        with self.assertRaises(applefm.ContextOverflowError) as ctx:
             applefm.respond("sys", "ERR_OVERFLOW now")
         self.assertIn("context_overflow", str(ctx.exception))
 
     def test_unavailable_error_surfaces_reason(self):
-        with self.assertRaises(RuntimeError) as ctx:
+        with self.assertRaises(applefm.AppleFMError) as ctx:
             applefm.respond("sys", "ERR_UNAVAIL now")
         self.assertIn("Apple Intelligence is not enabled", str(ctx.exception))
+
+    def test_generation_error_is_a_rejection(self):
+        # A per-request content rejection maps to GenerationRejectedError (an
+        # AppleFMError, itself a RuntimeError) so a batch caller can catch it
+        # precisely and skip the one bad input instead of aborting the run.
+        with self.assertRaises(applefm.GenerationRejectedError) as ctx:
+            applefm.respond("sys", "ERR_GENREJECT now")
+        self.assertIsInstance(ctx.exception, applefm.AppleFMError)
+        self.assertIsInstance(ctx.exception, RuntimeError)
+        self.assertIn("unsupported language", str(ctx.exception).lower())
+
+    def test_bad_request_stays_fatal(self):
+        # A protocol/framing bug (our fault) must remain a plain, fatal
+        # AppleFMError -- NOT the recoverable GenerationRejectedError -- so it
+        # surfaces instead of being silently skipped.
+        with self.assertRaises(applefm.AppleFMError) as ctx:
+            applefm.respond("sys", "ERR_BADREQ now")
+        self.assertNotIsInstance(ctx.exception, applefm.GenerationRejectedError)
+        self.assertIn("bad_request", str(ctx.exception))
 
     def test_crash_then_retry_recovers(self):
         # First attempt kills the shim after dropping the sentinel; the client
@@ -312,7 +360,7 @@ class TestShimProtocol(unittest.TestCase):
                          "recovered")
 
     def test_persistent_crash_raises_then_transport_recovers(self):
-        with self.assertRaises(RuntimeError) as ctx:
+        with self.assertRaises(applefm.AppleFMError) as ctx:
             applefm.respond("sys", "CRASH_ALWAYS")
         self.assertIn("crashed", str(ctx.exception).lower())
         # The dead proc was cleared, so the very next call spawns a fresh shim.
@@ -321,7 +369,7 @@ class TestShimProtocol(unittest.TestCase):
     def test_missing_binary_points_to_make_target(self):
         applefm.SHIM_PATH = pathlib.Path(self.tmpdir) / "does-not-exist"
         applefm._proc = None
-        with self.assertRaises(RuntimeError) as ctx:
+        with self.assertRaises(applefm.AppleFMError) as ctx:
             applefm.respond("sys", "hi")
         self.assertIn("make apple-shim", str(ctx.exception))
 

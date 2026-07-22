@@ -120,9 +120,19 @@ def chat_once_json(messages, model=None, retry_nudge=_JSON_RETRY_NUDGE,
     # there; FM has no think flag). Dispatch before any think handling.
     if is_apple_model(model or CHAT_MODEL):
         import applefm
-        return applefm.chat_once_json(messages, model=model,
-                                      retry_nudge=retry_nudge,
-                                      timeout=timeout, think=think)
+        try:
+            return applefm.chat_once_json(messages, model=model,
+                                          retry_nudge=retry_nudge,
+                                          timeout=timeout, think=think)
+        except (applefm.GenerationRejectedError,
+                applefm.ContextOverflowError) as exc:
+            # A per-request Apple rejection (unsupported language, guardrail, an
+            # over-long single input) degrades to this function's documented None
+            # contract -- the batch caller skips the row and retries next run --
+            # instead of aborting the whole run. A fatal AppleFMError
+            # (unavailable, or a bad_request protocol bug) still propagates.
+            print(f"  Apple FM skipped an input ({exc}); retried next run")
+            return None
     global _think_unsupported
     for _ in range(2):
         send_think = None if _think_unsupported else think

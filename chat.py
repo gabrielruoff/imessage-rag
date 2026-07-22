@@ -19,6 +19,7 @@ from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
 
+import applefm
 import config
 import ollama
 import query_tools
@@ -345,7 +346,7 @@ def run_turn(messages, show_model_header=True, model=None):
     return message.get("content", "")
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Chat with your iMessage history via a local Ollama model."
     )
@@ -361,7 +362,7 @@ def main():
         help="override the chat model for this run (default: CHAT_MODEL from .env, "
         "currently %(default)s)",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.prompt is not None:
         prompt = args.prompt.strip()
@@ -373,8 +374,11 @@ def main():
         ]
         try:
             reply = run_turn(messages, show_model_header=False, model=args.model)
-        except (http.client.HTTPException, OSError, ollama.OllamaResponseError) as e:
-            print(f"[error contacting Ollama: {e}]")
+        except (http.client.HTTPException, OSError, ollama.OllamaResponseError,
+                applefm.AppleFMError) as e:
+            backend = ("Apple Foundation Models"
+                       if config.is_apple_model(args.model) else "Ollama")
+            print(f"[error contacting {backend}: {e}]")
             sys.exit(1)
         # A non-empty reply was already streamed live by ollama_chat_stream.
         if not reply:
@@ -401,8 +405,10 @@ def main():
         n_before = len(messages)
         try:
             reply = run_turn(messages, model=args.model)
-        except (http.client.HTTPException, OSError, ollama.OllamaResponseError) as e:
-            print(f"[error contacting Ollama: {e}]")
+        except (http.client.HTTPException, OSError, ollama.OllamaResponseError,
+                applefm.AppleFMError) as e:
+            # `backend` was resolved above for the banner and stays in scope.
+            print(f"[error contacting {backend}: {e}]")
             # Drop the failed user turn plus any partial assistant/tool
             # messages run_turn appended before the error.
             del messages[n_before - 1:]
