@@ -491,7 +491,10 @@ chunk_vectors                     -- sqlite-vec vec0 table: chunk_id ->
   set; the `get_language_trajectory` envelope also carries a model-safe
   `flagged` boolean (the transcript-reader's departure signal now that
   `support_block` is stripped). wrapped.py runs the same
-  `sanitize_condition_names` scrub over its wellbeing blurb.
+  `sanitize_condition_names` scrub over its wellbeing blurb. The apple chat path
+  bypasses `chat.run_turn`, so `chat_apple.py` re-enforces this SAME floor
+  itself (strip in `_execute`, whole-reply sanitize in `_render_stream`, emit in
+  `run_turn`); it is not inherited — a new staged chat backend must re-add it.
 - `think` is per-call, not global: `ollama.chat_once`/`chat_stream` take
   `think=` with a `_UNSET` default. The tri-state is load-bearing — `None`
   means *omit* the flag (some models reject a `think` option) and is NOT the
@@ -519,8 +522,8 @@ chunk_vectors                     -- sqlite-vec vec0 table: chunk_id ->
   `messages`/`chats`/`handles`.
 - DB paths resolve relative to `config.py`'s directory, not the CWD.
 - Apple FM (the `apple` sentinel) has a **fixed 4,096-token window**, so the
-  chat path can't do native tool-calling (system + 21 tool schemas ≈ 8.3K tok
-  alone). `chat_apple.py` stages small route→fill→exec→digest→answer sessions
+  chat path can't do native tool-calling (system + every tool schema is ~2× the
+  window alone). `chat_apple.py` stages small route→fill→exec→digest→answer sessions
   and carries a Python scratchpad. The scratchpad — the *accumulated* facts, not
   just one result — is what busts the window, so it is compacted back under a
   char budget after every tool and every stage catches

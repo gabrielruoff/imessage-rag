@@ -1101,8 +1101,10 @@ every other caller stays backend-agnostic.
 
 The FM context window is a **fixed 4,096 tokens** (Apple TN3193; unchanged as
 of the 26.4 SDK). The Ollama chat setup does not remotely fit: system prompt
-~1,023 tok + the 21 tool schemas ~7,272 tok = **~8.3K tok of overhead, 2× the
-window, before the user types anything**. Native tool-calling is impossible.
+~1,023 tok + the tool schemas ~7,272 tok (measured at the then-21 tools; the
+toolset has since grown to 32, so the overhead is larger still) = **well over
+8K tok, 2×+ the window, before the user types anything**. Native tool-calling
+is impossible.
 
 So the apple chat path (`chat_apple.py`) stages many small, fresh,
 single-purpose sessions per turn and carries state in Python: **ROUTE** (pick
@@ -1156,9 +1158,9 @@ on this corpus is unproven; ship it measurable, never as the default.
 
 ### Known limits
 
-- **Routing across 21 tools is the quality ceiling.** The on-device model is
-  small; live runs show it inventing narrow date filters and occasionally a
-  wrong scope. The staging is correct and never crashes, but multi-hop
+- **Routing across the full toolset (32 tools) is the quality ceiling.** The
+  on-device model is small; live runs show it inventing narrow date filters and
+  occasionally a wrong scope. The staging is correct and never crashes, but multi-hop
   analytics accuracy is bounded by 3B-class routing. `eval/evalkit` records the
   apple path through a parallel recorder hook (`chat_apple._recorder`) so the
   sweep works under `CHAT_MODEL=apple`; quantifying the scorecard vs the gemma4

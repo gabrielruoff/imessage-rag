@@ -28,6 +28,7 @@ import chat
 import chat_apple
 import config
 import tool_schemas
+import wellbeing
 
 
 class ScriptedRespond:
@@ -232,7 +233,10 @@ class BadRouteTest(AppleChatTest):
 class CatalogTest(unittest.TestCase):
     def test_catalog_covers_every_tool(self):
         names = [t["name"] for t in tool_schemas.TOOL_DEFINITIONS]
-        self.assertEqual(len(names), 21)
+        # Derived, not a magic number: the catalog + route enum must stay in
+        # lockstep with the live toolset (which grows as tools are added), so
+        # this can never silently drift the way a hardcoded count did.
+        self.assertEqual(len(chat_apple._TOOL_SPECS), len(names))
         self.assertEqual(set(chat_apple._TOOL_SPECS), set(names))
         for name in names:
             self.assertIn(name, chat_apple.CATALOG)
@@ -375,6 +379,110 @@ class GenerationRejectedTest(AppleChatTest):
         reply = chat_apple.run_turn([{"role": "user", "content": "hi"}])
         self.assertEqual(reply, "final degraded")
         self.assertEqual(state["answer"], 3)  # two rejections, then a reply
+
+
+class WellbeingFloorTest(AppleChatTest):
+    """The apple path enforces chat.run_turn's code-level wellbeing floor:
+    get_language_trajectory arms a whole-reply condition-name sanitize, and its
+    reserved _epilogue/support_block are stripped BEFORE digest (never narrated
+    as data) and printed verbatim AFTER the reply. All of this lives in
+    chat.run_turn on the Ollama path; the apple dispatch bypasses it, so
+    chat_apple must re-enforce it (regressions here are silent + high-stakes)."""
+
+    _SUPPORT = "SUPPORT_RESOURCES_SENTINEL: reach out to someone you trust"
+
+    def _stub_wb_tool(self, name="get_language_trajectory", narratable=None):
+        """Stub a tool that returns the reserved wellbeing envelope keys."""
+        payload = {"scope": "self", "flagged": True,
+                   "_epilogue": self._SUPPORT, "support_block": self._SUPPORT}
+        if narratable:
+            payload.update(narratable)
+        self.stub_tool(name, lambda **kw: payload)
+
+    def _console_text(self):
+        return chat.console.file.getvalue()
+
+    def test_epilogue_and_support_block_never_reach_a_prompt(self):
+        # Both reserved keys are code-delivery directives, not data: they must be
+        # stripped before the result is digested, so they never enter the
+        # digester or the answer prompt (where the model could narrate them).
+        self._stub_wb_tool()
+        fake = self.install(ScriptedRespond(
+            route_actions=["get_language_trajectory", "answer"],
+            answer_chunks=("all clear",),
+        ))
+        chat_apple.run_turn([{"role": "user", "content": "how am I doing?"}])
+        for prompt in fake.prompts:
+            self.assertNotIn("SUPPORT_RESOURCES_SENTINEL", prompt)
+
+    def test_reply_condition_names_are_sanitized(self):
+        # The whole assembled answer is scrubbed once get_language_trajectory has
+        # run -- a condition name anywhere in the reply is redacted at sentence
+        # granularity, matching chat.ollama_chat_stream's floor.
+        self._stub_wb_tool()
+        raw = "Your messages show clear signs of depression lately."
+        expected, was = wellbeing.sanitize_condition_names(raw)
+        self.assertTrue(was)  # guard: the fixture really is redactable
+        self.install(ScriptedRespond(
+            route_actions=["get_language_trajectory", "answer"],
+            answer_chunks=(raw,),
+        ))
+        reply = chat_apple.run_turn([{"role": "user", "content": "how am I?"}])
+        self.assertNotIn("depression", reply)          # scrubbed in the return...
+        self.assertNotIn("depression", self._console_text())  # ...and on screen
+        self.assertIn(self._SUPPORT, reply)            # epilogue still folded in
+
+    def test_epilogue_printed_after_reply_and_deduped(self):
+        # Two tools return the SAME support block; it is printed + folded exactly
+        # once (order-preserving de-dup), never once per tool.
+        self._stub_wb_tool("get_language_trajectory")
+        self._stub_wb_tool("find_conflicts")
+        self.install(ScriptedRespond(
+            route_actions=["get_language_trajectory", "find_conflicts", "answer"],
+            answer_chunks=("here is the answer",),
+        ))
+        reply = chat_apple.run_turn([{"role": "user", "content": "check in"}])
+        self.assertEqual(reply.count(self._SUPPORT), 1)     # folded once
+        self.assertTrue(reply.startswith("here is the answer"))
+        self.assertTrue(reply.endswith(self._SUPPORT))      # after the reply
+        self.assertEqual(self._console_text().count(self._SUPPORT), 1)
+
+    def test_epilogue_survives_a_fully_degraded_answer(self):
+        # Every answer attempt overflows -> reply is "" -- the support block must
+        # STILL print (resources must survive even a failed answer).
+        self._stub_wb_tool()
+
+        def fake(system, prompt, schema=None, stream=False):
+            if stream:
+                def boom():
+                    raise applefm.ContextOverflowError("too big")
+                    yield  # unreachable -- makes boom a generator
+                return boom()
+            if schema is not None and "action" in (schema.get("properties") or {}):
+                # route: fire the wb tool once, then answer
+                action = "get_language_trajectory" if not fake.routed else "answer"
+                fake.routed = True
+                return json.dumps({"action": action})
+            return json.dumps({})  # fill / any non-stream
+
+        fake.routed = False
+        self.install(fake)
+        reply = chat_apple.run_turn([{"role": "user", "content": "how am I?"}])
+        self.assertEqual(reply, self._SUPPORT)  # empty answer, epilogue-only
+        self.assertIn(self._SUPPORT, self._console_text())
+
+    def test_non_wellbeing_turn_is_unchanged(self):
+        # Regression: no get_language_trajectory -> no sanitize, no epilogue. A
+        # condition word in the answer passes through untouched and the reply is
+        # exactly the streamed text (no block appended).
+        self.stub_tool("search_contacts_by_name", lambda **kw: [{"contact_id": 1}])
+        raw = "This casually mentions depression and must not be redacted here."
+        self.install(ScriptedRespond(
+            route_actions=["search_contacts_by_name", "answer"],
+            answer_chunks=(raw,),
+        ))
+        reply = chat_apple.run_turn([{"role": "user", "content": "who?"}])
+        self.assertEqual(reply, raw)  # no sanitize, no epilogue folded in
 
 
 class RunTurnSignatureTest(unittest.TestCase):

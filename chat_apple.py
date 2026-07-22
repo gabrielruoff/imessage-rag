@@ -1,8 +1,8 @@
 """Staged chat orchestration for the Apple Foundation Models backend.
 
 The FM window is a fixed 4,096 tokens and chat.py's default overhead (its
-system prompt + the 21 tool schemas) is ~8.3K tokens on its own -- native tool
-calling simply does not fit. So the apple chat path does NOT hand the model the
+system prompt + every tool schema) is roughly double the window on its own --
+native tool calling simply does not fit. So the apple chat path does NOT hand the model the
 whole tool loop at once; it stages many small, fresh, single-purpose sessions
 per user turn and carries state between them in Python, never in the model's
 context:
@@ -27,6 +27,7 @@ import json
 import applefm
 import config
 import tool_schemas
+import wellbeing  # feature: wellbeing -- dependency-free (stats + re), no config/Ollama pulled
 
 # Patchable hook (mirrors the DB_PATH/SHIM_PATH module-attribute convention):
 # when evalkit sets this to a callable, it fires at each tool EXECUTE with the
@@ -139,7 +140,8 @@ def _summary(description):
     sentence (split on '. '), hard-capped at _CATALOG_LINE_MAX chars. The full
     descriptions -- and even some first "sentences", which run 300+ chars when a
     parenthetical swallows the first period -- would eat the router's slice of
-    the 4,096-token window (21 lines share it with the question and scratchpad)."""
+    the 4,096-token window (one line per tool shares it with the question and
+    scratchpad)."""
     first = description.split(". ")[0].strip()
     return first if len(first) <= _CATALOG_LINE_MAX else first[:_CATALOG_LINE_MAX - 1] + "…"
 
@@ -332,12 +334,16 @@ def _fill_args(name, question, summary, scratchpad):
     return data if isinstance(data, dict) else {}
 
 
-def _execute(chat, name, args, seen_calls):
+def _execute(chat, name, args, seen_calls, wb_state):
     """EXEC stage: run the query_tools function behind `name` locally, reusing
     chat.py's registry. Mirrors chat.run_turn's guards -- an exact-repeat
     (name, args) call is short-circuited to a note rather than re-run, an unknown
     name and any exception both become a digestible {"error": ...}. The executed
-    call is echoed to chat.console and offered to the _recorder hook."""
+    call is echoed to chat.console and offered to the _recorder hook.
+
+    `wb_state` is the per-turn wellbeing dict (see run_turn); this stage applies
+    chat.run_turn's code-level floor before the result is digested (chat.py's
+    equivalent lives inline in its tool loop)."""
     call_key = (name, json.dumps(args, sort_keys=True, default=str))
     fn = chat.TOOL_FUNCTIONS.get(name)
     if call_key in seen_calls:
@@ -355,6 +361,21 @@ def _execute(chat, name, args, seen_calls):
             result = fn(**args)
         except Exception as e:
             result = {"error": str(e)}
+    # --- feature: wellbeing (parity with chat.run_turn) ---
+    # (a) Once get_language_trajectory has run this turn, arm the whole-reply
+    # condition-name sanitize for the answer stream. (b) Pull any tool's reserved
+    # `_epilogue` (the code-emitted support block) into wb_state and strip it --
+    # AND the duplicate `support_block` -- from the result BEFORE it is digested,
+    # so neither the crisis directive nor its text reaches the model's context or
+    # gets narrated as data. Both are code-delivery directives, not data.
+    if name == "get_language_trajectory":
+        wb_state["sanitize"] = True
+    if isinstance(result, dict) and isinstance(result.get("_epilogue"), str) \
+            and result["_epilogue"].strip():
+        wb_state["epilogues"].append(result["_epilogue"])
+        result = {k: v for k, v in result.items()
+                  if k not in ("_epilogue", "support_block")}
+    # --- end feature: wellbeing ---
     if isinstance(result, list):
         count = len(result)
     elif isinstance(result, dict) and isinstance(result.get("rows"), list):
@@ -450,11 +471,16 @@ def _model_label(model):
     return model or config.CHAT_MODEL
 
 
-def _render_stream(chat, stream, show_model_header, model):
+def _render_stream(chat, stream, show_model_header, model, sanitize=False):
     """Render the streamed answer to chat.console like chat.ollama_chat_stream: a
     live markdown render on a terminal, one faithful render at the end on a
     non-terminal (a file/pipe, where Live emits only its first wrapped line).
-    Returns the assembled reply string."""
+    Returns the assembled reply string.
+
+    On a wellbeing turn (`sanitize=True`) the whole assembled reply is run
+    through wellbeing.sanitize_condition_names before it ever reaches the screen
+    -- so partial, unsanitized content is never live-rendered, matching the
+    invariant chat.ollama_chat_stream holds (chat.py:350-366)."""
     from rich.live import Live
     from rich.markdown import Markdown
 
@@ -473,6 +499,13 @@ def _render_stream(chat, stream, show_model_header, model):
                         chat.console.print(f"[bold]{label}>[/bold]")
                     live = Live(Markdown(""), console=chat.console, refresh_per_second=12)
                     live.start()
+                # Hold every frame on a wellbeing turn until the whole reply has
+                # been sanitized below; never live-render partial content.
+                if not sanitize:
+                    live.update(Markdown(content))
+        if sanitize and content:
+            content, _redacted = wellbeing.sanitize_condition_names(content)
+            if use_live and live is not None:
                 live.update(Markdown(content))
     finally:
         if live is not None:
@@ -484,13 +517,15 @@ def _render_stream(chat, stream, show_model_header, model):
     return content
 
 
-def _answer(chat, question, summary, scratchpad, show_model_header, model):
+def _answer(chat, question, summary, scratchpad, show_model_header, model,
+            sanitize=False):
     """ANSWER stage: answer from the gathered facts ALONE, streamed to
     chat.console. No tools and no raw results reach here -- if the facts are
     incomplete the answerer is told to say so plainly rather than guess. On a
     window overflow (facts still too big for the answer prompt) the scratchpad is
     compacted and the summary dropped, then finally the question is answered
-    alone -- a degraded answer beats a crash on the final step."""
+    alone -- a degraded answer beats a crash on the final step. `sanitize` (a
+    wellbeing turn) is honored on EVERY attempt, degraded ones included."""
     attempts = [
         (summary, scratchpad),
         ("", _compact(question, scratchpad)),
@@ -500,10 +535,25 @@ def _answer(chat, question, summary, scratchpad, show_model_header, model):
         try:
             prompt = _context_block(question, summ, sp)
             stream = _respond(ANSWER_SYSTEM, prompt, stream=True)
-            return _render_stream(chat, stream, show_model_header, model)
+            return _render_stream(chat, stream, show_model_header, model,
+                                  sanitize=sanitize)
         except (applefm.ContextOverflowError, applefm.GenerationRejectedError):
             continue
     return ""
+
+
+def _emit_epilogues(chat, reply, epilogues):
+    """Print each collected epilogue verbatim after the reply and fold it into
+    the returned string (so `chat.py -p` and evalkit transcripts capture the
+    code-emitted support text), mirroring chat.run_turn._emit_epilogues. A no-op
+    when nothing was collected, so non-wellbeing turns are byte-for-byte
+    unchanged. Identical epilogues are de-duplicated (order preserved)."""
+    if not epilogues:
+        return reply
+    block = "\n\n".join(dict.fromkeys(epilogues))
+    chat.console.print()
+    chat.console.print(block, markup=False)
+    return f"{reply}\n\n{block}" if reply else block
 
 
 def run_turn(messages, show_model_header=True, model=None):
@@ -519,16 +569,25 @@ def run_turn(messages, show_model_header=True, model=None):
     summary = _prior_turns_summary(messages)
     scratchpad = []
     seen_calls = set()
+    # Per-turn wellbeing floor, carried through _execute (parity with
+    # chat.run_turn): `sanitize` arms the whole-reply condition-name scrub once
+    # get_language_trajectory has run; `epilogues` collects code-emitted support
+    # blocks to print verbatim after the reply.
+    wb_state = {"sanitize": False, "epilogues": []}
     for _ in range(config.MAX_TOOL_ITERATIONS):
         action = _route(question, summary, scratchpad)
         if action not in _TOOL_SPECS:  # "answer", or any off-catalog value
             break
         args = _fill_args(action, question, summary, scratchpad)
-        result = _execute(chat, action, args, seen_calls)
+        result = _execute(chat, action, args, seen_calls, wb_state)
         fact = _digest(question, action, result)
         if fact:
             scratchpad.append(f"[{action}] {fact}")
             scratchpad = _compact(question, scratchpad)
-    reply = _answer(chat, question, summary, scratchpad, show_model_header, model)
+    reply = _answer(chat, question, summary, scratchpad, show_model_header, model,
+                    sanitize=wb_state["sanitize"])
+    # Support resources must survive even a degraded/empty answer, so emit the
+    # epilogue regardless of `reply` (fold into the returned string too).
+    reply = _emit_epilogues(chat, reply, wb_state["epilogues"])
     messages.append({"role": "assistant", "content": reply})
     return reply
