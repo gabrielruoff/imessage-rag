@@ -1,18 +1,18 @@
 """Wellbeing trajectory query tool (RES-61 / W2): get_language_trajectory.
 
 Wire the deterministic, scope-agnostic change-point core (wellbeing.py, W1)
-to the analysis DB. This module owns ALL of the SQL and the consent gate; the
+to the analysis DB. This module owns ALL of the SQL and the denylist gate; the
 math lives in wellbeing.py and never touches sqlite/config.
 
 Two modes:
   - SELF (default, `contact=None`): the user's own trajectory -- every
     `handle_id IS NULL` lexicon row and every `is_from_me = 1` message/session,
     pooled across all chats.
-  - PER-CONTACT (`contact=<contacts.id>`, Master Spec A12): accepted ONLY when
-    that id is on the WELLBEING_CONSENT_IDS allowlist (consent.is_consented).
-    A non-consented target is refused IN CODE with a fixed message and never
-    analyzed. Otherwise the SAME machinery runs against that contact's own
-    identity (their handle rows / their `is_from_me = 0` lines).
+  - PER-CONTACT (`contact=<contacts.id>`): analyzed by DEFAULT (default-open),
+    unless that id is on the WELLBEING_DENY_IDS denylist (consent.is_denied), in
+    which case it is refused IN CODE with a fixed message and never analyzed. The
+    SAME machinery runs against that contact's own identity (their handle rows /
+    their `is_from_me = 0` lines).
 
 Marker construction is COUNT-BASED (never a rate of rates). For each marker we
 sum raw counts across the scoped `(chat_id, <target handle>, month)` rows and
@@ -37,7 +37,7 @@ import zoneinfo
 
 import config
 import wellbeing
-from consent import is_consented
+from consent import is_denied
 from function_words import ABSOLUTIST, FUNCTION_WORDS, PRONOUN_I, tokenize
 
 from ._shared import (
@@ -73,11 +73,11 @@ _FAMILY_TOKENS = {
     "self_focus": frozenset(PRONOUN_I),
 }
 
-# The fixed refusal shown for a non-consented per-contact target -- never an
+# The fixed refusal shown for a denylisted per-contact target -- never an
 # analysis, never a hint about who is on the list.
 _REFUSAL_MESSAGE = (
-    "Per-contact wellbeing analysis is not enabled for this contact. It runs "
-    "only for contacts explicitly opted in via WELLBEING_CONSENT_IDS."
+    "Per-contact wellbeing analysis is disabled for this contact. This contact "
+    "has been suppressed via WELLBEING_DENY_IDS."
 )
 
 _REPLY_LATENCY_NOTE = (
@@ -443,8 +443,8 @@ def get_language_trajectory(contact=None, date_from=None, date_to=None,
     SELF (contact=None) analyzes the user's own history (all your `handle_id
     IS NULL` lexicon rows and your sent messages/sessions, pooled across chats).
     Naming a `contact` (a contacts.id) analyzes THAT person's language instead,
-    but ONLY when they are on the WELLBEING_CONSENT_IDS allowlist -- a
-    non-consented contact is refused, never analyzed.
+    by default -- UNLESS they are on the WELLBEING_DENY_IDS denylist, in which
+    case they are refused, never analyzed.
 
     Markers (all count-based, NEVER a rate of rates): first-person-singular
     `i`, absolutist words, negation, laugh rate, emoji rate (from the lexicon),
@@ -463,7 +463,7 @@ def get_language_trajectory(contact=None, date_from=None, date_to=None,
         min_words = config.MIN_WELLBEING_WORDS
 
     with contextlib.closing(_connect()) as con:
-        # --- resolve target + consent gate ---
+        # --- resolve target + denylist gate ---
         target_handles = None      # None = self (handle_id IS NULL rows)
         contact_chat_ids = None    # None = all chats (self); else the contact's chats
         if contact is None:
@@ -471,7 +471,8 @@ def get_language_trajectory(contact=None, date_from=None, date_to=None,
         else:
             contact_id = int(contact)
             scope = member_key(False, contact_id, None)  # "contact:<id>"
-            if not is_consented(contact_id, config.WELLBEING_CONSENT_IDS):
+            # Default-open: analyze any contact unless explicitly suppressed.
+            if is_denied(contact_id, config.WELLBEING_DENY_IDS):
                 return _stub_envelope(scope, _REFUSAL_MESSAGE, refused=True)
             target_handles = _contact_handle_ids(con, contact_id)
             if not target_handles:

@@ -777,8 +777,8 @@ TOOL_DEFINITIONS = [
                         "when a lexical AND the behavioral family depart together "
                         "for several months. Defaults to YOUR own language "
                         "(self). A `contact` (a contacts.id) analyzes that "
-                        "person instead, but ONLY if they are on the opt-in "
-                        "allowlist -- a non-consented contact is refused. Returns "
+                        "person instead, by default -- unless they have been "
+                        "suppressed via the deny list, in which case it refuses. Returns "
                         "an envelope: scope, markers_available, dropped_markers, "
                         "baseline, series, windows, examples, note, and (only "
                         "when a shift fires) a support_block. Never diagnoses a "
@@ -788,7 +788,7 @@ TOOL_DEFINITIONS = [
             "properties": {
                 "contact": {"type": "integer",
                             "description": "a contacts.id to analyze instead of "
-                                           "yourself (allowlisted contacts only; "
+                                           "yourself (any contact unless deny-listed; "
                                            "omit for your own language)"},
                 "date_from": {"type": "string", "description": _DATE_PARAM_DESC},
                 "date_to": {"type": "string", "description": _DATE_PARAM_DESC},

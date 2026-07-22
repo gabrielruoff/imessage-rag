@@ -4,10 +4,14 @@ imports nothing from the app (no `config`, no sqlite, no Ollama). Each feature
 owns its own env var and passes the raw string in; this helper is agnostic
 about which list it is parsing.
 
-Consent is additive, explicit, and default-closed: an id present in the list
-is opted-in; absence means not consented. An empty list consents to nothing.
-Membership (`is_consented`) only ever ADDS a contact -- callers apply their own
-exclusions first, and consent never overrides an exclusion.
+Two membership semantics share one parser. `is_consented` is the ALLOWLIST
+check (default-closed): an id present is opted-in, absence means not consented,
+an empty list consents to nothing -- it only ever ADDS a contact, and callers
+apply their own exclusions first (consent never overrides an exclusion).
+`is_denied` is the DENYLIST counterpart (default-open): an id present is
+suppressed, absence means allowed, an empty list denies nothing. Which one a
+feature wants is the caller's choice; both are pure membership over the same
+tolerant `parse_consent_ids`.
 
 Parsing is deliberately tolerant: a malformed `.env` entry must never crash a
 pipeline or a Wrapped build, so non-integer tokens are skipped rather than
@@ -45,10 +49,24 @@ def parse_consent_ids(raw: str | None) -> frozenset[int]:
 
 
 def is_consented(contact_id: int | None, raw: str | None) -> bool:
-    """Return whether `contact_id` appears in the parsed consent list.
+    """ALLOWLIST membership (default-closed): whether `contact_id` appears in the
+    parsed list, i.e. is opted in.
 
-    `None` contact_id -> False. This is the single membership check every
-    consumer calls; consent adds and never overrides a caller's exclusion.
+    `None` contact_id -> False. Consent only ADDS a contact and never overrides
+    a caller's exclusion.
+    """
+    if contact_id is None:
+        return False
+    return contact_id in parse_consent_ids(raw)
+
+
+def is_denied(contact_id: int | None, raw: str | None) -> bool:
+    """DENYLIST membership (default-open): whether `contact_id` appears in the
+    parsed list, i.e. is explicitly suppressed. The complement of `is_consented`
+    for features that act by default and let the owner block specific ids -- an
+    empty list denies nothing, so absence means allowed.
+
+    `None` contact_id -> False (a self / no-identity read is never denied).
     """
     if contact_id is None:
         return False

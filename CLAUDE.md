@@ -443,12 +443,15 @@ chunk_vectors                     -- sqlite-vec vec0 table: chunk_id ->
   (hotline text) is NEVER removed: a `bypassed-with-footer` hit restores the
   role read but still appends it. The scan is read-only; the hit is never
   persisted.
-- Per-contact consent is enforced in code via `consent.is_consented`, never by
-  prompt. `get_language_trajectory` refuses a non-allowlisted `contact`
-  (`WELLBEING_CONSENT_IDS`) before any analysis; the Wrapped voiceprint card's
-  third-party game only renders cards for `WRAPPED_VOICEPRINT_CONSENT_IDS`.
-  Consent only ever ADDS a contact — it never overrides a roster/silent-contact
-  exclusion (those filter first).
+- Per-contact wellbeing is a code-enforced DENYLIST, never a prompt.
+  `get_language_trajectory` analyzes any `contact` by default and refuses only a
+  deny-listed one (`WELLBEING_DENY_IDS`, default empty → analyze anyone) via
+  `consent.is_denied`, before any analysis; self is never affected. Distinct
+  from the Wrapped voiceprint card's third-party game, which stays a
+  default-closed ALLOWLIST (`WRAPPED_VOICEPRINT_CONSENT_IDS`, `consent.is_consented`)
+  and only ADDS a contact — never overriding a roster/silent-contact exclusion
+  (those filter first). `consent.py` ships both membership helpers; the caller
+  picks allow vs deny.
 - Wellbeing narration is framed by two code mechanisms in `chat.run_turn`, not
   by the prompt. When `get_language_trajectory` runs, the turn (a) arms a
   final-sentence sanitize that holds back the reply's last sentence and runs it
@@ -505,7 +508,7 @@ chunk_vectors                     -- sqlite-vec vec0 table: chunk_id ->
   occasion knobs + the enable flags), `DRIFT_*`, `VOICEPRINT_*` (+ the V5
   `PERSONA_SIM_*` family: `PERSONA_SIM_ENABLED`, `PERSONA_SIM_BLOCK_IDS`, and the
   soft-dormant `PERSONA_SIM_DORMANT_DAYS`/`PERSONA_SIM_ONESIDED_MIN_MSGS`),
-  `WELLBEING_*` (+ `WELLBEING_CONSENT_IDS`), and `WRAPPED_*` (`WRAPPED_WELLBEING`,
+  `WELLBEING_*` (+ the `WELLBEING_DENY_IDS` per-contact deny list), and `WRAPPED_*` (`WRAPPED_WELLBEING`,
   `WRAPPED_VOICEPRINT_CONSENT_IDS`) families — all env-driven with working
   defaults, same as the rest.
 - Participant-identity merging (me / contact / handle / unknown) has one home:

@@ -548,11 +548,13 @@ WELLBEING_N_EXAMPLES = int(os.getenv("WELLBEING_N_EXAMPLES") or "3")
 # Corpus floor: below this many words in scope the tool returns an
 # insufficient-data envelope and runs no analysis.
 MIN_WELLBEING_WORDS = int(os.getenv("MIN_WELLBEING_WORDS") or "5000")
-# Per-contact allowlist (Master Spec A12): a comma/space-separated list of
-# `contacts.id` values opted in to per-contact wellbeing analysis. Empty (the
-# default) means self-only -- any named contact is refused. Parsed via
-# consent.parse_consent_ids (tolerant; non-positive/non-integer tokens skipped).
-WELLBEING_CONSENT_IDS = os.getenv("WELLBEING_CONSENT_IDS", "")
+# Per-contact DENYlist: a comma/space-separated list of `contacts.id` values to
+# SUPPRESS from per-contact wellbeing analysis. Default-open -- an empty list
+# (the default) denies nothing, so get_language_trajectory will analyze any
+# named contact; add an id here to refuse that specific contact in code. Self is
+# never affected. Parsed via consent.parse_consent_ids (tolerant; non-positive/
+# non-integer tokens skipped).
+WELLBEING_DENY_IDS = os.getenv("WELLBEING_DENY_IDS", "")
 # --- end feature: wellbeing ---
 
 # --- feature: conflict ---

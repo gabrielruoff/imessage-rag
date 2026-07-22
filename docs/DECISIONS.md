@@ -1003,8 +1003,10 @@ corroborated-only, and excludes the same silent contacts as the roster.
 
 **Baseline — wellbeing (W2–W4).** `get_language_trajectory` (RES-61) wires the
 W1 change-point core to the DB: count-based markers pooled across a scope, self
-by default and per-contact ONLY for an id on the `WELLBEING_CONSENT_IDS`
-allowlist (`consent.is_consented`, refused in code otherwise). Framing is
+by default and per-contact by default too (default-open), refused in code only
+for an id on the `WELLBEING_DENY_IDS` deny list (`consent.is_denied`). (Revised
+from the original default-closed `WELLBEING_CONSENT_IDS` allowlist to a deny
+list: analyze anyone unless explicitly suppressed.) Framing is
 enforced by code, not prompt (RES-67 / W3): the tool emits a code-built
 `support_block` via the generic `_epilogue` hook that `chat.run_turn` strips
 from the model's view and prints verbatim, and the turn holds back its reply's

@@ -78,6 +78,27 @@ class TestIsConsented(unittest.TestCase):
         self.assertFalse(consent.is_consented(0, "0, 12"))
 
 
+class TestIsDenied(unittest.TestCase):
+    def test_member_is_denied(self):
+        self.assertTrue(consent.is_denied(44, "12, 44 88"))
+
+    def test_non_member_is_not_denied(self):
+        # Default-open: absence from the deny list means allowed.
+        self.assertFalse(consent.is_denied(99, "12, 44 88"))
+
+    def test_empty_list_denies_nothing(self):
+        self.assertFalse(consent.is_denied(12, ""))
+        self.assertFalse(consent.is_denied(12, None))
+
+    def test_none_contact_id_is_never_denied(self):
+        self.assertFalse(consent.is_denied(None, "12, 44 88"))
+        self.assertFalse(consent.is_denied(None, None))
+
+    def test_malformed_list_still_matches_valid_ids(self):
+        self.assertTrue(consent.is_denied(44, "12,abc, ,44"))
+        self.assertFalse(consent.is_denied(99, "12,abc, ,44"))
+
+
 class TestConfigFree(unittest.TestCase):
     def test_importing_consent_does_not_pull_in_config(self):
         # F5 is a pure net-new helper: importing it must not drag in config

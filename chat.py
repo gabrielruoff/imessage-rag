@@ -83,7 +83,7 @@ SYSTEM_PROMPT = (
     # --- end feature: conflict ---
     # --- feature: wellbeing ---
     "- get_language_trajectory (sustained cross-family shift in someone's texting "
-    "language over months -- your own by default, or an allowlisted contact; "
+    "language over months -- your own by default, or any contact unless deny-listed; "
     "deterministic, never a diagnosis)\n"
     # --- end feature: wellbeing ---
     "- search_contacts_by_name (name/org -> contact + their handle_ids)\n"

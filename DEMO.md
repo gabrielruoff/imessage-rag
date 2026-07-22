@@ -121,7 +121,7 @@ works). Set the gates for whatever you intend to show. Verified against `config.
 | **`PERSONA_SIM_ENABLED`** | **off** | Demo `simulate_contact` (V5). Off = schema withheld; the model can't call it. This registration gate *is* the security boundary. |
 | **`WRAPPED_WELLBEING`** | **off** | Compose the Wrapped "Gentle Check-In" section (same as `wrapped.py --wellbeing`). |
 | `CONFLICT_DV_SCREEN` | **on** | Leave on. It's the softened DV floor (details in Conflict section). |
-| `WELLBEING_CONSENT_IDS` | empty | Allowlist a `contacts.id` for a *per-contact* wellbeing read (self needs no consent). |
+| `WELLBEING_DENY_IDS` | empty | Deny list of `contacts.id` for *per-contact* wellbeing reads. Default-open: empty analyzes anyone; list an id to suppress it (self is never affected). |
 | `WRAPPED_VOICEPRINT_CONSENT_IDS` | empty | Light the third-party "guess who texts like this" Wrapped card for listed ids. |
 | `PERSONA_SIM_BLOCK_IDS` | empty | Hard-block specific `contacts.id` from `simulate_contact` (deceased/grief denylist). |
 
@@ -355,8 +355,8 @@ a fixed crisis-support block verbatim after the reply.
 **Enable it.**
 - Self read needs **no** flag and **no** extra build step — it reads tables `ingest.py`
   already built.
-- A **per-contact** read is **refused in code** unless that `contacts.id` is on
-  **`WELLBEING_CONSENT_IDS`** (empty by default).
+- A **per-contact** read runs by default and is **refused in code** only when that
+  `contacts.id` is on the **`WELLBEING_DENY_IDS`** deny list (empty by default).
 - The Wrapped section needs **`WRAPPED_WELLBEING=true`** (or `wrapped.py --wellbeing`).
 
 **Check whether your history fires a window** before demoing (firing is deliberately hard —
@@ -373,8 +373,8 @@ An empty `windows: []` means no sustained departure — honest-degrade, not a fa
 | Prompt | Tool | What you'll see |
 |---|---|---|
 | `How has my own texting language and mood shifted over time? Any sustained rough stretches?` | `get_language_trajectory` | **Self mode** (the default). Narrates only the computed markers/window — never a diagnosis. If a window fired: the reply's final sentence is scrubbed of any clinical term, and a fixed support block (988 / text HOME to 741741 / findahelpline.com) is printed verbatim **after** the reply, by code. If nothing fired, it says so honestly. |
-| `Run a language trajectory check on my messages with <NAME>.` | `get_language_trajectory` | **Refused in code** unless `<NAME>`'s id is in `WELLBEING_CONSENT_IDS`. With the default empty allowlist it returns a fixed refusal *before any analysis*, and never hints who is on the list. |
-| *(after setting `WELLBEING_CONSENT_IDS=42`)* `Check contact 42's language trajectory.` | `get_language_trajectory` | Now proceeds against that person's own lines. Consent only **adds** a contact — it never overrides a roster/silent exclusion (those filter first). |
+| `Run a language trajectory check on my messages with <NAME>.` | `get_language_trajectory` | Runs by default (default-open) against `<NAME>`'s own lines, with non-clinical narration + the code-emitted support block if a shift fires. |
+| *(after setting `WELLBEING_DENY_IDS=42`)* `Check contact 42's language trajectory.` | `get_language_trajectory` | **Refused in code** *before any analysis* — contact 42 is on the deny list — and never hints who else is on it. Self is never affected. |
 
 One-shot example:
 
@@ -549,9 +549,9 @@ suppressed/empty output, this is usually why:
   demand-withdraw/role read (`diagnose_conflict` still returns the mechanical scorecard) and
   withholds the entire `draft_apology` scaffold. The hotline resource footer is **never**
   removed, even when the screen is bypassed. Read-only; never persisted.
-- **Per-contact wellbeing consent.** `get_language_trajectory` refuses any non-self contact
-  not on `WELLBEING_CONSENT_IDS`, *before* any analysis, revealing nothing about the list.
-  Self is always allowed. Consent only adds a contact; it never overrides an exclusion.
+- **Per-contact wellbeing deny list.** `get_language_trajectory` analyzes any contact by
+  default and refuses a contact on `WELLBEING_DENY_IDS`, *before* any analysis, revealing
+  nothing about the list. Self is never affected.
 - **Default-redacted third-party Wrapped content.** The wellbeing section
   (`WRAPPED_WELLBEING`) and the third-party voiceprint card
   (`WRAPPED_VOICEPRINT_CONSENT_IDS`) emit nothing unless explicitly enabled/allowlisted.

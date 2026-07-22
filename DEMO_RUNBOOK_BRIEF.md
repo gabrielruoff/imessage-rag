@@ -73,7 +73,7 @@ The runbook MUST call these out at the top of the relevant section:
 | `NUDGE_GOODNEWS_ENABLED` | **off** | The `unreciprocated_goodnews` detector. |
 | `CONFLICT_TRACE_ENABLED` | **off** | Registers `trace_conflict_across_chats` in the chat tool list. Off = the tool doesn't exist to the model. |
 | `CONFLICT_DV_SCREEN` | **on** | The softened DV floor. On (default) = a conflict window containing a DV marker gets its role/demand-withdraw read suppressed (mechanical scorecard still returned) and `draft_apology` withholds its whole scaffold. `chat.py --no-dv-screen` or `CONFLICT_DV_SCREEN=off` bypasses the role read but STILL appends the resource footer (the hotline text is never removed). Screen is read-only, never persisted. |
-| `WELLBEING_CONSENT_IDS` | empty | Allowlist of contact ids `get_language_trajectory` will analyze. `get_language_trajectory` is self by default; a per-contact request is **refused in code** unless that id is listed. Consent only ADDS a contact; it never overrides a roster/silent exclusion. |
+| `WELLBEING_DENY_IDS` | empty | Deny list of contact ids `get_language_trajectory` will NOT analyze. Default-open: self by default, and any per-contact request runs unless that id is listed (then **refused in code**). Self is never affected. |
 | `WRAPPED_WELLBEING` | **off** | Whether Wrapped composes the wellbeing trajectory section. Off even when a change-point window fires. Equivalent to `wrapped.py --wellbeing`. |
 | `WRAPPED_VOICEPRINT_CONSENT_IDS` | empty | Default-redacted. With no ids, Wrapped emits NO third-party verbatim/stylometric voiceprint card at all. |
 | `VOICEPRINT_MIN_CONTEXT_PAIRS` | `4` | `draft_reply` structurally DECLINES (zero generation) below this many reply pairs — an honest-degrade, not a failure. (`simulate_contact` reuses this floor too.) |
@@ -263,8 +263,8 @@ CRITICAL: DRIFT_ENABLED defaults FALSE — the ENTIRE feature (make drift step, 
     feature: 'Baseline (Wellbeing)',
     prompt: `${COMMON}
 
-FOCUS: Wellbeing family (W1-W4). Read: wellbeing.py (change-point core, support_block, sanitize_condition_names), query_tools/analytics_wellbeing.py (get_language_trajectory — self by default, consent-gated per contact), consent.py (is_consented), chat.py run_turn (the final-sentence sanitize arming + _epilogue support_block handling), config.py WELLBEING_* (incl. WELLBEING_CONSENT_IDS) + WRAPPED_WELLBEING, wrapped_sections.py (_sec_wellbeing / W4), wrapped.py (--wellbeing flag).
-build_steps: get_language_trajectory is a deterministic read (lexicon from ingest) — confirm what it reads. chat_demos: a SELF trajectory prompt (how has my language/mood shifted over time) hitting get_language_trajectory (self by default); then a per-contact prompt and explain it is REFUSED unless that contact id is in WELLBEING_CONSENT_IDS. gotchas: per-contact consent enforced in code (refuses non-allowlisted before analysis); the two run_turn framing mechanisms (final-sentence condition-name sanitize + code-printed support_block epilogue) — the reply's last sentence is scrubbed and a support block appended verbatim; consent only ADDS, never overrides exclusions. wrapped_demo: WRAPPED_WELLBEING=true OR wrapped.py --wellbeing (OFF by default even when a window fires) + the trajectory section.`,
+FOCUS: Wellbeing family (W1-W4). Read: wellbeing.py (change-point core, support_block, sanitize_condition_names), query_tools/analytics_wellbeing.py (get_language_trajectory — self by default, per contact by default too / deny-gated), consent.py (is_denied), chat.py run_turn (the final-sentence sanitize arming + _epilogue support_block handling), config.py WELLBEING_* (incl. WELLBEING_DENY_IDS) + WRAPPED_WELLBEING, wrapped_sections.py (_sec_wellbeing / W4), wrapped.py (--wellbeing flag).
+build_steps: get_language_trajectory is a deterministic read (lexicon from ingest) — confirm what it reads. chat_demos: a SELF trajectory prompt (how has my language/mood shifted over time) hitting get_language_trajectory (self by default); then a per-contact prompt and explain it RUNS by default (default-open) and is REFUSED only if that contact id is in WELLBEING_DENY_IDS. gotchas: per-contact deny list enforced in code (refuses a deny-listed id before analysis; self never affected); the two run_turn framing mechanisms (final-sentence condition-name sanitize + code-printed support_block epilogue) — the reply's last sentence is scrubbed and a support block appended verbatim; consent only ADDS, never overrides exclusions. wrapped_demo: WRAPPED_WELLBEING=true OR wrapped.py --wellbeing (OFF by default even when a window fires) + the trajectory section.`,
   },
   {
     label: 'voiceprint',
@@ -351,7 +351,7 @@ doesn't pass through.
 - [ ] Every env var + default matches `config.py` (don't trust memory —
       `DRIFT_ENABLED`, the two `NUDGE_*_ENABLED`, `CONFLICT_TRACE_ENABLED`,
       `PERSONA_SIM_ENABLED` are OFF; `CONFLICT_DV_SCREEN` is ON; `WRAPPED_WELLBEING`
-      OFF; all consent/block lists (`WELLBEING_CONSENT_IDS`,
+      OFF; all consent/deny/block lists (`WELLBEING_DENY_IDS`,
       `WRAPPED_VOICEPRINT_CONSENT_IDS`, `PERSONA_SIM_BLOCK_IDS`) empty).
 - [ ] The gated features (Drift; the two opt-in nudge detectors; cross-chat trace;
       V5 `simulate_contact`; Wrapped wellbeing/voiceprint) each have an explicit

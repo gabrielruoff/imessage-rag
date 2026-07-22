@@ -69,7 +69,7 @@ class WellbeingFixture(unittest.TestCase):
         for name, val in (("MIN_WELLBEING_WORDS", 1),
                           ("WELLBEING_MIN_MARKER_HITS", 1),
                           ("WELLBEING_N_EXAMPLES", 3),
-                          ("WELLBEING_CONSENT_IDS", ""),
+                          ("WELLBEING_DENY_IDS", ""),
                           ("LOCAL_TZ", "")):
             p = mock.patch.object(config, name, val)
             p.start()
@@ -184,10 +184,9 @@ class ConsentTest(WellbeingFixture):
         self._participant(10, 60)
         self._lex(10, 60, "2023-05", 100, neg_rate=0.10)  # target words exist
 
-    def test_non_consented_contact_refused_in_code(self):
-        # Allowlist does not include 5 -> refused, and analyze_trajectory is
-        # never reached.
-        with mock.patch.object(config, "WELLBEING_CONSENT_IDS", "7 8"), \
+    def test_denylisted_contact_refused_in_code(self):
+        # Denylist includes 5 -> refused, and analyze_trajectory is never reached.
+        with mock.patch.object(config, "WELLBEING_DENY_IDS", "5 8"), \
                 mock.patch.object(wellbeing, "analyze_trajectory") as spy:
             res = self._call(contact=5)
             spy.assert_not_called()
@@ -196,8 +195,18 @@ class ConsentTest(WellbeingFixture):
         self.assertEqual(res["note"], analytics_wellbeing._REFUSAL_MESSAGE)
         self.assertIsNone(res["series"])
 
-    def test_consented_contact_is_analyzed(self):
-        with mock.patch.object(config, "WELLBEING_CONSENT_IDS", "5"), \
+    def test_contact_analyzed_by_default(self):
+        # Default-open: an empty denylist analyzes any named contact.
+        with mock.patch.object(config, "WELLBEING_DENY_IDS", ""), \
+                mock.patch.object(wellbeing, "analyze_trajectory",
+                                  side_effect=_flagged_stub) as spy:
+            res = self._call(contact=5)
+            spy.assert_called_once()
+        self.assertEqual(res["scope"], "contact:5")
+
+    def test_non_denylisted_contact_is_analyzed(self):
+        # A denylist that does not include 5 still analyzes 5.
+        with mock.patch.object(config, "WELLBEING_DENY_IDS", "7 8"), \
                 mock.patch.object(wellbeing, "analyze_trajectory",
                                   side_effect=_flagged_stub) as spy:
             res = self._call(contact=5)
@@ -270,9 +279,9 @@ class GroundingContactTest(WellbeingFixture):
         self._msg(11, 10, 0, 1, "no not never", "2023-06-01T10:01:00", 710)
 
     def test_contact_framing_and_own_lines_only(self):
-        with mock.patch.object(config, "WELLBEING_CONSENT_IDS", "5"), \
-                mock.patch.object(wellbeing, "analyze_trajectory",
-                                  side_effect=_flagged_stub):
+        # Default-open denylist (empty, from setUp) -> contact 5 is analyzed.
+        with mock.patch.object(wellbeing, "analyze_trajectory",
+                               side_effect=_flagged_stub):
             res = self._call(contact=5)
         self.assertEqual(res["scope"], "contact:5")
         self.assertIn("Bob Jones's language", res["windows"][0]["framing"])
