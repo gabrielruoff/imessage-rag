@@ -1,0 +1,136 @@
+@import 'tailwindcss';
+
+/* Class-based dark mode so a JS toggle and the token variables stay in lockstep.
+   index.html resolves the stored/system preference into a class before paint. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* --- Design tokens ---------------------------------------------------------
+   Subject: a private, local retrieval engine over your own iMessage history —
+   a native-feeling companion to Messages.app. Warm-cool paper in light, deep
+   slate in dark; a deepened indigo-blue reserved for *your own voice*; a sand
+   block for the non-model support callout. */
+:root {
+  --paper: #fbfaf8; /* app canvas */
+  --surface: #ffffff; /* cards, assistant bubbles, sidebar */
+  --surface-2: #f4f2ee; /* hover / inset */
+  --ink: #1b1b1f; /* primary text */
+  --muted: #6b6b72; /* secondary text */
+  --faint: #9a978f; /* tertiary / captions */
+  --line: #e7e4de; /* hairline borders */
+  --accent: #3b5bda; /* your voice — user bubble */
+  --accent-ink: #ffffff; /* text on accent */
+  --accent-soft: rgba(59, 91, 218, 0.14); /* focus ring / tint */
+  --care-bg: #fbf3e2; /* support callout surface */
+  --care-line: #d9a441; /* support callout rule */
+  --care-ink: #7a5410; /* support callout text */
+  --danger: #b4462f; /* error */
+
+  --font-sans: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI',
+    Roboto, sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas,
+    monospace;
+}
+
+:root.dark {
+  --paper: #0f1115;
+  --surface: #171a21;
+  --surface-2: #1f232c;
+  --ink: #e9e9ec;
+  --muted: #8b8e97;
+  --faint: #6c6f78;
+  --line: #262a33;
+  --accent: #6b8aff;
+  --accent-ink: #0f1115;
+  --accent-soft: rgba(107, 138, 255, 0.18);
+  --care-bg: #221c10;
+  --care-line: #6f5620;
+  --care-ink: #e7c98a;
+  --danger: #e0785f;
+}
+
+/* Expose tokens as Tailwind utilities (bg-paper, text-ink, border-line, ...). */
+@theme inline {
+  --color-paper: var(--paper);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-faint: var(--faint);
+  --color-line: var(--line);
+  --color-accent: var(--accent);
+  --color-accent-ink: var(--accent-ink);
+  --color-care-bg: var(--care-bg);
+  --color-care-line: var(--care-line);
+  --color-care-ink: var(--care-ink);
+  --color-danger: var(--danger);
+
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-mono);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.5;
+  letter-spacing: 0.1px;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  /* Never scroll the page horizontally; inner regions scroll instead. */
+  overflow: hidden;
+}
+
+/* Respect reduced-motion for the typing caret and reveals. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+@keyframes caret-blink {
+  0%,
+  45% {
+    opacity: 1;
+  }
+  55%,
+  100% {
+    opacity: 0.15;
+  }
+}
+
+@keyframes msg-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* Thin, unobtrusive scrollbars for the scroll regions. */
+.scroll-slim {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}
+.scroll-slim::-webkit-scrollbar {
+  width: 8px;
+}
+.scroll-slim::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border-radius: 999px;
+}

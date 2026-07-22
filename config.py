@@ -45,6 +45,21 @@ OLLAMA_CHAT_PATH = os.getenv("OLLAMA_CHAT_PATH", "/api/chat")
 OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "60"))
 CHAT_TIMEOUT = int(os.getenv("CHAT_TIMEOUT", "300"))
 
+# --- Web API server (api/, single-user local UI) -----------------------------
+# app.db holds the web UI's own conversation history (plain sqlite3, no
+# sqlite-vec) -- kept separate from the analysis DB so the chat engine stays
+# stateless and callers rebuild the messages list from stored turns. Path is
+# anchored like the other DBs.
+APP_DB = _resolve(os.getenv("APP_DB", "app.db"))
+# uvicorn bind + the dev frontend's CORS origins (Vite defaults to 5173).
+API_HOST = os.getenv("API_HOST", "127.0.0.1")
+API_PORT = int(os.getenv("API_PORT", "8000"))
+API_CORS_ORIGINS = [
+    o.strip()
+    for o in os.getenv("API_CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
+    if o.strip()
+]
+
 # --- Models -------------------------------------------------------------------
 # nomic-embed-text, not the chat model: Ollama 0.32.0 refuses /api/embed for
 # generation models (see "Known environment quirks" in CLAUDE.md).
