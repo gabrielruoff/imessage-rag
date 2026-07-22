@@ -42,6 +42,7 @@ import db
 import ollama
 import progress
 import query_tools
+import wellbeing  # --- feature: wellbeing --- (RES-68 / W4): narrative scrub
 import wrapped_html
 import wrapped_sections
 
@@ -294,6 +295,15 @@ def compose_report(sections, title, subtitle="", use_llm=False):
                             f"({wrapped_html.esc(e)}); stats only.</p>"
                         )
                     else:
+                        # --- feature: wellbeing ---
+                        # A wellbeing section's LLM blurb is scrubbed of any
+                        # clinical-condition name before it reaches the page
+                        # (defense in depth with the tool's source-level scrub);
+                        # the support footer is code-emitted in extra_html and
+                        # never depends on this narration.
+                        if narrative and sec.get("sanitize_narrative"):
+                            narrative = wellbeing.sanitize_condition_names(narrative)[0]
+                        # --- end feature: wellbeing ---
                         if narrative:
                             parts.append(
                                 f'<p class="narrative">{wrapped_html.esc(narrative)}</p>'
@@ -470,7 +480,17 @@ def main(argv=None):
     parser.add_argument("--out", help="output path (default wrapped_<scope>.html)")
     parser.add_argument("--no-llm", action="store_true", help="stats-only, no narratives")
     parser.add_argument("--yes", action="store_true", help="skip the roster confirmation prompt")
+    # --- feature: wellbeing ---
+    # Opt-in wellbeing trajectory section (RES-68 / W4). The flag overrides the
+    # WRAPPED_WELLBEING config for this run; off by default either way.
+    parser.add_argument("--wellbeing", action="store_true",
+                        help="include the opt-in wellbeing trajectory section")
+    # --- end feature: wellbeing ---
     args = parser.parse_args(argv)
+
+    # --- feature: wellbeing ---
+    wellbeing_on = args.wellbeing or config.WRAPPED_WELLBEING
+    # --- end feature: wellbeing ---
 
     with contextlib.closing(_connect()) as con:
         exclude_chats, exclude_ranges, exclude_names = [], [], []
@@ -539,6 +559,14 @@ def main(argv=None):
         excluded_names = _excluded_name_set(con, excl_contact_ids,
                                             excluded_entries, drop_names)
 
+        # --- feature: wellbeing ---
+        # Discoverability: the section is opt-in, so surface it in the preview
+        # when it is off rather than leaving it invisible.
+        if not wellbeing_on:
+            print("wellbeing trajectory section available but off — pass "
+                  "--wellbeing (or set WRAPPED_WELLBEING=true) to include it")
+        # --- end feature: wellbeing ---
+
         if not args.yes:
             answer = input("Proceed? [y/N] ").strip().lower()
             if answer not in ("y", "yes"):
@@ -547,7 +575,8 @@ def main(argv=None):
 
         sections = wrapped_sections.build_sections(con, roster, contact_entry,
                                                    args.year, exclude_chats,
-                                                   exclude_ranges, excluded_names)
+                                                   exclude_ranges, excluded_names,
+                                                   wellbeing=wellbeing_on)
 
     year_label = str(args.year) if args.year else "All Time"
     title = f"Wrapped — {year_label}"

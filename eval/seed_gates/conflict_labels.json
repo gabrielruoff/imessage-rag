@@ -1,0 +1,21 @@
+{
+ "failed": [],
+ "labeled_at": "2026-07-20T00:00:00Z",
+ "metric": "kappa",
+ "n_labels": 250,
+ "passed": [
+  "contempt",
+  "criticism",
+  "defensiveness",
+  "repair",
+  "stonewalling"
+ ],
+ "source": "seed",
+ "values": {
+  "contempt": 0.875,
+  "criticism": 0.875,
+  "defensiveness": 0.875,
+  "repair": 0.875,
+  "stonewalling": 0.875
+ }
+}

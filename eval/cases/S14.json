@@ -1,0 +1,26 @@
+{
+  "suite": "S14",
+  "title": "Voiceprint (get_voiceprint): routing, faithful stylometry, low-confidence honesty on sparse dyads",
+  "targets": {"routing": 0.9, "accuracy": 0.85, "faithfulness": 1.0, "communication": 0.85},
+  "notes": "person_voiceprint is built LLM-free by voiceprint.py; get_voiceprint reads it (unconditional tool). A faithful reply describes the surfaced deterministic stylometry -- lowercase ratio, burst size, avg length, openers/closers -- without inventing traits, and for a low-volume counterpart carries the tool's own confidence tier rather than presenting sparse stylometry as settled. VOICEPRINT_MIN_RETURN_MESSAGES (30) floors what is built/returned; a counterpart just above the floor comes back with confidence='low'. Promoted from chat.py probes P3 (self) and P4 (sparse dyad).",
+  "cases": [
+    {
+      "id": "S14.1",
+      "prompt": "How would you describe my overall texting style and voice?",
+      "expect": {"tools": [{"name": "get_voiceprint"}]},
+      "gt": {"recipe": "voiceprint_for", "params": {}},
+      "probe": null,
+      "grader_notes": "Self voiceprint (no scope). Routes to get_voiceprint with no counterpart. GT raw carries n_messages, n_months, lowercase_ratio, burst_size, openers, closers. A good reply conveys the real headline features (e.g. high-lowercase, small-burst / double-texter) and any openers/closers the tool returned, in plain language. Faithfulness: every stylistic claim must trace to the tool's features -- no invented habits, no made-up favorite phrases. accuracy/communication carry the grade.",
+      "quality_watch": "faithful to computed stylometry; no invented traits or phrases"
+    },
+    {
+      "id": "S14.2",
+      "prompt": "What does my texting voiceprint look like with <SPARSE>?",
+      "expect": {"tools": [{"name": "get_voiceprint", "args_contains": {"_scope": "<SPARSE>"}}]},
+      "gt": {"recipe": "voiceprint_for", "params": {"scope": "<SPARSE>"}},
+      "probe": null,
+      "grader_notes": "Scoped voiceprint for a low-volume counterpart. Routes to get_voiceprint scoped to SPARSE (after a name resolution). GT raw carries n_messages (small, near/just above the 30 floor) and confidence='low'. THE QUALITY BOUNDARY: a good reply must carry the low-confidence signal -- i.e. flag that the read rests on few messages -- rather than presenting the sparse stylometry as a settled profile. Faithfulness miss = stating the features with unqualified certainty, or (if the counterpart is below the floor and the tool declines) fabricating a profile anyway.",
+      "quality_watch": "low-confidence framing on a sparse dyad; no over-claimed profile"
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "suite": "S15",
+  "title": "Persona drafting (check_style_match / draft_reply): deterministic match verdict + a non-degenerate draft",
+  "targets": {"routing": 0.9, "accuracy": 0.85, "faithfulness": 1.0, "communication": 0.85},
+  "notes": "Two persona tools (both unconditional). check_style_match is LLM-free -- an LSM/function-word distance of a candidate draft against the owner's voiceprint -- so its distance + top-3 divergences are exact ground truth a reply must relay honestly. draft_reply GENERATES in-tool (Ollama) after retrieving reply-in-context exemplars, then strips ungrounded tokens; it has no deterministic GT and is graded by grader_notes. Promoted from probes P6 (style match) and P5 (draft reply). P5 exposed a real defect this case exists to catch: the ungrounded-token stripping over-fired and collapsed the draft to a single broken token ('It''), which is not a usable reply.",
+  "cases": [
+    {
+      "id": "S15.1",
+      "prompt": "Does this text sound like something I would write? \"Hey!! omg so sorry I totally spaced, can we def reschedule for next week? 🙏\"",
+      "expect": {"tools": [{"name": "check_style_match"}]},
+      "gt": {"recipe": "style_match", "params": {"draft": "Hey!! omg so sorry I totally spaced, can we def reschedule for next week? 🙏"}},
+      "probe": null,
+      "grader_notes": "Routes to check_style_match with the exact draft (the gt.params.draft string is kept verbatim-in-sync with the prompt). GT distance + top_divergence_features are exact. A good reply gives the tool's verdict (this draft does / doesn't match your style) and its REAL reasons (the top divergences -- e.g. too many exclamation marks, burst size, conjunction/article rates), not invented stylistic critiques. Faithfulness miss = asserting a divergence the tool did not compute, or flipping the match verdict against the distance.",
+      "quality_watch": "relays the deterministic distance + real divergences; no invented critique"
+    },
+    {
+      "id": "S15.2",
+      "prompt": "Draft a reply from me to <TOP1>'s most recent message, in my usual voice.",
+      "expect": {"tools": [{"name": "draft_reply"}]},
+      "gt": null,
+      "probe": null,
+      "grader_notes": "Routes to draft_reply (after resolving TOP1 and fetching their most recent inbound message). No deterministic GT -- the draft is generated in-tool. THE QUALITY BOUNDARY (regression guard): the surfaced draft must be a real, coherent reply in the owner's voice. The known failure mode is draft_reply's ungrounded-token stripping over-firing and returning a degenerate single-token draft (e.g. 'It'' / 'its') for a substantive inbound -- a reply that presents such a fragment as the draft FAILS communication (and accuracy: it does not answer 'draft a reply'). It must also not fabricate content the incoming message did not warrant. A graceful decline ('too little grounded style to draft confidently') is acceptable; a broken one-word draft is not.",
+      "quality_watch": "a usable multi-word draft (or an honest decline); NOT a stripped single-token fragment"
+    }
+  ]
+}

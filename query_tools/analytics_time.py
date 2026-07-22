@@ -46,6 +46,7 @@ from ._shared import (
     _exclude_id_filters,
     _REAL_MESSAGE_CLAUSES,
     _resolve_chat_scope,
+    _restrict_to_direct_chats,
     _scope_requested,
     _validate_include,
 )
@@ -69,18 +70,6 @@ def _tz_label(tz):
     if tz is not None:
         return str(tz)
     return str(datetime.datetime.now().astimezone().tzinfo)
-
-
-def _restrict_to_direct_chats(con, chat_ids):
-    """Keep only 1:1 chats (is_group = 0) from a chat_id list."""
-    if not chat_ids:
-        return chat_ids
-    placeholders = ",".join("?" * len(chat_ids))
-    rows = con.execute(
-        f"SELECT id FROM chats WHERE id IN ({placeholders}) AND is_group = 0",
-        chat_ids,
-    ).fetchall()
-    return [r[0] for r in rows]
 
 
 def _side(is_from_me):

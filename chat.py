@@ -21,6 +21,7 @@ from rich.markdown import Markdown
 
 import ollama
 import query_tools
+import wellbeing  # feature: wellbeing — dependency-free (stats + re), no config/Ollama pulled
 from config import CHAT_MODEL, MAX_TOOL_ITERATIONS, TOOL_RESULT_MAX_CHARS
 from tool_schemas import TOOL_DEFINITIONS
 
@@ -59,12 +60,48 @@ SYSTEM_PROMPT = (
     "given, reactions received by type -- group-chat rankings)\n"
     "- get_word_frequency (most frequent words/phrases with counts, for a sender "
     "or chat -- 'what words do I overuse')\n"
+    # --- feature: persona ---
+    "- get_voiceprint (how a person texts: message length, casing, bursts, "
+    "function-word rates, signature openers/closers, tone -- your voice, a "
+    "person's voice, or your voice with them; scope='group' for group chats)\n"
+    "- draft_reply (draft a reply to an incoming message in your own voice with "
+    "a person, grounded in your real past replies to them; declines with your "
+    "recent replies when there's too little similar context)\n"
+    "- check_style_match (score how closely a user-written draft matches how you "
+    "(or they) text: a deterministic style distance + the top-3 diverging "
+    "features with rule-based explanations -- 'does this sound like me')\n"
+    # --- end feature: persona ---
+    # --- feature: conflict ---
+    "- find_conflicts (detected argument/tense stretches in a 1:1 chat or with a "
+    "person -- deterministic signals with receipts, ranked; labels are gated bands)\n"
+    "- get_conflict (one conflict_id -> its evidence and up to 15 labeled signal "
+    "turns as tentative/likely bands)\n"
+    "- diagnose_conflict (one conflict_id -> a deterministic scorecard: I-vs-you/"
+    "we-talk ratios, style-matching, session roles, latency/volume -- no "
+    "aggressor verdict; surface any resource_footer verbatim)\n"
+    "  For all three: report the surfaced signals with receipts, never a "
+    "who-started/fault verdict or a resolution the tool did not return; if a "
+    "row is marked reconciliation, say it looks like a make-up, not the tensest "
+    "fight; prefer n_corroborated over total_matching as a count.\n"
+    # --- end feature: conflict ---
+    # --- feature: wellbeing ---
+    "- get_language_trajectory (sustained cross-family shift in someone's texting "
+    "language over months -- your own by default, or any contact unless deny-listed; "
+    "deterministic, never a diagnosis)\n"
+    # --- end feature: wellbeing ---
     "- search_contacts_by_name (name/org -> contact + their handle_ids)\n"
     "- list_chats (name/participant -> chat_id, or label a chat_id)\n"
     "- search_contact_by_handle (a phone/email/handle_id -> contact name)\n"
     "- get_message_reactions (tapbacks on a message, by its guid)\n"
     "- get_full_messages (full untruncated text for one or more message ids, "
     "when a search result was truncated)\n"
+    # --- feature: nudges ---
+    "- get_loose_threads (the user's 'loose ends' digest: drifted relationships "
+    "to reach back out to, urgency-ranked -- 'who should I reconnect with')\n"
+    "- resolve_loose_thread (dismiss one loose thread by its id)\n"
+    "- mute_contact_from_nudges (stop nudging about a contact and dismiss their "
+    "open loose threads)\n"
+    # --- end feature: nudges ---
     "When a question names a person or group, first use search_contacts_by_name "
     "or list_chats to resolve it to the handle_id / chat_id / contact_id the "
     "search tools need. For 'what did we say about X' or topic/analysis "
@@ -90,6 +127,129 @@ SYSTEM_PROMPT = (
     "iMessage chat and an SMS twin): find every matching chat_id with list_chats "
     "and pass ALL of them to the tool you call."
 )
+
+# --- feature: drift ---
+# Drift tools are schema-gated on DRIFT_ENABLED (see tool_schemas.py's matching
+# gate). ONLY when they are registered do we advertise them here and fold in the
+# two load-bearing narration rules (relay the channel caveat first; narrate at
+# the payload's confidence_tier). When disabled, the tools don't exist to the
+# model, so there is no prompt-level "don't use drift" text. Appended, never
+# reflowing the base prompt, to stay a clean additive edit.
+import config as _drift_config  # noqa: E402 (local to the additive drift block)
+
+if _drift_config.DRIFT_ENABLED:
+    SYSTEM_PROMPT += (
+        "\n- get_relationship_drift (how ONE 1:1 relationship is trending over "
+        "time: phase, drift score, per-signal monthly evidence, current gap vs "
+        "typical, confidence tier -- 'are X and I drifting apart')"
+        "\n- get_fadeout_watchlist (relationships fading out, ranked WITHIN a "
+        "coverage tier; a separate insufficient_signal bucket is never ranked "
+        "against it -- 'who am I drifting from')"
+        "\nFor a get_relationship_drift result whose phase is "
+        "cooling/fading/dormant, the payload carries a channel_caveat -- relay "
+        "its `ask` (whether you still talk elsewhere: calls, IG, in person) "
+        "BEFORE characterizing the tie, because this read is iMessage-only. "
+        "Narrate strictly at the payload's confidence_tier `narration` template; "
+        "never phrase more confidently than the tier allows, and never rank "
+        "fadeout rows across the two coverage buckets."
+    )
+# --- end feature: drift ---
+
+
+# --- feature: drift ---
+# D3 (RES-65): grounded reconnection-opener flow. Same DRIFT_ENABLED gate as
+# above -- the tool's schema only exists to the model when enabled, so this
+# guidance rides the same flag. Appended, never reflowing the base prompt.
+import config as _drift_d3_config  # noqa: E402 (local to the additive drift block)
+
+if _drift_d3_config.DRIFT_ENABLED:
+    SYSTEM_PROMPT += (
+        "\n- get_reconnection_candidates (grounding step for a reconnection "
+        "opener to ONE 1:1 relationship: surfaces human-curated shared "
+        "references -- inside jokes, nicknames, LLM-annotated high points -- "
+        "'help me reach back out to X', 'write an opener to reconnect with Y')"
+        "\nReconnection openers are human-in-the-loop and reference-grounded. "
+        "ONLY on an explicit in-turn request, call get_reconnection_candidates; "
+        "never volunteer an opener. If it returns candidates, present them and "
+        "have the user PICK exactly one, then draft the opener ONLY after they "
+        "choose, grounded strictly in the picked reference -- never combine, "
+        "embellish, or invent a shared memory. If has_curated_reference is "
+        "false, relay its `refusal`: do not fabricate a memory; offer a plain, "
+        "reference-free opener instead. Never store an opener."
+    )
+# --- end feature: drift ---
+# --- feature: conflict (C3 trace) ---
+# The cross-chat conflict trace is schema-gated on CONFLICT_TRACE_ENABLED (see
+# tool_schemas.py's matching gate -- the real off-switch). ONLY when it is
+# registered do we advertise it here and fold in the ask-first rule. When
+# disabled, the tool does not exist to the model, so there is no prompt-level
+# "don't trace" text. Appended, never reflowing the base prompt, to stay a
+# clean additive edit.
+import config as _conflict_trace_config  # noqa: E402 (local to this block)
+
+if _conflict_trace_config.CONFLICT_TRACE_ENABLED:
+    SYSTEM_PROMPT += (
+        "\n- trace_conflict_across_chats (does ONE conflict episode -- a "
+        "conflict_id from find_conflicts -- spill into the user's OTHER chats? "
+        "Cross-chat, so ASK THE USER FIRST, then call with consent=true; each "
+        "returned link both matches the episode AND names the partner, and "
+        "nothing is saved)"
+    )
+# --- end feature: conflict (C3 trace) ---
+# --- feature: conflict (C4 apology) ---
+# draft_apology is unconditional (no config gate; the DV floor is enforced in
+# the function). Appended, not folded into C1/C2's conflict block above, to stay
+# a clean additive edit alongside the concurrent conflict worktrees.
+SYSTEM_PROMPT += (
+    "\n- draft_apology (one conflict_id -> a repair SCAFFOLD, not an apology: "
+    "the ranked Lewicki-6 apology checklist + the user's REAL grievance "
+    "excerpts + the other person's ignored repair attempts where available. It "
+    "NEVER ghostwrites the apology -- walk the user through the checklist "
+    "grounded in their real excerpts; only draft text if they explicitly ask "
+    "after seeing the scaffold, and label it 'draft template -- edit before "
+    "sending'. Surface any resource_footer verbatim)"
+)
+# --- end feature: conflict (C4 apology) ---
+# --- feature: wellbeing ---
+# Layer 3 (UX polish, best-effort): non-clinical framing for
+# get_language_trajectory narration, folded into the FIRST system message
+# (gemma honors only the first). Enforcement lives in run_turn -- final-sentence
+# sanitize (wellbeing.sanitize_condition_names) + the code-emitted support
+# epilogue -- so this steering is additive and never load-bearing. Appended,
+# not reflowed into the base prompt, so it stays a clean, mergeable edit.
+SYSTEM_PROMPT += (
+    "\nWhen narrating a get_language_trajectory result, describe only the "
+    "observed change in language and behavior over time and its window. NEVER "
+    "name, diagnose, label, or speculate about any clinical or mental-health "
+    "condition. Do NOT add crisis lines, helplines, or other support resources "
+    "yourself -- the app appends any appropriate support information directly "
+    "after your reply."
+)
+# --- end feature: wellbeing ---
+# --- feature: persona (V5 simulate) ---
+# simulate_contact is schema-gated on PERSONA_SIM_ENABLED (see tool_schemas.py's
+# matching gate -- the real off-switch). ONLY when it is registered do we advertise
+# it here and fold in the estimate-relay + acknowledgment rules. When disabled,
+# the tool does not exist to the model, so there is no prompt-level "don't
+# simulate" text. Appended, never reflowing the base prompt, to stay a clean
+# additive edit.
+import config as _persona_sim_config  # noqa: E402 (local to this block)
+
+if _persona_sim_config.PERSONA_SIM_ENABLED:
+    SYSTEM_PROMPT += (
+        "\n- simulate_contact (ESTIMATE how a contact might reply in their voice, "
+        "or talk to your PAST SELF as of a date -- grounded in real style/replies; "
+        "every line is code-labeled an estimate, never their real words)"
+        "\nsimulate_contact returns a STATISTICAL ESTIMATE, never real words. For a "
+        "living contact it first returns acknowledgment_required: relay any "
+        "deceased_warning, confirm the user understands the output is an estimate, "
+        "THEN call again with acknowledged=true. Relay the returned `simulation` "
+        "text VERBATIM with its per-line labels intact -- never strip them or "
+        "present the output as the person's actual message. If it hard-refuses "
+        "(refused=true) or returns a note / low-confidence decline, relay that "
+        "as-is and do not generate a substitute yourself."
+    )
+# --- end feature: persona (V5 simulate) ---
 
 def _build_system_prompt():
     """SYSTEM_PROMPT plus the current UTC date/time, computed fresh each time --
@@ -131,6 +291,20 @@ OLLAMA_TOOLS = [
 TOOL_FUNCTIONS = {t["name"]: getattr(query_tools, t["name"]) for t in TOOL_DEFINITIONS}
 
 
+# --- feature: wellbeing ---
+# Whole-reply sanitization is armed per-call through this module flag rather
+# than a new ollama_chat_stream kwarg: the eval runner (runner.py) wraps
+# ollama_chat_stream with a fixed-signature recorder, so a flag the wrapper
+# transparently passes through beats a kwarg it would have to forward. run_turn
+# sets it immediately before each stream call and re-initializes it to False at
+# the top of every turn, so it never leaks across turns. When armed, the whole
+# assembled reply is scrubbed before it is printed or returned (streaming is
+# held back on that turn -- see ollama_chat_stream), so a condition name in ANY
+# sentence is redacted, not just the last one.
+_SANITIZE_REPLY = False
+# --- end feature: wellbeing ---
+
+
 def ollama_chat_stream(messages, tools=OLLAMA_TOOLS, show_model_header=True, model=None):
     """Stream one chat request via ollama.chat_stream, live-rendering markdown
     content as it arrives and returning the assembled final message dict (same
@@ -150,6 +324,13 @@ def ollama_chat_stream(messages, tools=OLLAMA_TOOLS, show_model_header=True, mod
     # only the first wrapped line of the final frame. There, accumulate silently
     # and render the whole reply once after the stream (below).
     use_live = console.is_terminal
+    # --- feature: wellbeing ---
+    # On a wellbeing turn (run_turn armed the flag) hold ALL live rendering
+    # until the stream completes, then scrub the WHOLE reply before printing it
+    # (below). Streaming is waived here on purpose so no unsanitized condition
+    # name -- in any sentence -- ever reaches the screen.
+    sanitize_reply = _SANITIZE_REPLY
+    # --- end feature: wellbeing ---
     try:
         for msg in ollama.chat_stream(messages, tools, model=model):
             role = msg.get("role", role)
@@ -164,7 +345,23 @@ def ollama_chat_stream(messages, tools=OLLAMA_TOOLS, show_model_header=True, mod
                             console.print(f"[bold]{model}>[/bold]")
                         live = Live(Markdown(""), console=console, refresh_per_second=12)
                         live.start()
-                    live.update(Markdown(content))
+                    # --- feature: wellbeing ---
+                    # On a wellbeing turn hold every frame until the stream ends
+                    # and the whole reply has been sanitized (below); never
+                    # live-render partial, unsanitized content.
+                    if not sanitize_reply:
+                        live.update(Markdown(content))
+                    # --- end feature: wellbeing ---
+        # --- feature: wellbeing ---
+        # Whole-reply scrub: the ENTIRE assembled reply -- not just its final
+        # sentence -- goes through the condition-name sanitizer before it is
+        # printed or returned. Streaming was held back above, so this is the
+        # first time any of it reaches the screen.
+        if sanitize_reply and content:
+            content, _redacted = wellbeing.sanitize_condition_names(content)
+            if use_live and live is not None:
+                live.update(Markdown(content))
+        # --- end feature: wellbeing ---
     finally:
         if live is not None:
             live.stop()
@@ -250,8 +447,33 @@ def run_turn(messages, show_model_header=True, model=None):
     content nor tool calls -- one final request is made with the tools
     withheld and a final-turn note folded into the system prompt, forcing an
     answer out of whatever was already gathered."""
+    global _SANITIZE_REPLY
     seen_calls = set()
+    # --- feature: wellbeing ---
+    # Generic out-of-band epilogue channel (any tool may return a reserved
+    # `_epilogue` string; we print it verbatim after the reply) + the wellbeing
+    # whole-reply sanitize arm. Both re-initialized per turn; nothing below
+    # is reordered -- these are read at the fenced points that follow.
+    epilogues = []          # verbatim text tools ask run_turn to append after the reply
+    sanitize_reply = False  # armed once get_language_trajectory has run this turn
+
+    def _emit_epilogues(reply):
+        """Print each collected epilogue verbatim after the reply and fold it
+        into the returned string (so eval transcripts capture the code-emitted
+        text). A no-op when nothing was collected, so non-wellbeing turns are
+        byte-for-byte unchanged. Identical epilogues are de-duplicated (order
+        preserved) so a turn that calls several conflict tools -- each returning
+        the same disclaimer -- appends it once, not once per tool."""
+        if not epilogues:
+            return reply
+        deduped = list(dict.fromkeys(epilogues))
+        block = "\n\n".join(deduped)
+        console.print()
+        console.print(block, markup=False)
+        return f"{reply}\n\n{block}" if reply else block
+    # --- end feature: wellbeing ---
     for _ in range(MAX_TOOL_ITERATIONS):
+        _SANITIZE_REPLY = sanitize_reply  # feature: wellbeing
         try:
             message = ollama_chat_stream(
                 messages, show_model_header=show_model_header, model=model
@@ -269,7 +491,7 @@ def run_turn(messages, show_model_header=True, model=None):
         tool_calls = message.get("tool_calls")
         if not tool_calls:
             if message.get("content"):
-                return message["content"]
+                return _emit_epilogues(message["content"])  # feature: wellbeing
             # Empty content AND no tool calls: the model stalled out (seen on
             # aggregate questions it had no tool for). Drop the empty
             # assistant message and fall through to the same final-turn
@@ -300,6 +522,22 @@ def run_turn(messages, show_model_header=True, model=None):
                     result = fn(**args)
                 except Exception as e:
                     result = {"error": str(e)}
+            # --- feature: wellbeing ---
+            # (a) Once get_language_trajectory has run this turn, arm whole-reply
+            # sanitization for every later stream call (the narration reply).
+            # (b) Collect any tool's reserved `_epilogue` and strip it -- AND the
+            # duplicate `support_block` crisis text -- from the result the model
+            # sees: both are code-delivery directives (the epilogue is printed
+            # verbatim after the reply), not data the model should narrate from.
+            # Generic: any tool may use `_epilogue`.
+            if name == "get_language_trajectory":
+                sanitize_reply = True
+            if isinstance(result, dict) and isinstance(result.get("_epilogue"), str) \
+                    and result["_epilogue"].strip():
+                epilogues.append(result["_epilogue"])
+                result = {k: v for k, v in result.items()
+                          if k not in ("_epilogue", "support_block")}
+            # --- end feature: wellbeing ---
             if isinstance(result, list):
                 count = len(result)
             elif isinstance(result, dict) and isinstance(result.get("rows"), list):
@@ -330,11 +568,12 @@ def run_turn(messages, show_model_header=True, model=None):
     else:
         head, rest = SYSTEM_PROMPT, messages
     final_messages = [{"role": "system", "content": head + "\n\n" + FINAL_TURN_NOTE}] + rest
+    _SANITIZE_REPLY = sanitize_reply  # feature: wellbeing
     message = ollama_chat_stream(
         final_messages, tools=None, show_model_header=show_model_header, model=model
     )
     messages.append(message)
-    return message.get("content", "")
+    return _emit_epilogues(message.get("content", ""))  # feature: wellbeing
 
 
 def main():
@@ -353,7 +592,22 @@ def main():
         help="override the chat model for this run (default: CHAT_MODEL from .env, "
         "currently %(default)s)",
     )
+    # --- feature: conflict ---
+    parser.add_argument(
+        "--no-dv-screen",
+        action="store_true",
+        help="C2 DV floor: restore diagnose_conflict's role/aggressor read for "
+        "this run only (the safety resource footer is still appended on a marker "
+        "hit). Overrides CONFLICT_DV_SCREEN transiently.",
+    )
+    # --- end feature: conflict ---
     args = parser.parse_args()
+
+    # --- feature: conflict ---
+    # Transient per-run bypass of the DV-suppression floor (never persisted).
+    if getattr(args, "no_dv_screen", False):
+        query_tools.set_dv_screen_bypass(True)
+    # --- end feature: conflict ---
 
     if args.prompt is not None:
         prompt = args.prompt.strip()

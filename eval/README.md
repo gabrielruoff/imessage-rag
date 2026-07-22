@@ -173,3 +173,48 @@ Rules:
   `run --suite Sx --run-id <new> --db <real DB>` → `check` → grade →
   `report --run <new> --compare <prev>`. Keep every run dir — this is a
   regression harness, not a one-shot.
+
+## Gates (measurement gates — hand labels + κ/precision)
+
+`label` and `gate` are the shared eval-gate harness (RES-70 / F4): the κ/
+precision machinery the project's three measurement gates consume. A gate
+decides, per class, whether that class is *cleared to ship*; consumer pipeline
+code calls `eval_gate_passed(con, task, cls)` at write time and **suppresses**
+any class it returns `False` for (absent verdict ⇒ suppressed).
+
+**Tasks** (`eval/evalkit/gates.py` `TASKS`): `conflict_labels` (κ over
+Gottman-style escalation types + `repair`, floor 0.6, ships a seed),
+`dropped_plan` (binary detector precision, floor 0.85, no seed → suppressed
+until labeled), and `wellbeing_narration` (a deterministic transcript check
+listed only for the scorecard — no hand labels, no seed).
+
+**Seed labels vs personal labels — the load-bearing distinction:**
+
+- `eval/labels/<task>.jsonl` — the **owner's personal hand labels**. May carry
+  real corpus text, so the directory is **gitignored** (`eval/labels/.gitignore`
+  ignores everything but itself). Written only by the owner running `label`;
+  **agents never write here**.
+- `eval/seed_labels/<task>.jsonl` + `eval/seed_gates/<task>.json` — **committed,
+  non-personal** synthetic/illustrative seed labels and the verdict computed
+  from them. Committed because they contain no owner corpus data. Only
+  `conflict_labels` ships a seed, which pre-clears its classes out of the box.
+
+**Precedence** (`eval_gate_passed`, in `eval/evalkit/gates.py`): (1) an
+`ingest_state` key `eval_gate:<task>` — an owner relabel, always wins; else
+(2) a committed `eval/seed_gates/<task>.json` — so conflict stays pre-cleared
+across a `reset_db` / fresh-DB wipe of `ingest_state` (the seed lives in the
+repo, not the per-user DB); else (3) nothing cleared → suppressed.
+
+```
+# owner-run, interactive, Ollama-free — writes eval/labels/<task>.jsonl
+.venv/bin/python3 -m eval.evalkit label conflict_labels -n 60 --db imessage_analysis.db
+# score labels vs the model side + persist the verdict to ingest_state
+.venv/bin/python3 -m eval.evalkit gate conflict_labels --db imessage_analysis.db
+```
+
+Sample-size floors are pinned in `config.py`: `EVAL_GATE_MIN_LABELS` (50 gold
+labels per class for κ) and `EVAL_GATE_MIN_PRECISION_POSITIVES` (40 gold
+positives for precision). Below the floor a class can never be marked passed.
+`gate`'s model side reuses the task's registered production classifier; those
+land with their consumer pipelines (registry `classifier` is `None` until
+then).
