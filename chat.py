@@ -12,7 +12,6 @@ import argparse
 import datetime
 import http.client
 import json
-import re
 import readline  # noqa: F401 — enables arrow-key/history line editing in input()
 import sys
 
@@ -293,37 +292,16 @@ TOOL_FUNCTIONS = {t["name"]: getattr(query_tools, t["name"]) for t in TOOL_DEFIN
 
 
 # --- feature: wellbeing ---
-# Final-sentence sanitization is armed per-call through this module flag rather
+# Whole-reply sanitization is armed per-call through this module flag rather
 # than a new ollama_chat_stream kwarg: the eval runner (runner.py) wraps
 # ollama_chat_stream with a fixed-signature recorder, so a flag the wrapper
 # transparently passes through beats a kwarg it would have to forward. run_turn
 # sets it immediately before each stream call and re-initializes it to False at
-# the top of every turn, so it never leaks across turns.
-_SANITIZE_FINAL_SENTENCE = False
-
-# A sentence ends at a run of .!? (with any trailing space) or a run of
-# newlines -- mirrors wellbeing._SENT_SPLIT's granularity without importing a
-# private name.
-_SENT_BOUNDARY_RE = re.compile(r"[.!?]+\s*|\n+")
-
-
-def _split_final_sentence(text):
-    """(head, final_sentence), lossless: head + final_sentence == text.
-
-    `final_sentence` is the last sentence that still has content -- the piece we
-    buffer and sanitize on a wellbeing turn; `head` is every earlier (already
-    streamed) sentence. When the text ends in punctuation, the trailing empty
-    tail is not the final sentence: we back up to the last boundary that still
-    leaves content after it."""
-    if not text:
-        return "", ""
-    ends = [m.end() for m in _SENT_BOUNDARY_RE.finditer(text)]
-    for e in reversed(ends):
-        if text[e:].strip():          # content follows -> e closes a non-final sentence
-            return text[:e], text[e:]
-    if len(ends) >= 2:                # ...punctuation-terminated: final sentence is the last one
-        return text[:ends[-2]], text[ends[-2]:]
-    return "", text                   # single sentence (or no boundary yet)
+# the top of every turn, so it never leaks across turns. When armed, the whole
+# assembled reply is scrubbed before it is printed or returned (streaming is
+# held back on that turn -- see ollama_chat_stream), so a condition name in ANY
+# sentence is redacted, not just the last one.
+_SANITIZE_REPLY = False
 # --- end feature: wellbeing ---
 
 
@@ -347,11 +325,11 @@ def ollama_chat_stream(messages, tools=OLLAMA_TOOLS, show_model_header=True, mod
     # and render the whole reply once after the stream (below).
     use_live = console.is_terminal
     # --- feature: wellbeing ---
-    # On a wellbeing turn (run_turn armed the flag), stream everything NORMALLY
-    # except the final sentence, which we hold back to sanitize before it is
-    # printed. Only the buffered tail is sanitizable -- earlier sentences are
-    # already on screen (owner-revision: narrows the original whole-reply buffer).
-    sanitize_final = _SANITIZE_FINAL_SENTENCE
+    # On a wellbeing turn (run_turn armed the flag) hold ALL live rendering
+    # until the stream completes, then scrub the WHOLE reply before printing it
+    # (below). Streaming is waived here on purpose so no unsanitized condition
+    # name -- in any sentence -- ever reaches the screen.
+    sanitize_reply = _SANITIZE_REPLY
     # --- end feature: wellbeing ---
     try:
         for msg in ollama.chat_stream(messages, tools, model=model):
@@ -368,17 +346,19 @@ def ollama_chat_stream(messages, tools=OLLAMA_TOOLS, show_model_header=True, mod
                         live = Live(Markdown(""), console=console, refresh_per_second=12)
                         live.start()
                     # --- feature: wellbeing ---
-                    if sanitize_final:
-                        head, _tail = _split_final_sentence(content)
-                        live.update(Markdown(head))  # render committed sentences; hold the tail
-                    else:
+                    # On a wellbeing turn hold every frame until the stream ends
+                    # and the whole reply has been sanitized (below); never
+                    # live-render partial, unsanitized content.
+                    if not sanitize_reply:
                         live.update(Markdown(content))
                     # --- end feature: wellbeing ---
         # --- feature: wellbeing ---
-        if sanitize_final and content:
-            head, tail = _split_final_sentence(content)
-            clean_tail, _redacted = wellbeing.sanitize_condition_names(tail)
-            content = head + clean_tail  # returned + printed value both carry the sanitized tail
+        # Whole-reply scrub: the ENTIRE assembled reply -- not just its final
+        # sentence -- goes through the condition-name sanitizer before it is
+        # printed or returned. Streaming was held back above, so this is the
+        # first time any of it reaches the screen.
+        if sanitize_reply and content:
+            content, _redacted = wellbeing.sanitize_condition_names(content)
             if use_live and live is not None:
                 live.update(Markdown(content))
         # --- end feature: wellbeing ---
@@ -467,15 +447,15 @@ def run_turn(messages, show_model_header=True, model=None):
     content nor tool calls -- one final request is made with the tools
     withheld and a final-turn note folded into the system prompt, forcing an
     answer out of whatever was already gathered."""
-    global _SANITIZE_FINAL_SENTENCE
+    global _SANITIZE_REPLY
     seen_calls = set()
     # --- feature: wellbeing ---
     # Generic out-of-band epilogue channel (any tool may return a reserved
     # `_epilogue` string; we print it verbatim after the reply) + the wellbeing
-    # final-sentence sanitize arm. Both re-initialized per turn; nothing below
+    # whole-reply sanitize arm. Both re-initialized per turn; nothing below
     # is reordered -- these are read at the fenced points that follow.
     epilogues = []          # verbatim text tools ask run_turn to append after the reply
-    sanitize_final = False  # armed once get_language_trajectory has run this turn
+    sanitize_reply = False  # armed once get_language_trajectory has run this turn
 
     def _emit_epilogues(reply):
         """Print each collected epilogue verbatim after the reply and fold it
@@ -493,7 +473,7 @@ def run_turn(messages, show_model_header=True, model=None):
         return f"{reply}\n\n{block}" if reply else block
     # --- end feature: wellbeing ---
     for _ in range(MAX_TOOL_ITERATIONS):
-        _SANITIZE_FINAL_SENTENCE = sanitize_final  # feature: wellbeing
+        _SANITIZE_REPLY = sanitize_reply  # feature: wellbeing
         try:
             message = ollama_chat_stream(
                 messages, show_model_header=show_model_header, model=model
@@ -543,17 +523,20 @@ def run_turn(messages, show_model_header=True, model=None):
                 except Exception as e:
                     result = {"error": str(e)}
             # --- feature: wellbeing ---
-            # (a) Once get_language_trajectory has run this turn, arm final-
-            # sentence sanitization for every later stream call (the narration
-            # reply). (b) Collect any tool's reserved `_epilogue` and strip it
-            # from the result the model sees -- it is a code-delivery directive,
-            # not tool data. Generic: any tool may use `_epilogue`.
+            # (a) Once get_language_trajectory has run this turn, arm whole-reply
+            # sanitization for every later stream call (the narration reply).
+            # (b) Collect any tool's reserved `_epilogue` and strip it -- AND the
+            # duplicate `support_block` crisis text -- from the result the model
+            # sees: both are code-delivery directives (the epilogue is printed
+            # verbatim after the reply), not data the model should narrate from.
+            # Generic: any tool may use `_epilogue`.
             if name == "get_language_trajectory":
-                sanitize_final = True
+                sanitize_reply = True
             if isinstance(result, dict) and isinstance(result.get("_epilogue"), str) \
                     and result["_epilogue"].strip():
                 epilogues.append(result["_epilogue"])
-                result = {k: v for k, v in result.items() if k != "_epilogue"}
+                result = {k: v for k, v in result.items()
+                          if k not in ("_epilogue", "support_block")}
             # --- end feature: wellbeing ---
             if isinstance(result, list):
                 count = len(result)
@@ -585,7 +568,7 @@ def run_turn(messages, show_model_header=True, model=None):
     else:
         head, rest = SYSTEM_PROMPT, messages
     final_messages = [{"role": "system", "content": head + "\n\n" + FINAL_TURN_NOTE}] + rest
-    _SANITIZE_FINAL_SENTENCE = sanitize_final  # feature: wellbeing
+    _SANITIZE_REPLY = sanitize_reply  # feature: wellbeing
     message = ollama_chat_stream(
         final_messages, tools=None, show_model_header=show_model_header, model=model
     )

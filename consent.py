@@ -71,3 +71,47 @@ def is_denied(contact_id: int | None, raw: str | None) -> bool:
     if contact_id is None:
         return False
     return contact_id in parse_consent_ids(raw)
+
+
+def parse_member_block_ids(raw: str | None) -> frozenset[str]:
+    """Parse a denylist keyed by `_shared.member_key` strings, not bare ints.
+
+    Unlike `parse_consent_ids` (bare `contacts.id` ints only), this accepts:
+      - a bare positive int -> `"contact:N"` (back-compat: the historical
+        PERSONA_SIM_BLOCK_IDS format was contact ids), and
+      - an explicit `"contact:N"` / `"handle:N"` key (case-insensitive kind),
+    so a person who exists ONLY as an unlinked handle (no `contacts` row) can be
+    denylisted too. Tolerant like the int parser: junk tokens are skipped, never
+    raised; non-positive ids are dropped; duplicates collapse.
+    """
+    if not raw:
+        return frozenset()
+    keys = set()
+    for token in _SEP.split(raw.strip()):
+        if not token:
+            continue
+        kind, sep, num = token.lower().partition(":")
+        if sep:  # "contact:12" / "handle:70"
+            if kind not in ("contact", "handle"):
+                continue
+        else:    # bare int -> a contact id, for back-compat
+            kind, num = "contact", token
+        try:
+            value = int(num)
+        except ValueError:
+            continue
+        if value > 0:
+            keys.add(f"{kind}:{value}")
+    return frozenset(keys)
+
+
+def is_blocked_member(person_key: str | None, raw: str | None) -> bool:
+    """DENYLIST membership over a `member_key` string ("contact:N"/"handle:N").
+
+    True iff `person_key` is present in `parse_member_block_ids(raw)`. `None`/
+    empty person_key -> False. Bare ints in `raw` are treated as contact ids, so
+    an existing `"12"` still blocks `"contact:12"`.
+    """
+    if not person_key:
+        return False
+    return person_key in parse_member_block_ids(raw)

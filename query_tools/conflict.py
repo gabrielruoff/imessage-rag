@@ -71,12 +71,14 @@ def _signals_json(peak_signal_json):
     return data
 
 
-def _conflict_summary(con, row):
-    """Compact conflict row for find_conflicts (no per-signal excerpts)."""
+def _conflict_summary(row):
+    """Compact conflict row for find_conflicts (no per-signal excerpts).
+
+    `labeled_signal_turns` (non-abstain conflict_signals rows) is folded into the
+    find_conflicts SELECT as a GROUP BY aggregate, so this is a pure row->dict
+    shaper with no per-row query (was an N+1 COUNT)."""
     peak = _signals_json(row["peak_signal_json"])
-    n_signal_rows = con.execute(
-        "SELECT COUNT(*) FROM conflict_signals WHERE conflict_id = ? "
-        "AND label_class != 'abstain'", (row["id"],)).fetchone()[0]
+    n_signal_rows = row["labeled_signal_turns"]
     # A make-up window is one the LLM topic pass labeled 'repair'. Kept explicit
     # so the ranking can de-prioritize reconciliations (a make-up is not the
     # "tensest" stretch) and the model can narrate the arc faithfully. NOTE:
@@ -134,15 +136,25 @@ def find_conflicts(chat_id=None, handle_id=None, contact_id=None,
 
         clauses, params = [], []
         if chat_ids is not None:
-            clauses.append(f"chat_id IN ({','.join('?' * len(chat_ids))})")
+            clauses.append(f"c.chat_id IN ({','.join('?' * len(chat_ids))})")
             params.extend(chat_ids)
-        _date_clauses(clauses, params, date_from, date_to, column="first_date")
+        _date_clauses(clauses, params, date_from, date_to, column="c.first_date")
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        # Fold the per-conflict labeled-signal count into one query (was a per-row
+        # COUNT -> N+1). LEFT JOIN keeps conflicts with zero signals; the CASE sums
+        # only non-abstain rows (there is no index on label_class). No SQL LIMIT --
+        # total_matching/n_corroborated below must count the full in-scope
+        # population; the Python sort + [:limit] slice do the ranking.
         rows = con.execute(
-            f"SELECT id, chat_id, first_date, last_date, topic, peak_signal_json, "
-            f"corroboration, off_text_flag FROM conflicts{where}", params,
+            "SELECT c.id, c.chat_id, c.first_date, c.last_date, c.topic, "
+            "c.peak_signal_json, c.corroboration, c.off_text_flag, "
+            "COALESCE(SUM(CASE WHEN s.label_class != 'abstain' THEN 1 ELSE 0 END), 0) "
+            "AS labeled_signal_turns "
+            "FROM conflicts c "
+            "LEFT JOIN conflict_signals s ON s.conflict_id = c.id"
+            f"{where} GROUP BY c.id", params,
         ).fetchall()
-        summaries = [_conflict_summary(con, r) for r in rows]
+        summaries = [_conflict_summary(r) for r in rows]
 
     # Best-substantiated first: tone-corroborated episodes (llm > weak > none)
     # outrank raw signal count, so the ~5% with a corroborated valence drop

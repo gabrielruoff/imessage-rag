@@ -1009,8 +1009,13 @@ from the original default-closed `WELLBEING_CONSENT_IDS` allowlist to a deny
 list: analyze anyone unless explicitly suppressed.) Framing is
 enforced by code, not prompt (RES-67 / W3): the tool emits a code-built
 `support_block` via the generic `_epilogue` hook that `chat.run_turn` strips
-from the model's view and prints verbatim, and the turn holds back its reply's
-final sentence to run `wellbeing.sanitize_condition_names` over it; an S10
+from the model's view (along with the duplicate `support_block` field) and prints
+verbatim, and the turn holds back streaming to run
+`wellbeing.sanitize_condition_names` over the WHOLE reply before emitting — a
+later revision (PR #32 review) widened the original final-sentence-only buffer,
+since a condition named in an earlier sentence would otherwise slip through
+prompt-only; the envelope carries a model-safe `flagged` boolean as the
+transcript-reader's departure signal now that `support_block` is hidden. An S10
 evalkit case guards the behavior. The opt-in Wrapped wellbeing section (RES-68 /
 W4) reuses the same support footer + narration scrub and stays off unless
 `--wellbeing` / `WRAPPED_WELLBEING`.

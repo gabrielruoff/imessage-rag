@@ -45,11 +45,15 @@ Silence never decides on its own. The phase label
 intra-iMessage corroborator -- reciprocity erosion, or latency inflation while
 both sides still actively send -- backs the decline (`phase_corroborated`).
 
-Guard: `dyad_drift` is a full rebuild, skip-if-unchanged. The `ingest_state`
-high-water mark `drift_max_message_id` plus a hash of DRIFT_WEIGHTS /
-DRIFT_PHASE_THRESHOLDS (`drift_params_hash`) decide whether a rerun rebuilds or
-skips. DRIFT_ENABLED (default false) short-circuits the whole thing before any
-write, so a disabled pipeline never touches the table.
+Guard: `dyad_drift` is a full rebuild, skip-if-unchanged. Four `ingest_state`
+keys decide whether a rerun rebuilds or skips: the high-water mark
+`drift_max_message_id`, a hash of every scoring config input (`drift_params_hash`),
+a fingerprint of the chunk_annotations rows consumed (`drift_annotations_hash`,
+so an in-place re-annotation rebuilds), and a fingerprint of the sessions rows
+consumed (`drift_sessions_hash`, so a SESSION_GAP_MINUTES retune -- which
+rebuilds session boundaries with no new messages -- rebuilds too). DRIFT_ENABLED
+(default false) short-circuits the whole thing before any write, so a disabled
+pipeline never touches the table.
 
 Usage: drift.py [--force] [--dry-run] [--purge]
 """
@@ -681,6 +685,26 @@ def _annotations_hash(con):
     return hashlib.sha256(repr(tuple(row)).encode("utf-8")).hexdigest()
 
 
+def _sessions_hash(con):
+    """Fingerprint of the sessions rows _load_sessions consumes (the initiation
+    signal). A SESSION_GAP_MINUTES retune rebuilds session boundaries with NO new
+    messages and NO config change _params_hash sees, so without this a stale
+    `initiation` score would be served. Aggregates over the same 1:1 scope; a
+    plain COUNT can't catch a re-split that preserves row count, so SUM of
+    initiator_is_me + first_message_id (which shifts when boundaries move) and the
+    date extent carry the signal."""
+    row = con.execute(
+        "SELECT COUNT(*), "
+        "COALESCE(SUM(s.initiator_is_me), 0), "
+        "COALESCE(SUM(s.first_message_id), 0), "
+        "COALESCE(MIN(s.first_date), ''), COALESCE(MAX(s.last_date), '') "
+        "FROM sessions s "
+        "JOIN chats ch ON ch.id = s.chat_id AND ch.is_group = 0 "
+        "WHERE s.first_date IS NOT NULL"
+    ).fetchone()
+    return hashlib.sha256(repr(tuple(row)).encode("utf-8")).hexdigest()
+
+
 def build_drift(con, *, force=False, dry_run=False):
     """Full rebuild of dyad_drift, skipping when neither the corpus high-water
     mark nor the params hash changed. Returns the number of rows written (0 on a
@@ -690,11 +714,14 @@ def build_drift(con, *, force=False, dry_run=False):
     cur_max = _max_message_id(con)
     cur_hash = _params_hash()
     cur_ann = _annotations_hash(con)
+    cur_sess = _sessions_hash(con)
     prev_max = get_state(con, "drift_max_message_id")
     prev_hash = get_state(con, "drift_params_hash")
     prev_ann = get_state(con, "drift_annotations_hash")
+    prev_sess = get_state(con, "drift_sessions_hash")
     unchanged = (prev_max is not None and int(prev_max) == cur_max
-                 and prev_hash == cur_hash and prev_ann == cur_ann)
+                 and prev_hash == cur_hash and prev_ann == cur_ann
+                 and prev_sess == cur_sess)
     if unchanged and not force and not dry_run:
         print("dyad_drift up to date (skipped)")
         return 0
@@ -748,6 +775,7 @@ def build_drift(con, *, force=False, dry_run=False):
     set_state(con, "drift_max_message_id", cur_max)
     set_state(con, "drift_params_hash", cur_hash)
     set_state(con, "drift_annotations_hash", cur_ann)
+    set_state(con, "drift_sessions_hash", cur_sess)
     con.commit()
     print(f"Built dyad_drift: {len(rows)} dyads scored "
           f"(of {len(messages)} resolved 1:1 relationships)")
@@ -759,10 +787,10 @@ def build_drift(con, *, force=False, dry_run=False):
 # ---------------------------------------------------------------------------
 
 def purge_drift(con):
-    """Tear down the drift artifact: delete every dyad_drift row and the three
+    """Tear down the drift artifact: delete every dyad_drift row and the four
     ingest_state guard keys (drift_max_message_id, drift_params_hash,
-    drift_annotations_hash) so a later rerun starts clean, then print the one
-    manual step this process cannot do.
+    drift_annotations_hash, drift_sessions_hash) so a later rerun starts clean,
+    then print the one manual step this process cannot do.
 
     A Python process cannot durably unset an env var, so flipping
     DRIFT_ENABLED=false in .env stays the user's job -- and that flip is what
@@ -775,10 +803,11 @@ def purge_drift(con):
     con.execute("DELETE FROM dyad_drift")
     con.execute("DELETE FROM ingest_state "
                 "WHERE key IN ('drift_max_message_id', 'drift_params_hash', "
-                "'drift_annotations_hash')")
+                "'drift_annotations_hash', 'drift_sessions_hash')")
     con.commit()
     print(f"Purged dyad_drift: {n} rows deleted; cleared ingest_state guard keys "
-          "drift_max_message_id, drift_params_hash and drift_annotations_hash.")
+          "drift_max_message_id, drift_params_hash, drift_annotations_hash and "
+          "drift_sessions_hash.")
     print("Now set DRIFT_ENABLED=false in .env to keep drift off -- a process "
           "cannot unset an env var for you, so this flag flip is the one manual "
           "step. Until DRIFT_ENABLED=true again AND new messages arrive, nothing "

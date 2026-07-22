@@ -311,6 +311,35 @@ class ReadToolCapTest(_TempDBTest):
         self.assertEqual(env["total_matching"], 1)
         self.assertEqual(env["rows"][0]["conflict_id"], 7)
         self.assertIn("signals", env["rows"][0])
+        # labeled_signal_turns is folded from the conflict_signals count (all 3
+        # seeded rows are non-abstain 'criticism').
+        self.assertEqual(env["rows"][0]["labeled_signal_turns"], 3)
+
+    def test_labeled_signal_turns_excludes_abstain(self):
+        # The folded count (SUM CASE label_class != 'abstain') must exclude
+        # abstain rows, and a conflict with zero signals must report 0 (LEFT JOIN).
+        con = sqlite3.connect(self.db_path)
+        schema.create_schema(con)
+        con.execute("INSERT INTO chats(id, is_group) VALUES (1, 0)")
+        con.execute(
+            "INSERT INTO conflicts(id, chat_id, first_date, last_date, "
+            "peak_signal_json, corroboration, off_text_flag, source) VALUES "
+            "(7, 1, '2026-03-01', '2026-03-02', ?, 'none', 0, 'llm'), "
+            "(8, 1, '2026-02-01', '2026-02-02', ?, 'none', 0, 'llm')",
+            (json.dumps({"signals": ["dislike_run"], "signal_count": 1}),
+             json.dumps({"signals": [], "signal_count": 0})))
+        con.executemany(
+            "INSERT INTO conflict_signals(conflict_id, message_id, actor_is_me, "
+            "label_class, top2_labels_json, band, excerpt) VALUES "
+            "(7, ?, 0, ?, '[]', 'likely', 'x')",
+            [(1001, "criticism"), (1002, "abstain"), (1003, "contempt"),
+             (1004, "abstain")])
+        con.commit()
+        con.close()
+        env = query_tools.find_conflicts(chat_id=1)
+        by_id = {r["conflict_id"]: r for r in env["rows"]}
+        self.assertEqual(by_id[7]["labeled_signal_turns"], 2)  # criticism+contempt
+        self.assertEqual(by_id[8]["labeled_signal_turns"], 0)  # no signals at all
 
     def test_read_tools_empty_when_no_tables(self):
         # A DB without the conflict tables must return empty/err, not raise.

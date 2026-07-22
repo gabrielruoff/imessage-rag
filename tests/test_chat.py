@@ -286,13 +286,13 @@ class CapToolResultTest(unittest.TestCase):
 
 
 # --- feature: wellbeing (W3) ---
-class FinalSentenceSanitizeTest(unittest.TestCase):
-    """chat.ollama_chat_stream, on a wellbeing turn (the _SANITIZE_FINAL_SENTENCE
-    module flag armed), buffers the FINAL sentence and runs it through
-    wellbeing.sanitize_condition_names before it is printed/returned. Earlier
-    sentences (already streamed) are untouched; the flag off is a no-op. Drives
-    the REAL ollama_chat_stream with ollama.chat_stream (the token generator)
-    mocked -- no socket, no model."""
+class WholeReplySanitizeTest(unittest.TestCase):
+    """chat.ollama_chat_stream, on a wellbeing turn (the _SANITIZE_REPLY
+    module flag armed), holds back streaming and runs the WHOLE assembled reply
+    through wellbeing.sanitize_condition_names before it is printed/returned, so
+    a condition named in ANY sentence is redacted (not just the last); the flag
+    off is a no-op. Drives the REAL ollama_chat_stream with ollama.chat_stream
+    (the token generator) mocked -- no socket, no model."""
 
     def setUp(self):
         # A file console is not a terminal, so use_live is False: the stream is
@@ -301,8 +301,8 @@ class FinalSentenceSanitizeTest(unittest.TestCase):
         chat.console = Console(file=io.StringIO())
         self.addCleanup(setattr, chat, "console", self._saved_console)
 
-        self._saved_flag = chat._SANITIZE_FINAL_SENTENCE
-        self.addCleanup(setattr, chat, "_SANITIZE_FINAL_SENTENCE", self._saved_flag)
+        self._saved_flag = chat._SANITIZE_REPLY
+        self.addCleanup(setattr, chat, "_SANITIZE_REPLY", self._saved_flag)
 
         self._saved_chat_stream = chat.ollama.chat_stream
         self.addCleanup(setattr, chat.ollama, "chat_stream", self._saved_chat_stream)
@@ -316,7 +316,7 @@ class FinalSentenceSanitizeTest(unittest.TestCase):
 
     def _run(self, chunks, armed):
         self._stream_chunks(chunks)
-        chat._SANITIZE_FINAL_SENTENCE = armed
+        chat._SANITIZE_REPLY = armed
         return chat.ollama_chat_stream(
             [{"role": "system", "content": "s"}], show_model_header=False
         )["content"]
@@ -331,17 +331,31 @@ class FinalSentenceSanitizeTest(unittest.TestCase):
         self.assertNotIn("depression", content)
         self.assertIn("a sustained shift in your language patterns", content)
 
-    def test_only_the_final_sentence_is_sanitized(self):
-        # A denylist term in an EARLIER (already streamed) sentence survives --
-        # the owner-revision narrows sanitization to the buffered final sentence.
+    def test_earlier_sentence_condition_is_also_sanitized(self):
+        # A denylist term in an EARLIER sentence is now redacted too (the whole
+        # reply is scrubbed, not just the final sentence); the clean neighbor
+        # survives.
         content = self._run(
             ["I mentioned anxiety back in the spring. ", "Things read steadier now."],
             armed=True,
         )
-        self.assertIn("anxiety", content)
+        self.assertNotIn("anxiety", content)
+        self.assertIn("a sustained shift in your language patterns", content)
         self.assertIn("Things read steadier now.", content)
 
-    def test_flag_off_leaves_the_final_sentence_untouched(self):
+    def test_condition_in_the_middle_is_sanitized(self):
+        # Regression for the whole-reply widening: a middle sentence is scrubbed.
+        content = self._run(
+            ["All good up front. ", "This reads like bipolar disorder. ",
+             "Anyway, that's the summary."],
+            armed=True,
+        )
+        self.assertNotIn("bipolar", content)
+        self.assertNotIn("disorder", content)
+        self.assertIn("All good up front.", content)
+        self.assertIn("Anyway, that's the summary.", content)
+
+    def test_flag_off_leaves_the_reply_untouched(self):
         content = self._run(
             ["Your tone shifted a lot. ", "This looks like depression."],
             armed=False,
@@ -357,9 +371,10 @@ class FinalSentenceSanitizeTest(unittest.TestCase):
 
 class WellbeingEpilogueTest(unittest.TestCase):
     """run_turn collects a tool's reserved `_epilogue`, prints it verbatim after
-    the reply (and folds it into the returned string), strips it from the result
-    the model sees, and arms final-sentence sanitization once
-    get_language_trajectory has run. chat.ollama_chat_stream is mocked."""
+    the reply (and folds it into the returned string), strips it AND the
+    duplicate `support_block` crisis text from the result the model sees, and
+    arms whole-reply sanitization once get_language_trajectory has run.
+    chat.ollama_chat_stream is mocked."""
 
     def setUp(self):
         self._saved_iterations = chat.MAX_TOOL_ITERATIONS
@@ -373,8 +388,8 @@ class WellbeingEpilogueTest(unittest.TestCase):
         self._saved_stream = chat.ollama_chat_stream
         self.addCleanup(setattr, chat, "ollama_chat_stream", self._saved_stream)
 
-        self._saved_flag = chat._SANITIZE_FINAL_SENTENCE
-        self.addCleanup(setattr, chat, "_SANITIZE_FINAL_SENTENCE", self._saved_flag)
+        self._saved_flag = chat._SANITIZE_REPLY
+        self.addCleanup(setattr, chat, "_SANITIZE_REPLY", self._saved_flag)
 
     def _wire(self, tool_result):
         self.flag_at_final = None
@@ -398,7 +413,7 @@ class WellbeingEpilogueTest(unittest.TestCase):
         def fake_stream(messages, tools=chat.OLLAMA_TOOLS, show_model_header=True, model=None):
             if script:
                 return dict(script.pop(0))
-            self.flag_at_final = chat._SANITIZE_FINAL_SENTENCE
+            self.flag_at_final = chat._SANITIZE_REPLY
             return {"role": "assistant", "content": "Your language shifted over several months."}
 
         chat.ollama_chat_stream = fake_stream
@@ -414,6 +429,9 @@ class WellbeingEpilogueTest(unittest.TestCase):
         self.assertTrue(tool_msgs)
         self.assertNotIn("_epilogue", tool_msgs[0]["content"])  # reserved key stripped
         self.assertNotIn("SUPPORT-TEXT-XYZ", tool_msgs[0]["content"])
+        # The duplicate support_block crisis text is stripped from the model view.
+        self.assertNotIn("support_block", tool_msgs[0]["content"])
+        self.assertNotIn("SB", tool_msgs[0]["content"])
         self.assertTrue(self.flag_at_final)  # sanitization armed for the narration reply
 
     def test_unflagged_result_emits_no_epilogue(self):
@@ -429,7 +447,7 @@ class WellbeingEpilogueTest(unittest.TestCase):
         self.flag_at_final = None
 
         def fake_stream(messages, tools=chat.OLLAMA_TOOLS, show_model_header=True, model=None):
-            self.flag_at_final = chat._SANITIZE_FINAL_SENTENCE
+            self.flag_at_final = chat._SANITIZE_REPLY
             return dict(FINAL_REPLY)
 
         chat.ollama_chat_stream = fake_stream

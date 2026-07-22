@@ -678,14 +678,16 @@ NUDGE_OCCASION_MIN_YEARS = int(os.getenv("NUDGE_OCCASION_MIN_YEARS") or "2")
 # so V5 stays a clean additive edit.
 PERSONA_SIM_ENABLED = os.getenv("PERSONA_SIM_ENABLED", "").strip().lower() in (
     "1", "true", "yes", "on")
-# Hard deceased/grief denylist: a comma/space-separated list of `contacts.id`
-# the user marks do-not-simulate. The tool hard-refuses these in CODE with a
-# fixed compassionate message and never generates. DEFAULT-ALLOW (a contact
-# absent from the list is simulable -- owner considered default-deny and declined
-# for v1). There is NO reliable automatic deceased detection from chat.db; this
-# manual list is the FLOOR. Parsed via the shared consent.parse_consent_ids
-# (tolerant; non-positive/non-integer tokens skipped), same as the other id-list
-# consent knobs -- consent membership here means "blocked", not "opted-in".
+# Hard deceased/grief denylist: a comma/space-separated list the user marks
+# do-not-simulate. The tool hard-refuses these in CODE with a fixed
+# compassionate message and never generates. DEFAULT-ALLOW (a person absent from
+# the list is simulable -- owner considered default-deny and declined for v1).
+# There is NO reliable automatic deceased detection from chat.db; this manual
+# list is the FLOOR. Entries are `member_key`-style: a bare int is a
+# `contacts.id` (back-compat), and explicit `contact:N` / `handle:N` keys are
+# also accepted -- so a person who exists only as an unlinked handle (no
+# contacts row) can be denylisted too. Parsed via consent.parse_member_block_ids
+# (tolerant; junk/non-positive tokens skipped); membership here means "blocked".
 PERSONA_SIM_BLOCK_IDS = os.getenv("PERSONA_SIM_BLOCK_IDS", "")
 # Soft deceased/dormant heuristic (owner revision 2026-07-20): a FAIL-OPEN safety
 # net OVER the manual block list, not a substitute for it. Before simulating a

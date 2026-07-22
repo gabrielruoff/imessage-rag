@@ -525,6 +525,12 @@ def get_language_trajectory(contact=None, date_from=None, date_to=None,
         env = {
             "scope": scope,
             "markers_available": markers_available,
+            # Model-safe flagged signal: chat.run_turn strips the crisis-text
+            # `support_block` from the result the model sees, so this boolean is
+            # the reliable "a sustained departure was detected" flag for any
+            # transcript reader (e.g. the evalkit narration probe), independent
+            # of which `include` sections the caller requested.
+            "flagged": flagged,
             "dropped_markers": dropped,
             "support_block": wellbeing.support_block() if flagged else None,
         }

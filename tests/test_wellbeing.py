@@ -157,6 +157,26 @@ class TestSanitizeConditionNames(unittest.TestCase):
             _, redacted = wellbeing.sanitize_condition_names(f"Maybe it is {word} then.")
             self.assertTrue(redacted, word)
 
+    def test_inflected_and_plural_forms_redacted(self):
+        # Whole-word matching does not stem, so common plural/inflected forms are
+        # listed explicitly and must redact the whole sentence.
+        for sentence in (
+            "This shows signs of mood disorders.",
+            "She had several depressive episodes.",
+            "The report lists multiple diagnoses.",
+            "He mentioned old traumas.",
+            "That sounds traumatic.",
+            "It reads like anxieties piling up.",
+        ):
+            clean, redacted = wellbeing.sanitize_condition_names(sentence)
+            self.assertTrue(redacted, sentence)
+            self.assertEqual(clean, self.FALLBACK + ".", sentence)
+        # ...but the word-boundary guard still holds for the new entries.
+        for text in ("The diagnostics all came back fine.",
+                     "The mechanic fixed the car."):
+            _, redacted = wellbeing.sanitize_condition_names(text)
+            self.assertFalse(redacted, text)
+
     def test_multiple_offending_sentences(self):
         text = "This is trauma. Also a possible disorder. But you are strong."
         clean, redacted = wellbeing.sanitize_condition_names(text)

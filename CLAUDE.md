@@ -275,7 +275,8 @@ ingest_state(key, value)          -- last_message_rowid for --since-last, plus
                                   -- annotate_model, topic_model_k, the
                                   -- suite guards: loose_ends_model,
                                   -- conflict_model, drift_max_message_id +
-                                  -- drift_params_hash + drift_annotations_hash,
+                                  -- drift_params_hash + drift_annotations_hash +
+                                  -- drift_sessions_hash,
                                   -- voiceprint_max_message_id,
                                   -- eval_gate:<task> (F4 gate verdicts), and
                                   -- nudges_reconnect_ack (durable dormant-tie
@@ -327,9 +328,12 @@ dyad_drift(contact_key, label, n_messages, n_months, first_month, last_month,
                                   -- per-counterparty relationship drift (drift.py;
                                   -- one row per member_key, opt-in DRIFT_ENABLED);
                                   -- full rebuild, guarded by drift_max_message_id +
-                                  -- drift_params_hash + drift_annotations_hash
-                                  -- (the last re-fingerprints chunk_annotations so
-                                  -- an --upgrade-distilled re-annotation rebuilds)
+                                  -- drift_params_hash + drift_annotations_hash +
+                                  -- drift_sessions_hash (annotations re-fingerprints
+                                  -- chunk_annotations so an --upgrade-distilled
+                                  -- re-annotation rebuilds; sessions re-fingerprints
+                                  -- the sessions table so a SESSION_GAP_MINUTES
+                                  -- retune rebuilds)
 person_voiceprint(member_key, counterpart_key, scope, avg_msg_len,
          lowercase_ratio, exclaim_rate, ellipsis_rate, burst_size,
          ...9 fw_*_rate cols..., openers_json, closers_json, tone_valence,
@@ -457,13 +461,17 @@ chunk_vectors                     -- sqlite-vec vec0 table: chunk_id ->
   picks allow vs deny.
 - Wellbeing narration is framed by two code mechanisms in `chat.run_turn`, not
   by the prompt. When `get_language_trajectory` runs, the turn (a) arms a
-  final-sentence sanitize that holds back the reply's last sentence and runs it
-  through `wellbeing.sanitize_condition_names` before emitting, and (b) collects
-  any tool result's reserved `_epilogue` string (the code-emitted
-  `support_block`), strips it from the data the model sees, and prints it
-  verbatim after the reply. `_epilogue` is a generic hook any tool may set;
-  wrapped.py runs the same `sanitize_condition_names` scrub over its wellbeing
-  blurb.
+  whole-reply sanitize: streaming is held back for that turn and the ENTIRE
+  assembled reply is run through `wellbeing.sanitize_condition_names` before it
+  is printed or returned, so a condition name in any sentence is redacted (not
+  just the last one); and (b) collects any tool result's reserved `_epilogue`
+  string (the code-emitted `support_block`), strips both `_epilogue` AND the
+  duplicate `support_block` field from the data the model sees, and prints the
+  epilogue verbatim after the reply. `_epilogue` is a generic hook any tool may
+  set; the `get_language_trajectory` envelope also carries a model-safe
+  `flagged` boolean (the transcript-reader's departure signal now that
+  `support_block` is stripped). wrapped.py runs the same
+  `sanitize_condition_names` scrub over its wellbeing blurb.
 - `think` is per-call, not global: `ollama.chat_once`/`chat_stream` take
   `think=` with a `_UNSET` default. The tri-state is load-bearing — `None`
   means *omit* the flag (some models reject a `think` option) and is NOT the

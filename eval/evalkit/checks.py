@@ -373,25 +373,28 @@ def probe_block(case, transcript, calls, gt_entry):
 
 # --- feature: wellbeing (W3): deterministic narration-compliance check --------
 # W3 hardens get_language_trajectory narration IN CODE (chat.run_turn buffers +
-# sanitizes the final sentence and code-emits the support block). This probe
+# sanitizes the WHOLE reply and code-emits the support block). This probe
 # verifies the OUTPUT deterministically -- a transcript scan, never an LLM grade:
-#   1. the FINAL narration sentence carries no clinical denylist term, and
+#   1. the final narration sentence carries no clinical denylist term (the whole
+#      reply is sanitized, so this is a lower bound on what's enforced), and
 #   2. the code-emitted support block is present iff the trajectory flagged.
 # `wellbeing` is dependency-free (stats + re: no config/Ollama/sqlite), so this
 # lazy import keeps checks.py parallel-safe and app-DB-free.
 
 
 def _final_sentence(text):
-    """Last sentence with content (mirrors chat._split_final_sentence's
-    granularity: a boundary is a run of .!? or newlines). Empty for empty text."""
+    """Last sentence with content (a boundary is a run of .!? or newlines).
+    Empty for empty text."""
     segments = [s for s in re.split(r"[.!?]+\s*|\n+", text or "") if s.strip()]
     return segments[-1] if segments else ""
 
 
 def _trajectory_flagged(calls):
-    """True iff a get_language_trajectory result carried a departure -- a
-    non-null support_block or a non-empty windows list (both fire only when
-    flagged). A capped/unparseable result is treated as not-flagged."""
+    """True iff a get_language_trajectory result carried a departure. Prefers the
+    explicit `flagged` boolean (present regardless of `include`); falls back to a
+    non-empty windows list or a support_block for older transcripts (run_turn now
+    strips support_block from the model-visible result). Capped/unparseable ->
+    not-flagged."""
     for call in calls:
         if call["name"] != "get_language_trajectory" or not call["result"]:
             continue
@@ -399,7 +402,9 @@ def _trajectory_flagged(calls):
             env = json.loads(call["result"])
         except (TypeError, json.JSONDecodeError):
             continue
-        if isinstance(env, dict) and (env.get("support_block") or env.get("windows")):
+        if not isinstance(env, dict):
+            continue
+        if env.get("flagged") or env.get("windows") or env.get("support_block"):
             return True
     return False
 

@@ -1019,6 +1019,28 @@ class SimulateContactTest(_DBCase):
         self.assertFalse(res["generated"])
         self.assertIn("turned off", res["message"])
 
+    def test_blocked_bare_handle_hard_refuses_without_generating(self):
+        # A person that exists ONLY as an unlinked handle (no contacts row) must
+        # still be denylistable, via a handle:N key -- the gap this closes.
+        con = sqlite3.connect(self.db_path)
+        try:
+            con.execute("INSERT INTO handles(id, handle_identifier, contact_id, "
+                        "service) VALUES (71, '+1701', NULL, 'iMessage')")
+            con.commit()
+        finally:
+            con.close()
+        saved = config.PERSONA_SIM_BLOCK_IDS
+        config.PERSONA_SIM_BLOCK_IDS = "handle:71"
+        self.addCleanup(setattr, config, "PERSONA_SIM_BLOCK_IDS", saved)
+        with mock.patch.object(ollama, "chat_once") as chat_once:
+            res = query_tools.simulate_contact(
+                "hey", handle_id=71, acknowledged=True)
+        chat_once.assert_not_called()  # never generates for a blocked bare handle
+        self.assertTrue(res["refused"])
+        self.assertEqual(res["reason"], "blocked_contact")
+        self.assertFalse(res["generated"])
+        self.assertIn("turned off", res["message"])
+
     def test_living_contact_requires_acknowledged(self):
         with mock.patch.object(ollama, "chat_once") as chat_once:
             res = query_tools.simulate_contact("want dinner", contact_id=12)

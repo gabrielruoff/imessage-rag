@@ -363,6 +363,25 @@ class DriftBuildTest(unittest.TestCase):
             drift.build_drift(self.con), 0,
             "re-annotation with no new messages must still force a rebuild")
 
+    def test_sessions_change_forces_rebuild(self):
+        # Regression: a SESSION_GAP_MINUTES retune rebuilds session boundaries
+        # (which feed the initiation signal) with NO new messages and NO config
+        # change _params_hash sees. The sessions fingerprint must force a rebuild.
+        self.con.execute(
+            "INSERT INTO sessions(id, chat_id, first_message_id, last_message_id, "
+            "first_date, last_date, n_messages, n_from_me, initiator_is_me, "
+            "ender_is_me) VALUES "
+            "(9001, 100, 1000, 1005, '2023-03-15', '2023-03-15', 6, 3, 1, 0)")
+        self.con.commit()
+        self.assertGreater(drift.build_drift(self.con), 0)   # writes the sessions hash
+        self.assertEqual(drift.build_drift(self.con), 0)     # unchanged -> skip
+        # In-place re-split: row COUNT unchanged, but a boundary moves.
+        self.con.execute("UPDATE sessions SET first_message_id = 1001 WHERE id = 9001")
+        self.con.commit()
+        self.assertGreater(
+            drift.build_drift(self.con), 0,
+            "a sessions re-split with no new messages must still force a rebuild")
+
     def test_force_rebuild_is_idempotent(self):
         drift.build_drift(self.con, force=True)
         first = self._rows()
@@ -726,6 +745,7 @@ class DriftPurgeTest(unittest.TestCase):
         drift.set_state(con, "drift_max_message_id", 1234)
         drift.set_state(con, "drift_params_hash", "deadbeef")
         drift.set_state(con, "drift_annotations_hash", "cafef00d")
+        drift.set_state(con, "drift_sessions_hash", "5e5510a5")
         con.commit()
 
     def test_purge_drift_wipes_rows_and_guard_keys(self):
@@ -738,6 +758,7 @@ class DriftPurgeTest(unittest.TestCase):
         self.assertIsNone(drift.get_state(con, "drift_max_message_id"))
         self.assertIsNone(drift.get_state(con, "drift_params_hash"))
         self.assertIsNone(drift.get_state(con, "drift_annotations_hash"))
+        self.assertIsNone(drift.get_state(con, "drift_sessions_hash"))
 
     def test_purge_preserves_unrelated_ingest_state(self):
         _db, con = self._fresh_db()
@@ -775,7 +796,7 @@ class DriftPurgeTest(unittest.TestCase):
             keys = [r[0] for r in con.execute(
                 "SELECT key FROM ingest_state WHERE key IN "
                 "('drift_max_message_id', 'drift_params_hash', "
-                "'drift_annotations_hash')")]
+                "'drift_annotations_hash', 'drift_sessions_hash')")]
         finally:
             con.close()
         self.assertEqual(n_rows, 0)

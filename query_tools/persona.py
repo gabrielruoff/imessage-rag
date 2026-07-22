@@ -1217,12 +1217,11 @@ def _simulate_them(con, message, contact_id, handle_id, name, acknowledged):
     if person_key is None:
         return {"error": "simulate_contact needs a person (contact_id/handle_id/name)"}
 
-    # Deceased/grief HARD block. Only a resolved contact id can be on the list
-    # (a bare handle can't be marked); consent membership here means "blocked".
-    kind, _, raw = person_key.partition(":")
-    blocked_id = int(raw) if kind == "contact" else None
-    if blocked_id is not None and consent.is_consented(
-            blocked_id, config.PERSONA_SIM_BLOCK_IDS):
+    # Deceased/grief HARD block. Matches the resolved member-key against the
+    # denylist, which accepts bare contact ids (back-compat) AND explicit
+    # contact:N / handle:N keys -- so a person who exists only as an unlinked
+    # handle (no contacts row) can be protected too. Membership here == blocked.
+    if consent.is_blocked_member(person_key, config.PERSONA_SIM_BLOCK_IDS):
         return {"refused": True, "reason": "blocked_contact", "generated": False,
                 "person": label, "message": _SIM_BLOCK_MESSAGE}
 

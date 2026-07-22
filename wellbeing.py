@@ -152,10 +152,16 @@ _CONDITION_FALLBACK = "a sustained shift in your language patterns"
 # expected). Lower-cased; matched case-insensitively at word boundaries so
 # "OCD"/"ADHD"/"PTSD" and capitalized forms are caught. The sanitizer redacts
 # the whole SENTENCE containing any hit -- never coin a diagnosis for the user.
+# Common plural/inflected forms are listed explicitly (whole-word matching does
+# not stem), so "mood disorders" / "depressive episodes" / "diagnoses" are
+# caught too; each still keeps the word-boundary guard ("diagnostics" != any
+# "diagnos*" entry, "mechanic" != "manias").
 _CONDITION_DENYLIST = frozenset({
-    "depression", "depressed", "anxiety", "anxious", "bipolar", "ocd", "adhd",
-    "ptsd", "trauma", "disorder", "diagnosis", "manic", "mania", "clinical",
-    "symptomatic", "episode",
+    "depression", "depressed", "depressive", "anxiety", "anxious", "anxieties",
+    "bipolar", "ocd", "adhd", "ptsd", "trauma", "traumas", "traumatic",
+    "traumatized", "disorder", "disorders", "diagnosis", "diagnoses",
+    "diagnosed", "manic", "mania", "manias", "clinical", "symptomatic",
+    "episode", "episodes", "episodic",
 })
 
 _DENY_RE = re.compile(

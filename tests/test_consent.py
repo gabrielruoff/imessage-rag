@@ -99,6 +99,56 @@ class TestIsDenied(unittest.TestCase):
         self.assertFalse(consent.is_denied(99, "12,abc, ,44"))
 
 
+class TestParseMemberBlockIds(unittest.TestCase):
+    def test_none_and_empty_are_empty(self):
+        self.assertEqual(consent.parse_member_block_ids(None), frozenset())
+        self.assertEqual(consent.parse_member_block_ids("  "), frozenset())
+
+    def test_bare_int_maps_to_contact(self):
+        # Back-compat: the historical PERSONA_SIM_BLOCK_IDS format was contact ids.
+        self.assertEqual(consent.parse_member_block_ids("12, 44"),
+                         frozenset({"contact:12", "contact:44"}))
+
+    def test_explicit_contact_and_handle_keys(self):
+        self.assertEqual(
+            consent.parse_member_block_ids("contact:12, handle:70"),
+            frozenset({"contact:12", "handle:70"}))
+
+    def test_kind_is_case_insensitive(self):
+        self.assertEqual(consent.parse_member_block_ids("Contact:12 HANDLE:70"),
+                         frozenset({"contact:12", "handle:70"}))
+
+    def test_mixed_and_junk_skipped(self):
+        # Unknown kinds, non-numeric ids, and non-positive ids are dropped.
+        self.assertEqual(
+            consent.parse_member_block_ids("12, handle:70, chat:5, handle:abc, contact:0"),
+            frozenset({"contact:12", "handle:70"}))
+
+    def test_returns_frozenset_of_str(self):
+        out = consent.parse_member_block_ids("12")
+        self.assertIsInstance(out, frozenset)
+        self.assertEqual(out, frozenset({"contact:12"}))
+
+
+class TestIsBlockedMember(unittest.TestCase):
+    def test_bare_int_blocks_contact_key(self):
+        self.assertTrue(consent.is_blocked_member("contact:12", "12"))
+        self.assertFalse(consent.is_blocked_member("handle:12", "12"))
+
+    def test_handle_key_blockable(self):
+        # The gap this closes: a person that is only a bare handle can be blocked.
+        self.assertTrue(consent.is_blocked_member("handle:70", "handle:70"))
+        self.assertFalse(consent.is_blocked_member("handle:70", "12"))
+
+    def test_none_or_empty_person_key_is_false(self):
+        self.assertFalse(consent.is_blocked_member(None, "12"))
+        self.assertFalse(consent.is_blocked_member("", "12"))
+
+    def test_empty_list_blocks_nothing(self):
+        self.assertFalse(consent.is_blocked_member("contact:12", ""))
+        self.assertFalse(consent.is_blocked_member("contact:12", None))
+
+
 class TestConfigFree(unittest.TestCase):
     def test_importing_consent_does_not_pull_in_config(self):
         # F5 is a pure net-new helper: importing it must not drag in config
