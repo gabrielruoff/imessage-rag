@@ -18,16 +18,22 @@ Requests (Python -> shim):
   (from SystemLanguageModel.default.availability; reason strings like
   "Apple Intelligence is not enabled").
 
-- {"op":"respond","id":N,"system":str,"prompt":str,"schema":obj?,"stream":bool?}
+- {"op":"respond","id":N,"system":str,"prompt":str,"schema":obj?,"stream":bool?,
+   "max_tokens":int?}
   - schema present -> guided generation: the shim builds a
     DynamicGenerationSchema from the JSON-Schema subset (object with
     properties/required, string, integer, number, boolean, enum-of-strings,
     array of scalars). Response `content` is the generated JSON as a string.
+  - max_tokens present and > 0 -> caps the reply via
+    GenerationOptions.maximumResponseTokens; absent or <= 0 leaves generation
+    unbounded (the FM has no reasoning-effort flag, so this is the one per-call
+    speed lever). Omitted from the request when None.
   - stream:true -> {"id":N,"type":"chunk","content":str}* then
     {"id":N,"type":"done"}.
   - non-stream -> {"id":N,"type":"done","content":str}.
   - Every respond uses a FRESH LanguageModelSession (callers never want
-    history).
+    history). The shim prewarms the model at startup, so the first respond does
+    not pay the cold-load latency.
 
 - {"op":"embed","id":N,"texts":[str,...]} ->
   {"id":N,"type":"embed","vectors":[[f32 x 512],...]}
@@ -416,17 +422,23 @@ def embed_texts_apple(texts, kind="document"):
 # delegates to this, and is the single seam evalkit and the tests patch.
 
 
-def respond(system, prompt, schema=None, stream=False, timeout=None):
+def respond(system, prompt, schema=None, stream=False, timeout=None,
+            max_tokens=None):
     """The shim `respond` op, low-level. Non-stream (`stream=False`) returns the
     generated `content` as a str -- the guided JSON string when `schema` is
     given, else free text. `stream=True` returns a generator yielding content
     deltas (str) until the shim's `done`. `schema` is the JSON-Schema-subset
-    object for guided generation (omitted from the request when None). Raises
+    object for guided generation (omitted from the request when None).
+    `max_tokens`, when set and > 0, caps the reply length via the FM's
+    GenerationOptions.maximumResponseTokens (the one per-call speed lever);
+    None/<=0 leaves generation unbounded and is omitted from the request. Raises
     RuntimeError on a shim error (kind preserved in the message; a
     context-overflow surfaces distinctly)."""
     payload = {"op": "respond", "system": system, "prompt": prompt}
     if schema is not None:
         payload["schema"] = schema
+    if max_tokens and max_tokens > 0:
+        payload["max_tokens"] = int(max_tokens)
     if stream:
         payload["stream"] = True
         return _stream_respond(payload, timeout)

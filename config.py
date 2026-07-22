@@ -96,6 +96,24 @@ APPLE_SHIM_PATH = _resolve(os.getenv("APPLE_SHIM_PATH", "bin/applefm-shim"))
 # fixed 4,096 tokens, so a result over this is digested down to
 # question-relevant facts, never truncated blind.
 APPLE_TOOL_RESULT_MAX_CHARS = int(os.getenv("APPLE_TOOL_RESULT_MAX_CHARS", "5000"))
+# Per-stage output-token caps for the apple chat orchestrator, forwarded to the
+# shim as GenerationOptions.maximumResponseTokens. Bounding a stage's generation
+# is the main per-call speed lever the FM exposes (the on-device model has no
+# reasoning-effort flag), and the intermediate stages emit short, structured
+# text, so a cap trims real latency at no quality cost. 0 = uncapped. The router
+# emits one tool name + a brief reason; the arg-filler emits a small JSON object
+# (kept generous so a valid args object is never truncated into a {} fallback);
+# the digester summarizes one tool-result window down to question-relevant facts
+# -- the biggest previously-uncapped generation, and where the cap pays off
+# most. ANSWER stays uncapped by default (0): it is the user-facing reply and
+# must not be clipped mid-sentence.
+# Note: APPLE_DIGEST_MAX_TOKENS caps tokens, not characters -- it can bind
+# below chat_apple._SCRATCHPAD_BUDGET, silently clipping a digested fact
+# before the budget would. Raise it if digest output looks truncated.
+APPLE_ROUTE_MAX_TOKENS = int(os.getenv("APPLE_ROUTE_MAX_TOKENS", "128"))
+APPLE_FILL_MAX_TOKENS = int(os.getenv("APPLE_FILL_MAX_TOKENS", "256"))
+APPLE_DIGEST_MAX_TOKENS = int(os.getenv("APPLE_DIGEST_MAX_TOKENS", "512"))
+APPLE_ANSWER_MAX_TOKENS = int(os.getenv("APPLE_ANSWER_MAX_TOKENS", "0"))
 
 # --- CLI progress -------------------------------------------------------------
 # How the batch CLIs report progress. 'auto' (the default) draws a live rich

@@ -21,7 +21,10 @@ Full design history, schema rationale, and data forensics:
   (`CHAT_MODEL`/`EMBED_MODEL`/`ANNOTATE_MODEL`/…). Needs macOS 26+, Apple
   Silicon, Apple Intelligence. Both kept out of `make install` (slow / network).
 - Ingest: `make ingest` / `python3 ingest.py [--no-embed] [--since-last]
-  [--senders=...] [--exclude=...]`
+  [--senders=...] [--exclude=...] [--lookback=PERIOD]` (`--lookback`/`-l` takes a
+  period like `7d`/`3mo`/`2y` — units d/w/mo/y, calendar-correct — adding a
+  `message.date >= now-PERIOD` lower bound; combines with the other flags, drops
+  dateless/system rows for that run)
 - Chat: `python3 chat.py` (REPL) or `chat.py -p "..."` (one-shot; prints only
   the reply, exit 1 if Ollama is unreachable).
 - Annotate chunks: `make annotate` / `make annotate-all`, or `python3
@@ -352,9 +355,16 @@ chunk_vectors                     -- sqlite-vec vec0 table: chunk_id ->
   `{}`), so `applefm.chat_once`'s JSON mode folds a directive in and generates
   free text (`chat_once_json` parses + nudge-retries); a caller needing
   constrained decoding calls `applefm.respond(..., schema=...)`. Apple `think` is
-  ignored (accepted and dropped at the seam). The `annotate_model` and
-  `embed_model`/`embed_dim` guards apply to apple exactly as to Ollama. Batch
-  `--terms` is unclamped on apple — set a small `ANNOTATE_TERMS_BATCH_SIZE`.
+  ignored (accepted and dropped at the seam); the one speed lever FM exposes is
+  `maximumResponseTokens` — `applefm.respond` takes `max_tokens`, and
+  `chat_apple.py` caps its route/fill/digest stages via
+  `APPLE_ROUTE_MAX_TOKENS`/`APPLE_FILL_MAX_TOKENS`/`APPLE_DIGEST_MAX_TOKENS` while
+  leaving ANSWER uncapped (`APPLE_ANSWER_MAX_TOKENS=0`) so the reply is never
+  clipped. The persistent shim `prewarm()`s the model at startup (gated on
+  availability) so the first `respond` skips cold-load, amortized across the
+  session. The `annotate_model` and `embed_model`/`embed_dim` guards apply to
+  apple exactly as to Ollama. Batch `--terms` is unclamped on apple — set a small
+  `ANNOTATE_TERMS_BATCH_SIZE`.
 - Don't modify or read files in `tests/` unless the task is about tests.
 
 ## Conventions
