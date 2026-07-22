@@ -38,6 +38,21 @@ EXCERPT_CAP = 200            # defensive re-cap on stored excerpts
 # find_conflicts rank tie-break: tone-corroborated episodes surface first.
 _CORROBORATION_RANK = {"llm": 2, "weak": 1, "none": 0}
 
+# Fixed, code-emitted humility disclaimer for the conflict READ surfaces
+# (find_conflicts / get_conflict / diagnose_conflict). Delivered out-of-band via
+# the generic `_epilogue` channel (chat.run_turn strips it from the model's view
+# and prints it verbatim after the reply -- the wellbeing support_block
+# precedent), so it always reaches the user regardless of model compliance.
+# Never LLM-authored, never persisted. It replaces a hard who-started boundary:
+# the tool surfaces signals, not a fault verdict, and says so.
+_ANALYSIS_DISCLAIMER = (
+    "Heads up: this is an automated read of text-only signals (reply timing, "
+    "message volume, tapbacks). It has limited information -- it can't see calls, "
+    "in-person context, or tone -- so it can be wrong and does not determine who "
+    "was at fault or how things actually resolved. Treat it as a prompt to "
+    "reflect, not a verdict."
+)
+
 
 def _has_conflict_tables(con):
     """True only when both conflict tables exist -- a DB built before this
@@ -62,6 +77,14 @@ def _conflict_summary(con, row):
     n_signal_rows = con.execute(
         "SELECT COUNT(*) FROM conflict_signals WHERE conflict_id = ? "
         "AND label_class != 'abstain'", (row["id"],)).fetchone()[0]
+    # A make-up window is one the LLM topic pass labeled 'repair'. Kept explicit
+    # so the ranking can de-prioritize reconciliations (a make-up is not the
+    # "tensest" stretch) and the model can narrate the arc faithfully. NOTE:
+    # peak's `valence_boost` is NOT a make-up signal -- it flags a corroborated
+    # valence DROP (tension), so it is surfaced for context but never drives
+    # `reconciliation`.
+    valence_boost = bool(peak.get("valence_boost"))
+    reconciliation = row["topic"] == "repair"
     return {
         "conflict_id": row["id"],
         "chat_id": row["chat_id"],
@@ -72,6 +95,8 @@ def _conflict_summary(con, row):
         "signal_count": peak.get("signal_count", 0),
         "corroboration": row["corroboration"],
         "off_text_flag": bool(row["off_text_flag"]),
+        "valence_boost": valence_boost,
+        "reconciliation": reconciliation,
         "labeled_signal_turns": n_signal_rows,
         "peak_gap_hours": peak.get("peak_gap_hours"),
     }
@@ -88,10 +113,14 @@ def find_conflicts(chat_id=None, handle_id=None, contact_id=None,
     `signal_count` how many. 1:1 chats only. handle_id/contact_id scope to that
     person's direct chats; date bounds filter on the episode start. corroboration
     is 'none' unless source='llm' annotations backed the tone drop. Returns an
-    envelope {rows, total_matching, returned, order, truncated}; expand one with
-    get_conflict(conflict_id)."""
+    envelope {rows, total_matching, n_corroborated, returned, order, truncated};
+    total_matching counts EVERY detected stretch in scope (mostly uncorroborated
+    lulls -- not a count of real fights), while n_corroborated is the
+    substantiated subset (weak+llm) -- prefer it as a headline count. Expand one
+    with get_conflict(conflict_id)."""
     limit = max(1, min(int(limit), MAX_CONFLICT_ROWS))
-    order = "corroboration-desc, signal_count-desc, most-recent-first"
+    order = ("corroboration-desc, non-reconciliation-first, signal_count-desc, "
+             "most-recent-first")
     with contextlib.closing(_connect()) as con:
         if not _has_conflict_tables(con):
             return _envelope([], 0, order)
@@ -117,15 +146,25 @@ def find_conflicts(chat_id=None, handle_id=None, contact_id=None,
 
     # Best-substantiated first: tone-corroborated episodes (llm > weak > none)
     # outrank raw signal count, so the ~5% with a corroborated valence drop
-    # surface ahead of the majority of uncorroborated lulls; then most distinct
+    # surface ahead of the majority of uncorroborated lulls. WITHIN a
+    # corroboration tier, genuine tension outranks a reconciliation/make-up
+    # window (`not reconciliation` sorts first under reverse=True), so an apology
+    # exchange is never surfaced as the "tensest" stretch. Then most distinct
     # deterministic signals, then most recent. (Detection + total_matching are
     # unchanged -- this only reorders which episodes fill the top `limit`.)
     summaries.sort(
         key=lambda s: (_CORROBORATION_RANK.get(s["corroboration"], 0),
+                       not s["reconciliation"],
                        s["signal_count"], s["last_date"] or ""),
         reverse=True)
     total = len(summaries)
-    return _envelope(summaries[:limit], total, order)
+    n_corroborated = sum(
+        1 for s in summaries if _CORROBORATION_RANK.get(s["corroboration"], 0) >= 1)
+    env = _envelope(summaries[:limit], total, order)
+    env["n_corroborated"] = n_corroborated
+    if total:
+        env["_epilogue"] = _ANALYSIS_DISCLAIMER
+    return env
 
 
 def _signal_row(row):
@@ -192,6 +231,9 @@ def get_conflict(conflict_id, offset=0, limit=15):
         "limit": limit,
         "truncated": total > offset + len(signals),
         "note": "labels are eval-gated bands (tentative/likely), not certainties",
+        # Code-printed humility disclaimer (stripped from the model's view by
+        # chat.run_turn, appended verbatim after the reply).
+        "_epilogue": _ANALYSIS_DISCLAIMER,
     }
 
 
@@ -528,6 +570,9 @@ def diagnose_conflict(conflict_id):
         result["interaction_pattern"] = pattern
     if screen["footer"]:
         result["resource_footer"] = screen["footer"]
+    # Code-printed humility disclaimer (out-of-band via chat.run_turn); distinct
+    # from the in-payload resource_footer, which the model narrates.
+    result["_epilogue"] = _ANALYSIS_DISCLAIMER
     return result
 
 

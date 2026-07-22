@@ -259,6 +259,84 @@ class ExclusionGateTest(_FixtureTest):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], "dismissed")
 
+    def test_owner_self_contact_is_excluded(self):
+        # F4: mark Alice's contact (the only surviving dyad) as the account
+        # owner -> her self-chat is suppressed with reason auto:self_identity,
+        # and no thread is written.
+        with mock.patch.object(loose_ends, "NUDGE_OWNER_CONTACT_IDS", "1"):
+            loose_ends.main(["--no-llm"])
+        self.assertEqual(self._threads(), [])
+        reason = sqlite3.connect(self.db_path).execute(
+            "SELECT reason FROM nudge_exclusions WHERE contact_id = 1"
+        ).fetchone()
+        self.assertEqual(reason[0], "auto:self_identity")
+
+    def test_reconciliation_resolves_undetected_open_thread(self):
+        # A stale open thread whose (kind, chat_id) no detector re-emits is
+        # auto-closed to 'resolved' on the next run (never left dangling open).
+        con = sqlite3.connect(self.db_path)
+        con.execute(
+            "INSERT INTO loose_threads(kind, chat_id, status, detected_at) "
+            "VALUES ('faded_initiator', 555, 'open', '2020-01-01')")
+        con.commit()
+        con.close()
+        loose_ends.main(["--no-llm"])
+        statuses = dict(sqlite3.connect(self.db_path).execute(
+            "SELECT chat_id, status FROM loose_threads").fetchall())
+        self.assertEqual(statuses[555], "resolved")   # stale -> auto-closed
+        self.assertEqual(statuses[100], "open")        # Alice still detected
+
+
+class SenderClassifierTest(unittest.TestCase):
+    CFG = {"owner_contact_ids": frozenset({42}),
+           "owner_handles": frozenset({"+14438480968"}),
+           "shortcode_max_digits": 6}
+
+    def test_owner_by_contact_id_and_handle(self):
+        self.assertTrue(loose_ends._is_owner_counterparty(42, "+1555", self.CFG))
+        self.assertTrue(loose_ends._is_owner_counterparty(None, "+14438480968", self.CFG))
+        self.assertFalse(loose_ends._is_owner_counterparty(7, "+1555", self.CFG))
+
+    def test_shortcode_is_automated_real_number_is_not(self):
+        self.assertTrue(loose_ends._is_automated_sender("22022", self.CFG))
+        self.assertTrue(loose_ends._is_automated_sender("urn:biz:xyz", self.CFG))
+        self.assertFalse(loose_ends._is_automated_sender("+16074345333", self.CFG))
+        self.assertFalse(loose_ends._is_automated_sender("+1000", self.CFG))  # has '+'
+        self.assertFalse(loose_ends._is_automated_sender("6074345333", self.CFG))  # long
+
+
+class ThreadSummaryTest(unittest.TestCase):
+    """The deterministic per-kind summary that grounds the model's narration."""
+    _summary = staticmethod(query_tools.nudges._thread_summary)
+
+    def test_faded_initiator_states_the_counterparty_went_quiet(self):
+        # F11: the initiation share is the COUNTERPARTY's -- the summary must say
+        # THEY went quiet, never that the user stopped initiating.
+        s = self._summary("faded_initiator", "Alex",
+                          {"all_time_initiation_share": "0.62",
+                           "trailing_initiation_share": "0.0"})
+        self.assertIn("Alex used to start conversations with you", s)
+        self.assertIn("62%", s)
+        self.assertIn("gone quiet", s)
+
+    def test_inferred_occasion_does_not_guess_a_type(self):
+        # F12: a 'Congrats women' occasion must not be narrated as a 'birthday';
+        # the summary stays generic and quotes the real past message.
+        s = self._summary("inferred_occasion", "Jill",
+                          {"month_day": "08-06", "observed_years": "['2024', '2025']",
+                           "sample_message": "Congrats women"})
+        self.assertIn("recurring date", s)
+        self.assertIn("Congrats women", s)
+        self.assertNotIn("birthday", s.lower())
+
+    def test_unanswered_question_quotes_the_question(self):
+        s = self._summary("unanswered_question", "Sam", {"question": "you free sat?"})
+        self.assertIn("Sam asked", s)
+        self.assertIn("you free sat?", s)
+
+    def test_unknown_kind_returns_none(self):
+        self.assertIsNone(self._summary("mystery_kind", "X", {}))
+
 
 class DyadGapAndRegistryTest(_FixtureTest):
     def test_registry_and_helper_are_exported_with_docstrings(self):
@@ -312,13 +390,29 @@ class ToolsTest(unittest.TestCase):
         for u in (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8):
             self._insert_thread(u)
         rows = query_tools.get_loose_threads(limit=100)
-        self.assertEqual(len(rows), 5)  # hard-capped at NUDGE_MAX_RESULTS
-        urgencies = [r["urgency"] for r in rows]
+        threads = [r for r in rows if not r.get("digest_meta")]
+        self.assertEqual(len(threads), 5)  # hard-capped at NUDGE_MAX_RESULTS
+        urgencies = [r["urgency"] for r in threads]
         self.assertEqual(urgencies, sorted(urgencies, reverse=True))
         self.assertEqual(urgencies[0], 0.8)
         # evidence_json is parsed into `evidence`; the raw key is gone.
-        self.assertIn("evidence", rows[0])
-        self.assertNotIn("evidence_json", rows[0])
+        self.assertIn("evidence", threads[0])
+        self.assertNotIn("evidence_json", threads[0])
+        self.assertIn("summary", threads[0])  # F11/F12: grounded per-kind blurb
+        # F8: a completeness meta row exposes the un-capped total (8) so the
+        # caller never mistakes the capped sample for the whole list.
+        (meta,) = [r for r in rows if r.get("digest_meta")]
+        self.assertEqual(meta["n_total"], 8)
+        self.assertEqual(meta["returned"], 5)
+        self.assertTrue(meta["truncated"])
+
+    def test_get_loose_threads_no_meta_when_not_truncated(self):
+        # Below the cap: no digest_meta row (nothing is hidden).
+        for u in (0.5, 0.6):
+            self._insert_thread(u)
+        rows = query_tools.get_loose_threads(limit=100)
+        self.assertEqual(len(rows), 2)
+        self.assertFalse([r for r in rows if r.get("digest_meta")])
 
     def test_get_loose_threads_status_filter(self):
         self._insert_thread(0.5, status="open")
@@ -767,6 +861,18 @@ class UnansweredQuestionDetectorTest(_UnansweredFixtureTest):
         self.assertTrue(alice.evidence["question"].startswith("Do you want"))
         self.assertFalse(alice.evidence["answered_late"])
         self.assertNotIn("late_reply_date", alice.evidence)
+
+    def test_stale_question_dropped_by_max_age(self):
+        # F6: a question unanswered longer than question_max_age_days is too stale
+        # to be an actionable loose end. Alice fires by default; with a zero-day
+        # ceiling her (positive) silence exceeds it and she is dropped.
+        con = self._open()
+        cfg = loose_ends._build_cfg(con)
+        self.assertIn(100, {c.chat_id
+                            for c in loose_ends.detect_unanswered_question(con, cfg)})
+        cfg["question_max_age_days"] = 0
+        self.assertNotIn(100, {c.chat_id
+                               for c in loose_ends.detect_unanswered_question(con, cfg)})
 
     def test_stage1b_suppresses_reply_within_deadline(self):
         # Bob's question is answered 90 minutes later (a new session) -- well

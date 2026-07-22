@@ -543,8 +543,18 @@ TOOL_DEFINITIONS = [
                         "'any loose ends', 'who have I been neglecting'. Returns "
                         "at most 5 rows, each with a resolved contact name, the "
                         "detector `kind`, `urgency`, the anchor message/date, the "
-                        "`evidence`, and a one-line `nudge_text`. status defaults "
-                        "to 'open'; kind optionally narrows to one detector.",
+                        "`evidence`, a one-line `nudge_text`, and a deterministic "
+                        "plain-language `summary`. RELAY the `summary` as-is and "
+                        "respect each row's `kind`: a faded_initiator means the "
+                        "OTHER person went quiet (not you); an inferred_occasion is "
+                        "a recurring date -- do not guess it is a 'birthday' unless "
+                        "the summary says so; never re-label one kind as another. "
+                        "This is a hard-capped, urgency-ranked SAMPLE, not the full "
+                        "list: a trailing {digest_meta, n_total, returned} row "
+                        "appears when more exist, so hedge completeness ('your top "
+                        "loose ends') and never claim you have seen them all. "
+                        "status defaults to 'open'; kind optionally narrows to one "
+                        "detector.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -708,8 +718,12 @@ TOOL_DEFINITIONS = [
                         "cover a person across every handle. Each row names which "
                         "`signals` fired and a `signal_count`; escalation labels "
                         "are eval-gated and shown as bands, not certainties -- "
-                        "expand one with get_conflict(conflict_id). Returns "
-                        "{rows, total_matching, returned, order, truncated}.",
+                        "expand one with get_conflict(conflict_id). A row flagged "
+                        "`reconciliation` is a make-up window, not the tensest "
+                        "fight. Returns {rows, total_matching, n_corroborated, "
+                        "returned, order, truncated}; total_matching counts every "
+                        "detected stretch (mostly minor lulls) -- prefer "
+                        "n_corroborated as a headline count of substantiated ones.",
         "input_schema": {
             "type": "object",
             "properties": {

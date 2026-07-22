@@ -18,7 +18,7 @@ def loose_threads_digest(roster, kind=None, status="open"):
     threads or a total the tool never reported."""
     qt = _qt()
     rows = [r for r in qt.get_loose_threads(status=status, kind=kind)
-            if "notice" not in r]
+            if "notice" not in r and not r.get("digest_meta")]
     return {
         "values": {"n_shown": _v(len(rows), "exact")},
         "raw": {

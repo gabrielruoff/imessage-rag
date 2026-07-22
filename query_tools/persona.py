@@ -566,7 +566,10 @@ def _strip_ungrounded_terms(con, draft, chat_ids, pairs, incoming):
     for (term,) in con.execute("SELECT DISTINCT term FROM dyad_terms"):
         suspect |= set(tokenize(term or ""))
 
-    strip = suspect - allowed
+    # Never strip trivial short tokens (len < 3): a 1-2 char fragment like "s"
+    # (from another dyad's tokenized term) is noise, and removing it strands
+    # apostrophes/letters mid-word (the "It's okay" -> "It'" defect).
+    strip = {t for t in (suspect - allowed) if len(t) >= 3}
     if not strip or not draft:
         return draft, []
 
@@ -665,6 +668,24 @@ def draft_reply(incoming, contact_id=None, handle_id=None, name=None):
         draft = (reply.get("content") or "").strip()
 
         clean, stripped = _strip_ungrounded_terms(con, draft, chat_ids, pairs, incoming)
+        # DECLINE rather than emit a degenerate fragment: if the ungrounded-term
+        # strip removed so much that too little of the draft survives (e.g. it
+        # collapsed to "It'"), a broken stub is worse than no draft. Mirror the
+        # below-floor structural decline instead.
+        survived = len(clean) / max(1, len(draft))
+        if draft and survived < config.DRAFT_MIN_SURVIVING_FRACTION:
+            base.update({
+                "confidence": "low",
+                "draft": None,
+                "exemplars": exemplars,
+                "notes": [
+                    f"The drafted reply leaned on inside-joke/nickname terms not "
+                    f"grounded in your history with {label} ({stripped}); after "
+                    f"removing them too little remained to send confidently, so no "
+                    f"draft was produced. Use the examples above as a starting point."
+                ],
+            })
+            return base
         notes = []
         if stripped:
             notes.append(

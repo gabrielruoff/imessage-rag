@@ -326,16 +326,18 @@ class FindConflictsRankingTest(_TempDBTest):
     """find_conflicts surfaces the best-substantiated episode first:
     corroboration outranks raw signal_count."""
 
-    def _insert(self, cid, corroboration, signal_count, last_date):
+    def _insert(self, cid, corroboration, signal_count, last_date,
+                topic=None, valence_boost=False):
         con = sqlite3.connect(self.db_path)
         schema.create_schema(con)
         con.execute("INSERT OR IGNORE INTO chats(id, is_group) VALUES (1, 0)")
         con.execute(
-            "INSERT INTO conflicts(id, chat_id, first_date, last_date, "
+            "INSERT INTO conflicts(id, chat_id, first_date, last_date, topic, "
             "peak_signal_json, corroboration, off_text_flag, source) VALUES "
-            "(?, 1, ?, ?, ?, ?, 0, 'llm')",
-            (cid, last_date, last_date,
-             json.dumps({"signals": ["s"] * signal_count, "signal_count": signal_count}),
+            "(?, 1, ?, ?, ?, ?, ?, 0, 'llm')",
+            (cid, last_date, last_date, topic,
+             json.dumps({"signals": ["s"] * signal_count, "signal_count": signal_count,
+                         "valence_boost": valence_boost}),
              corroboration))
         con.commit()
         con.close()
@@ -354,6 +356,44 @@ class FindConflictsRankingTest(_TempDBTest):
         self._insert(3, "none", 2, "2026-03-05")  # same signals as 1, newer -> before 1
         rows = query_tools.find_conflicts(chat_id=1)["rows"]
         self.assertEqual([r["conflict_id"] for r in rows], [2, 3, 1])
+
+    def test_reconciliation_deprioritized_within_tier(self):
+        # F3: a repair/make-up window with MORE signals must NOT outrank a genuine
+        # tense window at the same corroboration tier -- an apology is not the
+        # "tensest" stretch. Both llm-corroborated; id 1 is a repair with 4
+        # signals, id 2 a non-repair with 2. The non-reconciliation ranks first.
+        self._insert(1, "llm", 4, "2026-03-02", topic="repair")
+        self._insert(2, "llm", 2, "2026-03-01")
+        rows = query_tools.find_conflicts(chat_id=1)["rows"]
+        self.assertEqual([r["conflict_id"] for r in rows], [2, 1])
+        self.assertTrue(rows[1]["reconciliation"])
+        self.assertFalse(rows[0]["reconciliation"])
+
+    def test_valence_boost_is_surfaced_but_not_reconciliation(self):
+        # valence_boost flags a corroborated valence DROP (tension), NOT a
+        # make-up -- it is surfaced for context but must not mark reconciliation.
+        self._insert(1, "llm", 3, "2026-03-01", valence_boost=True)
+        (row,) = query_tools.find_conflicts(chat_id=1)["rows"]
+        self.assertTrue(row["valence_boost"])
+        self.assertFalse(row["reconciliation"])
+
+    def test_n_corroborated_counts_weak_and_llm(self):
+        # F2: total_matching counts every episode; n_corroborated only weak+llm.
+        self._insert(1, "none", 2, "2026-03-01")
+        self._insert(2, "weak", 2, "2026-03-02")
+        self._insert(3, "llm", 2, "2026-03-03")
+        env = query_tools.find_conflicts(chat_id=1)
+        self.assertEqual(env["total_matching"], 3)
+        self.assertEqual(env["n_corroborated"], 2)
+
+    def test_disclaimer_epilogue_present_only_when_nonempty(self):
+        # F1: the humility disclaimer rides the generic _epilogue channel on a
+        # non-empty result, and is absent when nothing was found.
+        self.assertNotIn("_epilogue", query_tools.find_conflicts(chat_id=1))
+        self._insert(1, "none", 2, "2026-03-01")
+        env = query_tools.find_conflicts(chat_id=1)
+        self.assertIn("_epilogue", env)
+        self.assertIn("does not determine who was at fault", env["_epilogue"])
 
 
 # --- F4 gate wiring ----------------------------------------------------------

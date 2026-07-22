@@ -80,6 +80,10 @@ SYSTEM_PROMPT = (
     "- diagnose_conflict (one conflict_id -> a deterministic scorecard: I-vs-you/"
     "we-talk ratios, style-matching, session roles, latency/volume -- no "
     "aggressor verdict; surface any resource_footer verbatim)\n"
+    "  For all three: report the surfaced signals with receipts, never a "
+    "who-started/fault verdict or a resolution the tool did not return; if a "
+    "row is marked reconciliation, say it looks like a make-up, not the tensest "
+    "fight; prefer n_corroborated over total_matching as a count.\n"
     # --- end feature: conflict ---
     # --- feature: wellbeing ---
     "- get_language_trajectory (sustained cross-family shift in someone's texting "
@@ -477,10 +481,13 @@ def run_turn(messages, show_model_header=True, model=None):
         """Print each collected epilogue verbatim after the reply and fold it
         into the returned string (so eval transcripts capture the code-emitted
         text). A no-op when nothing was collected, so non-wellbeing turns are
-        byte-for-byte unchanged."""
+        byte-for-byte unchanged. Identical epilogues are de-duplicated (order
+        preserved) so a turn that calls several conflict tools -- each returning
+        the same disclaimer -- appends it once, not once per tool."""
         if not epilogues:
             return reply
-        block = "\n\n".join(epilogues)
+        deduped = list(dict.fromkeys(epilogues))
+        block = "\n\n".join(deduped)
         console.print()
         console.print(block, markup=False)
         return f"{reply}\n\n{block}" if reply else block

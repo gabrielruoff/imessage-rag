@@ -753,6 +753,18 @@ class DraftReplyTest(_DBCase):
         self.assertTrue(res["notes"])
         self.assertIn("floopy", " ".join(res["notes"]))
 
+    def test_declines_when_strip_leaves_a_fragment(self):
+        # F7: when ungrounded-term stripping removes so much that only a
+        # degenerate stub remains, draft_reply DECLINES rather than sending it.
+        # "floopy" (another chat's term) is fully stripped -> nothing survives.
+        with mock.patch.object(ollama, "chat_once",
+                               return_value={"content": "floopy"}):
+            res = query_tools.draft_reply(
+                "hey want to grab dinner tonight", contact_id=12)
+        self.assertIsNone(res["draft"])
+        self.assertEqual(res["confidence"], "low")
+        self.assertTrue(res["notes"])
+
     # --- input / scope guards -----------------------------------------------
     def test_requires_incoming_text(self):
         with mock.patch.object(ollama, "chat_once") as chat_once:

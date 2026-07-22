@@ -49,6 +49,9 @@ from config import (
     NUDGE_FADED_INIT_MIN_SESSIONS,
     NUDGE_FADED_INIT_WINDOW_DAYS,
     NUDGE_KIND_WEIGHTS,
+    NUDGE_OWNER_CONTACT_IDS,
+    NUDGE_OWNER_HANDLES,
+    NUDGE_SHORTCODE_MAX_DIGITS,
     NUDGE_URGENCY_HALFLIFE_DAYS,
     NUDGE_VALENCE_EXCLUDE,
     NUDGES_MODEL,
@@ -56,6 +59,7 @@ from config import (
     NUDGES_TIMEOUT,
     TARGET_DB,
 )
+from consent import parse_consent_ids
 from db import CONTACT_LABEL_SQL, connect_default, get_state, run_cli, set_state
 from query_tools._shared import _REAL_MESSAGE_CLAUSES, _restrict_to_direct_chats
 from query_tools.nudges import (
@@ -87,6 +91,7 @@ import re
 from config import (
     NUDGE_QUESTION_GRACE_HOURS,
     NUDGE_QUESTION_INCLUDE_ANSWERED_LATE,
+    NUDGE_QUESTION_MAX_AGE_DAYS,
     NUDGE_QUESTION_MIN_CHARS,
 )
 # --- detector: inferred_occasion ---
@@ -128,6 +133,8 @@ _REAL = " AND ".join(_REAL_MESSAGE_CLAUSES)
 # user mute written by mute_contact_from_nudges).
 _REASON_NEGATIVE = "auto:negative_valence"
 _REASON_ZERO_OUTBOUND = "auto:zero_outbound"
+_REASON_SELF = "auto:self_identity"          # the account owner's own number/card
+_REASON_AUTOMATED = "auto:automated_sender"  # shortcode / business / bot sender
 
 # Fallback urgency weight for a kind absent from NUDGE_KIND_WEIGHTS.
 _DEFAULT_KIND_WEIGHT = 0.5
@@ -582,6 +589,9 @@ def detect_unanswered_question(con, cfg) -> Iterable[CandidateRow]:
         if late_date is not None and not cfg["question_include_answered_late"]:
             continue  # answered, just late -- resolved, not an open loose end
         silence_days = max(0.0, (now - anchor_dt).total_seconds()) / 86400
+        max_age = cfg.get("question_max_age_days")
+        if max_age is not None and silence_days > max_age:
+            continue  # a years-old question is not an actionable loose end
         p90_days = (p90 / 86400) if p90 else None
         evidence = {
             "question": text[:TEXT_PREVIEW_CHARS],
@@ -1039,15 +1049,43 @@ DETECTORS.append(("unreciprocated_goodnews", detect_unreciprocated_goodnews))
 # ---------------------------------------------------------------------------
 
 def _direct_chat_counterparties(con):
-    """(chat_id, handle_id, contact_id) for every 1:1 chat's counterparty."""
+    """(chat_id, handle_id, contact_id, handle_identifier) for every 1:1 chat's
+    counterparty. handle_identifier lets the gate recognize the owner's own
+    number and automated/shortcode senders."""
     return con.execute(
         """
-        SELECT cp.chat_id, cp.handle_id, h.contact_id
+        SELECT cp.chat_id, cp.handle_id, h.contact_id, h.handle_identifier
         FROM chat_participants cp
         JOIN chats ch ON ch.id = cp.chat_id AND ch.is_group = 0
         JOIN handles h ON h.id = cp.handle_id
         """
     ).fetchall()
+
+
+def _is_owner_counterparty(contact_id, handle_identifier, cfg):
+    """True when a 1:1 counterparty IS the account owner -- a self-chat / the
+    owner's own second number. The schema stores no owner identity (see
+    member_key: 'me' is only is_from_me, and outbound rows carry handle_id=0), so
+    this is an explicit owner allowlist the owner configures once."""
+    if contact_id is not None and contact_id in cfg["owner_contact_ids"]:
+        return True
+    return bool(handle_identifier) and handle_identifier in cfg["owner_handles"]
+
+
+def _is_automated_sender(handle_identifier, cfg):
+    """True for an automated / non-human sender: an Apple business handle
+    (urn:biz:*) or a short numeric SMS shortcode (e.g. 22022) -- a marketing /
+    survey / 2FA sender, never a person the user owes a reply. A shortcode is a
+    BARE (no country-code '+') all-digit sender at most shortcode_max_digits long;
+    a real phone number carries a '+' or is 10-15 digits, so it is never a
+    shortcode."""
+    ident = (handle_identifier or "").strip()
+    if not ident:
+        return False
+    if ident.lower().startswith("urn:biz:"):
+        return True
+    return (not ident.startswith("+") and ident.isdigit()
+            and len(ident) <= cfg["shortcode_max_digits"])
 
 
 def _outbound_count(con, chat_id):
@@ -1086,13 +1124,21 @@ def run_exclusion_gate(con, cfg, now, dry_run=False):
     WOULD be muted -- the returned sets drive suppression for this same run."""
     excluded_handles, excluded_contacts = _load_exclusions(con)
     n_added = 0
-    for chat_id, handle_id, contact_id in _direct_chat_counterparties(con):
+    for chat_id, handle_id, contact_id, handle_identifier in \
+            _direct_chat_counterparties(con):
         if _is_excluded(handle_id, contact_id, excluded_handles, excluded_contacts):
             continue
-        reason = None
-        if _outbound_count(con, chat_id) == 0:
+        # Identity gates first (cheap, no SQL): the owner's own self-chat and
+        # automated/shortcode senders are never a loose end regardless of volume
+        # or valence.
+        if _is_owner_counterparty(contact_id, handle_identifier, cfg):
+            reason = _REASON_SELF
+        elif _is_automated_sender(handle_identifier, cfg):
+            reason = _REASON_AUTOMATED
+        elif _outbound_count(con, chat_id) == 0:
             reason = _REASON_ZERO_OUTBOUND
         else:
+            reason = None
             valence = _recent_llm_valence(con, chat_id)
             if valence is not None and valence <= cfg["valence_exclude"]:
                 reason = _REASON_NEGATIVE
@@ -1138,9 +1184,11 @@ def _score_urgency(kind, anchor_date, ref_now, cfg, due_by=None):
 
 def _upsert_thread(con, cand, urgency, now):
     """Insert a new open thread for (kind, chat_id), or refresh the existing
-    open one (anchor/urgency/evidence move as the corpus grows). A dismissed
-    thread for the same (kind, chat_id) is left untouched -- a detector never
-    resurrects a dismissal. Returns the row id, or None when skipped."""
+    one (anchor/urgency/evidence move as the corpus grows). A dismissed thread
+    for the same (kind, chat_id) is left untouched -- a detector never resurrects
+    a dismissal -- but a 'resolved' (auto-closed) thread that is detected again is
+    RE-OPENED, since the underlying loose end has recurred. Returns the row id,
+    or None when skipped."""
     existing = con.execute(
         "SELECT id, status FROM loose_threads WHERE kind = ? AND chat_id = ? "
         "ORDER BY id DESC LIMIT 1",
@@ -1151,9 +1199,9 @@ def _upsert_thread(con, cand, urgency, now):
         if existing["status"] == "dismissed":
             return None
         con.execute(
-            "UPDATE loose_threads SET handle_id = ?, anchor_message_id = ?, "
-            "anchor_date = ?, due_by = ?, urgency = ?, evidence_json = ?, "
-            "source = ?, detected_at = ? WHERE id = ?",
+            "UPDATE loose_threads SET status = 'open', handle_id = ?, "
+            "anchor_message_id = ?, anchor_date = ?, due_by = ?, urgency = ?, "
+            "evidence_json = ?, source = ?, detected_at = ? WHERE id = ?",
             (cand.handle_id, cand.anchor_message_id, cand.anchor_date, cand.due_by,
              urgency, evidence_json, cand.source, now, existing["id"]),
         )
@@ -1177,6 +1225,12 @@ def _build_cfg(con):
         "faded_window_days": NUDGE_FADED_INIT_WINDOW_DAYS,
         "kind_weights": NUDGE_KIND_WEIGHTS,
         "halflife_days": max(NUDGE_URGENCY_HALFLIFE_DAYS, 1e-9),
+        # Stage-0 identity gates: the owner's own contact/handles (self-chat) and
+        # the shortcode-length ceiling for automated senders.
+        "owner_contact_ids": parse_consent_ids(NUDGE_OWNER_CONTACT_IDS),
+        "owner_handles": frozenset(
+            t for t in re.split(r"[,\s]+", (NUDGE_OWNER_HANDLES or "").strip()) if t),
+        "shortcode_max_digits": NUDGE_SHORTCODE_MAX_DIGITS,
         # --- detector: dormant_tie ---
         "dormant_top_frac": NUDGE_DORMANT_TOP_FRAC,
         "dormant_min_messages": NUDGE_DORMANT_MIN_MESSAGES,
@@ -1186,6 +1240,7 @@ def _build_cfg(con):
         "question_min_chars": NUDGE_QUESTION_MIN_CHARS,
         "question_grace_hours": NUDGE_QUESTION_GRACE_HOURS,
         "question_include_answered_late": NUDGE_QUESTION_INCLUDE_ANSWERED_LATE,
+        "question_max_age_days": NUDGE_QUESTION_MAX_AGE_DAYS,
         # --- end detector: unanswered_question ---
         # --- detector: inferred_occasion ---
         "occasion_min_years": NUDGE_OCCASION_MIN_YEARS,
@@ -1239,10 +1294,30 @@ def detect_all(con, cfg, event_now, dry_run=False):
             if tid is not None:
                 thread_ids.append(tid)
                 n_written += 1
+    n_resolved = 0
     if not dry_run:
+        n_resolved = _resolve_stale_threads(con, thread_ids, event_now)
         con.commit()
     return {"auto_excluded": n_auto, "candidates": n_candidates,
-            "suppressed": n_suppressed, "written": n_written, "thread_ids": thread_ids}
+            "suppressed": n_suppressed, "written": n_written,
+            "resolved": n_resolved, "thread_ids": thread_ids}
+
+
+def _resolve_stale_threads(con, written_ids, now):
+    """Reconciliation: auto-close every OPEN thread this run did NOT re-detect --
+    the loose end resolved (question answered, tie reconnected, occasion passed).
+    Sets status='resolved' (distinct from a user 'dismissed'; hidden from both the
+    open and the 'already dealt with' digests). Detectors run corpus-wide, so a
+    thread absent from this run's candidates is genuinely no longer a loose end.
+    Returns the number closed. Does NOT commit -- the caller owns the transaction."""
+    placeholders = ",".join("?" * len(written_ids)) if written_ids else ""
+    keep = f" AND id NOT IN ({placeholders})" if written_ids else ""
+    cur = con.execute(
+        f"UPDATE loose_threads SET status = 'resolved', dismissed_at = ? "
+        f"WHERE status = 'open'{keep}",
+        [now, *written_ids],
+    )
+    return cur.rowcount
 
 
 # ---------------------------------------------------------------------------
@@ -1385,7 +1460,8 @@ def main(argv=None):
         event_now = _utcnow_iso()
         summary = detect_all(con, cfg, event_now, dry_run=args.dry_run)
         print(f"Loose threads: {summary['candidates']} candidates, "
-              f"{summary['suppressed']} suppressed, {summary['written']} written "
+              f"{summary['suppressed']} suppressed, {summary['written']} written, "
+              f"{summary.get('resolved', 0)} auto-resolved "
               f"({summary['auto_excluded']} new auto-exclusions)"
               f"{' [--dry-run: nothing written]' if args.dry_run else ''}")
         if args.dry_run:

@@ -86,6 +86,50 @@ def _add_exclusion(con, handle_id=None, contact_id=None, reason="muted", now=Non
     return True
 
 
+def _pct(value):
+    try:
+        return f"{round(float(value) * 100)}%"
+    except (TypeError, ValueError):
+        return None
+
+
+def _thread_summary(kind, contact, evidence):
+    """A deterministic, plain-language description of ONE loose thread, keyed on
+    its kind. Grounds the model's narration so it cannot invert who went quiet
+    (faded_initiator is about the COUNTERPARTY's initiation, not the user's) or
+    re-label the kind / guess an occasion type it wasn't told. Returns None for
+    an unknown kind (the model falls back to the raw evidence)."""
+    who = contact or "this contact"
+    ev = evidence if isinstance(evidence, dict) else {}
+    if kind == "faded_initiator":
+        allt, trail = _pct(ev.get("all_time_initiation_share")), _pct(
+            ev.get("trailing_initiation_share"))
+        s = f"{who} used to start conversations with you"
+        s += f" about {allt} of the time" if allt else " more than they do now"
+        s += f", but only about {trail} recently" if trail else ", but has gone quiet lately"
+        return s + " -- they have gone quiet, so reaching out could reconnect."
+    if kind == "unanswered_question":
+        q = (ev.get("question") or "").strip()
+        return (f"{who} asked you a question you have not answered"
+                + (f': "{q}"' if q else "") + ".")
+    if kind == "inferred_occasion":
+        md, yrs = ev.get("month_day"), ev.get("observed_years")
+        sample = (str(ev.get("sample_message") or "")).strip()
+        s = "A recurring date"
+        s += f" around {md}" if md else ""
+        s += f" you have marked with {who} in past years"
+        s += f" ({yrs})" if yrs else ""
+        # Include the actual past message verbatim so the type is not guessed
+        # (a 'Congrats women' note is not a birthday).
+        s += f'; a past message then was "{sample}"' if sample else ""
+        return s + "."
+    if kind == "unreciprocated_goodnews":
+        return f"{who} shared good news that may not have been fully acknowledged."
+    if kind == "dormant_tie":
+        return f"You and {who} used to talk regularly but have not in a while."
+    return None
+
+
 def get_loose_threads(status="open", kind=None, limit=5):
     """The current loose-thread digest: nudges the detector found, ranked by
     urgency (highest first). status defaults to 'open' (pass 'dismissed' to
@@ -144,12 +188,22 @@ def get_loose_threads(status="open", kind=None, limit=5):
                 "SELECT COUNT(*) FROM loose_threads "
                 "WHERE status = 'open' AND kind = 'dormant_tie'"
             ).fetchone()[0]
+        # Population total for the SAME filter (no LIMIT), so a capped digest is
+        # never mistaken for the whole list (mirrors _shared._envelope's rationale).
+        n_total = con.execute(
+            f"SELECT COUNT(*) FROM loose_threads lt WHERE {' AND '.join(clauses)}",
+            params,
+        ).fetchone()[0]
         # --- end feature: nudges ---
 
     out = []
     for r in rows:
         row = dict(r)
         row["evidence"] = json.loads(row.pop("evidence_json") or "null")
+        # Deterministic, unambiguous per-kind description (grounds narration:
+        # who went quiet, and the real kind -- not a guessed one).
+        row["summary"] = _thread_summary(row["kind"], row.get("contact"),
+                                         row["evidence"])
         out.append(row)
     # --- feature: nudges ---
     if hidden_dormant:
@@ -159,6 +213,17 @@ def get_loose_threads(status="open", kind=None, limit=5):
                       "in the digest.",
             "kind": "dormant_tie",
             "hidden": hidden_dormant,
+        })
+    # Completeness signal: this digest is urgency-ranked and hard-capped, so
+    # expose the population total when it exceeds what was returned -- the model
+    # must not claim it has seen every loose thread.
+    n_returned = len(rows)
+    if n_total > n_returned:
+        out.append({
+            "digest_meta": True,
+            "n_total": n_total,
+            "returned": n_returned,
+            "truncated": True,
         })
     # --- end feature: nudges ---
     return out

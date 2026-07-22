@@ -299,6 +299,17 @@ NUDGES_TIMEOUT = int(_nudges_timeout) if _nudges_timeout else CHAT_TIMEOUT
 # chunk_annotations rows with source='llm' count; no llm rows = no valence
 # exclusion on that dyad.
 NUDGE_VALENCE_EXCLUDE = float(os.getenv("NUDGE_VALENCE_EXCLUDE") or "-0.5")
+# Stage-0 identity exclusions. NUDGE_OWNER_CONTACT_IDS / NUDGE_OWNER_HANDLES are
+# the account owner's OWN contact-card ids and handle identifiers (comma/space
+# separated) -- the schema stores no owner identity, so a self-chat (your own
+# second number, saved under your own name) would otherwise surface as a nudge.
+# List your own contact_id / number(s) here once to suppress it. Both default
+# empty (no owner suppression). NUDGE_SHORTCODE_MAX_DIGITS is the length ceiling
+# for treating an all-digit handle as an automated SMS shortcode (e.g. 22022);
+# real 10-15 digit phone numbers are unaffected.
+NUDGE_OWNER_CONTACT_IDS = os.getenv("NUDGE_OWNER_CONTACT_IDS", "")
+NUDGE_OWNER_HANDLES = os.getenv("NUDGE_OWNER_HANDLES", "")
+NUDGE_SHORTCODE_MAX_DIGITS = int(os.getenv("NUDGE_SHORTCODE_MAX_DIGITS") or "6")
 # faded_initiator fires when the counterparty's trailing-window session
 # initiation share falls to <= this fraction of their all-time share...
 NUDGE_FADED_INIT_DROP = float(os.getenv("NUDGE_FADED_INIT_DROP") or "0.5")
@@ -439,6 +450,10 @@ VOICEPRINT_MIN_RETURN_MESSAGES = int(os.getenv("VOICEPRINT_MIN_RETURN_MESSAGES")
 # per-call style retrieval below this many example reply pairs. Separate knob,
 # separate job -- kept distinct on purpose.
 VOICEPRINT_MIN_CONTEXT_PAIRS = int(os.getenv("VOICEPRINT_MIN_CONTEXT_PAIRS") or "4")
+# draft_reply post-strips ungrounded inside-joke/nickname tokens. If less than
+# this fraction of the generated draft survives the strip, the remainder is a
+# degenerate stub (e.g. "It'") -- draft_reply declines instead of sending it.
+DRAFT_MIN_SURVIVING_FRACTION = float(os.getenv("DRAFT_MIN_SURVIVING_FRACTION") or "0.5")
 # Date-scoped get_voiceprint recomputes over a raw message scan. Below
 # MIN_RANGE_MESSAGES the window is too thin to trust (flagged); above
 # SCAN_MAX_MESSAGES the tool asks the caller to narrow the range rather than
@@ -596,6 +611,9 @@ NUDGE_QUESTION_GRACE_HOURS = float(os.getenv("NUDGE_QUESTION_GRACE_HOURS") or "7
 # "you replied slowly" signal, which then rides evidence.answered_late.
 NUDGE_QUESTION_INCLUDE_ANSWERED_LATE = os.getenv(
     "NUDGE_QUESTION_INCLUDE_ANSWERED_LATE", "").strip().lower() in ("1", "true", "yes", "on")
+# A question that has gone unanswered longer than this is too stale to be an
+# actionable loose end (mirrors NUDGE_GOODNEWS_MAX_AGE_DAYS). Default 365 days.
+NUDGE_QUESTION_MAX_AGE_DAYS = int(os.getenv("NUDGE_QUESTION_MAX_AGE_DAYS") or "365")
 # --- end feature: nudges ---
 # --- feature: nudges ---
 # --- N4 nudges: dropped_plan + unreciprocated_goodnews (loose_ends.py; RES-57) ---

@@ -392,8 +392,11 @@ CREATE TABLE IF NOT EXISTS loose_threads (
     due_by TEXT,                     -- NULL until N5 (scheduled follow-ups)
     urgency REAL,                    -- computed in Python (kind weight * half-life decay)
     status TEXT NOT NULL DEFAULT 'open',
-                                     -- v1: 'open' | 'dismissed'. 'snoozed' is
-                                     -- RESERVED (no v1 writer): N5 owns it.
+                                     -- 'open' | 'dismissed' (user mute) |
+                                     -- 'resolved' (auto-closed by the detector's
+                                     -- reconciliation pass when no longer found;
+                                     -- hidden from both digests, re-openable).
+                                     -- 'snoozed' is RESERVED (no writer): N5 owns it.
     evidence_json TEXT,              -- JSON detector evidence
     llm_verdict TEXT,                -- LLM-derived; guarded by loose_ends_model
     llm_reason TEXT,                 -- LLM-derived; guarded by loose_ends_model
