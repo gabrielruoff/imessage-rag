@@ -23,6 +23,9 @@ __pycache__/
 REPO_REVIEW.md
 REPO_FIX_PLAN.md
 APPLE_FM_PLAN.md
+# analytical-suite detector audit (throwaway working files)
+analytical_audit.py
+analytical_audit.txt
 
 # generated Wrapped reports -- they quote real messages verbatim
 wrapped_*.html

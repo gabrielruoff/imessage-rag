@@ -110,6 +110,37 @@ LAUGH_RE = re.compile(
 
 WE_WORDS = frozenset("we us our ours ourselves we're we've we'll we'd lets let's".split())
 
+# First-person SINGULAR pronouns -- the psycholinguistic "I" measure, kept
+# apart from the plural WE_WORDS above and the second-person set below so the
+# lexicon can split them (used by the conflict analyzer and baseline). Includes
+# the texting contractions tokenize() keeps whole ("i'm", "i've") and their
+# apostrophe-dropped variants ("im", "imma").
+PRONOUN_I = frozenset("""
+    i me my mine myself
+    i'm i've i'll i'd i'ma
+    im imma
+""".split())
+
+# Second-person pronouns (singular or plural). Includes texting shorthands
+# ("u", "ur"), apostrophe-dropped contractions ("youre"), and group address
+# ("yall", "y'all").
+PRONOUN_YOU = frozenset("""
+    you your yours yourself yourselves
+    you're you've you'll you'd youre
+    u ur yall y'all
+""".split())
+
+# Absolutist vocabulary (Al-Mosaiwi & Johnstone 2018): dichotomous,
+# all-or-nothing words whose elevated rate tracks distress and, for the
+# conflict analyzer, escalation. The canonical 19, plus a few texting variants
+# the tokenizer would otherwise miss ("def"/"defo" for definitely, "totes" for
+# totally, dropped-g "everythin"/"nothin").
+ABSOLUTIST = frozenset("""
+    absolutely all always complete completely constant constantly definitely
+    entire ever every everyone everything full must never nothing totally whole
+    def defo totes everythin nothin
+""".split())
+
 # High-frequency conversational English beyond the function words above:
 # generic verbs, generic nouns, fillers, and texting affirmations. Used by
 # the Wrapped report to filter "top words" down to vocabulary that is

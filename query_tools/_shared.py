@@ -74,7 +74,18 @@ def member_key(is_from_me, contact_id, handle_id, *, unknown="unknown"):
     `unknown` is what a row with no identity (is_from_me=0 + handle_id=0
     system noise) maps to: the default keeps such rows in an "unknown"
     bucket; analytics_social passes None to drop them instead. Callers keep
-    thin named wrappers preserving their exact contracts."""
+    thin named wrappers preserving their exact contracts (analytics_social's
+    `_person_key` maps no-identity rows to None; analytics_group's
+    `_member_key` keeps the "unknown" bucket).
+
+    Storage-format contract: the return is a stable, serializable string --
+    "me", "contact:<contacts.id>", "handle:<handles.id>", or the `unknown`
+    bucket -- and these strings ARE the storage format for derived-table
+    identity keys. Features that persist per-person rows keyed by RESOLVED
+    CONTACT IDENTITY (the dyad-scoped drift/persona tables) key on member_key's
+    output, never on a raw chat_id/handle_id, and never re-implement the merge:
+    member_key is the single home, so a contact's duplicate handles collapse to
+    the same key in the store as in every live aggregate."""
     if is_from_me:
         return "me"
     if contact_id is not None:
@@ -323,6 +334,29 @@ def _resolve_chat_scope(con, chat_id, handle_id, contact_id):
         if not chat_ids:
             return None, True
     return chat_ids, False
+
+
+def _restrict_to_direct_chats(con, chat_ids):
+    """Keep only 1:1 chats (chats.is_group = 0) from a resolved chat_id list,
+    returning the filtered list (or the input unchanged when None/empty).
+
+    Composes with the scope resolution above: feed it the chat_ids that
+    _resolve_chat_scope / _resolve_scope produced, and every downstream query
+    (built with _append_id_filters + _REAL_MESSAGE_CLAUSES) is then confined to
+    direct chats. Two-sided per-dyad analytics use this so a person scope never
+    silently folds in group traffic that has no single counterparty:
+    get_response_dynamics restricts a bare person scope to that person's 1:1
+    chats, and the dyad-scoped nudges/drift/persona features share the same
+    home rather than re-deriving is_group = 0. Opt-in -- existing tools that
+    don't call it keep their behavior unchanged."""
+    if not chat_ids:
+        return chat_ids
+    placeholders = ",".join("?" * len(chat_ids))
+    rows = con.execute(
+        f"SELECT id FROM chats WHERE id IN ({placeholders}) AND is_group = 0",
+        chat_ids,
+    ).fetchall()
+    return [r[0] for r in rows]
 
 
 def _resolve_scope(con, chat_id, handle_id, contact_id):

@@ -31,7 +31,12 @@ on this package, and the internals resolve both through it at call time.
 
 from embeddings import embed_texts
 
-from ._shared import DB_PATH, _date_bound_step, _normalize_date_bound
+from ._shared import (
+    DB_PATH,
+    _date_bound_step,
+    _normalize_date_bound,
+    _restrict_to_direct_chats,
+)
 from .analytics import (
     get_chat_participant_stats,
     get_word_frequency,
@@ -52,6 +57,14 @@ from .chunks import (
     search_conversations,
     search_messages_hybrid,
 )
+# --- feature: conflict ---
+from .conflict import (
+    diagnose_conflict,
+    find_conflicts,
+    get_conflict,
+    set_dv_screen_bypass,
+)
+# --- end feature: conflict ---
 from .directory import (
     get_chat_summary_stats,
     list_chats,
@@ -65,11 +78,73 @@ from .messages import (
     search_messages_fts,
     search_messages_sql,
 )
+# --- feature: persona ---
+from .persona import (
+    check_style_match,
+    draft_reply,
+    get_voiceprint,
+)
+# --- end feature: persona ---
+
+# --- feature: nudges ---
+from .nudges import (
+    get_loose_threads,
+    mute_contact_from_nudges,
+    resolve_loose_thread,
+)
+# --- end feature: nudges ---
+
+# --- feature: wellbeing ---
+from .analytics_wellbeing import get_language_trajectory
+# --- end feature: wellbeing ---
+# --- feature: drift ---
+# Re-exported UNCONDITIONALLY (the functions always exist); DRIFT_ENABLED gates
+# only whether their SCHEMAS are registered in tool_schemas/chat, which is the
+# repo's one reliable way to keep the model from calling a tool.
+from .drift import (
+    get_fadeout_watchlist,
+    get_relationship_drift,
+)
+# --- end feature: drift ---
+# --- feature: drift ---
+# D3 (RES-65): re-exported UNCONDITIONALLY like the D2 tools -- DRIFT_ENABLED
+# gates only its schema registration, not its importability.
+from .drift import get_reconnection_candidates
+# --- end feature: drift ---
+
+# --- feature: conflict (C3 trace) ---
+# Re-exported UNCONDITIONALLY (the function always exists); CONFLICT_TRACE_ENABLED
+# gates only whether its SCHEMA is registered (tool_schemas/chat), the repo's
+# one reliable way to keep the model from calling it. Separate appended fence so
+# C3 stays a clean additive edit alongside C1/C2's conflict re-exports above.
+from .conflict import trace_conflict_across_chats
+# --- end feature: conflict (C3 trace) ---
+
+# --- feature: conflict (C4 apology) ---
+# draft_apology is unconditional (no config gate; the DV floor is enforced in
+# the function). Separate appended fence so C4 stays a clean additive edit
+# alongside the concurrent conflict worktrees.
+from .conflict import draft_apology
+# --- end feature: conflict (C4 apology) ---
+
+# --- feature: persona (V5 simulate) ---
+# Re-exported UNCONDITIONALLY (the function always exists); PERSONA_SIM_ENABLED
+# gates only whether its SCHEMA is registered (tool_schemas/chat), the repo's one
+# reliable way to keep the model from calling it. Separate appended fence so V5
+# stays a clean additive edit alongside the V1-V3 persona re-exports above.
+from .persona import simulate_contact
+# --- end feature: persona (V5 simulate) ---
 
 __all__ = [
     "DB_PATH",
     "embed_texts",
     "find_similar_conversations",
+    # --- feature: conflict ---
+    "diagnose_conflict",
+    "find_conflicts",
+    "get_conflict",
+    "set_dv_screen_bypass",
+    # --- end feature: conflict ---
     "get_activity_patterns",
     "get_chat_participant_stats",
     "get_chat_summary_stats",
@@ -81,6 +156,11 @@ __all__ = [
     "get_milestones",
     "get_reaction_stats",
     "get_response_dynamics",
+    # --- feature: persona ---
+    "check_style_match",
+    "draft_reply",
+    "get_voiceprint",
+    # --- end feature: persona ---
     "get_word_frequency",
     "get_word_trends",
     "list_chats",
@@ -93,4 +173,30 @@ __all__ = [
     # private date helpers, re-exported because tests import them by name
     "_date_bound_step",
     "_normalize_date_bound",
+    # shared query helper for the dyad-scoped features (1:1-only restriction)
+    "_restrict_to_direct_chats",
+    # --- feature: nudges ---
+    "get_loose_threads",
+    "mute_contact_from_nudges",
+    "resolve_loose_thread",
+    # --- end feature: nudges ---
+    # --- feature: wellbeing ---
+    "get_language_trajectory",
+    # --- end feature: wellbeing ---
+    # --- feature: drift ---
+    "get_fadeout_watchlist",
+    "get_relationship_drift",
+    # --- end feature: drift ---
+    # --- feature: drift ---
+    "get_reconnection_candidates",
+    # --- end feature: drift ---
+    # --- feature: conflict (C3 trace) ---
+    "trace_conflict_across_chats",
+    # --- end feature: conflict (C3 trace) ---
+    # --- feature: conflict (C4 apology) ---
+    "draft_apology",
+    # --- end feature: conflict (C4 apology) ---
+    # --- feature: persona (V5 simulate) ---
+    "simulate_contact",
+    # --- end feature: persona (V5 simulate) ---
 ]

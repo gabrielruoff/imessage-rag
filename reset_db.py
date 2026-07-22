@@ -20,8 +20,21 @@ TABLES = [
     "chunk_topics",
     "topics",
     "chunk_annotations",
+    # --- feature: persona ---
+    # Derived voiceprint table; clearing it (and ingest_state below, which
+    # holds voiceprint_max_message_id) forces a clean rebuild next pipeline.
+    "person_voiceprint",
+    # --- end feature: persona ---
     "dyad_terms",
     "person_period_lexicon",
+    # --- feature: conflict ---
+    # Derived artifacts (RES-46 / C1). reset wipes ingest_state (below), which
+    # includes the `conflict_model` guard key -- but the committed F4 seed
+    # verdict is a repo file, not ingest_state, so the conflict label classes
+    # it pre-clears stay lit across a reset.
+    "conflict_signals",
+    "conflicts",
+    # --- end feature: conflict ---
     "sessions",
     "chunks",
     "attachments",
@@ -32,6 +45,20 @@ TABLES = [
     "contacts",
     "chats",
     "ingest_state",
+    # --- feature: nudges ---
+    # loose_threads is a derived detector artifact -> cleared. nudge_exclusions
+    # is durable user intent (mutes) and is deliberately NOT listed here, so it
+    # survives a reset (its source-PK handle/contact ids dangle harmlessly until
+    # re-ingest), the same way dyad_terms.llm_verdict is preserved across
+    # rebuilds.
+    "loose_threads",
+    # --- end feature: nudges ---
+    # --- feature: drift ---
+    # dyad_drift is a full-rebuild derived artifact; clearing ingest_state above
+    # already wipes its drift_max_message_id / drift_params_hash guard keys, so
+    # the next drift.py run rebuilds from scratch.
+    "dyad_drift",
+    # --- end feature: drift ---
 ]
 
 # Dropped outright rather than emptied: their declared vector dimension is

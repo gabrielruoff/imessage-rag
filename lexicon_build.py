@@ -18,9 +18,12 @@ import sqlite3
 import progress
 from config import DYAD_TERM_MIN_LIFT, DYAD_TERM_MIN_USES, DYAD_TERM_TOP_K
 from function_words import (
+    ABSOLUTIST,
     EMOJI_RE,
     FUNCTION_WORDS,
     LAUGH_RE,
+    PRONOUN_I,
+    PRONOUN_YOU,
     STOPWORDS,
     WE_WORDS,
     tokenize,
@@ -57,7 +60,9 @@ def build_person_period_lexicon(tgt: sqlite3.Connection) -> int:
     counterparty's handle_id or 0, never mine). Each row carries message/word
     counts, mean message length, the 9 function-word category rates
     (category hits / words, 0.0 for wordless months), we/question/laugh
-    message counts, and an {emoji: count} JSON dict.
+    message counts, first-person-singular / second-person / absolutist token
+    counts (i_count / you_count / absolutist_count -- raw token frequencies,
+    not per-message flags), and an {emoji: count} JSON dict.
 
     Full rebuild by design (DELETE + plain INSERTs, a few seconds at 350k
     messages): incremental upkeep would need read-modify-write on every
@@ -84,6 +89,7 @@ def build_person_period_lexicon(tgt: sqlite3.Connection) -> int:
                     "n_messages": 0, "n_words": 0, "chars": 0,
                     "fw": [0] * len(_FW_CATEGORIES),
                     "we": 0, "question": 0, "laugh": 0,
+                    "i_count": 0, "you_count": 0, "absolutist_count": 0,
                     "emoji": collections.Counter(),
                 }
             tokens = tokenize(text)
@@ -95,6 +101,14 @@ def build_person_period_lexicon(tgt: sqlite3.Connection) -> int:
                 for i, cat in enumerate(_FW_CATEGORIES):
                     if tok in FUNCTION_WORDS[cat]:
                         fw[i] += 1
+                # Raw token counts (every match, repeats included), unlike the
+                # per-message we/question/laugh flags below.
+                if tok in PRONOUN_I:
+                    s["i_count"] += 1
+                if tok in PRONOUN_YOU:
+                    s["you_count"] += 1
+                if tok in ABSOLUTIST:
+                    s["absolutist_count"] += 1
             if any(tok in WE_WORDS for tok in tokens):
                 s["we"] += 1
             if "?" in text:
@@ -114,13 +128,15 @@ def build_person_period_lexicon(tgt: sqlite3.Connection) -> int:
             *rates,
             s["we"], s["question"], s["laugh"],
             json.dumps(dict(s["emoji"]), ensure_ascii=False),
+            s["i_count"], s["you_count"], s["absolutist_count"],
         ))
     tgt.executemany(
         "INSERT INTO person_period_lexicon("
         "chat_id, handle_id, month, n_messages, n_words, avg_chars, "
         + ", ".join(_FW_COLUMNS)
-        + ", we_count, question_count, laugh_count, emoji_json) "
-        "VALUES (" + ", ".join("?" * (10 + len(_FW_COLUMNS))) + ")",
+        + ", we_count, question_count, laugh_count, emoji_json, "
+        "i_count, you_count, absolutist_count) "
+        "VALUES (" + ", ".join("?" * (13 + len(_FW_COLUMNS))) + ")",
         rows,
     )
     tgt.commit()

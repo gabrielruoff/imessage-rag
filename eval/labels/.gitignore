@@ -1,0 +1,4 @@
+# Personal hand labels live here (RES-70 / F4). They may carry owner corpus
+# text and are NEVER committed. Agents never write to this directory.
+*
+!.gitignore

@@ -19,6 +19,9 @@ PROBE_TYPES = (
     "negative_control",
     "thin_data",
     "open_ended",
+    # --- feature: wellbeing (W3) ---
+    "wellbeing_narration",  # deterministic transcript scan in checks.probe_block
+    # --- end feature: wellbeing (W3) ---
 )
 LEVERS = ("desc", "steer", "args", "shape", "size", "confab", "pipeline", "judge-batch")
 AXES = ("routing", "accuracy", "faithfulness", "communication")
@@ -34,6 +37,31 @@ ANALYTICS_TOOLS = (
     "get_chat_participant_stats",
     "get_word_frequency",
 )
+# Wave-1+ feature tools now shipped unconditionally in tool_schemas
+# (persona / conflict / nudges / wellbeing). ALL_TOOLS must mirror the schema
+# names exactly -- selfcheck fails on any drift -- so they are reconciled here.
+# Fenced by feature so the PM can dedupe if a sibling worktree adds the same
+# names. The flag-gated tools (DRIFT_ENABLED / CONFLICT_TRACE_ENABLED /
+# PERSONA_SIM_ENABLED -- see tool_schemas.GATED_TOOLS) are intentionally absent
+# here; selfcheck subtracts the active ones from the schema before diffing, so it
+# stays flag-config-agnostic without this module importing config.
+_FEATURE_TOOLS = (
+    # --- feature: persona ---
+    "get_voiceprint",
+    "draft_reply",
+    "check_style_match",
+    # --- feature: conflict ---
+    "find_conflicts",
+    "get_conflict",
+    "diagnose_conflict",
+    "draft_apology",
+    # --- feature: wellbeing ---
+    "get_language_trajectory",
+    # --- feature: nudges ---
+    "get_loose_threads",
+    "resolve_loose_thread",
+    "mute_contact_from_nudges",
+)
 ALL_TOOLS = (
     "search_messages_hybrid",
     "search_conversations",
@@ -47,7 +75,7 @@ ALL_TOOLS = (
     "search_contact_by_handle",
     "get_message_reactions",
     "get_full_messages",
-) + ANALYTICS_TOOLS
+) + ANALYTICS_TOOLS + _FEATURE_TOOLS
 # Superseded tool names that must never resurface anywhere in a transcript.
 # checks.py scans EVERY transcript for these (a hit is a run-level flag);
 # a case's banned_anywhere list adds case-specific strings on top.
@@ -55,6 +83,22 @@ REMOVED_TOOLS = (
     "get_activity_histogram",
     "get_conversation_dynamics",
     "get_top_reacted_messages",
+)
+# Flag-gated tools (tool_schemas.GATED_TOOLS): registered only when their
+# feature flag is on, so they are deliberately OUT of ALL_TOOLS (which selfcheck
+# diffs against the UNCONDITIONAL schema names). A hardcoded mirror -- like
+# _FEATURE_TOOLS -- kept so cases.py stays import-light. A case MAY name these in
+# expect.tools (routing is only assertable when the flag is on; the owning suite
+# must document the flag it requires), but they never enter the ALL_TOOLS sync.
+GATED_TOOLS = (
+    # --- DRIFT_ENABLED ---
+    "get_relationship_drift",
+    "get_fadeout_watchlist",
+    "get_reconnection_candidates",
+    # --- CONFLICT_TRACE_ENABLED ---
+    "trace_conflict_across_chats",
+    # --- PERSONA_SIM_ENABLED ---
+    "simulate_contact",
 )
 
 _EXPECT_KEYS = {"tools", "banned_tools", "banned_anywhere"}
@@ -121,7 +165,7 @@ def validate_case(case, roster_defs, suite_id=""):
     if unknown:
         fail(f"unknown expect keys {sorted(unknown)}")
     for tool in expect.get("banned_tools", []):
-        if tool not in ALL_TOOLS:
+        if tool not in ALL_TOOLS and tool not in GATED_TOOLS:
             fail(f"banned_tools entry {tool!r} is not a known tool")
     if not all(isinstance(s, str) for s in expect.get("banned_anywhere", [])):
         fail("banned_anywhere must be strings")
@@ -131,7 +175,7 @@ def validate_case(case, roster_defs, suite_id=""):
             fail(f"unknown ToolExpect keys {sorted(unknown)}")
         names = [te.get("name")] + list(te.get("alternates", []))
         for name in names:
-            if name not in ALL_TOOLS:
+            if name not in ALL_TOOLS and name not in GATED_TOOLS:
                 fail(f"ToolExpect tool {name!r} is not a known tool")
         if not isinstance(te.get("args_contains", {}), dict):
             fail("args_contains must be a dict")

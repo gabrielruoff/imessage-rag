@@ -1,0 +1,26 @@
+{
+  "suite": "S13",
+  "title": "Relationship drift / fade-out (get_fadeout_watchlist, reconnection): routing, honest framing, no self-nudge",
+  "targets": {"routing": 0.9, "accuracy": 0.85, "faithfulness": 1.0, "communication": 0.85},
+  "notes": "The drift read tools are DRIFT_ENABLED-gated (registered only when the flag is on -- this suite assumes the owner's default, DRIFT_ENABLED=true; with the flag off the tools are withheld and S13.1 cannot route). dyad_drift is built LLM-free by drift.py, so the watchlist is a deterministic, corroborated 'mandatory-complete tier' ranked by drift_score. Two things a faithful reply must do: carry the tool's channel caveat (the drift is iMessage-only; the pair may still talk elsewhere), and never manufacture a fade-out or overstate certainty. Promoted from chat.py probe P1 (fadeout) + P2 (reconnect), which both exercised these surfaces; P2 additionally surfaced a self-nudge (the owner's own second number) that a faithful reply must not tell the user to 'reconnect with'.",
+  "cases": [
+    {
+      "id": "S13.1",
+      "prompt": "Which of my friendships have been fading or drifting apart the most lately?",
+      "expect": {"tools": [{"name": "get_fadeout_watchlist"}]},
+      "gt": {"recipe": "fadeout_watchlist", "params": {}},
+      "probe": null,
+      "grader_notes": "Routes to get_fadeout_watchlist (DRIFT_ENABLED). GT n_watchlist is the corroborated mandatory-complete tier count (advisory); raw carries the contacts + phases (cooling/dormant). A good reply names real drifting ties with their phase and driver (reply latency, volume drop, one-sided initiation) and carries the channel caveat that the read is iMessage-only. Faithfulness: it must not invent a cooling contact absent from the watchlist, nor assert the relationship is definitively over -- drift is a signal, not a verdict. accuracy/communication carry the grade; the exact count is advisory.",
+      "quality_watch": "honest drift framing + iMessage-only channel caveat; no invented fade-out"
+    },
+    {
+      "id": "S13.2",
+      "prompt": "Who have I lost touch with that I should probably reconnect with, and how could I break the ice?",
+      "expect": {"tools": [{"name": "get_loose_threads", "alternates": ["get_reconnection_candidates"]}]},
+      "gt": {"recipe": "loose_threads_digest", "params": {"kind": "faded_initiator"}},
+      "probe": null,
+      "grader_notes": "Reconnection ask. Acceptable routing is get_loose_threads (the faded_initiator digest) OR the dedicated get_reconnection_candidates -- do NOT require one; both surface drifted ties, and the observed model behavior prefers get_loose_threads. GT is the faded_initiator digest (n_shown + contacts). A good reply names the drifted contacts and offers to help open the conversation. FAITHFULNESS/quality watch: the digest currently leaks the account owner's own second number (a self-chat resolved to the owner's name) -- a faithful, useful reply must not instruct the user to 'reconnect with' themselves. Naming a contact absent from the digest, or presenting the self-entry as a real reconnection target, is the miss this case guards.",
+      "quality_watch": "surfaces real drifted ties; never nudges the user to reconnect with their own self-chat"
+    }
+  ]
+}

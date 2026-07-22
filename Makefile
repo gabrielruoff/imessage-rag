@@ -270,10 +270,75 @@ topics:  ## Cluster embedded chunks into topics and label them
 # run these concurrently, and concurrent runs deadlock on the SQLite write
 # lock (each holds it across many LLM calls) while gaining nothing -- Ollama
 # serializes the inference anyway. Recipe lines run in order under any -j.
-pipeline:  ## ingest -> annotate -> topics, in order (stays serial under -j)
+pipeline:  ## ingest -> annotate -> suite -> topics, in order (stays serial under -j)
 	$(MAKE) ingest
 	$(MAKE) annotate
+	$(MAKE) suite
 	$(MAKE) topics
+
+# The analytical suite: the four derived-analytics features this repo layers on
+# top of the base ingest/annotate/topics flow. Kept as its own target so it can
+# be rebuilt on its own (`make suite`, after ingest+annotate) without a full
+# re-ingest; `pipeline` calls it between annotate and topics. Each feature is a
+# $(MAKE) recipe line so the group stays serial under -j (same reason as
+# `pipeline` above), and all four run AFTER annotate because each reads
+# chunk_annotations -- the per-feature rationale lives at each target below.
+.PHONY: suite
+suite:  ## Build the analytical suite: nudges -> drift -> voiceprint -> conflict
+	$(MAKE) nudges
+	$(MAKE) drift
+	$(MAKE) voiceprint
+	$(MAKE) conflict
+
+# --- feature: nudges ---
+# Standalone loose-ends detector pass. Runs AFTER annotate in `pipeline` because
+# its Stage-0 exclusion gate reads chunk_annotations, which annotate populates.
+# Needs Ollama only for the one-line nudge_text narration.
+.PHONY: nudges
+nudges:  ## Detect loose threads (nudges) -- run after annotate
+	@$(REQUIRE_OLLAMA)
+	.venv/bin/python3 loose_ends.py
+# --- end feature: nudges ---
+
+# feature: drift >>> (additive fence)
+# Deterministic drift scoring: no Ollama gate (drift.py makes no LLM calls; it
+# reads the annotations annotate.py already produced). DRIFT_ENABLED gates the
+# build inside, so `make drift` with the flag off just prints a notice.
+.PHONY: drift
+drift:  ## Score relationship drift into dyad_drift (opt-in: DRIFT_ENABLED=true)
+	.venv/bin/python3 drift.py
+
+# One-command teardown, mirroring reset-db: wipe dyad_drift + its ingest_state
+# guard keys and print the DRIFT_ENABLED=false reminder. drift.py --purge runs
+# regardless of the flag (it is what you run WHILE turning the feature off); the
+# flag flip is the user's one manual step and is what makes the purge durable.
+.PHONY: drift-purge
+drift-purge:  ## Purge dyad_drift + its guard keys (then set DRIFT_ENABLED=false)
+	.venv/bin/python3 drift.py --purge
+# feature: drift <<<
+
+# feature: persona >>>
+# Deterministic per-person voiceprints (person_voiceprint). Pure SQL/Python, no
+# Ollama gate. Reads chunk_annotations for its low-trust tone, hence after annotate.
+.PHONY: voiceprint
+voiceprint:  ## Build deterministic per-person voiceprints (person_voiceprint)
+	.venv/bin/python3 voiceprint.py
+# feature: persona <<<
+
+# feature: conflict >>>
+# Deterministic conflict finder + eval-gated escalation labels (RES-46 / C1).
+# Consumes chunk_annotations (for valence corroboration), so it slots into
+# `pipeline` AFTER annotate. Needs Ollama for the per-turn label pass; the
+# deterministic finding itself does not, and never refuses on a distilled corpus.
+.PHONY: conflict
+conflict:  ## Detect conflict windows (deterministic) + eval-gated labels
+	@$(REQUIRE_OLLAMA)
+	.venv/bin/python3 conflict_detect.py
+
+.PHONY: conflict-fast
+conflict-fast:  ## Detect conflict windows only (deterministic, no LLM labeling)
+	.venv/bin/python3 conflict_detect.py --no-llm
+# feature: conflict <<<
 
 # --- Running -----------------------------------------------------------------
 # ARGS passes flags through, e.g.:

@@ -806,6 +806,264 @@ Two smaller things the profile exposed:
   `NUM_PARALLEL` back, so there is nothing to assert afterwards; making the
   restart unconditional is the only fix.
 
+## 2026-07-20: the analytical suite (Wave 0 + Wave 1)
+
+A wave of self-insight features from the Linear project *Close Read —
+imessage-rag Analytical Suite*, specified in its canonical
+**00 — Master Spec & Parallel-Work Contract** (and the per-feature design docs
+below). Every feature turns a person's own complete iMessage history into
+private insight — 100% offline, local-LLM only, the corpus never leaving the
+machine or entering a prompt wholesale — the same retrieval-not-context-stuffing
+posture as the rest of the app. The *parallel-work contract* is why each
+feature's schema lands in its own `_create_*_tables` function called from
+`create_schema` (never an edit to the shared `SCHEMA` blob), its config behind a
+`# --- feature: X ---` fence, its tools behind matching fences in
+`tool_schemas.py` / `query_tools/__init__.py` / `chat.py`, and its pipeline step
+as a recipe line in `make pipeline`: the issues were built in parallel worktrees
+and had to merge additively. Pipeline order is now
+`ingest → annotate → nudges → drift → voiceprint → conflict → topics`; the four
+new stages each read `chunk_annotations`, so they slot in after `annotate`, and
+each is also a standalone `make` target.
+
+**Foundations (Wave 0).** Shared machinery the features build on:
+
+- `stats.py` (F2) — dependency-free robust statistics: Theil-Sen trend +
+  bootstrap CI, Kaplan-Meier survival / ECDF placement, modified-z (MAD) outlier
+  scoring, CUSUM change-point. Pure stdlib, no `config`/Ollama/sqlite, and every
+  function is total (returns `None`/`[]` on degenerate input, never raises), so
+  drift, conflict, and wellbeing all import one tested implementation. A
+  load-bearing modeling note lives in the module: do NOT reuse
+  `get_response_dynamics`'s censored-latency path — it drops gaps
+  `>= INITIATION_GAP_HOURS`, biasing a dying tie's latency *downward* (the
+  longest silences, exactly the fading signal, are thrown away); model absent
+  replies as right-censored observations instead.
+- Eval gates (F4, RES-70) — `eval/evalkit/{gates,agreement,labeling}.py` plus the
+  `label` / `gate` subcommands. A measurement gate decides whether a modest local
+  model is good enough to *ship* a class of labels: the owner hand-labels a
+  sample (`eval/labels/<task>.jsonl`, gitignored, owner-only, agents never write
+  there), `gate` runs the production classifier and scores Cohen's kappa
+  (`conflict_labels`, floor 0.6) or detector precision (`dropped_plan`, floor
+  0.85), and persists a pass/fail verdict. Clearance is default-closed: an absent
+  verdict suppresses the class (Master Spec A2). `conflict_labels` ships a
+  committed seed verdict (`eval/seed_gates/`), so conflict labels are pre-cleared
+  out of the box and survive `reset_db` (the seed is in the repo, not the
+  per-user DB).
+- `consent.py` (F5) — default-closed, tolerant, config-free opt-in id parsing;
+  landed as a shared primitive ahead of the features that will gate on explicit
+  per-contact consent.
+- Lexicon split (F1) — `person_period_lexicon` gained
+  `i_count` / `you_count` / `absolutist_count` (raw PRONOUN_I / PRONOUN_YOU /
+  ABSOLUTIST token counts), the speaker-attributable markers the wellbeing
+  baseline and the voiceprint read; nullable until the next full rebuild.
+
+**Clearing the Air — conflict (01, RES-46 / C1).** `conflict_detect.py` finds
+"tense stretches" in 1:1 chats from **deterministic signals only** — reply-latency
+withdrawal (survival over raw right-censored gaps vs a trailing-90-day baseline),
+one-sided sessions, dislike-tapback runs, message-volume collapse — writing a
+`conflicts` window when `>= CONFLICT_MIN_SIGNALS` fire, plus `conflict_signals`
+for per-turn escalation labels. The LLM never *originates* a conflict; it only
+attaches Gottman-style escalation / `repair` labels, and only for classes the F4
+gate has cleared — surfaced as `tentative`/`likely` bands, never raw scores.
+Valence corroborates *ranking* (source='llm' chunks only) but never detection,
+so the finder is never dead on a default all-distilled corpus (a window with no
+llm chunks is written `corroboration='none'`). A large intra-window gap sets
+`off_text_flag` (the fight likely moved off-channel), which forbids any
+resolution verdict downstream. Deliberately carries no role/aggressor/status
+column — that posture is a later issue (C2). Read via `find_conflicts` /
+`get_conflict`; guarded in `ingest_state` by `conflict_model`.
+
+**Loose Ends — nudges (02, N1).** `loose_ends.py` mines the history for open
+interpersonal loops and writes `loose_threads` to nudge about later. Shape:
+Stage 0 is an exclusion gate that always runs first (durable `nudge_exclusions`
+mutes + auto-mute of dyads whose most-recent llm-annotated exchange is negative,
+`NUDGE_VALENCE_EXCLUDE`) — no candidate is ever generated for an excluded
+contact; then pure-SQL detectors (N1 ships `faded_initiator` over the derived
+`sessions` table); then Python urgency scoring
+(`kind_weight * exp(-age/halflife)`, age from the corpus's latest message).
+The one LLM touch is a one-line `nudge_text` narration, guarded by
+`loose_ends_model`, which never blocks or deletes the SQL-detected rows.
+`nudge_exclusions` is durable user intent — PRESERVED across `reset_db` — while
+`loose_threads` is derived. Dismissals set `dismissed_at` and never delete (a
+reused id could re-open a dismissed thread, hence AUTOINCREMENT). Read/act via
+`get_loose_threads` / `resolve_loose_thread` / `mute_contact_from_nudges`.
+
+**Fadeout Radar — drift (03, D1).** `drift.py` scores how each 1:1 relationship
+is trending over time into `dyad_drift`, aggregated by **resolved counterparty**
+(`member_key`, so a contact's several handles/chats fold into one relationship
+before scoring; a full rebuild self-heals a `handle:N → contact:M` key flip).
+Seven monthly signals (volume, reciprocity, latency, silence, valence, depth,
+initiation), each turned into a 0..1 contribution by a Theil-Sen trend with a
+bootstrap CI — a CI still spanning 0 contributes 0 — then combined into a
+weight-renormalized composite `drift_score` and a `phase` label. Deterministic
+and LLM-free; it consumes messages, the `sessions` table, and
+`chunk_annotations`. **Opt-in: `DRIFT_ENABLED` defaults false**, so the pipeline
+step is a no-op and `dyad_drift` never builds out of the box. This is enforced
+inside `drift.py`, not by withholding the step — an enable-flag gates the BUILD,
+not a prompt. Guarded by `drift_max_message_id` + `drift_params_hash` (a
+skip-if-unchanged full rebuild). The read tools are a *separate* future issue's
+`query_tools/drift.py` — a deliberate name-twin that shares nothing with this
+compute pipeline; not yet landed, so nothing exposes drift to the LLM yet.
+
+**Baseline — wellbeing (04, RES-49 / W1).** `wellbeing.py` is the deterministic,
+hermetically testable core that decides whether a single conversational
+identity's recent language + behavior shows a *sustained, cross-family*
+departure from its own history. False positives are the enemy: gates stack
+multiplicatively (per-marker winsorizing, family capping below the z-threshold
+so no lone marker carries a family, and a concordance requirement across a
+lexical and a behavioral family against a leave-window-out baseline). W1 is the
+core only — no `config` wiring, no SQL, no delivery (those are W2/W3), and no
+tool — so nothing surfaces wellbeing to the LLM yet; it is documented here as a
+landed foundation, not a live feature.
+
+**Voiceprint — persona (05, V1).** `voiceprint.py` builds a deterministic,
+zero-LLM per-person voice profile into `person_voiceprint`: per-message style
+(avg length, lowercase ratio, exclaim/ellipsis rates, burst size), the nine
+function-word rates (n_words-weighted from `person_period_lexicon`), signature
+openers/closers, and a **LOW-TRUST** emotional tone read from source='llm'
+chunks only (NULL when there are none). Keyed by `member_key` × `counterpart_key`
+× scope (`dyad`/`group`/`all`), so "my voice with Mom" and "Mom's voice with me"
+are distinct rows; a confidence flag reads `high` only when a row clears all
+three volume/engagement/breadth floors. Full rebuild, guarded by
+`voiceprint_max_message_id`; read via `get_voiceprint` (which can also recompute
+over a date window, capped). Later persona issues (draft-reply, style-match,
+simulate) will extend `query_tools/persona.py`, which stays a thin read layer.
+
+## 2026-07-21: the analytical suite (Waves 2–4 — surfaces, read tools, generative tools)
+
+The Wave 0+1 foundations above are deterministic cores and their first read
+tools; Waves 2–4 (same *Close Read* project, same Master Spec) put the last
+mile on each feature — the LLM-facing read tools the compute pipelines were
+built for, the generative tools that speak in the user's own material, and the
+Wrapped surfaces — each still additive behind its `# --- feature: X ---`
+fences. Default LLM tool count rose from 27 to **32**
+(`len(tool_schemas.TOOL_DEFINITIONS)`); five more register only behind flags
+(three drift tools + D3 behind `DRIFT_ENABLED`, `trace_conflict_across_chats`
+behind `CONFLICT_TRACE_ENABLED`, and `simulate_contact` behind
+`PERSONA_SIM_ENABLED` — the last added in V5 below). No new tables landed —
+every Wave 2–4 tool and detector reads the six derived tables Wave 0+1 already
+built.
+
+**Clearing the Air — conflict (C2–C5).** `diagnose_conflict` (RES-51) is a
+DETERMINISTIC scorecard over one episode — per-side I/you and we-talk ratios,
+LSM, who opened / had the last word, latency + volume read off C1's stored
+evidence, and a non-blame demand-withdraw read — carrying no aggressor/who-won
+verdict. It introduced the **softened, code-enforced DV floor** (Master Spec
+A10): `_dv_screen` scans a window's full text for threat/isolation/fear markers
+and returns `clean` / `role-suppress` / `bypassed-with-footer`; a role-suppress
+hit withholds ONLY the demand-withdraw read while the mechanical scorecard
+still returns, and the hotline `resource_footer` is never removed (a bypass
+restores the role read but still appends it). The scan is read-only and never
+persisted. `draft_apology` (RES-53) SCAFFOLDS a repair message — the Lewicki-6
+checklist ranked by measured effectiveness, the user's REAL grievance excerpts
+pulled verbatim from labeled turns, and (only when the `repair` label class has
+cleared its F4 kappa gate) the other person's ignored repair bids — and emits
+no finished prose (`emits_prose` always False). Because drafting an apology is
+itself the risky output, its DV floor is stricter than the scorecard's: a
+role-suppress hit WITHHOLDS the entire scaffold and returns only the resource
+pointer. `trace_conflict_across_chats` (RES-52) is an opt-in cross-chat
+spillover trace, registration-gated behind `CONFLICT_TRACE_ENABLED` (its
+per-call `consent` is a UX device, not the boundary), name-referenced, and
+never persisted. The Wrapped **Repair Report** (RES-54) aggregates the conflict
+tables into per-class stats, every one eval-gated (a class shows only when
+`conflict_labels` cleared it) and off-text episodes excluded from recovery-time.
+
+**Loose Ends — nudges (N2–N5).** Four detectors joined `faded_initiator` in the
+`DETECTORS` registry, each pure detection behind the shared Stage-0 exclusion
+gate: `dormant_tie` (RES-55, a once-close 1:1 tie gone quiet past its own p90
+cadence; written but hidden until the durable `nudges_reconnect_ack` opt-in),
+`unanswered_question` (RES-56, a session ending on the other person's genuine,
+length/stoplist-gated question, with a mandatory cross-session answered-check),
+`dropped_plan` (RES-57, an FTS cue-phrase pre-filter + a Searle-style LLM
+verifier — HARD-GATED off by default AND, even on, writing nothing until the F4
+`dropped_plan` precision gate clears at ≥ 0.85, which ships no seed so it stays
+suppressed), and `unreciprocated_goodnews` (RES-57, opt-in, reading
+`response_class` out of `chunk_annotations.events_json` for source='llm' rows
+only and reporting llm-coverage so "no good news" ≠ "not annotated").
+`inferred_occasion` (RES-58) infers a recurring birthday/anniversary from
+congratulatory messages on the same calendar date across years and is the one
+detector that fills `loose_threads.due_by` (the next upcoming occurrence). The
+Wrapped **Open Loops** board (RES-58) surfaces the digest, honoring the same
+exclusions.
+
+**Fadeout Radar — drift (D2–D4).** The read layer the Wave-1 doc marked "not yet
+landed" now exists: `query_tools/drift.py` (RES-59) reads `dyad_drift` verbatim
+(no re-scoring, no Ollama) as `get_relationship_drift` (one resolved
+counterparty) and `get_fadeout_watchlist` (a leaderboard partitioned by
+coverage — the rankable tier never ranked against the insufficient-signal
+bucket), both code-emitting the "still talk elsewhere?" channel caveat on any
+cooling/fading/dormant phase and narrating strictly at the pipeline's
+`confidence_tier`. `get_reconnection_candidates` (RES-65 / D3) surfaces curated
+shared references (dyad_terms + high-valence llm shared moments) for a grounded
+opener or refuses rather than fabricating; it writes nothing. All are the
+name-twin of the compute `drift.py` and import nothing from it, and all are
+schema-gated behind `DRIFT_ENABLED`. Calibration + the `--purge` /
+`make drift-purge` teardown and heuristic defaults landed alongside (RES-60).
+The Wrapped **Who's Drifting** section (RES-66) is opt-in (DRIFT_ENABLED-gated),
+corroborated-only, and excludes the same silent contacts as the roster.
+
+**Baseline — wellbeing (W2–W4).** `get_language_trajectory` (RES-61) wires the
+W1 change-point core to the DB: count-based markers pooled across a scope, self
+by default and per-contact by default too (default-open), refused in code only
+for an id on the `WELLBEING_DENY_IDS` deny list (`consent.is_denied`). (Revised
+from the original default-closed `WELLBEING_CONSENT_IDS` allowlist to a deny
+list: analyze anyone unless explicitly suppressed.) Framing is
+enforced by code, not prompt (RES-67 / W3): the tool emits a code-built
+`support_block` via the generic `_epilogue` hook that `chat.run_turn` strips
+from the model's view (along with the duplicate `support_block` field) and prints
+verbatim, and the turn holds back streaming to run
+`wellbeing.sanitize_condition_names` over the WHOLE reply before emitting — a
+later revision (PR #32 review) widened the original final-sentence-only buffer,
+since a condition named in an earlier sentence would otherwise slip through
+prompt-only; the envelope carries a model-safe `flagged` boolean as the
+transcript-reader's departure signal now that `support_block` is hidden. An S10
+evalkit case guards the behavior. The opt-in Wrapped wellbeing section (RES-68 /
+W4) reuses the same support footer + narration scrub and stays off unless
+`--wellbeing` / `WRAPPED_WELLBEING`.
+
+**Voiceprint — persona (V2–V4).** `draft_reply` (RES-62) drafts a reply in the
+user's own voice grounded ONLY in real retrieved reply pairs from that 1:1 chat,
+declining structurally (no draft) below the context-pairs floor.
+`check_style_match` (RES-63) scores a user-written draft against a stored
+voiceprint DETERMINISTICALLY (feature-distance + rule-based top-3 divergences —
+no model judges it). The Wrapped **Your Voiceprint** card (RES-64) renders the
+reader's own ("me", "\*", "all") card, plus a consent-gated "guess who texts
+like this" game that is default-redacted: with an empty
+`WRAPPED_VOICEPRINT_CONSENT_IDS` no third-party card appears, and consent only
+adds a contact — it never overrides a roster exclusion.
+
+## 2026-07-21: persona V5 — `simulate_contact` + past-self (RES-69)
+
+`simulate_contact` extends `query_tools/persona.py` (still a thin read layer plus
+this one in-tool generator) with an ESTIMATE of how a named contact might reply in
+their voice, or a "talk to your past self" mode as of a date. It follows the
+persona-V2 `draft_reply` architecture (in-tool `ollama.chat_once`, structural
+decline below `VOICEPRINT_MIN_CONTEXT_PAIRS`) and the established registration
+gate (`DRIFT_ENABLED` / `CONFLICT_TRACE_ENABLED`): the schema is withheld from
+`TOOL_DEFINITIONS` + `SYSTEM_PROMPT` unless `PERSONA_SIM_ENABLED` (default false),
+while the function stays unconditionally importable/re-exported — so the default
+tool count stays **32** and rises to 33 only when the flag is on. This is the
+fifth flag-gated tool (see the Waves 2–4 count above).
+
+Guardrails, all in code (prompting is not a control here): (1) the returned
+`simulation` is wrapped POST-generation — every non-empty line prefixed with an
+`[ESTIMATE …]` label by `_wrap_simulation` — so the outer chat loop only ever
+relays a pre-labeled artifact, never an unlabeled draft it could strip;
+(2) a hard deceased/grief denylist `PERSONA_SIM_BLOCK_IDS` (parsed via the shared
+`consent.is_consented`, membership = blocked) hard-refuses in code with no
+generation — only a resolved contact id can be listed, since a bare handle can't
+be marked; (3) a soft, fail-open dormant/deceased warning
+(`PERSONA_SIM_DORMANT_DAYS` + `PERSONA_SIM_ONESIDED_MIN_MSGS`) rides in the
+acknowledgment payload so it is seen before acknowledging — it warns, never
+blocks; (4) a living-contact `acknowledged=true` UX flow (documented as a flow,
+NOT the boundary — the registration gate is); (5) past-self is bounded by
+`VOICEPRINT_MIN_RANGE_MESSAGES` / `VOICEPRINT_SCAN_MAX_MESSAGES` over a
+date-scoped raw rescan; (6) the payload also carries a tapback base-rate
+prediction computed over a FULL-MESSAGE denominator (every real message received
+from the contact, NOT only messages that drew a reaction — that denominator
+conditions on a reaction and overstates every rate). An empty generation is
+treated as a low-confidence decline, never emitted as `generated: true` with a
+blank `simulation`. Nothing sends, nothing is persisted.
+
 ## 2026-07-21: Apple Foundation Models backend (chat + embeddings, no-Ollama capable)
 
 Goal: make Apple's on-device Foundation Model (Apple Intelligence, Apple
@@ -944,3 +1202,42 @@ or real `chat.db` needed).
    reachable Ollama and hours, while ingest must stay runnable offline.
 4. **`.txt` parser** — not built; only needed if `chat.db` access isn't
    available for some future conversation/export.
+
+## 2026-07-21: review follow-ups — drift rebuild guard + nudge reconciliation
+
+Two correctness fixes from the PR #32 ("Close Read") review.
+
+**Drift rebuild guard widened (`drift.py`).** `build_drift` skips when neither
+the corpus high-water mark nor a params hash changed. Two scoring inputs weren't
+covered, so a change to either silently served stale scores until `--force`:
+
+- `_params_hash()` hashed only `DRIFT_WEIGHTS` + `DRIFT_PHASE_THRESHOLDS`, but
+  scoring also consumes `alpha` (`DRIFT_SLOPE_CI`) and the four `DRIFT_MIN_*`
+  gates — `alpha` drives every signal's CI/significance and thus `drift_score`,
+  the per-signal gates, `phase`, and `confidence_tier`. It now hashes the full
+  `_current_config()`, so retuning any scoring param forces a rebuild.
+- The guard was blind to `chunk_annotations`. `annotate.py --upgrade-distilled`
+  rewrites existing rows in place (`INSERT OR REPLACE`, same `chunk_id` PK):
+  `source` flips `distilled → llm` and `valence`/`depth` change with **no new
+  messages**, so both the message-id and params guards stayed identical while the
+  valence signal + `confidence_tier` should have moved. A new
+  `drift_annotations_hash` guard key fingerprints exactly the rows
+  `_load_annotations` consumes — `COUNT` plus `SUM(source='llm')`,
+  `SUM(valence)`, `SUM(depth)` (a plain `COUNT` can't detect an in-place
+  upgrade). `purge_drift`/`make drift-purge` clears all three keys.
+
+**Nudge reconciliation exempts degraded nondeterministic detectors
+(`loose_ends.py`).** `_resolve_stale_threads` auto-resolves any open thread a run
+did not re-detect — sound for the deterministic SQL detectors, wrong for
+`dropped_plan`, the one detector that re-verifies via Ollama each run. When
+`_verify_plan` returns `None` (unparseable/empty JSON after retry) or `""` (dict
+missing `verdict`), the candidate is suppressed and the thread would flip to
+`resolved` — a transient model hiccup silently closing a real loose end. Fix: a
+module-level `NONDETERMINISTIC_KINDS = {"dropped_plan"}`; `detect_dropped_plan`
+sets `cfg["dropped_plan_degraded"]` on a no-usable-verdict verify; `detect_all`
+builds the degraded-kind set and `_resolve_stale_threads` skips those kinds
+(`AND kind NOT IN (...)`). A clean `fulfilled`/`unknown` verdict is a legitimate
+resolve and does NOT set the flag, so genuine closes still reconcile — the
+exemption only defers to the next clean run, never resolves wrongly. (A hard
+socket timeout instead raises and crashes the run before the reconcile/commit
+step, so it can't silently over-resolve; left as-is.)

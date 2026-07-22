@@ -414,3 +414,23 @@ def get_word_trends(phrase=None, chat_id=None, handle_id=None, contact_id=None,
             if want("valence"):
                 result["valence"] = _valence_section(ann, granularity)
     return result
+
+
+# --- feature: nudges ---
+def lsm_score(lexicon_rows):
+    """Public, thin re-export of the language-style-matching primitive for the
+    nudges pipeline (loose_ends.py dormant_tie detector) -- so callers outside
+    the package never reach into the package-private _lsm_score / _weighted_rates.
+
+    Given a dyad's person_period_lexicon rows (handle_id NULL = my side,
+    non-NULL = the counterparty), return the scalar mean LSM between the two
+    sides' word-count-weighted category rates, or None when either side carries
+    no words in the given rows (nothing to match). Mirrors _lsm_section's
+    me/them split; drops the per-category breakdown the internal callers need."""
+    me_rows = [r for r in lexicon_rows if r["handle_id"] is None]
+    them_rows = [r for r in lexicon_rows if r["handle_id"] is not None]
+    rates_me, rates_them = _weighted_rates(me_rows), _weighted_rates(them_rows)
+    if rates_me is None or rates_them is None:
+        return None
+    return _lsm_score(rates_me, rates_them)[0]
+# --- end feature: nudges ---

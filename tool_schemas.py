@@ -533,4 +533,574 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    # --- feature: nudges ---
+    {
+        "name": "get_loose_threads",
+        "description": "The user's current 'loose ends' digest: relationships "
+                        "that have drifted (e.g. someone who used to reach out "
+                        "and has gone quiet), detected offline and ranked by "
+                        "urgency. Use for 'who should I reach back out to', "
+                        "'any loose ends', 'who have I been neglecting'. Returns "
+                        "at most 5 rows, each with a resolved contact name, the "
+                        "detector `kind`, `urgency`, the anchor message/date, the "
+                        "`evidence`, a one-line `nudge_text`, and a deterministic "
+                        "plain-language `summary`. RELAY the `summary` as-is and "
+                        "respect each row's `kind`: a faded_initiator means the "
+                        "OTHER person went quiet (not you); an inferred_occasion is "
+                        "a recurring date -- do not guess it is a 'birthday' unless "
+                        "the summary says so; never re-label one kind as another. "
+                        "This is a hard-capped, urgency-ranked SAMPLE, not the full "
+                        "list: a trailing {digest_meta, n_total, returned} row "
+                        "appears when more exist, so hedge completeness ('your top "
+                        "loose ends') and never claim you have seen them all. "
+                        "status defaults to 'open'; kind optionally narrows to one "
+                        "detector.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "enum": ["open", "dismissed"],
+                           "default": "open"},
+                "kind": {"type": "string",
+                         "description": "narrow to one detector, e.g. 'faded_initiator'"},
+                "limit": {"type": "integer", "default": 5,
+                          "description": "hard-capped at 5"},
+            },
+        },
+    },
+    {
+        "name": "resolve_loose_thread",
+        "description": "Dismiss one loose thread (nudge) by its id -- the user "
+                        "has handled it or wants it gone. Sets it to dismissed "
+                        "(never deletes), so it stops resurfacing. Pass the `id` "
+                        "from a get_loose_threads row.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "thread_id": {"type": "integer",
+                              "description": "the loose thread id to dismiss"},
+            },
+            "required": ["thread_id"],
+        },
+    },
+    {
+        "name": "mute_contact_from_nudges",
+        "description": "Permanently exclude a contact from future nudges AND "
+                        "dismiss their currently-open loose threads -- use when "
+                        "the user says to stop nudging about someone. Prefer "
+                        "contact_id (covers every handle they own; get it from "
+                        "search_contacts_by_name); handle_id also accepted. "
+                        "Muting twice never stacks duplicate rows.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "contact_id": {"type": "integer"},
+                "handle_id": {"type": "integer"},
+                "reason": {"type": "string", "default": "muted"},
+            },
+        },
+    },
+    # --- end feature: nudges ---
+    # --- feature: persona ---
+    {
+        "name": "get_voiceprint",
+        "description": "How a person texts -- their deterministic 'voiceprint': "
+                        "message length, lowercase habit, exclamation/ellipsis "
+                        "rates, double-texting burst size, function-word rates, "
+                        "signature openers/closers, and a LOW-TRUST emotional "
+                        "tone. Defaults to YOUR voice: name a person "
+                        "(contact_id/handle_id/name) for your voice WITH them (a "
+                        "dyad), or omit for your overall voice. subject='them' "
+                        "returns the named person's voice instead. Group chats "
+                        "only with scope='group' + a group chat_id. Passing "
+                        "date_from/date_to recomputes over that window (capped). "
+                        "Returns a card with a confidence flag (high/low), "
+                        "coverage counts, and the per-feature corpus std "
+                        "(feature_std) for normalization.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "contact_id": {"type": "integer",
+                               "description": "the person (from search_contacts_by_name)"},
+                "handle_id": {"type": "integer"},
+                "name": {"type": "string",
+                         "description": "person name to resolve (contact_id is exact)"},
+                "subject": {"type": "string", "enum": ["me", "them"],
+                            "default": "me",
+                            "description": "whose voice: 'me' (default) or 'them' "
+                                           "(the named person)"},
+                "scope": {"type": "string", "enum": ["dyad", "group", "all"],
+                          "description": "dyad (default when a person is named), "
+                                         "all (default when none), group (needs a "
+                                         "group chat_id)"},
+                "chat_id": {"type": "integer",
+                            "description": "group chat id, required for scope='group'"},
+                "date_from": {"type": "string", "description": _DATE_PARAM_DESC},
+                "date_to": {"type": "string", "description": _DATE_PARAM_DESC},
+            },
+        },
+    },
+    {
+        "name": "draft_reply",
+        "description": "Draft a reply to an incoming message in the USER's own "
+                        "voice with a specific person, grounded ONLY in real past "
+                        "exchanges retrieved from that 1:1 chat (their message -> "
+                        "how you actually replied). Name the person "
+                        "(contact_id/handle_id/name) and pass the `incoming` "
+                        "message text. Returns {draft, exemplars, confidence, "
+                        "notes}: on confidence='low' (too few similar reply "
+                        "examples) NO draft is generated (draft=null) and your "
+                        "recent replies to that person are returned instead. The "
+                        "draft mirrors the exemplars' style and invents no facts "
+                        "or inside jokes. 1:1 only.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "incoming": {"type": "string",
+                             "description": "the incoming message text to reply to"},
+                "contact_id": {"type": "integer",
+                               "description": "the person (from search_contacts_by_name)"},
+                "handle_id": {"type": "integer"},
+                "name": {"type": "string",
+                         "description": "person name to resolve (contact_id is exact)"},
+            },
+            "required": ["incoming"],
+        },
+    },
+    {
+        "name": "check_style_match",
+        "description": "Score how closely a user-written DRAFT matches a person's "
+                        "voiceprint, DETERMINISTICALLY (no model judges it). Pass "
+                        "the `draft` text and name the person "
+                        "(contact_id/handle_id/name). Computes the draft's own "
+                        "style features (message length, capitalization, "
+                        "exclamation/ellipsis use, function-word rates) and returns "
+                        "a `distance` (mean absolute z-difference vs the stored "
+                        "voiceprint; 0 = identical voice, higher = more divergent) "
+                        "plus the TOP-3 diverging features, each with a rule-based "
+                        "explanation. Defaults to YOUR voice with that person "
+                        "(subject='me'); subject='them' checks whether the draft "
+                        "imitates the named person. Reads the stored voiceprint "
+                        "only -- never rescans the corpus.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "draft": {"type": "string",
+                          "description": "the user-written draft message to score"},
+                "contact_id": {"type": "integer",
+                               "description": "the person (from search_contacts_by_name)"},
+                "handle_id": {"type": "integer"},
+                "name": {"type": "string",
+                         "description": "person name to resolve (contact_id is exact)"},
+                "subject": {"type": "string", "enum": ["me", "them"],
+                            "default": "me",
+                            "description": "match against YOUR voice with the person "
+                                           "(default) or the person's own voice"},
+                "scope": {"type": "string", "enum": ["dyad", "group", "all"],
+                          "description": "dyad (default when a person is named), all, "
+                                         "or group (needs a group chat_id)"},
+                "chat_id": {"type": "integer",
+                            "description": "group chat id, required for scope='group'"},
+            },
+            "required": ["draft"],
+        },
+    },
+    # --- end feature: persona ---
+    # --- feature: conflict ---
+    {
+        "name": "find_conflicts",
+        "description": "Detected conflict/argument episodes ('tense stretches') "
+                        "in a 1:1 chat or with a person, found from DETERMINISTIC "
+                        "signals with receipts -- reply-latency withdrawal, "
+                        "one-sided sessions, dislike-tapback runs, message-volume "
+                        "collapse -- ranked strongest first. Use for 'did we fight "
+                        "in June', 'our worst arguments', 'tense periods with X'. "
+                        "1:1 only (group chats excluded). Prefer contact_id to "
+                        "cover a person across every handle. Each row names which "
+                        "`signals` fired and a `signal_count`; escalation labels "
+                        "are eval-gated and shown as bands, not certainties -- "
+                        "expand one with get_conflict(conflict_id). A row flagged "
+                        "`reconciliation` is a make-up window, not the tensest "
+                        "fight. Returns {rows, total_matching, n_corroborated, "
+                        "returned, order, truncated}; total_matching counts every "
+                        "detected stretch (mostly minor lulls) -- prefer "
+                        "n_corroborated as a headline count of substantiated ones.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "chat_id": _ID_OR_LIST_SCHEMA,
+                "handle_id": _ID_OR_LIST_SCHEMA,
+                "contact_id": _ID_OR_LIST_SCHEMA,
+                "date_from": {"type": "string", "description": _DATE_PARAM_DESC},
+                "date_to": {"type": "string", "description": _DATE_PARAM_DESC},
+                "limit": {"type": "integer", "default": 10},
+            },
+        },
+    },
+    {
+        "name": "get_conflict",
+        "description": "One conflict episode (by conflict_id from find_conflicts): "
+                        "its deterministic evidence (peak_signal), tone "
+                        "corroboration, off_text_flag, and up to 15 labeled "
+                        "signal turns (paginated; excerpts <= 200 chars). Labels "
+                        "are eval-gated BANDS (band 'tentative'/'likely'), never "
+                        "raw scores -- describe them as tentative, and never read "
+                        "a resolution or apology into an episode whose "
+                        "off_text_flag is true (the exchange moved off-channel).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "conflict_id": {"type": "integer"},
+                "offset": {"type": "integer", "default": 0},
+                "limit": {"type": "integer", "default": 15},
+            },
+            "required": ["conflict_id"],
+        },
+    },
+    {
+        "name": "diagnose_conflict",
+        "description": "A DETERMINISTIC scorecard for one conflict episode (by "
+                        "conflict_id from find_conflicts): per-side I-vs-you and "
+                        "we-talk language ratios, style-matching (LSM), who opened "
+                        "the episode and who had the last word, reply-latency and "
+                        "message-volume-collapse read off the stored evidence, and "
+                        "a non-blame demand-withdraw read (who withdrew vs kept "
+                        "reaching out). It carries NO aggressor/who-won verdict -- "
+                        "present it as mechanical description, not a ruling on who "
+                        "was right. A built-in safety screen may withhold the "
+                        "withdraw/pursue read and append a support-resource footer; "
+                        "if a resource_footer is present, include it verbatim.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "conflict_id": {"type": "integer"},
+            },
+            "required": ["conflict_id"],
+        },
+    },
+    # --- end feature: conflict ---
+    # --- feature: wellbeing ---
+    {
+        "name": "get_language_trajectory",
+        "description": "Detect a SUSTAINED, cross-family shift in someone's "
+                        "texting language over months -- for questions like 'has "
+                        "my texting changed', 'am I doing okay', 'how has the way "
+                        "I write shifted this year'. Deterministic (no guessing): "
+                        "it pools count-based markers (first-person 'I', "
+                        "absolutist words, negation, laugh + emoji rate, "
+                        "late-night share, who-initiates share) and only fires "
+                        "when a lexical AND the behavioral family depart together "
+                        "for several months. Defaults to YOUR own language "
+                        "(self). A `contact` (a contacts.id) analyzes that "
+                        "person instead, by default -- unless they have been "
+                        "suppressed via the deny list, in which case it refuses. Returns "
+                        "an envelope: scope, markers_available, dropped_markers, "
+                        "baseline, series, windows, examples, note, and (only "
+                        "when a shift fires) a support_block. Never diagnoses a "
+                        "condition; report the window and framing plainly.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "contact": {"type": "integer",
+                            "description": "a contacts.id to analyze instead of "
+                                           "yourself (any contact unless deny-listed; "
+                                           "omit for your own language)"},
+                "date_from": {"type": "string", "description": _DATE_PARAM_DESC},
+                "date_to": {"type": "string", "description": _DATE_PARAM_DESC},
+                "include": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "envelope sections to return: series, windows, "
+                                   "examples, baseline (default all)",
+                },
+                "min_words": {"type": "integer",
+                              "description": "corpus floor; below it no analysis "
+                                             "runs (default MIN_WELLBEING_WORDS)"},
+            },
+        },
+    },
+    # --- end feature: wellbeing ---
 ]
+
+
+# --- feature: drift ---
+# Drift read tools are registered ONLY when DRIFT_ENABLED (mirrors drift.py's
+# build-side gate). Withholding the schema is the repo's one reliable way to
+# stop the model calling a tool, so a disabled deployment does not need any
+# prompt-level "don't use drift" text -- the tools simply do not exist to the
+# model. The functions are always importable from query_tools; only their
+# schemas (and the SYSTEM_PROMPT lines in chat.py) are conditional.
+import config as _config  # noqa: E402 (local to the additive drift block)
+
+_DRIFT_TOOL_DEFINITIONS = [
+    {
+        "name": "get_relationship_drift",
+        "description": "How ONE 1:1 relationship is trending over time, read "
+                        "from the drift pipeline (deterministic; no re-scoring). "
+                        "Use for 'are X and I drifting apart', 'how is my "
+                        "friendship with Y doing', 'am I losing touch with Z'. "
+                        "Identify the person with exactly one of contact_id / "
+                        "handle_id / chat_id (a group chat_id is an error). "
+                        "Returns the resolved contact, the phase "
+                        "(thriving/steady/cooling/fading/dormant) with "
+                        "phase_corroborated, a drift_score, the ranked "
+                        "contributing signals each with a monthly evidence trail "
+                        "and gate verdict, the current gap vs its typical size, a "
+                        "reconnection_window, coverage, and a confidence_tier. "
+                        "When the phase is cooling/fading/dormant the result "
+                        "carries a channel_caveat: relay its `ask` (whether you "
+                        "still talk elsewhere -- calls, IG, in person) BEFORE "
+                        "characterizing the relationship, and narrate strictly at "
+                        "the `narration` confidence_tier template -- never phrase "
+                        "more confidently than the tier allows.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "contact_id": _ID_OR_LIST_SCHEMA,
+                "handle_id": _ID_OR_LIST_SCHEMA,
+                "chat_id": _ID_OR_LIST_SCHEMA,
+            },
+        },
+    },
+    {
+        "name": "get_fadeout_watchlist",
+        "description": "A leaderboard of relationships that are fading out, read "
+                        "from the drift pipeline. Use for 'who am I drifting from', "
+                        "'which friendships are cooling off', 'who's fading'. "
+                        "PARTITIONED BY COVERAGE: `watchlist` is the rankable tier "
+                        "(all mandatory signals present), ordered by drift_score; "
+                        "`insufficient_signal` is a SEPARATE bucket (a mandatory "
+                        "signal missing) that is never ranked against the "
+                        "watchlist -- do not compare scores across the two. Each "
+                        "row carries its gated signal_count, its top_driver, and "
+                        "(for cooling/fading/dormant rows) a channel_caveat. "
+                        "min_messages floors the dyad size; phase_filter (a phase "
+                        "name or list) narrows to given phases; limit caps each "
+                        "bucket.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "default": 10},
+                "min_messages": {"type": "integer", "default": 0},
+                "phase_filter": {
+                    "type": ["string", "array"],
+                    "items": {"type": "string"},
+                    "description": "a phase name (thriving/steady/cooling/fading/"
+                                   "dormant) or a list of them",
+                },
+            },
+        },
+    },
+]
+
+if _config.DRIFT_ENABLED:
+    TOOL_DEFINITIONS.extend(_DRIFT_TOOL_DEFINITIONS)
+# --- end feature: drift ---
+
+
+# --- feature: drift ---
+# D3 (RES-65): the grounded reconnection-opener helper. Registered ONLY when
+# DRIFT_ENABLED, exactly like the D2 tools above -- withholding the schema is
+# the repo's one reliable way to keep the model from calling it, so a disabled
+# deployment needs no prompt-level "don't reconnect" text. Kept in its own
+# appended block (not folded into _DRIFT_TOOL_DEFINITIONS) so concurrent drift
+# worktrees extend the file additively without reflowing each other's lists.
+import config as _config  # noqa: E402 (local to the additive drift block)
+
+_DRIFT_D3_TOOL_DEFINITIONS = [
+    {
+        "name": "get_reconnection_candidates",
+        "description": "Grounding step for drafting a reconnection opener to ONE "
+                        "1:1 relationship. Use on an explicit request like 'help "
+                        "me reach back out to X', 'write an opener to reconnect "
+                        "with Y'. It does NOT write an opener and stores nothing: "
+                        "it surfaces CANDIDATE curated shared references -- "
+                        "human-curated inside jokes / nicknames (dyad_terms) and "
+                        "high-valence LLM-annotated shared moments (kind "
+                        "shared_memory; distilled valence is never eligible). "
+                        "Identify the person with exactly one of contact_id / "
+                        "handle_id / chat_id (a group chat_id is an error). When "
+                        "candidates exist the result carries an `instruction`: "
+                        "present them and have the user PICK exactly one, then "
+                        "draft grounded strictly in that pick -- never invent or "
+                        "embellish a shared memory. When none exist "
+                        "(has_curated_reference false) it carries a `refusal`: do "
+                        "NOT fabricate a memory; offer a plain, reference-free "
+                        "opener instead. Never store the opener.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "contact_id": _ID_OR_LIST_SCHEMA,
+                "handle_id": _ID_OR_LIST_SCHEMA,
+                "chat_id": _ID_OR_LIST_SCHEMA,
+            },
+        },
+    },
+]
+
+if _config.DRIFT_ENABLED:
+    TOOL_DEFINITIONS.extend(_DRIFT_D3_TOOL_DEFINITIONS)
+# --- end feature: drift ---
+
+
+# --- feature: conflict (C3 trace) ---
+# The cross-chat conflict trace is registered ONLY when CONFLICT_TRACE_ENABLED
+# (RES-52 / C3), mirroring the DRIFT_ENABLED gate above. This registration gate
+# is the REAL security boundary: withholding the schema is the repo's one
+# reliable way to stop the model calling a tool, so a disabled deployment (the
+# default) never needs prompt-level "don't trace" text -- the tool simply does
+# not exist to the model. The per-call `consent` param is a UX prompt-gate only,
+# NOT the boundary. The function is always importable from query_tools; only its
+# schema (and the SYSTEM_PROMPT line in chat.py) is conditional.
+import config as _config  # noqa: E402 (local to the additive C3 block)
+
+_CONFLICT_TRACE_TOOL_DEFINITIONS = [
+    {
+        "name": "trace_conflict_across_chats",
+        "description": "OPT-IN cross-chat trace: did ONE conflict episode (a "
+                        "conflict_id from find_conflicts) spill into the user's "
+                        "OTHER conversations? Finds conversation chunks in a "
+                        "DIFFERENT chat, within a few days of the episode, that "
+                        "are BOTH semantically close to it AND literally name "
+                        "the episode's partner (their handle, first name, or one "
+                        "of the chat's distinctive terms); topically-similar but "
+                        "unnamed chunks are dropped. Because it reads across "
+                        "chats, ASK THE USER FIRST, then call again with "
+                        "consent=true -- `consent` is a UX prompt device, NOT "
+                        "the security boundary (this tool only exists when the "
+                        "user has enabled it in config). Without consent=true it "
+                        "returns a fixed ask-the-user payload and reads no data. "
+                        "Nothing is ever persisted.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "conflict_id": {"type": "integer"},
+                "k": {"type": "integer", "default": 10,
+                      "description": "max cross-chat links to return"},
+                "consent": {"type": "boolean", "default": False,
+                            "description": "pass true ONLY after the user agrees "
+                                           "to trace across their other chats; a "
+                                           "UX gate, not the security boundary"},
+            },
+            "required": ["conflict_id"],
+        },
+    },
+]
+
+if _config.CONFLICT_TRACE_ENABLED:
+    TOOL_DEFINITIONS.extend(_CONFLICT_TRACE_TOOL_DEFINITIONS)
+# --- end feature: conflict (C3 trace) ---
+
+
+# --- feature: conflict (C4 apology) ---
+# draft_apology scaffolds a repair message (Lewicki-6) and NEVER ghostwrites.
+# Unconditional (no config gate -- the DV floor is enforced inside the function,
+# not by withholding the schema). Appended as its own additive block rather than
+# folded into C1/C2's conflict fence, so it stays a clean edit alongside the
+# concurrent conflict worktrees.
+TOOL_DEFINITIONS.append({
+    "name": "draft_apology",
+    "description": "SCAFFOLD (never ghostwrite) a repair message for one "
+                    "conflict episode (a conflict_id from find_conflicts). "
+                    "Returns the ranked Lewicki-6 apology checklist (components "
+                    "ordered by measured effectiveness: acknowledging "
+                    "responsibility first, offering repair second, requesting "
+                    "forgiveness last and flagged skippable), the user's REAL "
+                    "grievance excerpts pulled VERBATIM from the episode (never "
+                    "invented), and -- only where the `repair` label class is "
+                    "eval-cleared -- the ignored repair attempts the other "
+                    "person made (otherwise that component is marked "
+                    "unavailable, never guessed). It emits NO finished apology "
+                    "prose: do NOT ghostwrite the message -- walk the user "
+                    "through the checklist grounded in their real excerpts. A "
+                    "built-in DV safety screen may WITHHOLD the entire scaffold "
+                    "and return only a support-resource pointer; if a "
+                    "resource_footer is present, include it verbatim.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "conflict_id": {"type": "integer"},
+        },
+        "required": ["conflict_id"],
+    },
+})
+# --- end feature: conflict (C4 apology) ---
+
+
+# --- feature: persona (V5 simulate) ---
+# simulate_contact is registered ONLY when PERSONA_SIM_ENABLED (RES-69), mirroring
+# the DRIFT_ENABLED / CONFLICT_TRACE_ENABLED gates above. This registration gate
+# is the REAL security boundary: withholding the schema is the repo's one reliable
+# way to stop the model calling a tool, so a disabled deployment (the default)
+# never needs prompt-level "don't simulate" text -- the tool simply does not exist
+# to the model. The per-call `acknowledged` param is a UX flow device, NOT the
+# boundary. The function is always importable from query_tools; only its schema
+# (and the SYSTEM_PROMPT block in chat.py) is conditional.
+import config as _config  # noqa: E402 (local to the additive persona V5 block)
+
+_PERSONA_SIM_TOOL_DEFINITIONS = [
+    {
+        "name": "simulate_contact",
+        "description": "ESTIMATE how a contact might reply in their voice, or talk "
+                        "to your PAST SELF as of a date. Returns a STATISTICAL "
+                        "ESTIMATE, never real words: the `simulation` text is "
+                        "code-labeled an estimate on EVERY line -- relay it "
+                        "verbatim with those labels, never strip them or present "
+                        "it as the person's actual message. subject='them' "
+                        "(default) simulates the named person (contact_id/handle_id"
+                        "/name); it FIRST returns acknowledgment_required (relay "
+                        "any deceased_warning, confirm the user understands it is "
+                        "an estimate, THEN call again with acknowledged=true), and "
+                        "a deny-listed contact is hard-refused (refused=true). It "
+                        "also carries a reaction base-rate tapback prediction. "
+                        "subject='me' + as_of_date talks to your past self (name a "
+                        "person to scope to your past voice with them). On a "
+                        "low-confidence/note/refusal decline, relay it as-is and "
+                        "generate no substitute. 1:1 only; nothing is sent or saved.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "message": {"type": "string",
+                            "description": "the message the simulated persona "
+                                           "should respond to"},
+                "contact_id": {"type": "integer",
+                               "description": "the person (from search_contacts_by_name)"},
+                "handle_id": {"type": "integer"},
+                "name": {"type": "string",
+                         "description": "person name to resolve (contact_id is exact)"},
+                "subject": {"type": "string", "enum": ["them", "me"],
+                            "default": "them",
+                            "description": "'them' (a contact, default) or 'me' "
+                                           "(your past self -- needs as_of_date)"},
+                "as_of_date": {"type": "string",
+                               "description": "for subject='me': the date to "
+                                              "simulate your past self as of "
+                                              "(ISO date)"},
+                "acknowledged": {"type": "boolean", "default": False,
+                                 "description": "living-contact UX flow: pass true "
+                                                "ONLY after confirming with the "
+                                                "user; a UX gate, NOT the security "
+                                                "boundary"},
+            },
+            "required": ["message"],
+        },
+    },
+]
+
+if _config.PERSONA_SIM_ENABLED:
+    TOOL_DEFINITIONS.extend(_PERSONA_SIM_TOOL_DEFINITIONS)
+# --- end feature: persona (V5 simulate) ---
+
+
+# The flag-gated tools, keyed by the config flag that registers them -- DERIVED
+# from the same definition lists the conditional .extend blocks above consume, so
+# a newly-added gated tool is picked up automatically and can never drift from the
+# schema. evalkit selfcheck reads this to reconcile cases.ALL_TOOLS (which, by
+# design, omits every gated tool) against the ACTIVE tool set for the current
+# flag configuration.
+GATED_TOOLS = {
+    "DRIFT_ENABLED": tuple(
+        d["name"] for d in _DRIFT_TOOL_DEFINITIONS + _DRIFT_D3_TOOL_DEFINITIONS),
+    "CONFLICT_TRACE_ENABLED": tuple(
+        d["name"] for d in _CONFLICT_TRACE_TOOL_DEFINITIONS),
+    "PERSONA_SIM_ENABLED": tuple(
+        d["name"] for d in _PERSONA_SIM_TOOL_DEFINITIONS),
+}

@@ -1,0 +1,35 @@
+{
+  "suite": "S12",
+  "title": "Loose Ends / nudges (get_loose_threads): routing, digest fidelity, no invented totals",
+  "targets": {"routing": 0.9, "accuracy": 0.85, "faithfulness": 1.0, "communication": 0.85},
+  "notes": "get_loose_threads is the nudge digest: detector-found loose threads (faded_initiator, unanswered_question, inferred_occasion, unreciprocated_goodnews), ranked by urgency and hard-capped at NUDGE_MAX_RESULTS. It returns NO population total and dormant-tie reconnect nudges are hidden until an explicit opt-in. So the model only ever sees a short list -- a faithful reply speaks to the surfaced nudges (their kinds/contacts) and never claims a grand total it was not given, nor invents a thread. GT (loose_threads_digest) supplies n_shown + the surfaced kinds/contacts as advisory evidence.",
+  "cases": [
+    {
+      "id": "S12.1",
+      "prompt": "Is there anyone I owe a reply to, or anything I've left hanging?",
+      "expect": {"tools": [{"name": "get_loose_threads"}]},
+      "gt": {"recipe": "loose_threads_digest", "params": {}},
+      "probe": null,
+      "grader_notes": "Routes to get_loose_threads (open digest). GT raw carries n_shown, kinds, and contacts of the surfaced nudges. A good reply lists those specific loose threads (who + what kind) and does not invent threads or assert a total beyond what was returned. Naming a contact/thread absent from the digest is a faithfulness miss.",
+      "quality_watch": "reports only surfaced nudges; no invented total"
+    },
+    {
+      "id": "S12.2",
+      "prompt": "Did anyone ask me a question I never got back to?",
+      "expect": {"tools": [{"name": "get_loose_threads"}]},
+      "gt": {"recipe": "loose_threads_digest", "params": {"kind": "unanswered_question"}},
+      "probe": null,
+      "grader_notes": "Routes to get_loose_threads. The model may narrow with kind='unanswered_question' OR call the bare open digest and filter unanswered questions in its narration -- both are acceptable routing (do NOT require the kind arg). GT is the unanswered_question digest (n_shown + contacts). A good reply surfaces those specific unanswered questions with their anchors and does not present other nudge kinds (faded_initiator, occasions) as if they were unanswered questions -- that kind-fidelity slip is a faithfulness miss, graded on accuracy/communication, not routing.",
+      "quality_watch": "kind fidelity: unanswered questions only"
+    },
+    {
+      "id": "S12.3",
+      "prompt": "Show me the nudges I've already dealt with.",
+      "expect": {"tools": [{"name": "get_loose_threads", "args_contains": {"status": "dismissed"}}]},
+      "gt": {"recipe": "loose_threads_digest", "params": {"status": "dismissed"}},
+      "probe": "thin_data",
+      "grader_notes": "Routes to get_loose_threads with status='dismissed'. Dismissed rows are kept, never deleted, but the corpus likely has none -- GT n_shown may be 0. A correct reply says there are no dismissed/resolved nudges to show rather than falling back to the open digest and presenting open nudges as 'already dealt with'. thin_data probe grades manually.",
+      "quality_watch": "honors status=dismissed; no fallback to open nudges"
+    }
+  ]
+}

@@ -138,6 +138,14 @@ CREATE TABLE IF NOT EXISTS person_period_lexicon (
     question_count INTEGER,
     laugh_count INTEGER,
     emoji_json TEXT,
+    -- Pronoun-split + absolutist token counts (raw tokens in PRONOUN_I /
+    -- PRONOUN_YOU / ABSOLUTIST, not per-message flags): nullable, filled on
+    -- full rebuild. Downstream sums these across rows and forms rates against
+    -- summed n_words. Declared last to match the ALTER migration's append
+    -- order on pre-existing DBs (see create_schema).
+    i_count INTEGER,
+    you_count INTEGER,
+    absolutist_count INTEGER,
     -- NULL handle_id in the PK is fine: the table is full-rebuild only
     -- (plain INSERTs, never upserts), so PK uniqueness is never relied on.
     PRIMARY KEY (chat_id, handle_id, month)
@@ -219,6 +227,52 @@ END;
 """
 
 
+# --- feature: drift ---
+def _create_drift_tables(con: sqlite3.Connection):
+    """Derived relationship-drift table (built by drift.py; reset_db clears it,
+    the append-only carve-out applies). One row per resolved counterparty,
+    keyed by member_key's stable string -- 'contact:<id>' for contact-resolved
+    handles, 'handle:<id>' for contact-less ones; 'me'/unknown never get a row.
+    A FULL-rebuild, skip-if-unchanged artifact guarded in ingest_state by
+    drift_max_message_id + drift_params_hash. Adjacent to create_schema and
+    called from it with a single line, so this stays out of the SCHEMA blob and
+    merges cleanly alongside other features' additive edits.
+
+    Each of the seven signals stores its normalized drift contribution
+    (`*_value`, 0..1; 0 when its trend's CI still spans 0) and a `*_gate` flag
+    (a significant trend was detected). The composite `drift_score`, the `phase`
+    label with its `phase_corroborated` flag, `mandatory_complete`,
+    `confidence_tier`, and three JSON evidence columns round out the row."""
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS dyad_drift (
+        contact_key TEXT PRIMARY KEY,     -- member_key: 'contact:<id>'|'handle:<id>'
+        label TEXT,                       -- human-readable contact/handle label
+        n_messages INTEGER,
+        n_months INTEGER,                 -- distinct active months for the dyad
+        first_month TEXT,                 -- 'YYYY-MM'
+        last_month TEXT,
+        drift_score REAL,                 -- 0..1 weighted composite (higher = more drift)
+        phase TEXT,                       -- thriving|steady|cooling|fading|dormant
+        phase_corroborated INTEGER,       -- 1 when an intra-iMessage corroborator
+                                          -- (reciprocity erosion / latency inflation)
+                                          -- backs a decline label
+        mandatory_complete INTEGER,       -- all mandatory signals present
+        confidence_tier TEXT,             -- high|medium|low (computed in Python)
+        volume_value REAL,      volume_gate INTEGER,
+        reciprocity_value REAL, reciprocity_gate INTEGER,
+        latency_value REAL,     latency_gate INTEGER,
+        silence_value REAL,     silence_gate INTEGER,
+        valence_value REAL,     valence_gate INTEGER,
+        depth_value REAL,       depth_gate INTEGER,
+        initiation_value REAL,  initiation_gate INTEGER,
+        per_signal_gate_json TEXT,        -- full per-signal trend detail
+        coverage_json TEXT,               -- month/message/annotation coverage
+        monthly_series_json TEXT          -- {signal: [[month, value], ...]} (<= 36 mo)
+    );
+    """)
+
+
+# --- end feature: drift ---
 def create_schema(con: sqlite3.Connection):
     cols_before = {row[1]: row[2] for row in con.execute("PRAGMA table_info(handles)")}
     if cols_before.get("contact_id") == "TEXT":
@@ -261,12 +315,44 @@ def create_schema(con: sqlite3.Connection):
         con.execute("ALTER TABLE dyad_terms "
                     "ADD COLUMN curate_failures INTEGER NOT NULL DEFAULT 0")
 
+    # Pre-F1 person_period_lexicon: add the pronoun-split + absolutist counts.
+    # Nullable, no DEFAULT -- pre-existing rows predate the counters and read
+    # NULL until the next full lexicon rebuild fills them. Idempotent: each
+    # column is added only if absent, so re-running create_schema is a no-op
+    # (and on a fresh DB lex_cols is empty, so SCHEMA creates them instead).
+    lex_cols = {row[1] for row in con.execute("PRAGMA table_info(person_period_lexicon)")}
+    if lex_cols:
+        for col in ("i_count", "you_count", "absolutist_count"):
+            if col not in lex_cols:
+                con.execute(f"ALTER TABLE person_period_lexicon ADD COLUMN {col} INTEGER")
+
     # The update trigger used to fire on ANY messages update; drop it so
     # FTS_SCHEMA recreates it scoped to UPDATE OF text (see comment there).
     con.execute("DROP TRIGGER IF EXISTS messages_au")
 
     con.executescript(SCHEMA)
     con.executescript(FTS_SCHEMA)
+    # --- feature: drift ---
+    _create_drift_tables(con)
+    # --- end feature: drift ---
+
+    # --- feature: nudges ---
+    _create_nudges_tables(con)
+    # --- end feature: nudges ---
+
+    # --- feature: persona ---
+    # Persona-feature derived tables (person_voiceprint, ...). Kept in a
+    # separate def + single call so the block stays additive and never touches
+    # _SCHEMA; IF NOT EXISTS makes it idempotent alongside create_schema.
+    _create_persona_tables(con)
+    # --- end feature: persona ---
+
+    # --- feature: conflict ---
+    # Per-feature DDL function (RES-46 / C1): net-new tables live in their own
+    # adjacent def with a single call here, so a feature's schema never edits
+    # the shared SCHEMA blob (keeps concurrent-worktree merges clean).
+    _create_conflict_tables(con)
+    # --- end feature: conflict ---
 
     # Reactions used to be stored with chat.db's raw associated_message_guid,
     # which carries a message-part prefix ('p:0/<guid>' -- tapback on part N
@@ -285,3 +371,153 @@ def create_schema(con: sqlite3.Connection):
          if (stripped := strip_reaction_guid_prefix(guid)) != guid],
     )
     con.commit()
+
+
+# --- feature: nudges ---
+# Loose Ends / nudges tables (loose_ends.py + query_tools/nudges.py). Kept in a
+# separate function, called once from create_schema, so the feature's DDL never
+# touches the SCHEMA string. Pure CREATE ... IF NOT EXISTS -- idempotent, and
+# these are derived artifacts (reset_db clears loose_threads), except
+# nudge_exclusions, which is durable user intent and is PRESERVED across resets.
+_NUDGES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS loose_threads (
+    -- AUTOINCREMENT: dismissed rows are never deleted, so ids must never be
+    -- reused (a reused id could re-open a thread the user dismissed).
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,              -- detector name (e.g. 'faded_initiator')
+    chat_id INTEGER,
+    handle_id INTEGER,               -- counterparty handle (NULL = me/degenerate)
+    anchor_message_id INTEGER,       -- the message the nudge points back at
+    anchor_date TEXT,                -- unlabeled-UTC ISO; plain-string compares only
+    due_by TEXT,                     -- NULL until N5 (scheduled follow-ups)
+    urgency REAL,                    -- computed in Python (kind weight * half-life decay)
+    status TEXT NOT NULL DEFAULT 'open',
+                                     -- 'open' | 'dismissed' (user mute) |
+                                     -- 'resolved' (auto-closed by the detector's
+                                     -- reconciliation pass when no longer found;
+                                     -- hidden from both digests, re-openable).
+                                     -- 'snoozed' is RESERVED (no writer): N5 owns it.
+    evidence_json TEXT,              -- JSON detector evidence
+    llm_verdict TEXT,                -- LLM-derived; guarded by loose_ends_model
+    llm_reason TEXT,                 -- LLM-derived; guarded by loose_ends_model
+    nudge_text TEXT,                 -- LLM one-line narration; guarded by loose_ends_model
+    source TEXT NOT NULL DEFAULT 'sql',   -- detector provenance
+    detected_at TEXT,                -- when the detector last wrote this row
+    dismissed_at TEXT                -- set on dismissal; the row is never deleted
+);
+CREATE INDEX IF NOT EXISTS idx_loose_threads_status ON loose_threads(status, urgency);
+CREATE INDEX IF NOT EXISTS idx_loose_threads_kind_chat ON loose_threads(kind, chat_id);
+
+CREATE TABLE IF NOT EXISTS nudge_exclusions (
+    handle_id INTEGER,               -- handles.id (source PK; stable for same source DB)
+    contact_id INTEGER,              -- contacts.id (source PK); NULL when unresolved
+    reason TEXT,                     -- why muted (user mute, or auto:* Stage-0 gate)
+    created_at TEXT,
+    -- UNIQUE keeps duplicate mutes from stacking rows. NULLs compare distinct
+    -- in a UNIQUE constraint, so writers additionally do a NULL-safe existence
+    -- check before inserting (see query_tools/nudges._add_exclusion).
+    UNIQUE(handle_id, contact_id, reason)
+);
+"""
+
+
+def _create_nudges_tables(con: sqlite3.Connection):
+    """Create the loose_threads / nudge_exclusions tables (idempotent). New
+    tables only -- no in-place migration needed, so this is a bare executescript
+    of CREATE ... IF NOT EXISTS."""
+    con.executescript(_NUDGES_SCHEMA)
+# --- end feature: nudges ---
+
+
+# --- feature: persona ---
+# Derived table behind the voiceprint pipeline (voiceprint.py) and the
+# get_voiceprint tool. member_key/counterpart_key are member_key() strings
+# ("me" / "contact:<id>" / "handle:<id>"); counterpart is the other party's
+# member_key for scope='dyad', "chat:<chat_id>" for scope='group', and "*" for
+# scope='all' (the global card). The fw_*_rate columns mirror
+# person_period_lexicon's 9 categories in the same (FUNCTION_WORDS) order.
+# feature_std_json holds the per-scope population std of each numeric feature,
+# replicated onto every row so a downstream z-normalization reads it off the
+# row without a join. Full-rebuild only (voiceprint.py DELETEs + reinserts),
+# so the NULL-free PK is never relied on for upserts.
+_PERSONA_SCHEMA = """
+CREATE TABLE IF NOT EXISTS person_voiceprint (
+    member_key TEXT,                 -- whose voice (member_key(); never 'unknown')
+    counterpart_key TEXT,            -- dyad: other member_key; group: 'chat:<id>'; all: '*'
+    scope TEXT,                      -- 'dyad' | 'group' | 'all'
+    avg_msg_len REAL,                -- mean chars per (text) message
+    lowercase_ratio REAL,            -- mean per-message lowercase-letter ratio
+    exclaim_rate REAL,               -- fraction of text messages containing '!'
+    ellipsis_rate REAL,              -- fraction of text messages with '...'/'…'
+    burst_size REAL,                 -- mean length of same-sender bursts
+    fw_pronoun_rate REAL,
+    fw_ipron_rate REAL,
+    fw_article_rate REAL,
+    fw_conj_rate REAL,
+    fw_prep_rate REAL,
+    fw_aux_rate REAL,
+    fw_adverb_rate REAL,
+    fw_negation_rate REAL,
+    fw_quant_rate REAL,
+    openers_json TEXT,               -- top session-opening phrases [{phrase,count}]
+    closers_json TEXT,               -- top session-closing phrases  [{phrase,count}]
+    tone_valence REAL,               -- LOW-TRUST: mean valence over source='llm' chunks
+    tone_emotions_json TEXT,         -- LOW-TRUST: top emotions; NULL when no llm rows
+    n_messages INTEGER,
+    n_reply_pairs INTEGER,
+    n_months INTEGER,
+    feature_std_json TEXT,           -- per-scope {feature: population std}, std==0 omitted
+    PRIMARY KEY (member_key, counterpart_key, scope)
+);
+"""
+
+
+def _create_persona_tables(con: sqlite3.Connection):
+    con.executescript(_PERSONA_SCHEMA)
+# --- end feature: persona ---
+
+
+# --- feature: conflict ---
+def _create_conflict_tables(con: sqlite3.Connection):
+    """Conflict core (RES-46 / C1): the deterministic tense-stretch finder's
+    output tables. Idempotent (CREATE ... IF NOT EXISTS), so re-running
+    create_schema is a no-op; guarded against model mixing by the
+    ingest_state `conflict_model` key the way chunk_annotations is by
+    `annotate_model` (enforced in conflict_detect.py, not here).
+
+    `conflicts` carries NO status/my-role/aggressor/who-won field on purpose:
+    the domestic-violence posture and role attribution live in a separate
+    issue (C2) and must not be pre-empted by a column here.
+    """
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS conflicts (
+        -- AUTOINCREMENT: rebuilt per chat, ids must never be reused (a stale
+        -- conflict_signals row could otherwise alias onto a different episode)
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER,
+        first_date TEXT,                 -- unlabeled-UTC ISO; plain-string compares only
+        last_date TEXT,
+        start_session_id INTEGER,        -- sessions.id at the episode's start
+        end_session_id INTEGER,          -- sessions.id at the episode's end
+        topic TEXT,                      -- dominant surviving label_class, or NULL
+        peak_signal_json TEXT,           -- deterministic evidence + receipts (JSON)
+        corroboration TEXT,              -- 'none' | 'weak' | 'llm' (valence, source='llm' only)
+        off_text_flag INTEGER DEFAULT 0, -- large intra-window gap: forbids a resolution verdict
+        source TEXT DEFAULT 'llm'        -- pipeline provenance; guarded by conflict_model
+    );
+    CREATE INDEX IF NOT EXISTS idx_conflicts_chat ON conflicts(chat_id, first_date);
+
+    CREATE TABLE IF NOT EXISTS conflict_signals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conflict_id INTEGER,
+        message_id INTEGER,
+        actor_is_me INTEGER,
+        label_class TEXT,                -- Gottman horseman / repair / 'abstain'
+        top2_labels_json TEXT,           -- the model's top-2 candidate classes
+        band TEXT,                       -- 'tentative' | 'likely' (never a raw float)
+        excerpt TEXT                     -- verbatim, <= 200 chars
+    );
+    CREATE INDEX IF NOT EXISTS idx_conflict_signals_conflict
+        ON conflict_signals(conflict_id);
+    """)
+# --- end feature: conflict ---
