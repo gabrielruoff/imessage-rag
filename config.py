@@ -114,6 +114,14 @@ APPLE_ROUTE_MAX_TOKENS = int(os.getenv("APPLE_ROUTE_MAX_TOKENS", "128"))
 APPLE_FILL_MAX_TOKENS = int(os.getenv("APPLE_FILL_MAX_TOKENS", "256"))
 APPLE_DIGEST_MAX_TOKENS = int(os.getenv("APPLE_DIGEST_MAX_TOKENS", "512"))
 APPLE_ANSWER_MAX_TOKENS = int(os.getenv("APPLE_ANSWER_MAX_TOKENS", "0"))
+# Apple chat loop controls, kept SEPARATE from the shared MAX_TOOL_ITERATIONS so
+# tuning the on-device staged loop never shortens the Ollama tool loop (chat.py).
+# The small FM model over-iterates on near-duplicate calls; a lower ceiling plus
+# a no-progress backoff keeps a turn from spinning. APPLE_NO_PROGRESS_LIMIT is
+# the number of consecutive no-signal iterations (a duplicate, an error, or a
+# zero-row result) after which the loop stops and answers from what it has.
+APPLE_MAX_TOOL_ITERATIONS = int(os.getenv("APPLE_MAX_TOOL_ITERATIONS", "8"))
+APPLE_NO_PROGRESS_LIMIT = int(os.getenv("APPLE_NO_PROGRESS_LIMIT", "2"))
 
 # --- CLI progress -------------------------------------------------------------
 # How the batch CLIs report progress. 'auto' (the default) draws a live rich

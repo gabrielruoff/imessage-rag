@@ -48,7 +48,7 @@ class ScriptedRespond:
         self.prompts = []
         self.route_calls = self.fill_calls = self.digest_calls = self.answer_calls = 0
 
-    def __call__(self, system, prompt, schema=None, stream=False):
+    def __call__(self, system, prompt, schema=None, stream=False, max_tokens=None):
         self.prompts.append(prompt)
         if stream:
             self.answer_calls += 1
@@ -108,7 +108,9 @@ class HappyPathTest(AppleChatTest):
 
         self.assertEqual(reply, "Alice is contact 7.")
         self.assertEqual(messages[-1], {"role": "assistant", "content": reply})
-        self.assertEqual(executed, [{"name": "Alice"}])  # ran once, with filled args
+        # Deterministic pre-resolution queries the name first (limit=5), then the
+        # routed loop runs it again with the model-filled args.
+        self.assertEqual(executed, [{"name": "Alice", "limit": 5}, {"name": "Alice"}])
         self.assertEqual(fake.route_calls, 2)  # a tool, then answer
         self.assertEqual(fake.fill_calls, 1)
         self.assertEqual(fake.answer_calls, 1)
@@ -186,9 +188,15 @@ class DigestOverflowTest(AppleChatTest):
 
 class IterationBoundTest(AppleChatTest):
     def test_loop_stops_at_max_iterations_and_answers(self):
-        self._saved_max = config.MAX_TOOL_ITERATIONS
-        config.MAX_TOOL_ITERATIONS = 3
-        self.addCleanup(setattr, config, "MAX_TOOL_ITERATIONS", self._saved_max)
+        # Apple path reads its OWN bound (APPLE_MAX_TOOL_ITERATIONS), not the
+        # shared MAX_TOOL_ITERATIONS. Disable the no-progress backoff so the
+        # iteration budget is what stops the loop.
+        self.addCleanup(setattr, config, "APPLE_MAX_TOOL_ITERATIONS",
+                        config.APPLE_MAX_TOOL_ITERATIONS)
+        self.addCleanup(setattr, config, "APPLE_NO_PROGRESS_LIMIT",
+                        config.APPLE_NO_PROGRESS_LIMIT)
+        config.APPLE_MAX_TOOL_ITERATIONS = 3
+        config.APPLE_NO_PROGRESS_LIMIT = 99  # never backs off in this test
 
         executed = []
         self.stub_tool("search_messages_fts", lambda **kw: executed.append(kw) or [{"id": 1}])
@@ -201,9 +209,171 @@ class IterationBoundTest(AppleChatTest):
         reply = chat_apple.run_turn([{"role": "user", "content": "search hi"}])
 
         self.assertEqual(reply, "final")
-        self.assertEqual(fake.route_calls, 3)  # exactly MAX_TOOL_ITERATIONS routes
+        self.assertEqual(fake.route_calls, 3)  # exactly APPLE_MAX_TOOL_ITERATIONS routes
         self.assertEqual(fake.answer_calls, 1)  # then it answers regardless
         self.assertEqual(len(executed), 1)  # the dedup guard collapses the repeats
+
+
+class BackoffAndIntentTest(AppleChatTest):
+    def setUp(self):
+        super().setUp()
+        for k in ("APPLE_MAX_TOOL_ITERATIONS", "APPLE_NO_PROGRESS_LIMIT"):
+            self.addCleanup(setattr, config, k, getattr(config, k))
+
+    def test_no_progress_backoff_stops_early_without_polluting(self):
+        # Every call is an exact repeat -> dud after the first; the loop must stop
+        # after APPLE_NO_PROGRESS_LIMIT no-signal iterations, well short of the
+        # bound, and never append a duplicate_call/error note to the scratchpad.
+        config.APPLE_MAX_TOOL_ITERATIONS = 20
+        config.APPLE_NO_PROGRESS_LIMIT = 2
+        self.stub_tool("search_messages_fts", lambda **kw: [])  # always zero rows
+        fake = self.install(ScriptedRespond(
+            route_default="search_messages_fts", fill_args={"query": "hi"},
+            answer_chunks=("done",),
+        ))
+        reply = chat_apple.run_turn([{"role": "user", "content": "search hi"}])
+        self.assertEqual(reply, "done")
+        # 2 no-signal iterations then break -- not the full 20.
+        self.assertEqual(fake.route_calls, 2)
+        # No dud fact reached the answer prompt.
+        self.assertNotIn("duplicate_call", fake.prompts[-1])
+        self.assertNotIn("error", fake.prompts[-1])
+
+    def test_intent_forces_first_action_without_routing_it(self):
+        config.APPLE_MAX_TOOL_ITERATIONS = 8
+        config.APPLE_NO_PROGRESS_LIMIT = 2
+        executed = []
+        self.stub_tool("get_chat_summary_stats",
+                       lambda **kw: executed.append(kw) or {"message_count": 42})
+        # The router queue would say "answer" first -- but the intent rule forces
+        # get_chat_summary_stats as iteration 0 BEFORE any _route call.
+        fake = self.install(ScriptedRespond(
+            route_actions=["answer"], fill_args={}, answer_chunks=("42 total",),
+        ))
+        reply = chat_apple.run_turn(
+            [{"role": "user", "content": "how many total messages do I have?"}])
+        self.assertEqual(reply, "42 total")
+        self.assertEqual(len(executed), 1)          # the forced tool ran
+        self.assertEqual(fake.route_calls, 1)       # only the SECOND step routed
+        self.assertEqual(fake.fill_calls, 1)        # filled the forced tool
+        self.assertIn("message_count", fake.prompts[-1])  # its result reached answer
+
+    def test_forced_contact_scoped_intent_fills_scope_deterministically(self):
+        # A named person + a contact-scoped intent: the resolved contact_id is
+        # injected in code (no FM fill for the scope), sidestepping the
+        # contact_id/chat_id conflation.
+        config.APPLE_MAX_TOOL_ITERATIONS = 8
+        config.APPLE_NO_PROGRESS_LIMIT = 2
+        self.stub_tool("search_contacts_by_name",
+                       lambda **kw: [{"id": 168, "first_name": "Jill", "handles": []}])
+        self.stub_tool("list_chats", lambda **kw: [{"id": 43, "is_group": 0}])
+        executed = []
+        self.stub_tool("get_milestones",
+                       lambda **kw: executed.append(kw) or {"firsts": {"first": {"date": "2019"}}})
+        fake = self.install(ScriptedRespond(
+            route_actions=["answer"], answer_chunks=("2019, Jill first",)))
+        chat_apple.run_turn(
+            [{"role": "user", "content": "When did Jill and I first text?"}])
+        # contact_id filled from pre-resolution, NOT a fabricated/ conflated id;
+        # no model fill call was needed for the forced step.
+        self.assertEqual(executed, [{"contact_id": 168}])
+        self.assertEqual(fake.fill_calls, 0)
+
+
+class SuggestFirstActionTest(unittest.TestCase):
+    def test_canonical_intents_map_to_tools(self):
+        cases = {
+            "how many total messages have I sent and received?": "get_chat_summary_stats",
+            "what is my total number of texts?": "get_chat_summary_stats",
+            "what hour of the day do I text the most?": "get_activity_patterns",
+            "who is my busiest day with?": "get_activity_patterns",
+            "when did Jill and I first text?": "get_milestones",
+            "who texted first between me and Kyle?": "get_milestones",
+            "what was our 10,000th message?": "get_milestones",
+            "who replies faster, me or Kyle?": "get_response_dynamics",
+            "how long does Teddy take to reply?": "get_response_dynamics",
+            "does she leave me on read?": "get_response_dynamics",
+        }
+        for q, tool in cases.items():
+            self.assertEqual(chat_apple._suggest_first_action(q), tool, q)
+
+    def test_non_matching_questions_return_none(self):
+        for q in ["who is Jill Handrahan?", "find messages about the beach",
+                  "what did Kyle say about his job?", ""]:
+            self.assertIsNone(chat_apple._suggest_first_action(q), q)
+
+
+class ProgressSignalTest(unittest.TestCase):
+    def test_is_dud(self):
+        self.assertTrue(chat_apple._is_dud({"duplicate_call": True, "note": "x"}))
+        self.assertTrue(chat_apple._is_dud({"error": "boom"}))
+        self.assertFalse(chat_apple._is_dud({"message_count": 5}))
+        self.assertFalse(chat_apple._is_dud([{"id": 1}]))
+
+    def test_has_signal(self):
+        self.assertTrue(chat_apple._has_signal([{"id": 1}]))
+        self.assertFalse(chat_apple._has_signal([]))
+        self.assertTrue(chat_apple._has_signal({"rows": [1], "total_matching": 9}))
+        self.assertFalse(chat_apple._has_signal({"rows": [], "total_matching": 0}))
+        self.assertTrue(chat_apple._has_signal({"message_count": 0}))  # aggregate dict
+        self.assertFalse(chat_apple._has_signal({"duplicate_call": True}))
+        self.assertFalse(chat_apple._has_signal({"error": "x"}))
+
+
+class DeriveSummaryFactsTest(unittest.TestCase):
+    def test_heatmap_busiest_hour_and_day(self):
+        # 7x24 zero matrix except a spike at Wednesday(2) 22:00 and a Friday load.
+        counts = [[0] * 24 for _ in range(7)]
+        counts[2][22] = 100          # Wednesday 22:00 -> busiest hour
+        for d in range(7):
+            counts[4][d] = 0
+        counts[4] = [5] * 24         # Friday total 120 -> busiest weekday
+        result = {"timezone": "America/New_York", "heatmap": {"counts": counts}}
+        facts = chat_apple._derive_summary_facts("get_activity_patterns", result)
+        self.assertEqual(len(facts), 1)
+        self.assertIn("22:00 America/New_York", facts[0])
+        self.assertIn("busiest weekday = Friday", facts[0])
+
+    def test_ignores_other_tools_and_shapes(self):
+        self.assertEqual(chat_apple._derive_summary_facts("get_milestones", {"x": 1}), [])
+        self.assertEqual(
+            chat_apple._derive_summary_facts("get_activity_patterns", {"heatmap": {}}), [])
+        self.assertEqual(
+            chat_apple._derive_summary_facts("get_activity_patterns",
+                                             {"heatmap": {"counts": [[0] * 24] * 7}}), [])
+
+    def test_response_dynamics_who_replies_faster(self):
+        result = {"reply_latency": {"me": {"median_seconds": 16.7},
+                                    "them": {"median_seconds": 18.3}}}
+        facts = chat_apple._derive_summary_facts("get_response_dynamics", result)
+        self.assertEqual(len(facts), 1)
+        self.assertIn("you = 16.7s", facts[0])
+        self.assertIn("you reply faster", facts[0])
+        # reversed
+        result2 = {"reply_latency": {"me": {"median_seconds": 40},
+                                     "them": {"median_seconds": 5}}}
+        self.assertIn("the other person replies faster",
+                      chat_apple._derive_summary_facts("get_response_dynamics", result2)[0])
+
+    def test_response_dynamics_missing_medians(self):
+        self.assertEqual(
+            chat_apple._derive_summary_facts("get_response_dynamics", {"reply_latency": {}}), [])
+
+    def test_milestone_who_first_gated_on_question(self):
+        result = {"firsts": {
+            "first": {"date": "2022-05-21T06:37:50", "text": "Phone died"},
+            "first_from_me": {"date": "2022-05-21T06:37:50"},
+            "first_from_them": {"date": "2022-05-21T06:37:59"}}}
+        # Fires for a first/who-first question ...
+        facts = chat_apple._derive_summary_facts(
+            "get_milestones", result, "When did Jill and I first text, and who texted first?")
+        joined = " ".join(facts)
+        self.assertIn("2022-05-21", joined)
+        self.assertIn("You sent that very first message", joined)  # 06:37:50 < 06:37:59
+        # ... but NOT for an unrelated milestone question (nth/anniversary).
+        self.assertEqual(
+            chat_apple._derive_summary_facts("get_milestones", result,
+                                             "what was our 10,000th message?"), [])
 
 
 class BadRouteTest(AppleChatTest):
@@ -225,7 +395,8 @@ class BadRouteTest(AppleChatTest):
         fake = self.install(ScriptedRespond(
             route_actions=["get_milestones", "answer"], answer_chunks=("ok",),
         ))
-        reply = chat_apple.run_turn([{"role": "user", "content": "first message?"}])
+        # Neutral wording: exercises the model-routed path, not an intent rule.
+        reply = chat_apple.run_turn([{"role": "user", "content": "anything at all?"}])
         self.assertEqual(reply, "ok")
         self.assertEqual(fake.fill_calls, 1)  # it did try to fill + execute
 
@@ -279,6 +450,196 @@ class SchemaConverterTest(unittest.TestCase):
             for req in simplified.get("required", []):
                 self.assertIn(req, simplified["properties"])  # required stays kept-only
 
+    def test_description_is_preserved_and_capped(self):
+        long_desc = "x" * (chat_apple._ARG_DESC_MAX + 50)
+        schema = {
+            "type": "object",
+            "properties": {
+                "chat_id": {"type": ["integer", "array"], "items": {"type": "integer"},
+                            "description": "  " + long_desc + "  "},
+                "granularity": {"type": "string", "enum": ["day", "month"],
+                                "description": "bucket size"},
+                "bare": {"type": "integer"},
+            },
+        }
+        out = chat_apple._simplify_schema(schema)["properties"]
+        # kept, stripped, and capped to _ARG_DESC_MAX
+        self.assertEqual(out["chat_id"]["description"], "x" * chat_apple._ARG_DESC_MAX)
+        # survives on an enum-bearing string property too
+        self.assertEqual(out["granularity"]["description"], "bucket size")
+        # a property with no description gets no description key
+        self.assertNotIn("description", out["bare"])
+
+    def test_real_schemas_carry_descriptions_through(self):
+        # The regression this fixes: the FILL model was blind to what each arg
+        # meant. get_activity_patterns.include's valid sections live only in its
+        # description; assert that guidance now reaches the simplified schema.
+        spec = chat_apple._TOOL_SPECS["get_activity_patterns"]
+        self.assertIn("heatmap", spec["schema"]["properties"]["include"]["description"])
+
+
+class GroundArgsTest(unittest.TestCase):
+    """The code guardrail behind ARG_SYSTEM's 'never invent an id or date' rule:
+    id/date filters not grounded in the gathered facts (or question) are dropped
+    before the tool runs."""
+
+    def test_empty_scratchpad_drops_every_id(self):
+        # First call of a turn: no facts -> filters stripped -> whole-corpus call.
+        out = chat_apple._ground_args({"chat_id": 1, "handle_id": 42}, "how many messages?", "", [])
+        self.assertEqual(out, {})
+
+    def test_grounded_id_survives_fabricated_dropped(self):
+        sp = ["[search_contacts_by_name] contact_id=168, chat_id=42 for Jill"]
+        out = chat_apple._ground_args(
+            {"chat_id": 42, "handle_id": 999}, "when did Jill and I first text?", "", sp)
+        self.assertEqual(out, {"chat_id": 42})  # 42 grounded, 999 fabricated
+
+    def test_word_boundary_not_substring(self):
+        # The prototype bug: "1" in "1234" matched. A word-boundary test must not.
+        out = chat_apple._ground_args({"chat_id": 1}, "q", "", ["chat with id=1234"])
+        self.assertEqual(out, {})
+
+    def test_list_valued_id_filters_to_grounded_members(self):
+        sp = ["chat_id=42 and chat_id=43 in the family thread"]
+        out = chat_apple._ground_args({"chat_id": [42, 999, 43]}, "q", "", sp)
+        self.assertEqual(out, {"chat_id": [42, 43]})
+
+    def test_date_year_grounding(self):
+        out = chat_apple._ground_args(
+            {"date_from": "2024-01-01", "date_to": "2019-05-01"},
+            "what did we say in 2024?", "", [])
+        self.assertEqual(out, {"date_from": "2024-01-01"})  # 2019 ungrounded
+
+    def test_non_id_date_keys_pass_untouched(self):
+        args = {"limit": 50, "granularity": "day", "include": ["heatmap"],
+                "is_from_me": True, "query": "beach"}
+        out = chat_apple._ground_args(dict(args), "q", "", [])
+        self.assertEqual(out, args)
+
+    def test_id_grounded_via_summary_or_question(self):
+        # Grounding corpus includes the prior-turn summary and the question.
+        out = chat_apple._ground_args({"contact_id": 7}, "tell me about contact 7", "", [])
+        self.assertEqual(out, {"contact_id": 7})
+        out = chat_apple._ground_args({"contact_id": 7}, "q", "earlier we found contact_id 7", [])
+        self.assertEqual(out, {"contact_id": 7})
+
+
+class ExtractNamesTest(unittest.TestCase):
+    """The model-free capitalized-name scan feeding pre-resolution."""
+
+    def test_drops_question_words_keeps_names(self):
+        self.assertEqual(
+            chat_apple._extract_candidate_names("When did Jill and I first text?"),
+            ["Jill"])
+        self.assertEqual(
+            chat_apple._extract_candidate_names("Who is Jill Handrahan?"),
+            ["Jill Handrahan"])
+
+    def test_dedup_and_multiple_names(self):
+        self.assertEqual(
+            chat_apple._extract_candidate_names("Who replies faster, me or Kyle? And Kyle again"),
+            ["Kyle"])
+
+    def test_no_names_returns_empty(self):
+        self.assertEqual(
+            chat_apple._extract_candidate_names("what hour of the day do i text the most?"), [])
+
+    def test_caps_candidate_count(self):
+        q = "A B C D E F G"  # single letters are dropped (len < 2); use real tokens
+        many = "Al Bo Cy Di El Fo Gu"
+        self.assertLessEqual(len(chat_apple._extract_candidate_names(many)),
+                             chat_apple._MAX_PRERESOLVE_NAMES)
+        self.assertEqual(chat_apple._extract_candidate_names(q), [])
+
+
+class PreresolveTest(AppleChatTest):
+    """Deterministic name->id seeding runs before the loop, using only the public
+    directory tools, and emits clearly-labeled id facts."""
+
+    def _fake_chat(self, contacts_fn, chats_fn=None):
+        class _C:
+            TOOL_FUNCTIONS = {"search_contacts_by_name": contacts_fn}
+            console = chat.console
+        if chats_fn is not None:
+            _C.TOOL_FUNCTIONS["list_chats"] = chats_fn
+        return _C
+
+    def test_seeds_labeled_ids_with_direct_chat(self):
+        calls = {"contacts": [], "chats": []}
+
+        def contacts_fn(**kw):
+            calls["contacts"].append(kw)
+            return [{"id": 168, "first_name": "Jill", "last_name": "Handrahan",
+                     "handles": [{"id": 5}]}]
+
+        def chats_fn(**kw):
+            calls["chats"].append(kw)
+            return [{"id": 42, "is_group": 0}, {"id": 99, "is_group": 1}]
+
+        facts, resolved = chat_apple._preresolve_entities(
+            self._fake_chat(contacts_fn, chats_fn), "When did Jill and I first text?")
+        self.assertEqual(len(facts), 1)
+        f = facts[0]
+        self.assertIn("contact_id=168", f)
+        self.assertIn("handle_id=[5]", f)
+        self.assertIn("1:1 chat_id=[42]", f)   # only the is_group=0 chat
+        self.assertNotIn("99", f)              # the group chat is excluded
+        self.assertEqual(calls["contacts"], [{"name": "Jill", "limit": 5}])
+        self.assertEqual(calls["chats"], [{"contact_id": 168, "limit": 50}])
+        # structured resolution carries the scope for deterministic filling
+        self.assertEqual(resolved, [{"contact_id": 168, "chats": [42]}])
+        self.assertEqual(chat_apple._primary_contact(resolved), 168)
+
+    def test_no_name_no_tool_calls(self):
+        called = []
+        facts, resolved = chat_apple._preresolve_entities(
+            self._fake_chat(lambda **kw: called.append(kw) or []),
+            "what hour of the day do i text the most?")
+        self.assertEqual(facts, [])
+        self.assertEqual(resolved, [])
+        self.assertEqual(called, [])  # never queried the directory
+
+    def test_unresolved_name_is_skipped(self):
+        facts, resolved = chat_apple._preresolve_entities(
+            self._fake_chat(lambda **kw: []), "Who is Nobody Here?")
+        self.assertEqual(facts, [])
+        self.assertEqual(resolved, [])
+
+    def test_tool_exception_degrades_to_no_seed(self):
+        def boom(**kw):
+            raise RuntimeError("db down")
+        facts, resolved = chat_apple._preresolve_entities(
+            self._fake_chat(boom), "Who is Jill?")
+        self.assertEqual(facts, [])
+        self.assertEqual(resolved, [])
+
+    def test_seed_grounds_a_filled_chat_id(self):
+        # End-to-end: the seeded chat_id survives _ground_args on the next fill.
+        facts, _ = chat_apple._preresolve_entities(
+            self._fake_chat(
+                lambda **kw: [{"id": 168, "first_name": "Jill", "handles": []}],
+                lambda **kw: [{"id": 42, "is_group": 0}]),
+            "Who is Jill?")
+        out = chat_apple._ground_args({"chat_id": 42}, "Who is Jill?", "", facts)
+        self.assertEqual(out, {"chat_id": 42})  # grounded by the seed
+
+
+class PrimaryContactTest(unittest.TestCase):
+    def test_prefers_the_one_with_a_chat(self):
+        # Ambiguous name (two matches) but only one has a real 1:1 chat.
+        resolved = [{"contact_id": 230, "chats": []}, {"contact_id": 168, "chats": [43]}]
+        self.assertEqual(chat_apple._primary_contact(resolved), 168)
+
+    def test_sole_match_used_even_without_chat(self):
+        self.assertEqual(
+            chat_apple._primary_contact([{"contact_id": 7, "chats": []}]), 7)
+
+    def test_ambiguous_returns_none(self):
+        # Two contacts each with a chat -> can't pick deterministically.
+        resolved = [{"contact_id": 1, "chats": [10]}, {"contact_id": 2, "chats": [20]}]
+        self.assertIsNone(chat_apple._primary_contact(resolved))
+        self.assertIsNone(chat_apple._primary_contact([]))
+
 
 class CompactionTest(AppleChatTest):
     """The scratchpad is compacted back under _SCRATCHPAD_BUDGET so a later
@@ -293,7 +654,7 @@ class CompactionTest(AppleChatTest):
         self.assertEqual(called, [])  # no digest call when already under budget
 
     def test_over_budget_compacts_via_one_digest(self):
-        self.install(lambda system, prompt, schema=None, stream=False: "COMPACTED")
+        self.install(lambda system, prompt, schema=None, stream=False, max_tokens=None: "COMPACTED")
         sp = ["f" * 4000, "g" * 4000]  # 8000 > _SCRATCHPAD_BUDGET
         self.assertEqual(chat_apple._compact("q", sp), ["COMPACTED"])
 
@@ -312,7 +673,7 @@ class WindowOverflowTest(AppleChatTest):
     failure a hermetic fake can only reach by raising it deliberately."""
 
     def test_route_overflow_falls_through_to_answer(self):
-        def fake(system, prompt, schema=None, stream=False):
+        def fake(system, prompt, schema=None, stream=False, max_tokens=None):
             if stream:
                 return iter(("degraded answer",))
             if schema is not None and "action" in (schema.get("properties") or {}):
@@ -326,7 +687,7 @@ class WindowOverflowTest(AppleChatTest):
     def test_answer_overflow_retries_then_degrades(self):
         state = {"answer": 0}
 
-        def fake(system, prompt, schema=None, stream=False):
+        def fake(system, prompt, schema=None, stream=False, max_tokens=None):
             if stream:
                 state["answer"] += 1
                 if state["answer"] < 3:
@@ -350,7 +711,7 @@ class GenerationRejectedTest(AppleChatTest):
     raised out of run_turn. Mirrors WindowOverflowTest with the sibling error."""
 
     def test_route_rejection_falls_through_to_answer(self):
-        def fake(system, prompt, schema=None, stream=False):
+        def fake(system, prompt, schema=None, stream=False, max_tokens=None):
             if stream:
                 return iter(("degraded answer",))
             if schema is not None and "action" in (schema.get("properties") or {}):
@@ -364,7 +725,7 @@ class GenerationRejectedTest(AppleChatTest):
     def test_answer_rejection_retries_then_degrades(self):
         state = {"answer": 0}
 
-        def fake(system, prompt, schema=None, stream=False):
+        def fake(system, prompt, schema=None, stream=False, max_tokens=None):
             if stream:
                 state["answer"] += 1
                 if state["answer"] < 3:
@@ -452,7 +813,7 @@ class WellbeingFloorTest(AppleChatTest):
         # STILL print (resources must survive even a failed answer).
         self._stub_wb_tool()
 
-        def fake(system, prompt, schema=None, stream=False):
+        def fake(system, prompt, schema=None, stream=False, max_tokens=None):
             if stream:
                 def boom():
                     raise applefm.ContextOverflowError("too big")

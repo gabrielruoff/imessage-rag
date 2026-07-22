@@ -23,6 +23,7 @@ config.is_apple_model(model) -- see chat.py.
 """
 
 import json
+import re
 
 import applefm
 import config
@@ -47,23 +48,28 @@ ROUTE_SYSTEM = (
 )
 ARG_SYSTEM = (
     "You produce the arguments for one tool call of an iMessage-history "
-    "assistant. Given the question and the facts gathered so far, fill in the "
-    "tool's JSON arguments. Reuse ids (chat_id, handle_id, contact_id) that "
-    "already appear in the facts rather than inventing them; leave out any "
-    "argument you do not need. Reply with only the JSON object."
+    "assistant. Most arguments are OPTIONAL filters -- read each argument's "
+    "description. Include an id (chat_id, handle_id, contact_id) or a date "
+    "(date_from, date_to) ONLY if its value appears in the question or the facts "
+    "gathered so far; NEVER invent one. To count or analyze the whole corpus, "
+    "pass no filters at all. Reply with only the JSON object."
 )
 DIGEST_SYSTEM = (
     "You extract the facts relevant to a question from one chunk of a tool "
     "result. Reply with a terse plain-text list of only the specific facts that "
-    "bear on the question -- names, ids, dates, counts, exact message text. Omit "
-    "everything else. If nothing in the chunk is relevant, reply exactly "
-    "\"nothing relevant\". Add no commentary."
+    "bear on the question -- names, ids, dates, counts, exact message text. "
+    "Preserve every id with its field name exactly as written (chat_id=42, "
+    "handle_id=5, contact_id=168) so it can be reused -- never merge or relabel "
+    "them. Omit everything else. If nothing in the chunk is relevant, reply "
+    "exactly \"nothing relevant\". Add no commentary."
 )
 ANSWER_SYSTEM = (
     "You answer a question about the user's iMessage history using ONLY the "
-    "facts gathered below. Do not invent messages, names, dates, or counts. If "
-    "the facts are incomplete or do not answer the question, say so plainly "
-    "instead of guessing. Cite dates when relevant, and be concise."
+    "facts gathered below. Do not invent messages, names, dates, or counts. When "
+    "a fact states a number (a count, total, id, or date), use it EXACTLY as "
+    "written -- never recompute, sum, round, or estimate it. If the facts are "
+    "incomplete or do not answer the question, say so plainly instead of "
+    "guessing. Cite dates when relevant, and be concise."
 )
 _NOTHING_RELEVANT = "nothing relevant"
 
@@ -77,6 +83,13 @@ _NOTHING_RELEVANT = "nothing relevant"
 # the narrowest, giving the plan's collapse rules: ["integer","array"]->integer,
 # ["string","array"]->string, ["string","integer"]->string.
 _TYPE_PREFERENCE = ("string", "integer", "number", "boolean", "array")
+
+# Per-property descriptions are the shim's generation guides (main.swift threads
+# them into DynamicGenerationSchema.Property) and ride out-of-band as the
+# `schema` payload, so they cost nothing against the 4,096-token PROMPT budget --
+# but a cap keeps the constrained-decoding grammar small and keeps the first,
+# load-bearing sentence (e.g. the id/date-format and include-section guidance).
+_ARG_DESC_MAX = 200
 
 
 def _pick_type(type_field):
@@ -95,7 +108,11 @@ def _simplify_property(prop):
     """Map one JSON-Schema property to the shim's supported subset, or None to
     drop it. A union collapses to a single type (_pick_type); an enum survives
     only as an enum-of-strings on a string; an array keeps a scalar `items`
-    type (array-of-object / array-of-array are unsupported and dropped)."""
+    type (array-of-object / array-of-array are unsupported and dropped). The
+    property's `description` is preserved (capped at _ARG_DESC_MAX) -- the shim
+    forwards it to the model as a generation guide, and without it the arg-filler
+    is blind to what each id/date/enum field means (the classic fabricated-arg
+    failure)."""
     if not isinstance(prop, dict):
         return None
     t = _pick_type(prop.get("type"))
@@ -105,11 +122,15 @@ def _simplify_property(prop):
         item_t = _pick_type((prop.get("items") or {}).get("type"))
         if item_t is None or item_t == "array":
             return None
-        return {"type": "array", "items": {"type": item_t}}
-    out = {"type": t}
-    enum = prop.get("enum")
-    if t == "string" and isinstance(enum, list) and all(isinstance(e, str) for e in enum):
-        out["enum"] = list(enum)
+        out = {"type": "array", "items": {"type": item_t}}
+    else:
+        out = {"type": t}
+        enum = prop.get("enum")
+        if t == "string" and isinstance(enum, list) and all(isinstance(e, str) for e in enum):
+            out["enum"] = list(enum)
+    desc = prop.get("description")
+    if isinstance(desc, str) and desc.strip():
+        out["description"] = desc.strip()[:_ARG_DESC_MAX]
     return out
 
 
@@ -320,11 +341,53 @@ def _route(question, summary, scratchpad):
     return action if isinstance(action, str) else "answer"
 
 
+# Id / date filter args the small FM model fabricates most (see _ground_args).
+_ID_ARG_KEYS = ("chat_id", "handle_id", "contact_id")
+_DATE_ARG_KEYS = ("date_from", "date_to")
+
+
+def _ground_args(args, question, summary, scratchpad):
+    """Code enforcement of ARG_SYSTEM's "never invent an id or date" rule: drop
+    any id/date filter whose value is not grounded in the facts gathered so far
+    (or the question). The FM arg-filler routinely fabricates precise-looking
+    chat_id/handle_id/contact_id values and date windows that were never
+    retrieved, zeroing out the query; prompting alone does not stop it.
+
+    An id member survives only on a WORD-BOUNDARY match against the corpus -- a
+    substring test ("1" in "1234") matched everything and let bad ids through. A
+    date survives only if its leading 4-digit year appears in the corpus. Every
+    other argument (is_from_me, limit, granularity, include, query, ...) passes
+    untouched. On an empty scratchpad nothing grounds, so the first call runs
+    filter-free (the whole-corpus aggregate) and name->id resolution must precede
+    any filtering -- exactly the intended flow."""
+    if not isinstance(args, dict):
+        return {}
+    corpus = "\n".join(scratchpad) + "\n" + (summary or "") + "\n" + (question or "")
+    cleaned = {}
+    for key, value in args.items():
+        if key in _ID_ARG_KEYS:
+            members = value if isinstance(value, list) else [value]
+            kept = [x for x in members
+                    if re.search(rf"\b{re.escape(str(x))}\b", corpus)]
+            if not kept:
+                continue  # every id fabricated -- drop the filter
+            cleaned[key] = kept if isinstance(value, list) else kept[0]
+        elif key in _DATE_ARG_KEYS:
+            year = re.match(r"\s*(\d{4})", str(value))
+            if year and year.group(1) in corpus:
+                cleaned[key] = value
+            # else: fabricated date window -- drop it
+        else:
+            cleaned[key] = value
+    return cleaned
+
+
 def _fill_args(name, question, summary, scratchpad):
     """FILL stage: generate `name`'s arguments as JSON, guided against its
     simplified input schema, reusing ids already in the scratchpad. A malformed
     reply yields {} (the tool then runs with its defaults, or errors into a note
-    the next digest can read)."""
+    the next digest can read). Filled args pass through _ground_args, which drops
+    any id/date filter the model fabricated rather than took from the facts."""
     spec = _TOOL_SPECS[name]
     prompt = (
         _context_block(question, summary, scratchpad)
@@ -335,7 +398,8 @@ def _fill_args(name, question, summary, scratchpad):
                              max_tokens=config.APPLE_FILL_MAX_TOKENS)
     except (applefm.ContextOverflowError, applefm.GenerationRejectedError):
         return {}  # fall back to the tool's own argument defaults
-    return data if isinstance(data, dict) else {}
+    data = data if isinstance(data, dict) else {}
+    return _ground_args(data, question, summary, scratchpad)
 
 
 def _execute(chat, name, args, seen_calls, wb_state):
@@ -562,34 +626,344 @@ def _emit_epilogues(chat, reply, epilogues):
     return f"{reply}\n\n{block}" if reply else block
 
 
+# --- Deterministic name->id pre-resolution (before the staged loop) ----------
+# Question words / imperative verbs that a capitalized-token scan picks up but
+# that must never be looked up as a contact.
+_NAME_STOPWORDS = frozenset({
+    "who", "what", "when", "where", "why", "how", "which", "whose", "whom",
+    "did", "do", "does", "is", "are", "was", "were", "has", "have", "had",
+    "draft", "find", "break", "based", "help", "looking", "if", "the", "a",
+    "an", "and", "or", "but", "my", "me", "i", "you", "we", "us", "show",
+    "tell", "give", "list", "count", "compare",
+})
+_NAME_CANDIDATE_RE = re.compile(r"[A-Z][a-zA-Z'’]+(?:\s+[A-Z][a-zA-Z'’]+)*")
+_MAX_PRERESOLVE_NAMES = 4
+_MAX_PRERESOLVE_CONTACTS = 2
+_MAX_PRERESOLVE_CHATS = 3
+
+
+def _extract_candidate_names(question):
+    """Pull the capitalized name-shaped spans out of the question (single or
+    multi-word), dropping the sentence-initial question words / verbs a naive
+    scan also catches. Deterministic and model-free -- a false candidate simply
+    resolves to no contact and is skipped. Order-preserving, de-duplicated."""
+    out, seen = [], set()
+    for span in _NAME_CANDIDATE_RE.findall(question or ""):
+        # Trim leading/trailing question-words the scan swept in ("And Kyle" ->
+        # "Kyle", "Who" -> "") so a real name is kept clean and dedups with its
+        # bare form; an all-stopword span trims to nothing and is dropped.
+        words = span.split()
+        while words and words[0].lower() in _NAME_STOPWORDS:
+            words.pop(0)
+        while words and words[-1].lower() in _NAME_STOPWORDS:
+            words.pop()
+        name = " ".join(words)
+        if len(name) < 2:
+            continue
+        key = name.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(name)
+    return out[:_MAX_PRERESOLVE_NAMES]
+
+
+def _preresolve_entities(chat, question):
+    """Resolve person names in the question to labeled id facts BEFORE the staged
+    loop, using only the public directory tools. This hands the FM model the
+    chat_id / handle_id / contact_id it otherwise fabricates (or resolves
+    unreliably across several loop turns), each clearly labeled so it cannot
+    conflate a contact_id with a chat_id. Best-effort: any failure degrades to no
+    seed. Deterministic infra, so it does not consume APPLE_MAX_TOOL_ITERATIONS
+    and is not offered to the _recorder (which counts model-initiated calls).
+
+    Returns (facts, resolved): `facts` are the [resolved] scratchpad seed strings;
+    `resolved` is the structured list ({"contact_id","chats"}) that lets a forced
+    contact-scoped intent be filled deterministically (_primary_contact) rather
+    than trusting the FM to reuse the right labeled id."""
+    find_contacts = chat.TOOL_FUNCTIONS.get("search_contacts_by_name")
+    find_chats = chat.TOOL_FUNCTIONS.get("list_chats")
+    if find_contacts is None:
+        return [], []
+    facts, resolved = [], []
+    for name in _extract_candidate_names(question):
+        try:
+            contacts = find_contacts(name=name, limit=5)
+        except Exception:
+            continue
+        if not isinstance(contacts, list):
+            continue
+        for c in contacts[:_MAX_PRERESOLVE_CONTACTS]:
+            if not isinstance(c, dict) or c.get("id") is None:
+                continue
+            cid = c["id"]
+            handle_ids = [h.get("id") for h in (c.get("handles") or [])
+                          if isinstance(h, dict) and h.get("id") is not None]
+            label = " ".join(str(c.get(k) or "").strip()
+                             for k in ("first_name", "last_name")).strip() or name
+            direct_chats = []
+            if find_chats is not None:
+                try:
+                    rows = find_chats(contact_id=cid, limit=50)
+                    direct_chats = [r["id"] for r in (rows or [])
+                                    if isinstance(r, dict) and not r.get("is_group")
+                                    and r.get("id") is not None][:_MAX_PRERESOLVE_CHATS]
+                except Exception:
+                    direct_chats = []
+            fact = (f'"{name}" -> {label}: contact_id={cid}'
+                    + (f", handle_id={handle_ids}" if handle_ids else "")
+                    + (f", 1:1 chat_id={direct_chats}" if direct_chats else ""))
+            facts.append(f"[resolved] {fact}")
+            resolved.append({"contact_id": cid, "chats": direct_chats})
+            chat.console.print(f"  [resolve] {fact}", style="dim cyan", markup=False)
+    return facts, resolved
+
+
+# Forced-intent tools whose scope is naturally a contact_id -- when the question
+# named exactly one clear person, we fill that scope deterministically instead of
+# trusting the FM (which conflates contact_id with chat_id even when the seed
+# labels both). No-name questions leave `resolved` empty and fall through to the
+# normal FILL (whole-corpus for the aggregates).
+_CONTACT_SCOPED_INTENT_TOOLS = frozenset({
+    "get_milestones", "get_response_dynamics", "get_chat_summary_stats",
+    "get_activity_patterns",
+})
+
+
+def _primary_contact(resolved):
+    """The single unambiguous contact to scope a forced aggregate by: the one
+    resolved contact that has a known 1:1 chat (a real conversation), or the sole
+    resolved contact if only one matched. None when ambiguous or empty -- then the
+    FM fills the scope itself."""
+    if not resolved:
+        return None
+    with_chat = [r for r in resolved if r.get("chats")]
+    if len(with_chat) == 1:
+        return with_chat[0]["contact_id"]
+    if not with_chat and len(resolved) == 1:
+        return resolved[0]["contact_id"]
+    return None
+
+
+# --- Deterministic intent -> tool routing (the loop's forced first action) ---
+# The small FM model routes fine once pointed at the right tool but reliably
+# MIS-picks the canonical aggregate/milestone tools -- reaching for
+# search_conversations / search_messages_sql on "how many messages", "what hour",
+# or "when did we first text" (which search_messages_sql cannot answer: it is
+# newest-first only). Each rule maps a high-precision question pattern to the
+# canonical tool and forces it as iteration 0's action, bypassing _route (also
+# saving one model round-trip). Arg-filling still goes through _fill_args, so a
+# rule decides only the tool NAME. A miss falls back to model routing -- no harm.
+_ROUTE_RULES = [
+    (re.compile(r"\bfirst (text|message|messaged|texted)\b", re.I), "get_milestones"),
+    (re.compile(r"\bwho (texted|messaged|reached out|contacted) .*first\b", re.I),
+     "get_milestones"),
+    (re.compile(r"\bwhen did .* first\b", re.I), "get_milestones"),
+    (re.compile(r"\b\d[\d,]*(st|nd|rd|th) message\b", re.I), "get_milestones"),
+    (re.compile(r"\banniversar", re.I), "get_milestones"),
+    (re.compile(r"\blongest (silence|gap|stretch)\b", re.I), "get_milestones"),
+    (re.compile(r"\bwho (replies|responds|texts|gets back) .*(faster|fastest|first)\b",
+                re.I), "get_response_dynamics"),
+    (re.compile(r"\bhow (long|fast|quick).*(reply|respond|get back|text back)\b", re.I),
+     "get_response_dynamics"),
+    (re.compile(r"\bresponse time\b", re.I), "get_response_dynamics"),
+    (re.compile(r"\b(leave|left|leaves) .* on read\b", re.I), "get_response_dynamics"),
+    (re.compile(r"\bghost", re.I), "get_response_dynamics"),
+    (re.compile(r"\b(what|which) (hour|time of day)\b", re.I), "get_activity_patterns"),
+    (re.compile(r"\bbusiest (day|hour|time|night)\b", re.I), "get_activity_patterns"),
+    (re.compile(r"\bwhen do (i|we) (text|message)\b", re.I), "get_activity_patterns"),
+    (re.compile(r"\bhow often do (i|we)\b", re.I), "get_activity_patterns"),
+    (re.compile(r"\bhow many (total )?(messages|texts)\b", re.I), "get_chat_summary_stats"),
+    (re.compile(r"\btotal (number of )?(messages|texts)\b", re.I), "get_chat_summary_stats"),
+    (re.compile(r"\bmessage count\b", re.I), "get_chat_summary_stats"),
+]
+
+
+def _suggest_first_action(question):
+    """The canonical tool for a recognized question intent, or None. First rule
+    wins; only fires for a tool the FM model reliably mis-picks. Returns a name in
+    _TOOL_SPECS or None (guarded so a rule can never name an unregistered tool)."""
+    for pattern, tool in _ROUTE_RULES:
+        if tool in _TOOL_SPECS and pattern.search(question or ""):
+            return tool
+    return None
+
+
+_WEEKDAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+                  "Saturday", "Sunday")
+
+
+_FIRST_MSG_RE = re.compile(
+    r"first (text|message|messaged|texted)|who .*(texted|messaged|reached out) .*first"
+    r"|when did .* first", re.I)
+
+
+def _derive_summary_facts(name, result, question=""):
+    """Pre-compute the arithmetic a small model cannot do over a structured
+    aggregate result, returning clean plain-text facts to seed alongside the
+    digest (a non-empty return also ends the loop -- the exact answer is in hand).
+    Cases the FM otherwise fails on: reducing the get_activity_patterns 7x24
+    heatmap to the busiest hour/day; comparing the nested get_response_dynamics
+    reply-latency medians to say who replies faster; and reading who sent the
+    first message from get_milestones (a two-timestamp comparison), gated to an
+    actual first/who-first question so nth/anniversary queries are untouched.
+    Returns [] for anything it does not special-case."""
+    if not isinstance(result, dict):
+        return []
+    if name == "get_activity_patterns":
+        return _derive_activity_facts(result)
+    if name == "get_response_dynamics":
+        return _derive_response_facts(result)
+    if name == "get_milestones" and _FIRST_MSG_RE.search(question or ""):
+        return _derive_milestone_facts(result)
+    return []
+
+
+def _derive_milestone_facts(result):
+    firsts = result.get("firsts")
+    if not isinstance(firsts, dict):
+        return []
+    first = firsts.get("first") if isinstance(firsts.get("first"), dict) else {}
+    fm = firsts.get("first_from_me") if isinstance(firsts.get("first_from_me"), dict) else {}
+    ft = firsts.get("first_from_them") if isinstance(firsts.get("first_from_them"), dict) \
+        else {}
+    first_date = first.get("date")
+    fm_date, ft_date = fm.get("date"), ft.get("date")
+    if not first_date:
+        return []
+    # Keep the who-first verdict a single unambiguous clause -- including the two
+    # near-identical raw timestamps confused the small model into inverting it.
+    day = str(first_date)[:10]
+    facts = [f"[derived] The first message between you and the other person was on {day}."]
+    if fm_date and ft_date:  # ISO strings compare lexicographically = chronologically
+        who = "You" if fm_date <= ft_date else "The other person (not you)"
+        facts.append(f"[derived] {who} sent that very first message.")
+    return facts
+
+
+def _derive_activity_facts(result):
+    heatmap = result.get("heatmap")
+    counts = heatmap.get("counts") if isinstance(heatmap, dict) else None
+    if not (isinstance(counts, list) and len(counts) == 7
+            and all(isinstance(row, list) and len(row) == 24 for row in counts)):
+        return []
+    hour_totals = [sum(counts[d][h] for d in range(7)) for h in range(24)]
+    day_totals = [sum(counts[d]) for d in range(7)]
+    if not any(hour_totals):
+        return []
+    tz = result.get("timezone", "local")
+    busiest_hour = max(range(24), key=lambda h: hour_totals[h])
+    busiest_day = max(range(7), key=lambda d: day_totals[d])
+    return [
+        f"[derived] busiest hour of day = {busiest_hour:02d}:00 {tz} "
+        f"({hour_totals[busiest_hour]} messages); busiest weekday = "
+        f"{_WEEKDAY_NAMES[busiest_day]} ({day_totals[busiest_day]} messages)"
+    ]
+
+
+def _derive_response_facts(result):
+    lat = result.get("reply_latency")
+    if not isinstance(lat, dict):
+        return []
+    me, them = lat.get("me"), lat.get("them")
+    if not (isinstance(me, dict) and isinstance(them, dict)):
+        return []
+    me_med, them_med = me.get("median_seconds"), them.get("median_seconds")
+    if not (isinstance(me_med, (int, float)) and isinstance(them_med, (int, float))):
+        return []
+    if me_med < them_med:
+        verdict = "you reply faster (lower median reply time)"
+    elif them_med < me_med:
+        verdict = "the other person replies faster (lower median reply time)"
+    else:
+        verdict = "you both reply about equally fast"
+    return [
+        f"[derived] median reply time: you = {me_med}s, the other person = "
+        f"{them_med}s -> {verdict}"
+    ]
+
+
+# --- Loop-progress signals (deterministic backoff) ---------------------------
+def _is_dud(result):
+    """A result that carries no new information: the _execute dedup note or an
+    error dict. Its content must not pollute the scratchpad."""
+    return isinstance(result, dict) and bool(
+        result.get("duplicate_call") or result.get("error"))
+
+
+def _has_signal(result):
+    """Whether a result advanced the turn -- used to detect a spinning loop. A
+    dud, an empty list, or an all-empty envelope (total_matching == 0) is
+    no-progress; a populated list, a matching envelope, or an aggregate stats
+    dict is progress."""
+    if _is_dud(result):
+        return False
+    if isinstance(result, list):
+        return len(result) > 0
+    if isinstance(result, dict) and isinstance(result.get("rows"), list):
+        return (result.get("total_matching") or 0) > 0
+    if isinstance(result, dict):
+        return True  # an aggregate/stats dict (get_chat_summary_stats, etc.)
+    return bool(result)
+
+
 def run_turn(messages, show_model_header=True, model=None):
     """Run one user turn to a final answer via staged FM sessions, mirroring
     chat.run_turn's signature and contract: the final reply is returned AND
     appended to `messages` (so the REPL, `chat.py -p`, and evalkit all see it).
     Earlier turns in `messages` fold into a compressed summary; the last user
-    message is the current question. Up to config.MAX_TOOL_ITERATIONS
-    route/fill/exec/digest cycles run before the loop falls through to answer."""
+    message is the current question. Named people in the question are resolved to
+    labeled id facts up front (_preresolve_entities); a recognized intent forces
+    the first tool (_suggest_first_action). Up to config.APPLE_MAX_TOOL_ITERATIONS
+    route/fill/exec/digest cycles run, stopping early after
+    config.APPLE_NO_PROGRESS_LIMIT consecutive no-signal iterations, before the
+    loop falls through to answer."""
     import chat  # lazy: chat.py imports this module lazily in its dispatch
 
     question = _current_question(messages)
     summary = _prior_turns_summary(messages)
-    scratchpad = []
+    scratchpad, resolved = _preresolve_entities(chat, question)
     seen_calls = set()
+    first_action = _suggest_first_action(question)
+    if first_action is not None:
+        chat.console.print(f"  [route] intent -> {first_action}", style="dim cyan",
+                           markup=False)
     # Per-turn wellbeing floor, carried through _execute (parity with
     # chat.run_turn): `sanitize` arms the whole-reply condition-name scrub once
     # get_language_trajectory has run; `epilogues` collects code-emitted support
     # blocks to print verbatim after the reply.
     wb_state = {"sanitize": False, "epilogues": []}
-    for _ in range(config.MAX_TOOL_ITERATIONS):
-        action = _route(question, summary, scratchpad)
+    no_progress = 0
+    for _ in range(config.APPLE_MAX_TOOL_ITERATIONS):
+        forced = first_action is not None
+        if forced:  # deterministic first step, no route round-trip
+            action, first_action = first_action, None
+        else:
+            action = _route(question, summary, scratchpad)
         if action not in _TOOL_SPECS:  # "answer", or any off-catalog value
             break
-        args = _fill_args(action, question, summary, scratchpad)
+        scope = _primary_contact(resolved) if forced else None
+        if forced and action in _CONTACT_SCOPED_INTENT_TOOLS and scope is not None:
+            args = {"contact_id": scope}  # fill the scope in code, not via the FM
+        else:
+            args = _fill_args(action, question, summary, scratchpad)
         result = _execute(chat, action, args, seen_calls, wb_state)
-        fact = _digest(question, action, result)
-        if fact:
-            scratchpad.append(f"[{action}] {fact}")
-            scratchpad = _compact(question, scratchpad)
+        derived = []
+        if not _is_dud(result):  # never let a duplicate/error note enter the scratchpad
+            derived = _derive_summary_facts(action, result, question)
+            if derived:
+                # The exact answer was computed in code. Seed ONLY the clean
+                # derived fact (the raw result's digest is noise that the small
+                # model has been observed to answer from, contradicting the
+                # verdict) and stop before it makes noisy follow-up calls.
+                scratchpad.extend(derived)
+                break
+            fact = _digest(question, action, result)
+            if fact:
+                scratchpad.append(f"[{action}] {fact}")
+                scratchpad = _compact(question, scratchpad)
+        no_progress = 0 if _has_signal(result) else no_progress + 1
+        if no_progress >= config.APPLE_NO_PROGRESS_LIMIT:
+            break  # the loop is spinning (duplicates/empties) -- answer from facts
     reply = _answer(chat, question, summary, scratchpad, show_model_header, model,
                     sanitize=wb_state["sanitize"])
     # Support resources must survive even a degraded/empty answer, so emit the
