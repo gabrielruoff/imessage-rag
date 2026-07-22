@@ -188,9 +188,15 @@ class DigestOverflowTest(AppleChatTest):
 
 class IterationBoundTest(AppleChatTest):
     def test_loop_stops_at_max_iterations_and_answers(self):
-        self._saved_max = config.MAX_TOOL_ITERATIONS
-        config.MAX_TOOL_ITERATIONS = 3
-        self.addCleanup(setattr, config, "MAX_TOOL_ITERATIONS", self._saved_max)
+        # Apple path reads its OWN bound (APPLE_MAX_TOOL_ITERATIONS), not the
+        # shared MAX_TOOL_ITERATIONS. Disable the no-progress backoff so the
+        # iteration budget is what stops the loop.
+        self.addCleanup(setattr, config, "APPLE_MAX_TOOL_ITERATIONS",
+                        config.APPLE_MAX_TOOL_ITERATIONS)
+        self.addCleanup(setattr, config, "APPLE_NO_PROGRESS_LIMIT",
+                        config.APPLE_NO_PROGRESS_LIMIT)
+        config.APPLE_MAX_TOOL_ITERATIONS = 3
+        config.APPLE_NO_PROGRESS_LIMIT = 99  # never backs off in this test
 
         executed = []
         self.stub_tool("search_messages_fts", lambda **kw: executed.append(kw) or [{"id": 1}])
@@ -203,9 +209,171 @@ class IterationBoundTest(AppleChatTest):
         reply = chat_apple.run_turn([{"role": "user", "content": "search hi"}])
 
         self.assertEqual(reply, "final")
-        self.assertEqual(fake.route_calls, 3)  # exactly MAX_TOOL_ITERATIONS routes
+        self.assertEqual(fake.route_calls, 3)  # exactly APPLE_MAX_TOOL_ITERATIONS routes
         self.assertEqual(fake.answer_calls, 1)  # then it answers regardless
         self.assertEqual(len(executed), 1)  # the dedup guard collapses the repeats
+
+
+class BackoffAndIntentTest(AppleChatTest):
+    def setUp(self):
+        super().setUp()
+        for k in ("APPLE_MAX_TOOL_ITERATIONS", "APPLE_NO_PROGRESS_LIMIT"):
+            self.addCleanup(setattr, config, k, getattr(config, k))
+
+    def test_no_progress_backoff_stops_early_without_polluting(self):
+        # Every call is an exact repeat -> dud after the first; the loop must stop
+        # after APPLE_NO_PROGRESS_LIMIT no-signal iterations, well short of the
+        # bound, and never append a duplicate_call/error note to the scratchpad.
+        config.APPLE_MAX_TOOL_ITERATIONS = 20
+        config.APPLE_NO_PROGRESS_LIMIT = 2
+        self.stub_tool("search_messages_fts", lambda **kw: [])  # always zero rows
+        fake = self.install(ScriptedRespond(
+            route_default="search_messages_fts", fill_args={"query": "hi"},
+            answer_chunks=("done",),
+        ))
+        reply = chat_apple.run_turn([{"role": "user", "content": "search hi"}])
+        self.assertEqual(reply, "done")
+        # 2 no-signal iterations then break -- not the full 20.
+        self.assertEqual(fake.route_calls, 2)
+        # No dud fact reached the answer prompt.
+        self.assertNotIn("duplicate_call", fake.prompts[-1])
+        self.assertNotIn("error", fake.prompts[-1])
+
+    def test_intent_forces_first_action_without_routing_it(self):
+        config.APPLE_MAX_TOOL_ITERATIONS = 8
+        config.APPLE_NO_PROGRESS_LIMIT = 2
+        executed = []
+        self.stub_tool("get_chat_summary_stats",
+                       lambda **kw: executed.append(kw) or {"message_count": 42})
+        # The router queue would say "answer" first -- but the intent rule forces
+        # get_chat_summary_stats as iteration 0 BEFORE any _route call.
+        fake = self.install(ScriptedRespond(
+            route_actions=["answer"], fill_args={}, answer_chunks=("42 total",),
+        ))
+        reply = chat_apple.run_turn(
+            [{"role": "user", "content": "how many total messages do I have?"}])
+        self.assertEqual(reply, "42 total")
+        self.assertEqual(len(executed), 1)          # the forced tool ran
+        self.assertEqual(fake.route_calls, 1)       # only the SECOND step routed
+        self.assertEqual(fake.fill_calls, 1)        # filled the forced tool
+        self.assertIn("message_count", fake.prompts[-1])  # its result reached answer
+
+    def test_forced_contact_scoped_intent_fills_scope_deterministically(self):
+        # A named person + a contact-scoped intent: the resolved contact_id is
+        # injected in code (no FM fill for the scope), sidestepping the
+        # contact_id/chat_id conflation.
+        config.APPLE_MAX_TOOL_ITERATIONS = 8
+        config.APPLE_NO_PROGRESS_LIMIT = 2
+        self.stub_tool("search_contacts_by_name",
+                       lambda **kw: [{"id": 168, "first_name": "Jill", "handles": []}])
+        self.stub_tool("list_chats", lambda **kw: [{"id": 43, "is_group": 0}])
+        executed = []
+        self.stub_tool("get_milestones",
+                       lambda **kw: executed.append(kw) or {"firsts": {"first": {"date": "2019"}}})
+        fake = self.install(ScriptedRespond(
+            route_actions=["answer"], answer_chunks=("2019, Jill first",)))
+        chat_apple.run_turn(
+            [{"role": "user", "content": "When did Jill and I first text?"}])
+        # contact_id filled from pre-resolution, NOT a fabricated/ conflated id;
+        # no model fill call was needed for the forced step.
+        self.assertEqual(executed, [{"contact_id": 168}])
+        self.assertEqual(fake.fill_calls, 0)
+
+
+class SuggestFirstActionTest(unittest.TestCase):
+    def test_canonical_intents_map_to_tools(self):
+        cases = {
+            "how many total messages have I sent and received?": "get_chat_summary_stats",
+            "what is my total number of texts?": "get_chat_summary_stats",
+            "what hour of the day do I text the most?": "get_activity_patterns",
+            "who is my busiest day with?": "get_activity_patterns",
+            "when did Jill and I first text?": "get_milestones",
+            "who texted first between me and Kyle?": "get_milestones",
+            "what was our 10,000th message?": "get_milestones",
+            "who replies faster, me or Kyle?": "get_response_dynamics",
+            "how long does Teddy take to reply?": "get_response_dynamics",
+            "does she leave me on read?": "get_response_dynamics",
+        }
+        for q, tool in cases.items():
+            self.assertEqual(chat_apple._suggest_first_action(q), tool, q)
+
+    def test_non_matching_questions_return_none(self):
+        for q in ["who is Jill Handrahan?", "find messages about the beach",
+                  "what did Kyle say about his job?", ""]:
+            self.assertIsNone(chat_apple._suggest_first_action(q), q)
+
+
+class ProgressSignalTest(unittest.TestCase):
+    def test_is_dud(self):
+        self.assertTrue(chat_apple._is_dud({"duplicate_call": True, "note": "x"}))
+        self.assertTrue(chat_apple._is_dud({"error": "boom"}))
+        self.assertFalse(chat_apple._is_dud({"message_count": 5}))
+        self.assertFalse(chat_apple._is_dud([{"id": 1}]))
+
+    def test_has_signal(self):
+        self.assertTrue(chat_apple._has_signal([{"id": 1}]))
+        self.assertFalse(chat_apple._has_signal([]))
+        self.assertTrue(chat_apple._has_signal({"rows": [1], "total_matching": 9}))
+        self.assertFalse(chat_apple._has_signal({"rows": [], "total_matching": 0}))
+        self.assertTrue(chat_apple._has_signal({"message_count": 0}))  # aggregate dict
+        self.assertFalse(chat_apple._has_signal({"duplicate_call": True}))
+        self.assertFalse(chat_apple._has_signal({"error": "x"}))
+
+
+class DeriveSummaryFactsTest(unittest.TestCase):
+    def test_heatmap_busiest_hour_and_day(self):
+        # 7x24 zero matrix except a spike at Wednesday(2) 22:00 and a Friday load.
+        counts = [[0] * 24 for _ in range(7)]
+        counts[2][22] = 100          # Wednesday 22:00 -> busiest hour
+        for d in range(7):
+            counts[4][d] = 0
+        counts[4] = [5] * 24         # Friday total 120 -> busiest weekday
+        result = {"timezone": "America/New_York", "heatmap": {"counts": counts}}
+        facts = chat_apple._derive_summary_facts("get_activity_patterns", result)
+        self.assertEqual(len(facts), 1)
+        self.assertIn("22:00 America/New_York", facts[0])
+        self.assertIn("busiest weekday = Friday", facts[0])
+
+    def test_ignores_other_tools_and_shapes(self):
+        self.assertEqual(chat_apple._derive_summary_facts("get_milestones", {"x": 1}), [])
+        self.assertEqual(
+            chat_apple._derive_summary_facts("get_activity_patterns", {"heatmap": {}}), [])
+        self.assertEqual(
+            chat_apple._derive_summary_facts("get_activity_patterns",
+                                             {"heatmap": {"counts": [[0] * 24] * 7}}), [])
+
+    def test_response_dynamics_who_replies_faster(self):
+        result = {"reply_latency": {"me": {"median_seconds": 16.7},
+                                    "them": {"median_seconds": 18.3}}}
+        facts = chat_apple._derive_summary_facts("get_response_dynamics", result)
+        self.assertEqual(len(facts), 1)
+        self.assertIn("you = 16.7s", facts[0])
+        self.assertIn("you reply faster", facts[0])
+        # reversed
+        result2 = {"reply_latency": {"me": {"median_seconds": 40},
+                                     "them": {"median_seconds": 5}}}
+        self.assertIn("the other person replies faster",
+                      chat_apple._derive_summary_facts("get_response_dynamics", result2)[0])
+
+    def test_response_dynamics_missing_medians(self):
+        self.assertEqual(
+            chat_apple._derive_summary_facts("get_response_dynamics", {"reply_latency": {}}), [])
+
+    def test_milestone_who_first_gated_on_question(self):
+        result = {"firsts": {
+            "first": {"date": "2022-05-21T06:37:50", "text": "Phone died"},
+            "first_from_me": {"date": "2022-05-21T06:37:50"},
+            "first_from_them": {"date": "2022-05-21T06:37:59"}}}
+        # Fires for a first/who-first question ...
+        facts = chat_apple._derive_summary_facts(
+            "get_milestones", result, "When did Jill and I first text, and who texted first?")
+        joined = " ".join(facts)
+        self.assertIn("2022-05-21", joined)
+        self.assertIn("You sent that very first message", joined)  # 06:37:50 < 06:37:59
+        # ... but NOT for an unrelated milestone question (nth/anniversary).
+        self.assertEqual(
+            chat_apple._derive_summary_facts("get_milestones", result,
+                                             "what was our 10,000th message?"), [])
 
 
 class BadRouteTest(AppleChatTest):
@@ -227,7 +395,8 @@ class BadRouteTest(AppleChatTest):
         fake = self.install(ScriptedRespond(
             route_actions=["get_milestones", "answer"], answer_chunks=("ok",),
         ))
-        reply = chat_apple.run_turn([{"role": "user", "content": "first message?"}])
+        # Neutral wording: exercises the model-routed path, not an intent rule.
+        reply = chat_apple.run_turn([{"role": "user", "content": "anything at all?"}])
         self.assertEqual(reply, "ok")
         self.assertEqual(fake.fill_calls, 1)  # it did try to fill + execute
 
@@ -407,7 +576,7 @@ class PreresolveTest(AppleChatTest):
             calls["chats"].append(kw)
             return [{"id": 42, "is_group": 0}, {"id": 99, "is_group": 1}]
 
-        facts = chat_apple._preresolve_entities(
+        facts, resolved = chat_apple._preresolve_entities(
             self._fake_chat(contacts_fn, chats_fn), "When did Jill and I first text?")
         self.assertEqual(len(facts), 1)
         f = facts[0]
@@ -417,35 +586,59 @@ class PreresolveTest(AppleChatTest):
         self.assertNotIn("99", f)              # the group chat is excluded
         self.assertEqual(calls["contacts"], [{"name": "Jill", "limit": 5}])
         self.assertEqual(calls["chats"], [{"contact_id": 168, "limit": 50}])
+        # structured resolution carries the scope for deterministic filling
+        self.assertEqual(resolved, [{"contact_id": 168, "chats": [42]}])
+        self.assertEqual(chat_apple._primary_contact(resolved), 168)
 
     def test_no_name_no_tool_calls(self):
         called = []
-        facts = chat_apple._preresolve_entities(
+        facts, resolved = chat_apple._preresolve_entities(
             self._fake_chat(lambda **kw: called.append(kw) or []),
             "what hour of the day do i text the most?")
         self.assertEqual(facts, [])
+        self.assertEqual(resolved, [])
         self.assertEqual(called, [])  # never queried the directory
 
     def test_unresolved_name_is_skipped(self):
-        facts = chat_apple._preresolve_entities(
+        facts, resolved = chat_apple._preresolve_entities(
             self._fake_chat(lambda **kw: []), "Who is Nobody Here?")
         self.assertEqual(facts, [])
+        self.assertEqual(resolved, [])
 
     def test_tool_exception_degrades_to_no_seed(self):
         def boom(**kw):
             raise RuntimeError("db down")
-        facts = chat_apple._preresolve_entities(self._fake_chat(boom), "Who is Jill?")
+        facts, resolved = chat_apple._preresolve_entities(
+            self._fake_chat(boom), "Who is Jill?")
         self.assertEqual(facts, [])
+        self.assertEqual(resolved, [])
 
     def test_seed_grounds_a_filled_chat_id(self):
         # End-to-end: the seeded chat_id survives _ground_args on the next fill.
-        facts = chat_apple._preresolve_entities(
+        facts, _ = chat_apple._preresolve_entities(
             self._fake_chat(
                 lambda **kw: [{"id": 168, "first_name": "Jill", "handles": []}],
                 lambda **kw: [{"id": 42, "is_group": 0}]),
             "Who is Jill?")
         out = chat_apple._ground_args({"chat_id": 42}, "Who is Jill?", "", facts)
         self.assertEqual(out, {"chat_id": 42})  # grounded by the seed
+
+
+class PrimaryContactTest(unittest.TestCase):
+    def test_prefers_the_one_with_a_chat(self):
+        # Ambiguous name (two matches) but only one has a real 1:1 chat.
+        resolved = [{"contact_id": 230, "chats": []}, {"contact_id": 168, "chats": [43]}]
+        self.assertEqual(chat_apple._primary_contact(resolved), 168)
+
+    def test_sole_match_used_even_without_chat(self):
+        self.assertEqual(
+            chat_apple._primary_contact([{"contact_id": 7, "chats": []}]), 7)
+
+    def test_ambiguous_returns_none(self):
+        # Two contacts each with a chat -> can't pick deterministically.
+        resolved = [{"contact_id": 1, "chats": [10]}, {"contact_id": 2, "chats": [20]}]
+        self.assertIsNone(chat_apple._primary_contact(resolved))
+        self.assertIsNone(chat_apple._primary_contact([]))
 
 
 class CompactionTest(AppleChatTest):
