@@ -7,7 +7,9 @@ Three measurement gates share this machinery:
                              (Gottman-style types + ``repair``); floor 0.6.
                              Ships a committed seed verdict, so it is
                              pre-cleared out of the box.
-  * ``dropped_plan``      -- binary detector precision; floor 0.85. No seed:
+  * ``dropped_plan``      -- detector precision over a two-class label space
+                             (``dropped_plan`` vs ``not_dropped_plan``, gated on
+                             the ``positive`` class); floor 0.85. No seed:
                              suppressed by default until the owner labels it.
   * ``wellbeing_narration`` -- a deterministic transcript check (W3), not a
                              hand-label task; registered only so the scorecard
@@ -61,14 +63,25 @@ TASKS = {
     "dropped_plan": {
         "metric": "precision",
         "floor": 0.85,
-        "classes": ("dropped_plan",),
+        # Two-class label space so the owner can record false positives. With a
+        # single positive class every gold label is positive, so fp is
+        # structurally 0 and precision is a spurious 1.0 the floor can never
+        # fail. "positive" names the one class the gate measures and clears
+        # (kept as "dropped_plan" so the consumer's eval_gate_passed call is
+        # unchanged). NOTE: sample_sql draws random chunks, so with a rare
+        # positive the owner may struggle to reach min_positives real positives;
+        # a positive-stratified / classifier confirm-deny audit sample is the
+        # eventual refinement (needs the not-yet-wired classifier). The two-class
+        # space already makes the gate fail CLOSED, never falsely open.
+        "classes": ("dropped_plan", "not_dropped_plan"),
+        "positive": "dropped_plan",
         "sample_sql": (
             "SELECT c.id AS id, c.text AS text FROM chunks c "
             "WHERE c.n_messages >= 3 ORDER BY RANDOM() LIMIT ?"
         ),
         "seed": False,
         "classifier": None,
-        "description": "dropped-plan detector precision (binary)",
+        "description": "dropped-plan detector precision (dropped_plan vs not)",
     },
     "wellbeing_narration": {
         "metric": "transcript_check",
@@ -122,10 +135,21 @@ def compute_verdict(task_cfg, gold, predicted, *, min_labels, min_positives,
                 values[c] = round(k, 4)
                 (passed if k >= floor else failed).append(c)
     else:  # precision
-        for c in classes:
+        # A precision task names the class it gates on via "positive" (the label
+        # space in "classes" also carries the negative class so the owner can
+        # record false positives). Fall back to every class only for a legacy
+        # task that declares no "positive".
+        positive = task_cfg.get("positive")
+        targets = [positive] if positive else classes
+        for c in targets:
             pr = agreement.precision_recall(gold, predicted, positive=c)
             prec, support = pr["precision"], pr["support"]
-            if prec is None or support < min_positives:
+            # Precision is measurable only when the gold holds at least one non-c
+            # example -- otherwise a false positive is impossible (fp structurally
+            # 0) and precision is a spurious 1.0. Fail closed, mirroring the kappa
+            # p_e>=1.0 degenerate guard.
+            measurable = any(g != c for g in gold)
+            if prec is None or support < min_positives or not measurable:
                 values[c] = None if prec is None else round(prec, 4)
                 failed.append(c)
             else:

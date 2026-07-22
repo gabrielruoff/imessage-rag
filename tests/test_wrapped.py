@@ -1188,6 +1188,28 @@ class TestOpenLoopsSection(WrappedTestCase):
         self.assertNotIn("dormant-tie reconnect", html)  # notice is not an item
         self.assertIn("2027", html)                    # occasion due date shown
 
+    def test_skips_digest_meta_completeness_sentinel(self):
+        # finding #3 regression: get_loose_threads appends a
+        # {"digest_meta": True, ...} completeness sentinel when the population
+        # exceeds the LIMIT. It is NOT a board item; before the fix it passed the
+        # "notice"-only guard and rendered a phantom "Someone: a loose end" bubble
+        # that also inflated the open_loops count.
+        threads = [
+            {"kind": "faded_initiator", "chat_id": 100, "handle_id": 10,
+             "contact": "Alice", "anchor_date": "2025-01-01T00:00:00",
+             "due_by": None, "nudge_text": "Reach out to Alice", "urgency": 0.3,
+             "status": "open", "evidence": {}},
+            {"digest_meta": True, "n_total": 9, "returned": 1, "truncated": True},
+        ]
+        with mock.patch.object(query_tools, "get_loose_threads",
+                               mock.Mock(return_value=threads)):
+            sec = wrapped_sections._sec_open_loops()
+        html = sec["extra_html"]
+        self.assertEqual(sec["stats"]["open_loops"], 1)   # sentinel not counted
+        self.assertIn("Alice", html)
+        self.assertNotIn("a loose end", html)             # no phantom fallback bubble
+        self.assertNotIn("Someone", html)
+
     def test_muted_and_wrapped_excluded_absent_from_rendered_board(self):
         # End-to-end through the REAL detector + get_loose_threads. Alice is
         # kept; Mia is MUTED (Stage-0 writes no row); Wes has a row but is

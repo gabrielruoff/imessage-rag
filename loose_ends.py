@@ -854,10 +854,14 @@ def _render_plan_context(anchor_text, anchor_is_me, following):
 
 def _verify_plan(anchor_text, anchor_is_me, following, cfg):
     """Stage-2 verdict from ollama.chat_once_json: 'fulfilled' / 'unfulfilled' /
-    'unknown' (lowercased), or None when the model returns no usable JSON. think
-    is passed per the tri-state via cfg['nudges_think']; with gemma the effective
-    value must be false -- a one-word verdict is not worth a reasoning pass, and
-    NUDGES_THINK is only ever True/False/None (never an effort-level string)."""
+    'unknown' (lowercased), or None when the model is REACHABLE but returns no
+    usable JSON. An unreachable / erroring backend (Ollama down, model not
+    pulled, HTTP error) raises OSError/RuntimeError out of chat_once_json rather
+    than returning None -- detect_dropped_plan catches that at the call site and
+    degrades the pass. think is passed per the tri-state via cfg['nudges_think'];
+    with gemma the effective value must be false -- a one-word verdict is not
+    worth a reasoning pass, and NUDGES_THINK is only ever True/False/None (never
+    an effort-level string)."""
     context = _render_plan_context(anchor_text, anchor_is_me, following)
     user = ("ANCHOR message and the conversation that followed it:\n\n"
             f"{context}\n\nWas the plan or commitment in the ANCHOR carried out?")
@@ -908,7 +912,19 @@ def detect_dropped_plan(con, cfg) -> Iterable[CandidateRow]:
         seen.add(chat_id)  # the most-recent cue message owns this chat's verdict
         following = _plan_following_context(
             con, chat_id, r["id"], r["date"], cfg["plan_context_msgs"])
-        verdict = _verify_plan(r["text"], r["is_from_me"], following, cfg)
+        try:
+            verdict = _verify_plan(r["text"], r["is_from_me"], following, cfg)
+        except (OSError, RuntimeError) as exc:
+            # Verify backend unusable (Ollama down / model not pulled / HTTP
+            # error). Unlike a reachable-but-unparseable reply (None, handled
+            # below), retrying a dead backend per candidate is pointless -- each
+            # can burn a full NUDGES_TIMEOUT. Mark the pass degraded so detect_all
+            # exempts dropped_plan from absence-based auto-resolve (a delayed
+            # close, never a wrongful one -- NONDETERMINISTIC_KINDS) and stop this
+            # detector for the pass.
+            cfg["dropped_plan_degraded"] = True
+            print(f"  dropped_plan verify unavailable ({exc}); degrading this pass")
+            return
         if verdict in (None, ""):
             # Verify ran but produced no usable verdict (unparseable/empty JSON
             # after retry, or a dict missing 'verdict'). Mark the run degraded so

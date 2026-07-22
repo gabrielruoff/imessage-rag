@@ -1557,7 +1557,8 @@ def _sec_open_loops(exclude_chat_ids=(), excluded_names=frozenset()):
     Wrapped itself excluded -- the silent-contact roster guard or --exclude,
     expanded to their 1:1 chats in wrapped.main, plus the lowercase-name
     fallback for unsaved handles -- so an excluded person can never resurface
-    here. The dormant-tie batch-hide notice (a non-thread marker) is skipped."""
+    here. The dormant-tie batch-hide notice and the digest_meta completeness
+    sentinel (non-thread markers) are skipped."""
     threads, note = wrapped._tool("get_loose_threads", status="open",
                                   limit=config.NUDGE_MAX_RESULTS)
     if threads is None:
@@ -1565,8 +1566,10 @@ def _sec_open_loops(exclude_chat_ids=(), excluded_names=frozenset()):
     exclude_chat_ids = set(exclude_chat_ids)
     rows = []
     for t in threads:
-        if not isinstance(t, dict) or "notice" in t:
-            continue  # the dormant-tie batch-hide notice is not a board item
+        if not isinstance(t, dict) or "notice" in t or "digest_meta" in t:
+            continue  # skip the dormant-tie batch-hide notice AND the
+            # get_loose_threads digest_meta completeness sentinel -- neither is a
+            # board item (both can trail the real threads in the same response)
         if t.get("chat_id") in exclude_chat_ids:
             continue
         name = t.get("contact")

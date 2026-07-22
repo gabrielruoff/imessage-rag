@@ -101,14 +101,45 @@ class ComputeVerdictTest(unittest.TestCase):
         self.assertEqual(sorted(v["failed"]), ["a", "b"])
         self.assertIsNone(v["values"]["a"])
 
-    def test_precision_verdict(self):
-        cfg = {"metric": "precision", "floor": 0.85, "classes": ("dropped_plan",)}
-        gold = ["dropped_plan"] * 3 + ["other"]
-        pred = ["dropped_plan"] * 3 + ["other"]
-        v = gates.compute_verdict(cfg, gold, pred, min_labels=2, min_positives=3,
-                                  labeled_at="T", source="owner")
+    # The shipped dropped_plan shape: a two-class label space gated on "positive".
+    _PRECISION_CFG = {"metric": "precision", "floor": 0.85,
+                      "classes": ("dropped_plan", "not_dropped_plan"),
+                      "positive": "dropped_plan"}
+
+    def test_precision_verdict_fails_on_false_positive(self):
+        # A false positive (gold not_dropped_plan, predicted dropped_plan) drives
+        # precision below the floor -> the gate FAILS. This path is UNREACHABLE
+        # with a single-class label space, where every gold is positive, fp is
+        # structurally 0, and precision is a spurious 1.0 (finding #2).
+        gold = ["dropped_plan"] * 3 + ["not_dropped_plan"]
+        pred = ["dropped_plan"] * 4                      # over-fires on the negative
+        v = gates.compute_verdict(self._PRECISION_CFG, gold, pred, min_labels=2,
+                                  min_positives=3, labeled_at="T", source="owner")
+        self.assertEqual(v["failed"], ["dropped_plan"])
+        self.assertEqual(v["passed"], [])
+        self.assertEqual(v["values"]["dropped_plan"], 0.75)
+
+    def test_precision_verdict_passes_with_real_negative(self):
+        # Classifier correct on the negative -> precision 1.0 with a false
+        # positive POSSIBLE (gold holds a negative) -> the gate clears.
+        gold = ["dropped_plan"] * 3 + ["not_dropped_plan"]
+        pred = ["dropped_plan"] * 3 + ["not_dropped_plan"]
+        v = gates.compute_verdict(self._PRECISION_CFG, gold, pred, min_labels=2,
+                                  min_positives=3, labeled_at="T", source="owner")
         self.assertEqual(v["passed"], ["dropped_plan"])
         self.assertEqual(v["values"]["dropped_plan"], 1.0)
+
+    def test_precision_single_class_gold_is_unmeasurable(self):
+        # finding #2 regression: an all-positive gold (the only thing a
+        # single-class label space could produce) is UNMEASURABLE -- fp is
+        # structurally 0, so precision is a spurious 1.0. The degenerate guard
+        # must FAIL it closed, never pass it (mirrors the kappa p_e>=1.0 guard).
+        gold = ["dropped_plan"] * 4
+        pred = ["dropped_plan"] * 4
+        v = gates.compute_verdict(self._PRECISION_CFG, gold, pred, min_labels=2,
+                                  min_positives=3, labeled_at="T", source="owner")
+        self.assertEqual(v["passed"], [])
+        self.assertIn("dropped_plan", v["failed"])
 
 
 # --- label / gate fixture flow -----------------------------------------------
@@ -131,6 +162,16 @@ FIXTURE_TASK = {
     "metric": "kappa",
     "floor": 0.6,
     "classes": ("a", "b"),
+    "sample_sql": "SELECT id AS id, text AS text FROM chunks ORDER BY id LIMIT ?",
+    "seed": False,
+    "classifier": None,
+}
+
+PRECISION_FIXTURE_TASK = {
+    "metric": "precision",
+    "floor": 0.85,
+    "classes": ("pos", "neg"),
+    "positive": "pos",
     "sample_sql": "SELECT id AS id, text AS text FROM chunks ORDER BY id LIMIT ?",
     "seed": False,
     "classifier": None,
@@ -214,6 +255,55 @@ class GateFlowTest(unittest.TestCase):
             labeling.run_gate(self.con, "fixture_task", FIXTURE_TASK,
                               lambda con, items: {}, empty,
                               min_labels=2, min_positives=2)
+
+
+class PrecisionGateFlowTest(unittest.TestCase):
+    """End-to-end proof the precision gate can now FAIL closed (finding #2). The
+    old single-class label space made precision a structural 1.0 that the floor
+    could never fail; the two-class space + degenerate guard make a false-positive
+    classifier fail and stay suppressed."""
+
+    def setUp(self):
+        self.con = _fixture_con()
+        self.addCleanup(self.con.close)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.labels_path = Path(self.tmp.name) / "precision_task.jsonl"
+        # Owner labels over the TWO-class space so a false positive is recordable.
+        golds = ["pos", "pos", "pos", "neg"]
+        with open(self.labels_path, "w") as f:
+            for i, g in enumerate(golds):
+                f.write(json.dumps({"id": f"ch{i}", "text": f"t{i}", "gold": g}) + "\n")
+
+    def test_false_positive_fails_gate_and_stays_suppressed(self):
+        # Classifier over-fires: predicts pos on the neg-labeled ch3 -> a real
+        # false positive -> precision 3/4 = 0.75 < 0.85 -> gate FAILS, consumer
+        # stays suppressed.
+        pred_map = {"ch0": "pos", "ch1": "pos", "ch2": "pos", "ch3": "pos"}
+        verdict, _ = labeling.run_gate(
+            self.con, "precision_task", PRECISION_FIXTURE_TASK,
+            lambda con, items: pred_map, self.labels_path,
+            min_labels=2, min_positives=3, labeled_at="T",
+        )
+        self.assertEqual(verdict["failed"], ["pos"])
+        self.assertEqual(verdict["passed"], [])
+        self.assertEqual(verdict["values"]["pos"], 0.75)
+        self.assertFalse(gates.eval_gate_passed(self.con, "precision_task", "pos",
+                                                seed_dir=Path(self.tmp.name)))
+
+    def test_clean_classifier_passes_when_negatives_present(self):
+        # Classifier correct on the negative -> precision 1.0 with a false
+        # positive POSSIBLE (gold holds a neg) -> gate clears and persists.
+        pred_map = {"ch0": "pos", "ch1": "pos", "ch2": "pos", "ch3": "neg"}
+        verdict, _ = labeling.run_gate(
+            self.con, "precision_task", PRECISION_FIXTURE_TASK,
+            lambda con, items: pred_map, self.labels_path,
+            min_labels=2, min_positives=3, labeled_at="T",
+        )
+        self.assertEqual(verdict["passed"], ["pos"])
+        self.assertEqual(verdict["values"]["pos"], 1.0)
+        self.assertTrue(gates.eval_gate_passed(self.con, "precision_task", "pos",
+                                               seed_dir=Path(self.tmp.name)))
 
 
 # --- eval_gate_passed 3-step precedence --------------------------------------

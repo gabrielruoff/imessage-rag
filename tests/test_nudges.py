@@ -1229,6 +1229,43 @@ class DroppedPlanDriverTest(_DroppedPlanFixtureTest):
             loose_ends.detect_all(con, cfg, "2026-07-01T00:00:00+00:00")
         self.assertEqual(self._status_map()[("dropped_plan", 100)], "resolved")
 
+    def _assert_unreachable_verify_degrades(self, exc):
+        # finding #1 regression: an EXCEPTION from the verify backend (Ollama
+        # down -> ConnectionRefusedError/OSError; model not pulled -> RuntimeError)
+        # must degrade the pass exactly like a None verdict, NOT crash the whole
+        # run. Before the fix the exception escaped detect_dropped_plan ->
+        # detect_all's unguarded loop and aborted the run before its single
+        # commit, discarding every deterministic detector's writes.
+        self._pass_gate()
+        con = sqlite3.connect(self.db_path)
+        con.execute("INSERT INTO loose_threads(kind, chat_id, status, detected_at) "
+                    "VALUES ('dropped_plan', 100, 'open', '2020-01-01')")
+        con.execute("INSERT INTO loose_threads(kind, chat_id, status, detected_at) "
+                    "VALUES ('faded_initiator', 555, 'open', '2020-01-01')")
+        con.commit()
+        con.close()
+        con = self._open()
+        cfg = self._cfg(con, enabled=True)
+        with mock.patch.object(loose_ends.ollama, "chat_once_json", side_effect=exc):
+            loose_ends.detect_all(con, cfg, "2026-07-01T00:00:00+00:00")  # must not raise
+        self.assertTrue(cfg.get("dropped_plan_degraded"))
+        status = self._status_map()
+        # Degraded -> dropped_plan exempted from absence-based auto-resolve.
+        self.assertEqual(status[("dropped_plan", 100)], "open")
+        # A deterministic detector's stale thread still resolves normally.
+        self.assertEqual(status[("faded_initiator", 555)], "resolved")
+
+    def test_unreachable_verify_connection_error_degrades(self):
+        # Ollama down: chat_once raises ConnectionRefusedError (an OSError).
+        self._assert_unreachable_verify_degrades(
+            ConnectionRefusedError("connection refused"))
+
+    def test_unreachable_verify_runtime_error_degrades(self):
+        # Model not pulled: ollama.chat_once raises RuntimeError("Ollama error: ...")
+        # and chat_once_json re-raises it (not a think-rejection).
+        self._assert_unreachable_verify_degrades(
+            RuntimeError("Ollama error: model 'x' not found"))
+
 
 class DroppedPlanConfigTest(unittest.TestCase):
     def test_pinned_config_defaults(self):
