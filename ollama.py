@@ -105,6 +105,27 @@ _JSON_RETRY_NUDGE = (
 _think_unsupported = False
 
 
+def _extract_reply(reply, messages, retry_nudge):
+    """Shared JSON-mode reply handling for chat_once_json here and in applefm
+    (which returns the identical {"role","content"} shape): parse the assistant
+    content as a JSON object and return (data, next_messages). On success `data`
+    is the dict and next_messages is unchanged; on a missing/non-JSON/non-object
+    reply `data` is None and next_messages is the conversation extended with the
+    assistant turn plus the corrective nudge, ready for a retry pass. Single
+    source so a change to the parse/retry shape can't miss the other backend."""
+    content = reply.get("content") or ""
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        data = None
+    if isinstance(data, dict):
+        return data, messages
+    return None, messages + [
+        {"role": "assistant", "content": content},
+        {"role": "user", "content": retry_nudge},
+    ]
+
+
 def chat_once_json(messages, model=None, retry_nudge=_JSON_RETRY_NUDGE,
                    timeout=None, think=_UNSET):
     """chat_once(format='json') -> parsed dict, retrying once with a
@@ -160,17 +181,9 @@ def chat_once_json(messages, model=None, retry_nudge=_JSON_RETRY_NUDGE,
                   "continuing without reasoning control")
             reply = chat_once(messages, model=model, format="json",
                               timeout=timeout, think=None)
-            content = reply.get("content") or ""
-        try:
-            data = json.loads(content)
-        except json.JSONDecodeError:
-            data = None
-        if isinstance(data, dict):
+        data, messages = _extract_reply(reply, messages, retry_nudge)
+        if data is not None:
             return data
-        messages = messages + [
-            {"role": "assistant", "content": content},
-            {"role": "user", "content": retry_nudge},
-        ]
     return None
 
 

@@ -200,22 +200,6 @@ def winsorize(series, limits=(0.05, 0.95)):
     return [min(max(float(x), lo), hi) for x in series]
 
 
-def winsorized_log_gap_ecdf(value, sample, *, limits=(0.05, 0.95)):
-    """ECDF placement of `value` against `sample` in winsorized log space:
-    log-transform the (positive) sample, winsorize its tails, then place
-    log(value) via `ecdf_percentile`. Intended for heavy-tailed reply-gap
-    distributions, where the raw ECDF is dominated by a few huge silences.
-
-    Returns a float in [0, 1], or None if the sample has no positive values."""
-    positives = [v for v in sample if v > 0]
-    if not positives:
-        return None
-    logs = [math.log(v) for v in positives]
-    winsorized = winsorize(logs, limits)
-    log_value = math.log(value) if value > 0 else float("-inf")
-    return ecdf_percentile(log_value, winsorized)
-
-
 def modified_z(series):
     """Iglewicz-Hoaglin modified z-score per point:
     0.6745 * (x_i - median) / MAD, where MAD == median(|x_i - median|).
