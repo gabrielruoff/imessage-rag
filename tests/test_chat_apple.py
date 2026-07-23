@@ -289,6 +289,48 @@ class BackoffAndIntentTest(AppleChatTest):
         # The deriver over the defaults result reached the answer prompt.
         self.assertIn("Liked", fake.prompts[-1])
 
+    def test_forced_retry_keeps_grounded_scope_drops_shape_args(self):
+        # The retry sheds ONLY ungated shape args; a grounded contact_id is part of
+        # the question and must survive, else the retry computes whole-corpus stats
+        # and misattributes them to the named contact.
+        config.APPLE_MAX_TOOL_ITERATIONS = 8
+        config.APPLE_NO_PROGRESS_LIMIT = 2
+        calls = []
+
+        def reaction_tool(**kw):
+            calls.append(kw)
+            if "is_from_me" in kw:  # the spurious shape arg -> error
+                return {"error": "bad arg"}
+            return {"given": {"by_type": {"like": 6879}}}
+        self.stub_tool("get_reaction_stats", reaction_tool)
+        # contact_id 7 is grounded ("7" appears in the question) so it survives
+        # _ground_args AND the retry; is_from_me is the sheddable shape arg.
+        fake = self.install(ScriptedRespond(
+            route_actions=["answer"], fill_args={"contact_id": 7, "is_from_me": True},
+            answer_chunks=("Liked most.",)))
+        chat_apple.run_turn(
+            [{"role": "user",
+              "content": "which tapback does contact 7 use the most?"}])
+        self.assertEqual(calls, [{"contact_id": 7, "is_from_me": True},
+                                 {"contact_id": 7}])
+        self.assertIn("Liked", fake.prompts[-1])
+
+    def test_forced_error_with_only_grounded_args_does_not_retry(self):
+        # Every arg is grounded/asked-for -> nothing sheddable -> no retry at all
+        # (a retry could only drop the scope and answer a different question).
+        config.APPLE_MAX_TOOL_ITERATIONS = 8
+        config.APPLE_NO_PROGRESS_LIMIT = 2
+        calls = []
+        self.stub_tool("get_reaction_stats",
+                       lambda **kw: calls.append(kw) or {"error": "boom"})
+        self.install(ScriptedRespond(
+            route_actions=["answer"], fill_args={"contact_id": 7},
+            answer_chunks=("couldn't find it",)))
+        chat_apple.run_turn(
+            [{"role": "user",
+              "content": "which tapback does contact 7 use the most?"}])
+        self.assertEqual(calls, [{"contact_id": 7}])
+
     def test_forced_contact_scoped_intent_fills_scope_deterministically(self):
         # A named person + a contact-scoped intent: the resolved contact_id is
         # injected in code (no FM fill for the scope), sidestepping the
@@ -361,6 +403,11 @@ class SuggestFirstActionTest(unittest.TestCase):
             "who replies faster, me or Kyle?": "get_response_dynamics",
             "how long does Teddy take to reply?": "get_response_dynamics",
             "does she leave me on read?": "get_response_dynamics",
+            # Specific intents phrased with a generic-frequency opener must not be
+            # stolen by the activity "how often do i" rule (ordering invariant).
+            "how often do I ghost people?": "get_response_dynamics",
+            "how often does she leave me on read?": "get_response_dynamics",
+            "how often do we text?": "get_activity_patterns",
         }
         for q, tool in cases.items():
             self.assertEqual(chat_apple._suggest_first_action(q), tool, q)
@@ -427,6 +474,45 @@ class DeriveSummaryFactsTest(unittest.TestCase):
         self.assertEqual(
             chat_apple._derive_summary_facts("get_response_dynamics", {"reply_latency": {}}), [])
 
+    def test_response_dynamics_ghosted_reads_ghosted_section(self):
+        # only_me lives under "ghosted", not "sessions"; a ghost question must derive
+        # the one-sided-session count, NOT fall through to a reply-latency verdict.
+        result = {"ghosted": {"only_me": 3, "only_them": 1},
+                  "sessions": {"count": 10, "median_messages": 6},
+                  "reply_latency": {"me": {"median_seconds": 5},
+                                    "them": {"median_seconds": 40}}}
+        facts = chat_apple._derive_summary_facts(
+            "get_response_dynamics", result, "who have I ghosted?")
+        self.assertEqual(len(facts), 1)
+        self.assertIn("3 conversation(s)", facts[0])
+        self.assertIn("out of 10 sessions", facts[0])
+        self.assertNotIn("reply faster", facts[0])   # not the latency default
+
+    def test_response_dynamics_double_text(self):
+        # A double-text question has its own branch; without it the deriver fell to
+        # the reply-latency default and answered a different question.
+        result = {"double_text": {"me": 50, "them": 10},
+                  "reply_latency": {"me": {"median_seconds": 5},
+                                    "them": {"median_seconds": 40}}}
+        facts = chat_apple._derive_summary_facts(
+            "get_response_dynamics", result, "do I double-text more than her?")
+        self.assertEqual(len(facts), 1)
+        self.assertIn("Double-texts", facts[0])
+        self.assertIn("You double-text more", facts[0])
+        self.assertNotIn("reply faster", facts[0])
+
+    def test_response_dynamics_latency_verdict_gated_to_speed_questions(self):
+        # A question that reached this tool but is not about reply speed must fall to
+        # DIGEST ([]), not a spurious latency verdict...
+        result = {"reply_latency": {"me": {"median_seconds": 16.7},
+                                    "them": {"median_seconds": 18.3}}}
+        self.assertEqual(chat_apple._derive_summary_facts(
+            "get_response_dynamics", result, "what emoji do we use?"), [])
+        # ...but a no-question call keeps the default verdict (production always
+        # supplies a question; this guards the empty-question leniency).
+        self.assertIn("you reply faster", chat_apple._derive_summary_facts(
+            "get_response_dynamics", result)[0])
+
     def test_milestone_who_first_gated_on_question(self):
         result = {"firsts": {
             "first": {"date": "2022-05-21T06:37:50", "text": "Phone died"},
@@ -442,6 +528,78 @@ class DeriveSummaryFactsTest(unittest.TestCase):
         self.assertEqual(
             chat_apple._derive_summary_facts("get_milestones", result,
                                              "what was our 10,000th message?"), [])
+
+    def test_milestone_last_message_uses_last_only(self):
+        # The last-message branch must quote firsts.last and NEVER fall back to a
+        # first_* receipt (which would present the oldest message as the newest).
+        result = {"firsts": {
+            "first_from_them": {"date": "2022-05-21T06:37:59", "sender": "Jill",
+                                "text": "Phone died", "is_from_me": 0},
+            "last": {"date": "2026-07-20T21:11:02", "sender": "Jill",
+                     "text": "see you tomorrow!", "is_from_me": 0}}}
+        facts = chat_apple._derive_summary_facts(
+            "get_milestones", result, "what was the last message Jill sent me?")
+        self.assertEqual(len(facts), 1)
+        self.assertIn("see you tomorrow!", facts[0])
+        self.assertNotIn("Phone died", facts[0])
+        # No last at all -> [] (degrade to DIGEST), even with first_from_them present.
+        no_last = {"firsts": {
+            "first_from_them": {"date": "2022-05-21T06:37:59", "text": "Phone died"}}}
+        self.assertEqual(chat_apple._derive_summary_facts(
+            "get_milestones", no_last, "what was the last message she sent?"), [])
+
+    def test_milestone_last_from_them_not_answered_with_my_message(self):
+        # "Last thing THEY sent" when the most recent message is mine: the tool has
+        # no last-inbound field, so degrade to DIGEST rather than present my own
+        # message as theirs. A neutral "last message" ask still gets the fact.
+        result = {"firsts": {
+            "last": {"date": "2026-07-20T21:11:02", "sender": "Me",
+                     "text": "on my way", "is_from_me": 1}}}
+        self.assertEqual(chat_apple._derive_summary_facts(
+            "get_milestones", result, "what's the last thing she sent me?"), [])
+        facts = chat_apple._derive_summary_facts(
+            "get_milestones", result, "what was the last message in our chat?")
+        self.assertIn("on my way", facts[0])
+
+    def test_response_dynamics_on_read_coverage_conditional(self):
+        # Low coverage -> the honest caveat, with the pct; no measured figures.
+        low = {"read_to_reply": {
+            "pairs": 4, "median_deliberation_seconds": 30,
+            "coverage": {"inbound_with_date_read": 5, "inbound_total": 100,
+                         "outbound_with_date_read": 2, "outbound_total": 80}}}
+        facts = chat_apple._derive_summary_facts(
+            "get_response_dynamics", low, "do I leave people on read?")
+        self.assertEqual(len(facts), 1)
+        self.assertIn("only 5.0%", facts[0])
+        self.assertIn("cannot be measured reliably", facts[0])
+        # Adequate coverage -> a grounded partial answer (coverage + read->reply
+        # median), not the blanket refusal -- but still no left-on-read count.
+        high = {"read_to_reply": {
+            "pairs": 62, "median_deliberation_seconds": 41,
+            "coverage": {"inbound_with_date_read": 90, "inbound_total": 100,
+                         "outbound_with_date_read": 2, "outbound_total": 80}}}
+        facts = chat_apple._derive_summary_facts(
+            "get_response_dynamics", high, "do I leave people on read?")
+        self.assertEqual(len(facts), 1)
+        self.assertIn("90.0%", facts[0])
+        self.assertIn("41s", facts[0])
+        self.assertNotIn("cannot be measured reliably", facts[0])
+        self.assertIn("read-but-never-answered count is not available", facts[0])
+
+    def test_response_dynamics_on_read_picks_side_from_question(self):
+        # "Does she leave ME on read" is about THEIR receipts of my outbound --
+        # the outbound coverage decides, and my read->reply median (which measures
+        # my own replying) is not quoted for their side.
+        result = {"read_to_reply": {
+            "pairs": 62, "median_deliberation_seconds": 41,
+            "coverage": {"inbound_with_date_read": 90, "inbound_total": 100,
+                         "outbound_with_date_read": 70, "outbound_total": 80}}}
+        facts = chat_apple._derive_summary_facts(
+            "get_response_dynamics", result, "does she leave me on read?")
+        self.assertEqual(len(facts), 1)
+        self.assertIn("87.5%", facts[0])           # 70/80, the outbound side
+        self.assertIn("your messages to them", facts[0])
+        self.assertNotIn("41s", facts[0])          # my median: wrong side, omitted
 
 
 class DeriveAggregateFactsTest(unittest.TestCase):
@@ -506,6 +664,21 @@ class DeriveAggregateFactsTest(unittest.TestCase):
         facts = self.d("find_conflicts", {"total_matching": 0, "rows": []},
                        "have Jenna and I ever had a fight?")
         self.assertIn("No tense stretches", facts[0])
+        # The zero-conflict fact must be pure data -- no model-directive that could
+        # leak into the user-facing reply (via _compose_no_fault_answer or a paraphrase).
+        self.assertNotIn("manufacture", facts[0].lower())
+
+    def test_zero_conflict_fault_answer_is_clean_no_leak(self):
+        # A who-started question with zero conflicts: the composed reply must read
+        # cleanly and never splice the internal negative fact / a directive.
+        sp = self.d("find_conflicts", {"total_matching": 0, "rows": []},
+                    "who started our fights?")
+        out = chat_apple._compose_no_fault_answer(sp)
+        self.assertIsNotNone(out)
+        self.assertIn("couldn't find", out.lower())
+        self.assertNotIn("manufacture", out.lower())
+        self.assertNotIn("[derived]", out)
+        self.assertNotIn("What the signals do show", out)
 
     def test_conflict_never_infers_fault(self):
         r = {"total_matching": 318, "rows": [{"first_date": "2026-05-27",
@@ -550,6 +723,19 @@ class DeriveAggregateFactsTest(unittest.TestCase):
         facts = self.d("get_activity_patterns", r, "how much do I text after midnight?")
         self.assertIn("54141", facts[0])
         self.assertIn("Callie", facts[0])
+
+    def test_summary_stats_group_by_chat_leaderboard_derives(self):
+        # group_by_chat=True returns a bare LIST -- the "who do I text most"
+        # leaderboard must derive (top row by message_count), not fall through
+        # to DIGEST/confabulation.
+        r = [{"chat_id": 7, "message_count": 120, "from_me": 60, "from_them": 60},
+             {"chat_id": 42, "message_count": 980, "from_me": 500, "from_them": 480}]
+        facts = self.d("get_chat_summary_stats", r, "who do I text the most?")
+        self.assertEqual(len(facts), 1)
+        self.assertIn("chat_id=42", facts[0])
+        self.assertIn("980", facts[0])
+        # And an empty leaderboard degrades to DIGEST, not a crash.
+        self.assertEqual(self.d("get_chat_summary_stats", [], "who do I text most?"), [])
 
 
 class BadRouteTest(AppleChatTest):
@@ -750,6 +936,30 @@ class ExtractNamesTest(unittest.TestCase):
     def test_no_names_returns_empty(self):
         self.assertEqual(
             chat_apple._extract_candidate_names("what hour of the day do i text the most?"), [])
+
+    def test_name_colliding_auxiliaries_are_positional(self):
+        # Mid-sentence, a capitalized Will/May/Can is a NAME -- swallowing it
+        # would also disarm the unresolved-name guard (S7.6 misattribution).
+        self.assertEqual(
+            chat_apple._extract_candidate_names("How often does Will text me?"), ["Will"])
+        self.assertEqual(
+            chat_apple._extract_candidate_names("What did May send over?"), ["May"])
+        # Sentence-initial, the same word is an auxiliary and is trimmed.
+        self.assertEqual(
+            chat_apple._extract_candidate_names("Will I ever hear from Jenna again?"),
+            ["Jenna"])
+        self.assertEqual(
+            chat_apple._extract_candidate_names("Can you check on Kyle?"), ["Kyle"])
+        # After a trimmed sentence-initial auxiliary, the next token is a name.
+        self.assertEqual(
+            chat_apple._extract_candidate_names("Can Will text back?"), ["Will"])
+        # A new sentence mid-question restarts sentence-initial trimming.
+        self.assertEqual(
+            chat_apple._extract_candidate_names("Tell me about Jill. Will she reply?"),
+            ["Jill"])
+        # Non-name auxiliaries stay unconditional stopwords everywhere.
+        self.assertEqual(
+            chat_apple._extract_candidate_names("Am I texting too much?"), [])
 
     def test_caps_candidate_count(self):
         q = "A B C D E F G"  # single letters are dropped (len < 2); use real tokens
