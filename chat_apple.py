@@ -363,6 +363,13 @@ _DATE_ARG_KEYS = ("date_from", "date_to")
 # granularity/ngram/include/is_from_me/limit (legitimate shape args, and a value
 # like 2 for "two-word" would not match literally).
 _FILTER_ARG_KEYS = ("status", "kind", "reaction_type", "subject", "phase_filter")
+# Args a forced-tool error retry may NOT shed: everything above survived
+# _ground_args, so it is grounded (id/date) or literally asked for (filter) --
+# dropping one changes WHICH question gets answered (a shed contact_id computes
+# whole-corpus stats misattributed to the named person). Ungated shape args
+# (is_from_me/granularity/ngram/...) pass grounding unchecked, so they are the
+# error causes a retry can safely shed.
+_RETRY_KEEP_KEYS = frozenset(_ID_ARG_KEYS + _DATE_ARG_KEYS + _FILTER_ARG_KEYS)
 
 
 def _ground_args(args, question, summary, scratchpad):
@@ -695,12 +702,24 @@ _NAME_STOPWORDS = frozenset({
     # otherwise fuzzy-resolve to a real contact (Am -> Durham/Graham), poison the
     # scratchpad, and -- with the unresolved-name guard -- suppress a correct
     # forced route. See RC-5 in APPLE_FM_EVAL_REPORT.md.
-    "am", "can", "could", "would", "should", "will", "shall", "may", "might",
+    "am", "could", "would", "should", "shall", "might",
     "must", "been", "being", "be", "get", "got", "make", "made", "let", "see",
     "look", "there", "here", "any", "some", "no", "not", "over", "about",
     "around", "between", "with", "for", "from", "of", "on", "in", "at", "to",
     "does", "whats", "hows", "wheres", "im", "ive", "id",
 })
+# Auxiliaries that are ALSO real first names (Will, May, Can). Unconditionally
+# stopwording them swallows the contact ("How often does Will text me?" -> no
+# candidate), which ALSO disarms the unresolved-name guard (no candidates -> no
+# guard) so a forced contact-scoped intent runs unscoped and misattributes
+# whole-corpus stats to the person -- the S7.6 confabulation. Capitalization
+# disambiguates: mid-sentence these are capitalized only as names, while an
+# auxiliary is capitalized only sentence-initially ("Will I ever…"). So they are
+# trimmed ONLY as a span's first token at a sentence start.
+_POSITIONAL_STOPWORDS = frozenset({"will", "may", "can"})
+# Nothing but whitespace / an opening quote/paren between the span and either the
+# start of the question or the previous sentence's terminator.
+_SENTENCE_INITIAL_RE = re.compile(r"(?:^|[.?!;])[\s\"'“”‘’(\[]*$")
 _NAME_CANDIDATE_RE = re.compile(r"[A-Z][a-zA-Z'’]+(?:\s+[A-Z][a-zA-Z'’]+)*")
 _MAX_PRERESOLVE_NAMES = 4
 _MAX_PRERESOLVE_CONTACTS = 2
@@ -712,14 +731,27 @@ def _extract_candidate_names(question):
     multi-word), dropping the sentence-initial question words / verbs a naive
     scan also catches. Deterministic and model-free -- a false candidate simply
     resolves to no contact and is skipped. Order-preserving, de-duplicated."""
+    question = question or ""
     out, seen = [], set()
-    for span in _NAME_CANDIDATE_RE.findall(question or ""):
+    for m in _NAME_CANDIDATE_RE.finditer(question):
         # Trim leading/trailing question-words the scan swept in ("And Kyle" ->
         # "Kyle", "Who" -> "") so a real name is kept clean and dedups with its
-        # bare form; an all-stopword span trims to nothing and is dropped.
-        words = span.split()
-        while words and words[0].lower() in _NAME_STOPWORDS:
-            words.pop(0)
+        # bare form; an all-stopword span trims to nothing and is dropped. A
+        # name-colliding auxiliary (_POSITIONAL_STOPWORDS) is trimmed only as the
+        # span's opening token at a sentence start -- mid-sentence, or after a
+        # trimmed opener ("Can Will text back?"), it is a name and is kept; the
+        # trailing trim never touches it ("Jenna May" stays whole).
+        words = m.group(0).split()
+        sentence_initial = bool(_SENTENCE_INITIAL_RE.search(question[:m.start()]))
+        lead = 0
+        while lead < len(words):
+            head = words[lead].lower()
+            if head in _NAME_STOPWORDS or (
+                    lead == 0 and sentence_initial and head in _POSITIONAL_STOPWORDS):
+                lead += 1
+            else:
+                break
+        words = words[lead:]
         while words and words[-1].lower() in _NAME_STOPWORDS:
             words.pop()
         name = " ".join(words)
@@ -869,8 +901,14 @@ def _preresolve_groups(chat, question):
 # saving one model round-trip). Arg-filling still goes through _fill_args, so a
 # rule decides only the tool NAME. A miss falls back to model routing -- no harm.
 _ROUTE_RULES = [
-    # --- Response dynamics: double-text first (else "how often do i" steals it) ---
+    # --- Specific intents FIRST. First rule wins: any specific intent whose
+    # phrasing can also match a generic frequency/volume rule below ("how often
+    # do i", "when do i text", ...) must sit ABOVE the activity block, or the
+    # generic rule steals it ("how often do I ghost people?" is a ghost ask). ---
     (re.compile(r"\bdouble.?text", re.I), "get_response_dynamics"),
+    (re.compile(r"\bghost", re.I), "get_response_dynamics"),
+    (re.compile(r"\b(leave|left|leaves) .* on read\b", re.I), "get_response_dynamics"),
+    (re.compile(r"\bnot replied to a conversation\b", re.I), "get_response_dynamics"),
     # --- Milestones (firsts / nth / anniversaries / gaps / history bounds) ---
     (re.compile(r"\bfirst (text|message|messaged|texted)\b", re.I), "get_milestones"),
     (re.compile(r"\bwho (texted|messaged|reached out|contacted) .*first\b", re.I),
@@ -902,11 +940,8 @@ _ROUTE_RULES = [
     (re.compile(r"\bhow (long|fast|quick).*(reply|respond|get back|text back)\b", re.I),
      "get_response_dynamics"),
     (re.compile(r"\bresponse time\b", re.I), "get_response_dynamics"),
-    (re.compile(r"\b(leave|left|leaves) .* on read\b", re.I), "get_response_dynamics"),
-    (re.compile(r"\bghost", re.I), "get_response_dynamics"),
     (re.compile(r"\bwho (starts|initiates) .*(me or|\bmore\b)", re.I),
      "get_response_dynamics"),
-    (re.compile(r"\bnot replied to a conversation\b", re.I), "get_response_dynamics"),
     (re.compile(r"\b(long conversations|quick bursts)\b", re.I), "get_response_dynamics"),
     # --- Per-member (chat_participant_stats) BEFORE reactions/group (more specific) ---
     (re.compile(r"\breactions? per message\b", re.I), "get_chat_participant_stats"),
@@ -1026,11 +1061,14 @@ def _derive_summary_facts(name, result, question=""):
     deriver that cannot read its result) returns [] and falls back to DIGEST."""
     q = question or ""
     if isinstance(result, list):
-        # List-shaped results (loose threads, participant stats).
+        # List-shaped results (loose threads, participant stats, and the
+        # group_by_chat=True per-chat leaderboard of get_chat_summary_stats).
         if name == "get_loose_threads":
             return _derive_loose_threads_facts(result)
         if name == "get_chat_participant_stats":
             return _derive_participant_facts(result, q)
+        if name == "get_chat_summary_stats":
+            return _derive_summary_stats_facts(result, q)
         return []
     if not isinstance(result, dict):
         return []
@@ -1120,14 +1158,19 @@ def _derive_milestone_facts(result, question=""):
             return [f"[derived] Message history goes back to {str(first['date'])[:10]} "
                     f"({_msg_snippet(first)})."]
         return []
-    # Last thing they sent (their-side last inbound preferred).
+    # Last message: ONLY firsts.last (the overall most recent message). Milestones
+    # has no last-inbound field, and any fallback to a "first_*" receipt would
+    # present the oldest message as the newest -- degrade to DIGEST instead.
     if re.search(r"\blast (thing|message)\b", q):
-        ft = firsts.get("first_from_them")  # milestones has no explicit last-inbound;
-        last = firsts.get("last")           # fall back to overall last message.
-        pick = last if isinstance(last, dict) else ft
-        if isinstance(pick, dict) and pick.get("date"):
-            return [f"[derived] The last message was {_msg_snippet(pick)}."]
-        return []
+        last = firsts.get("last")
+        if not (isinstance(last, dict) and last.get("date")):
+            return []
+        # "Last thing THEY sent": if the most recent message is mine, the
+        # their-side answer is not in this result -- do not present my own
+        # message as theirs.
+        if last.get("is_from_me") and re.search(r"\b(they|she|he|them)\b", q):
+            return []
+        return [f"[derived] The last message was {_msg_snippet(last)}."]
     # Default: first / who-first.
     first = firsts.get("first") if isinstance(firsts.get("first"), dict) else {}
     fm = firsts.get("first_from_me") if isinstance(firsts.get("first_from_me"), dict) else {}
@@ -1226,6 +1269,20 @@ def _derive_activity_facts(result, question=""):
     ]
 
 
+# Reply-speed cues that justify the get_response_dynamics reply-latency verdict (who
+# replies faster / response time / quickest). Gates the default so a non-speed
+# question routed here does not get a spurious latency fact.
+_REPLY_SPEED_RE = re.compile(
+    r"\b(fast(er|est)?|quick(er|est)?|slow(er|est)?|repl(y|ies|ied)|respond|responds"
+    r"|response|get(s)? back|text(s)? back|first)\b", re.I)
+
+# Read-receipt coverage below this share carries no usable "left on read" signal
+# (the caveat is the honest answer); at/above it, the measured read->reply
+# figures are worth stating -- still never a left-on-read COUNT, because the
+# tool records read-and-replied pairs only.
+_READ_COVERAGE_MIN = 0.5
+
+
 def _derive_response_facts(result, question=""):
     q = question.lower()
     # Initiation: who starts more.
@@ -1237,17 +1294,50 @@ def _derive_response_facts(result, question=""):
                    else "The other person" if init["them"] > init["me"] else "Both equally")
             return [f"[derived] Conversation starts: you initiated {init['me']}, the "
                     f"other person {init['them']} -> {who} start(s) more."]
-    # Left on read (needs the coverage caveat -- their read receipts are sparse).
+    # Double-texting (a follow-up you send before the other person replies). Routed
+    # here by the \bdouble.?text rule -- without this branch it fell to the reply-
+    # latency default and answered a different question.
+    if re.search(r"\bdouble.?text", q):
+        dt = result.get("double_text")
+        if isinstance(dt, dict) and isinstance(dt.get("me"), (int, float)) \
+                and isinstance(dt.get("them"), (int, float)):
+            who = ("You double-text more" if dt["me"] > dt["them"]
+                   else "The other person double-texts more" if dt["them"] > dt["me"]
+                   else "You both double-text about equally")
+            return [f"[derived] Double-texts (a follow-up sent before a reply): you "
+                    f"{dt['me']}, the other person {dt['them']} -> {who}."]
+    # Left on read. The tool has no read-but-never-replied count -- only my
+    # read->reply medians plus per-side read-receipt coverage. Pick the side the
+    # question asks about: "leaves ME on read" is about THEIR receipts of my
+    # outbound messages; anything else is about my receipts of their inbound.
     if re.search(r"\bon read\b", q):
         r2r = result.get("read_to_reply")
         if isinstance(r2r, dict):
             cov = r2r.get("coverage") or {}
-            inb = cov.get("inbound_with_date_read") or 0
-            tot = cov.get("inbound_total") or 0
-            pct = round(inb / tot * 100, 1) if tot else 0
-            return [f"[derived] Read receipts are only available for {pct}% of their "
-                    f"inbound messages ({inb}/{tot}), so 'left on read' cannot be "
-                    f"measured reliably -- state this caveat rather than a verdict."]
+            about_me = re.search(r"\b(leave|left|leaves)\s+me\b", q)
+            if about_me:
+                got = cov.get("outbound_with_date_read") or 0
+                tot = cov.get("outbound_total") or 0
+                side = "your messages to them"
+            else:
+                got = cov.get("inbound_with_date_read") or 0
+                tot = cov.get("inbound_total") or 0
+                side = "their messages to you"
+            pct = round(got / tot * 100, 1) if tot else 0
+            if not tot or got / tot < _READ_COVERAGE_MIN:
+                return [f"[derived] Read receipts cover only {pct}% of {side} "
+                        f"({got}/{tot}), so 'left on read' cannot be measured "
+                        f"reliably -- state this caveat rather than a verdict."]
+            fact = f"[derived] Read receipts cover {pct}% of {side} ({got}/{tot})"
+            med = r2r.get("median_deliberation_seconds")
+            # The read->reply medians measure MY replies to messages I read, so
+            # they only bear on the "do I leave them on read" side.
+            if not about_me and isinstance(med, (int, float)):
+                fact += (f"; you reply a median of {med}s after reading "
+                         f"({r2r.get('pairs', 0)} read->reply pairs)")
+            return [fact + ". Only read-and-replied pairs are recorded -- a "
+                    "read-but-never-answered count is not available, so report "
+                    "what is measured, not a left-on-read verdict."]
     # Long conversations vs quick bursts.
     if re.search(r"\b(long conversations|quick bursts|bursts)\b", q):
         sess = result.get("sessions")
@@ -1256,11 +1346,13 @@ def _derive_response_facts(result, question=""):
             shape = "longer conversations" if med >= 8 else "quick bursts"
             return [f"[derived] {sess.get('count')} conversation sessions, median "
                     f"{med} messages each -> {shape}."]
-    # Ghosted / never replied.
+    # Ghosted / never replied. only_me lives under the "ghosted" section (a count of
+    # one-sided sessions), NOT "sessions" (which has no such field).
     if re.search(r"\b(ghost|not repl|never repl)", q):
-        sess = result.get("sessions")
-        only_me = sess.get("only_me") if isinstance(sess, dict) else None
+        ghost = result.get("ghosted")
+        only_me = ghost.get("only_me") if isinstance(ghost, dict) else None
         if only_me is not None:
+            sess = result.get("sessions") or {}
             return [f"[derived] {only_me} conversation(s) you started got no reply at "
                     f"all (out of {sess.get('count', '?')} sessions)."]
     # Default: reply-latency comparison.
@@ -1282,6 +1374,13 @@ def _derive_response_facts(result, question=""):
         # model quote the wrong side (S2.2). The answer is a single figure.
         return [f"[derived] The other person takes a median of {them_med}s to reply "
                 f"to you{p90}."]
+    # The reply-latency verdict must answer only a reply-SPEED question -- a question
+    # that reached this tool for another reason (double-text, a future intent) would
+    # otherwise get a bogus "who replies faster" fact. Gate it, but only when a
+    # question is present (a no-question call keeps the default -- production always
+    # supplies one, so this affects tests/edge callers only).
+    if q and not _REPLY_SPEED_RE.search(q):
+        return []
     if me_med < them_med:
         verdict = "you reply faster (lower median reply time)"
     elif them_med < me_med:
@@ -1561,9 +1660,11 @@ def _derive_summary_stats_facts(result, question=""):
         if not rows:
             return []
         top = max(rows, key=lambda r: r.get("message_count") or 0)
+        # A derived fact ends the loop, so no follow-up call can resolve the id
+        # to a name -- present the id honestly instead of asking the model to.
         return [f"[derived] Your highest-volume thread is chat_id={top.get('chat_id')} "
-                f"with {top.get('message_count')} messages -- resolve this chat_id to a "
-                f"name before reporting who."]
+                f"with {top.get('message_count')} messages (a chat id -- the thread's "
+                f"name is not in this result)."]
     if not isinstance(result, dict):
         return []
     if re.search(r"\b(photo|picture|image|attachment)", q):
@@ -1623,8 +1724,7 @@ def _derive_conflict_facts(result, question=""):
     if total is None or not isinstance(rows, list):
         return []
     if total == 0 or not rows:
-        return ["[derived] No tense stretches / conflicts were detected in this thread. "
-                "Do not manufacture one."]
+        return ["[derived] No tense stretches / conflicts were detected in this thread."]
     top = rows[0] if isinstance(rows[0], dict) else {}
     signals = top.get("signals")
     sig = ", ".join(map(str, signals)) if isinstance(signals, list) else "?"
@@ -1654,6 +1754,15 @@ def _compose_no_fault_answer(scratchpad):
     conflict = next((f for f in scratchpad if "tense stretch" in f.lower()), None)
     if conflict is None:
         return None
+    # No conflict was found: nothing to assign a start/fault to. Compose a clean
+    # reply rather than splicing the negative fact into "what the signals show".
+    if "no tense stretch" in conflict.lower():
+        return (
+            "I couldn't find any tense stretches or conflicts in this thread, so "
+            "there's nothing to assign a start or fault to — and I wouldn't guess "
+            "even if there were. These signals are a text-only read (reply gaps, "
+            "one-sided sessions, tapbacks) that can't see calls, tone, or in-person "
+            "context, so treat their absence as reassuring but not definitive.")
     body = conflict.split("]", 1)[-1].strip() if conflict.startswith("[") else conflict
     body = body.split("These signals do NOT")[0].strip().rstrip(".")
     return (
@@ -1748,16 +1857,21 @@ def run_turn(messages, show_model_header=True, model=None):
             args = _fill_args(action, question, summary, scratchpad)
         result = _execute(chat, action, args, seen_calls, wb_state)
         # A forced (deterministically-routed) tool is the RIGHT tool; when the FM
-        # arg-filler decorates it with a spurious filter/subject that errors it
-        # (e.g. get_voiceprint subject='them' with no person, a hallucinated enum),
-        # retry once with tool defaults so the correct tool still answers rather
-        # than the loop falling through to search/refusal. NOT for a code-filled
-        # scope (contact_id/chat_id): dropping it would recompute whole-corpus stats
-        # and misattribute them to the named person/group -- the confabulation the
-        # unresolved-name guard prevents.
+        # arg-filler decorates it with a spurious shape arg that errors it (an
+        # unsupported is_from_me/granularity value), retry once with only the
+        # grounded/asked-for args (_RETRY_KEEP_KEYS) so the correct tool still
+        # answers rather than the loop falling through to search/refusal. Never
+        # shed a kept arg: a grounded contact_id or an asked-for date/filter is
+        # part of the question, and dropping it would answer a different one
+        # (whole-corpus stats misattributed to the named person -- the same
+        # confabulation the code-filled-scope and unresolved-name guards prevent).
+        # NOT for a code-filled scope (contact_id/chat_id): that call carried the
+        # scope alone, so there is nothing sheddable by construction.
         if (forced and args and not code_filled_scope
                 and isinstance(result, dict) and result.get("error")):
-            result = _execute(chat, action, {}, seen_calls, wb_state)
+            kept = {k: v for k, v in args.items() if k in _RETRY_KEEP_KEYS}
+            if kept != args:  # only retry when a shape arg can actually be shed
+                result = _execute(chat, action, kept, seen_calls, wb_state)
         derived = []
         if not _is_dud(result):  # never let a duplicate/error note enter the scratchpad
             derived = _derive_summary_facts(action, result, question)
