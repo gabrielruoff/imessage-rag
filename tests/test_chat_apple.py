@@ -310,6 +310,24 @@ class BackoffAndIntentTest(AppleChatTest):
         self.assertEqual(executed, [{"contact_id": 168}])
         self.assertEqual(fake.fill_calls, 0)
 
+    def test_forced_contact_scoped_error_does_not_retry_without_scope(self):
+        # A CODE-filled contact scope must not be dropped on error: retrying with {}
+        # would recompute whole-corpus stats and misattribute them to the person.
+        config.APPLE_MAX_TOOL_ITERATIONS = 8
+        config.APPLE_NO_PROGRESS_LIMIT = 2
+        self.stub_tool("search_contacts_by_name",
+                       lambda **kw: [{"id": 168, "first_name": "Jill", "handles": []}])
+        self.stub_tool("list_chats", lambda **kw: [{"id": 43, "is_group": 0}])
+        calls = []
+        self.stub_tool("get_milestones",
+                       lambda **kw: calls.append(kw) or {"error": "boom"})
+        self.install(ScriptedRespond(
+            route_actions=["answer"], answer_chunks=("couldn't find it",)))
+        chat_apple.run_turn(
+            [{"role": "user", "content": "When did Jill and I first text?"}])
+        # Exactly one call, WITH the scope -- no {} whole-corpus retry.
+        self.assertEqual(calls, [{"contact_id": 168}])
+
     def test_forced_group_intent_fills_group_chat_id_from_preresolution(self):
         # A named GROUP + a group-scoped intent: list_chats resolves the group name
         # to its chat_id, which is injected in code (get_group_dynamics errors

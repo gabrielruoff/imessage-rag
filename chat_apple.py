@@ -1737,10 +1737,13 @@ def run_turn(messages, show_model_header=True, model=None):
             break
         scope = _primary_contact(resolved) if forced else None
         group_scope = group_ids[0] if (forced and len(group_ids) == 1) else None
+        code_filled_scope = False
         if forced and action in _CONTACT_SCOPED_INTENT_TOOLS and scope is not None:
             args = {"contact_id": scope}  # fill the scope in code, not via the FM
+            code_filled_scope = True
         elif forced and action in _GROUP_SCOPED_INTENT_TOOLS and group_scope is not None:
             args = {"chat_id": group_scope}  # fill the group chat_id deterministically
+            code_filled_scope = True
         else:
             args = _fill_args(action, question, summary, scratchpad)
         result = _execute(chat, action, args, seen_calls, wb_state)
@@ -1748,8 +1751,12 @@ def run_turn(messages, show_model_header=True, model=None):
         # arg-filler decorates it with a spurious filter/subject that errors it
         # (e.g. get_voiceprint subject='them' with no person, a hallucinated enum),
         # retry once with tool defaults so the correct tool still answers rather
-        # than the loop falling through to search/refusal.
-        if (forced and args and isinstance(result, dict) and result.get("error")):
+        # than the loop falling through to search/refusal. NOT for a code-filled
+        # scope (contact_id/chat_id): dropping it would recompute whole-corpus stats
+        # and misattribute them to the named person/group -- the confabulation the
+        # unresolved-name guard prevents.
+        if (forced and args and not code_filled_scope
+                and isinstance(result, dict) and result.get("error")):
             result = _execute(chat, action, {}, seen_calls, wb_state)
         derived = []
         if not _is_dud(result):  # never let a duplicate/error note enter the scratchpad
