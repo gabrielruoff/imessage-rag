@@ -192,6 +192,74 @@ class CheckCaseFixtureTest(unittest.TestCase):
         self.assertTrue(any("_scope" in d for d in expected["arg_diffs"]))
 
 
+class AppleTranscriptTest(unittest.TestCase):
+    """The Apple staged path (chat_apple.py) records tool calls in round_trips,
+    not messages[*].tool_calls, and keeps no tool-role messages -- so the checker
+    must read routing and the numeric/faithfulness source from round_trips."""
+
+    def _apple_transcript(self, tool_calls, reply):
+        # An Apple transcript: assistant messages carry no tool_calls; the calls
+        # (with captured results) live on round_trips.
+        return {
+            "corpus_fingerprint": FIXTURE["corpus_fingerprint"],
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": reply},
+            ],
+            "turn_boundaries": [{"turn": 1, "user_index": 1, "final_reply_index": 2}],
+            "round_trips": [
+                {"turn": 1, "duration_s": 0.0, "tool_calls": [tc]} for tc in tool_calls
+            ],
+            "final_reply": reply,
+            "run_id": "apple-test",
+            "status": "ok",
+        }
+
+    def test_routing_reads_round_trips_when_messages_have_no_tool_calls(self):
+        t = self._apple_transcript(
+            [{"name": "get_activity_patterns",
+              "arguments": {"contact_id": 12, "granularity": "month",
+                            "date_from": "2025-01-01", "date_to": "2026-01-01"}}],
+            "In 2025 you and Alice exchanged 431 texts in March.",
+        )
+        result = checks.check_case(FIXTURE_CASE, t, MANIFEST)
+        self.assertEqual(result["routing"]["auto"], "pass")
+        self.assertEqual(result["routing"]["called"], ["get_activity_patterns"])
+
+    def test_wrong_tool_in_round_trips_fails_routing(self):
+        t = self._apple_transcript(
+            [{"name": "search_messages_fts", "arguments": {"query": "beach"}}],
+            "I couldn't determine that.",
+        )
+        result = checks.check_case(FIXTURE_CASE, t, MANIFEST)
+        self.assertEqual(result["routing"]["auto"], "fail")
+
+    def test_captured_result_feeds_numeric_and_faithfulness(self):
+        t = self._apple_transcript(
+            [{"name": "get_activity_patterns",
+              "arguments": {"contact_id": 12, "granularity": "month"},
+              "result": json.dumps({"total": 1234})}],
+            "You exchanged 1,234 texts total, and 999 in some invented month.",
+        )
+        result = checks.check_case(FIXTURE_CASE, t, MANIFEST)
+        # 1234 is sourced from the captured result; 999 is not.
+        self.assertTrue(result["numeric"]["values"]["total"]["found_in_tool_results"])
+        confab = result["unsupported_numbers"]["numbers_in_reply_not_in_tool_results"]
+        self.assertIn("999", confab)
+        self.assertNotIn("1,234", confab)
+
+    def test_removed_tool_in_round_trips_is_banned(self):
+        t = self._apple_transcript(
+            [{"name": "get_conversation_dynamics", "arguments": {}}],
+            "answer",
+        )
+        result = checks.check_case(FIXTURE_CASE, t, MANIFEST)
+        self.assertEqual(result["routing"]["auto"], "fail")
+        self.assertIn("get_conversation_dynamics",
+                      result["routing"]["banned_anywhere_hits"])
+
+
 def _probe_transcript(messages):
     transcript = copy.deepcopy(FIXTURE)
     transcript["messages"] = messages

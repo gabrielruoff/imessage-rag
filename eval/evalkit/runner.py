@@ -20,6 +20,10 @@ from .manifest import (
     write_json_atomic,
 )
 
+# Cap on each captured Apple tool result attached to a round trip (advisory
+# numeric/faithfulness source only -- the digested facts, not this, drive the model).
+_RESULT_CAPTURE_MAX_CHARS = 20000
+
 # Config knobs snapshotted into every transcript (plan §1).
 CONFIG_KNOBS = (
     "CHAT_MODEL", "MAX_TOOL_ITERATIONS", "TOOL_RESULT_MAX_CHARS", "CHAT_TIMEOUT",
@@ -154,7 +158,23 @@ def _install_recorder(chat_mod):
             "tool_calls": [{"name": name, "arguments": arguments}],
         })
 
+    # Post-exec companion: attach the captured result to the round trip
+    # apple_recorder just appended (same tool, in order) so checks.extract_tool_calls
+    # / _tool_text have a source. Capped and JSON-serialized; a match on the last
+    # round lacking a result keeps it robust if the order ever drifts.
+    def apple_result_recorder(name, result):
+        try:
+            payload = json.dumps(result, default=str)[:_RESULT_CAPTURE_MAX_CHARS]
+        except (TypeError, ValueError):
+            payload = str(result)[:_RESULT_CAPTURE_MAX_CHARS]
+        for rt in reversed(state["rounds"]):
+            calls = rt.get("tool_calls") or []
+            if calls and calls[0].get("name") == name and "result" not in calls[0]:
+                calls[0]["result"] = payload
+                return
+
     chat_apple._recorder = apple_recorder
+    chat_apple._result_recorder = apple_result_recorder
     return state
 
 
@@ -252,6 +272,7 @@ def cmd_run(args):
 
     import http.client
 
+    import applefm  # for its transient-shim-error type (apple backend retry)
     import chat
     import ollama
     import progress  # imports config -- must stay below the env block above
@@ -328,7 +349,8 @@ def cmd_run(args):
                             chat, state, case, turns, model, args.case_timeout
                         )
                         break
-                    except (OSError, http.client.HTTPException, ollama.OllamaResponseError) as e:
+                    except (OSError, http.client.HTTPException, ollama.OllamaResponseError,
+                            applefm.AppleFMError) as e:
                         print(f"{cid}: transport error ({e}), attempt {attempt}")
                         if attempt == 2:
                             status, messages, boundaries, reply = "transport_error", [], [], ""

@@ -23,7 +23,14 @@ ISO_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 def extract_tool_calls(transcript):
     """Flatten the transcript into [{name, arguments, turn, result, msg_index}].
     Assistant messages carry tool_calls; the following len(tool_calls) tool
-    messages are their results, in order (run_turn appends them that way)."""
+    messages are their results, in order (run_turn appends them that way).
+
+    The Apple staged path (chat_apple.py) never populates `messages[*].tool_calls`
+    -- it round-trips the FM shim directly and digests each tool result out of
+    `messages` entirely -- so when no Ollama-shape calls are present we fall back
+    to `round_trips[*].tool_calls` (which the runner also records for that path,
+    optionally carrying a captured `result`). Without this fallback every Apple
+    routing verdict is a false `fail` and every reply number looks unsupported."""
     messages = transcript.get("messages") or []
     boundaries = transcript.get("turn_boundaries") or []
 
@@ -46,6 +53,19 @@ def extract_tool_calls(transcript):
                 "result": result_msg.get("content") if result_msg.get("role") == "tool" else None,
                 "msg_index": i,
             })
+    if calls:
+        return calls
+    # Apple staged path: calls live in round_trips, not messages.
+    for rt in transcript.get("round_trips") or []:
+        turn = rt.get("turn", 1)
+        for call in rt.get("tool_calls") or []:
+            calls.append({
+                "name": call.get("name"),
+                "arguments": call.get("arguments") or {},
+                "turn": turn,
+                "result": call.get("result"),
+                "msg_index": None,
+            })
     return calls
 
 
@@ -58,11 +78,21 @@ def _assistant_text(transcript):
 
 
 def _tool_text(transcript):
-    return "\n".join(
+    parts = [
         m.get("content") or ""
         for m in transcript.get("messages") or []
         if m.get("role") == "tool"
-    )
+    ]
+    # Apple path keeps no tool-role messages; captured results (when the runner
+    # recorded them) ride on round_trips instead -- fold them in so the numeric /
+    # unsupported-number checks have a source to test the reply against.
+    for rt in transcript.get("round_trips") or []:
+        for call in rt.get("tool_calls") or []:
+            result = call.get("result")
+            if result:
+                parts.append(result if isinstance(result, str)
+                             else json.dumps(result, default=str))
+    return "\n".join(parts)
 
 
 # --- args_contains matching (plan §3.2 value forms) --------------------------
@@ -452,7 +482,10 @@ def check_case(case, transcript, manifest_doc):
     expected = [match_expect(te, calls, roster) for te in expect.get("tools", [])]
     called = [c["name"] for c in calls]
     banned_called = sorted({n for n in called if n in expect.get("banned_tools", [])})
-    serialized = json.dumps(transcript.get("messages") or [])
+    # Include round_trips so the Apple path (no tool calls in `messages`) is
+    # scanned too -- a REMOVED_TOOLS name surfaces there, not in `messages`.
+    serialized = json.dumps(transcript.get("messages") or []) + json.dumps(
+        transcript.get("round_trips") or [])
     # REMOVED_TOOLS resurfacing is a run-level failure no matter which case it
     # happens in (test-plan rule), so every transcript is scanned, not just
     # cases that declare banned_anywhere.

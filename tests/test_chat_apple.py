@@ -246,7 +246,10 @@ class BackoffAndIntentTest(AppleChatTest):
         self.stub_tool("get_chat_summary_stats",
                        lambda **kw: executed.append(kw) or {"message_count": 42})
         # The router queue would say "answer" first -- but the intent rule forces
-        # get_chat_summary_stats as iteration 0 BEFORE any _route call.
+        # get_chat_summary_stats as iteration 0 BEFORE any _route call. Its result
+        # is a structured aggregate, so _derive_summary_facts computes the answer
+        # in code and ENDS the loop (no second route call) -- the derive-and-stop
+        # contract that keeps the small model from confabulating over the result.
         fake = self.install(ScriptedRespond(
             route_actions=["answer"], fill_args={}, answer_chunks=("42 total",),
         ))
@@ -254,9 +257,37 @@ class BackoffAndIntentTest(AppleChatTest):
             [{"role": "user", "content": "how many total messages do I have?"}])
         self.assertEqual(reply, "42 total")
         self.assertEqual(len(executed), 1)          # the forced tool ran
-        self.assertEqual(fake.route_calls, 1)       # only the SECOND step routed
+        self.assertEqual(fake.route_calls, 0)       # derived fact ended the loop
         self.assertEqual(fake.fill_calls, 1)        # filled the forced tool
-        self.assertIn("message_count", fake.prompts[-1])  # its result reached answer
+        # The code-derived fact (not the raw result) reached the answer prompt.
+        self.assertIn("42 messages", fake.prompts[-1])
+        self.assertIn("[derived]", fake.prompts[-1])
+
+    def test_forced_action_retries_with_defaults_when_fill_arg_errors(self):
+        # The FM arg-filler decorates the forced tool with a spurious filter that
+        # errors it; the loop must retry the (correct) tool with defaults rather
+        # than fall through to search/refusal.
+        config.APPLE_MAX_TOOL_ITERATIONS = 8
+        config.APPLE_NO_PROGRESS_LIMIT = 2
+        calls = []
+
+        def reaction_tool(**kw):
+            calls.append(kw)
+            if kw:  # spurious FILL arg (survives grounding) -> error
+                return {"error": "bad filter"}
+            return {"given": {"by_type": {"like": 6879, "laugh": 1998}}}
+        self.stub_tool("get_reaction_stats", reaction_tool)
+        # is_from_me is a shape arg _ground_args keeps (not an enum narrowing), so
+        # it reaches the tool and errors -- exercising the retry-on-error path.
+        fake = self.install(ScriptedRespond(
+            route_actions=["answer"], fill_args={"is_from_me": True},
+            answer_chunks=("You use Liked most.",)))
+        chat_apple.run_turn(
+            [{"role": "user", "content": "which tapback do I use the most?"}])
+        # First call carried the bad arg; the retry ran with {} and succeeded.
+        self.assertEqual(calls, [{"is_from_me": True}, {}])
+        # The deriver over the defaults result reached the answer prompt.
+        self.assertIn("Liked", fake.prompts[-1])
 
     def test_forced_contact_scoped_intent_fills_scope_deterministically(self):
         # A named person + a contact-scoped intent: the resolved contact_id is
@@ -277,6 +308,43 @@ class BackoffAndIntentTest(AppleChatTest):
         # contact_id filled from pre-resolution, NOT a fabricated/ conflated id;
         # no model fill call was needed for the forced step.
         self.assertEqual(executed, [{"contact_id": 168}])
+        self.assertEqual(fake.fill_calls, 0)
+
+    def test_forced_contact_scoped_error_does_not_retry_without_scope(self):
+        # A CODE-filled contact scope must not be dropped on error: retrying with {}
+        # would recompute whole-corpus stats and misattribute them to the person.
+        config.APPLE_MAX_TOOL_ITERATIONS = 8
+        config.APPLE_NO_PROGRESS_LIMIT = 2
+        self.stub_tool("search_contacts_by_name",
+                       lambda **kw: [{"id": 168, "first_name": "Jill", "handles": []}])
+        self.stub_tool("list_chats", lambda **kw: [{"id": 43, "is_group": 0}])
+        calls = []
+        self.stub_tool("get_milestones",
+                       lambda **kw: calls.append(kw) or {"error": "boom"})
+        self.install(ScriptedRespond(
+            route_actions=["answer"], answer_chunks=("couldn't find it",)))
+        chat_apple.run_turn(
+            [{"role": "user", "content": "When did Jill and I first text?"}])
+        # Exactly one call, WITH the scope -- no {} whole-corpus retry.
+        self.assertEqual(calls, [{"contact_id": 168}])
+
+    def test_forced_group_intent_fills_group_chat_id_from_preresolution(self):
+        # A named GROUP + a group-scoped intent: list_chats resolves the group name
+        # to its chat_id, which is injected in code (get_group_dynamics errors
+        # without a group scope, so this is what stops the S6 confabulation).
+        config.APPLE_MAX_TOOL_ITERATIONS = 8
+        config.APPLE_NO_PROGRESS_LIMIT = 2
+        self.stub_tool("search_contacts_by_name", lambda **kw: [])  # not a person
+        self.stub_tool("list_chats", lambda **kw:
+                       [{"id": 990, "display_name": "Real Tahoe", "is_group": 1}]
+                       if kw.get("query") else [])
+        executed = []
+        self.stub_tool("get_group_dynamics", lambda **kw:
+                       executed.append(kw) or {"members": [{"member": "Me", "share": 0.30}]})
+        fake = self.install(ScriptedRespond(
+            route_actions=["answer"], answer_chunks=("Me carries it.",)))
+        chat_apple.run_turn([{"role": "user", "content": "Who carries Real Tahoe?"}])
+        self.assertEqual(executed, [{"chat_id": 990}])  # group scope filled in code
         self.assertEqual(fake.fill_calls, 0)
 
 
@@ -374,6 +442,114 @@ class DeriveSummaryFactsTest(unittest.TestCase):
         self.assertEqual(
             chat_apple._derive_summary_facts("get_milestones", result,
                                              "what was our 10,000th message?"), [])
+
+
+class DeriveAggregateFactsTest(unittest.TestCase):
+    """P2: every specialized aggregate routes through a deriver so the reply
+    narrates a code-computed fact instead of confabulating over the raw result."""
+
+    def d(self, name, result, q=""):
+        return chat_apple._derive_summary_facts(name, result, q)
+
+    def test_reaction_top_tapback_named_not_numbered(self):
+        r = {"given": {"by_type": {"like": 6879, "love": 3469, "emphasize": 6342}}}
+        facts = self.d("get_reaction_stats", r, "which tapback do I use the most?")
+        self.assertIn("Liked", facts[0])       # the label, not "6879"
+        self.assertIn("6879", facts[0])
+
+    def test_reaction_hall_of_fame_quotes_the_real_message(self):
+        r = {"hall_of_fame": [{"sender": "Matt", "text": "Cumdinger",
+                               "date": "2026-06-18", "reaction_count": 3}]}
+        facts = self.d("get_reaction_stats", r, "which message got the most reactions?")
+        self.assertIn("Cumdinger", facts[0])
+        self.assertIn("3 reactions", facts[0])
+
+    def test_word_frequency_is_verbatim_from_rows(self):
+        r = {"rows": [{"ngram": "want to", "count": 3071}, {"ngram": "going to", "count": 2988}],
+             "ngram": 2, "messages_scanned": 100}
+        facts = self.d("get_word_frequency", r, "two-word phrases I say most")
+        self.assertIn("want to (3071)", facts[0])
+        self.assertIn("phrases", facts[0])
+
+    def test_word_trends_phrase_direction(self):
+        r = {"phrase_trend": {"phrase": "sweet", "total_messages": 2647,
+             "series": [{"period": "2022", "me": 300, "them": 25},
+                        {"period": "2026", "me": 130, "them": 32}]}}
+        facts = self.d("get_word_trends", r, "use of the word sweet over the years")
+        self.assertIn("sweet", facts[0])
+        self.assertIn("falling", facts[0])
+
+    def test_group_top_member_and_gini(self):
+        r = {"members": [{"member": "Me", "is_me": True, "share": 0.301}],
+             "gini": {"gini": 0.20}}
+        facts = self.d("get_group_dynamics", r, "who carries Real Tahoe?")
+        self.assertIn("Me carries", facts[0])
+        self.assertIn("fairly balanced", facts[0])
+
+    def test_voiceprint_low_confidence_is_flagged(self):
+        r = {"confidence": "low", "n_messages": 33,
+             "features": {"lowercase_ratio": 0.9, "burst_size": 1.5}, "openers": [], "closers": []}
+        facts = self.d("get_voiceprint", r, "voiceprint with Jenna")
+        self.assertIn("low confidence", facts[0])
+        self.assertIn("tentatively", facts[0])
+
+    def test_participant_reactions_per_message_applies_floor(self):
+        r = [{"participant": "Me", "messages_sent": 10, "reactions_received": 8},   # below floor
+             {"participant": "Teddy", "messages_sent": 51, "reactions_received": 14},
+             {"participant": "Owen", "messages_sent": 21, "reactions_received": 9}]
+        facts = self.d("get_chat_participant_stats", r,
+                       "who gets the most reactions per message among people with at least 20 messages?")
+        self.assertIn("Owen", facts[0])        # 9/21=0.43 beats Teddy 14/51=0.27; Me excluded
+        self.assertNotIn("Me", facts[0])
+
+    def test_conflict_zero_says_none_and_does_not_manufacture(self):
+        facts = self.d("find_conflicts", {"total_matching": 0, "rows": []},
+                       "have Jenna and I ever had a fight?")
+        self.assertIn("No tense stretches", facts[0])
+
+    def test_conflict_never_infers_fault(self):
+        r = {"total_matching": 318, "rows": [{"first_date": "2026-05-27",
+             "signals": ["latency_withdrawal"], "corroboration": "llm"}]}
+        facts = self.d("find_conflicts", r, "who started more of the arguments?")
+        self.assertIn("318", facts[0])
+        self.assertIn("do NOT identify who was at fault", facts[0])
+
+    def test_fault_question_answer_is_code_composed_no_blame(self):
+        sp = ['[derived] 318 tense stretch(es) detected (deterministic text-only '
+              'signals, not confirmed fights). The strongest: around 2026-05-27, '
+              'signals: latency_withdrawal. These signals do NOT identify who was at '
+              'fault or who started it.']
+        out = chat_apple._compose_no_fault_answer(sp)
+        self.assertIn("can't say who started", out.lower())
+        self.assertIn("318 tense stretch", out)     # relays the count
+        self.assertNotIn("[derived]", out)           # no scaffolding leaks
+        # No conflict fact gathered -> falls back to the normal answer path.
+        self.assertIsNone(chat_apple._compose_no_fault_answer(["nothing here"]))
+        # The trigger fires on the fault phrasings, not on a neutral conflict ask.
+        self.assertTrue(chat_apple._FAULT_QUESTION_RE.search("who started the fight?"))
+        self.assertTrue(chat_apple._FAULT_QUESTION_RE.search("whose fault was it?"))
+        self.assertFalse(chat_apple._FAULT_QUESTION_RE.search(
+            "have we had any rough patches?"))
+
+    def test_conflict_defers_for_apology_only(self):
+        # Apology defers (draft_apology needs the conflict_id downstream); a
+        # diagnosis ask grounds instead of deferring (the model won't reliably
+        # chain to diagnose_conflict, so a grounded summary beats digest confab).
+        r = {"total_matching": 318, "rows": [{"first_date": "2026-05-27", "signals": []}]}
+        self.assertEqual(self.d("find_conflicts", r, "help me write an apology"), [])
+        facts = self.d("find_conflicts", r, "break down the tensest stretch")
+        self.assertTrue(facts and "318" in facts[0])
+
+    def test_loose_threads_empty_says_none(self):
+        self.assertIn("No open loose threads",
+                      self.d("get_loose_threads", [], "anyone I owe a reply?")[0])
+
+    def test_activity_late_night_names_top_contact(self):
+        r = {"late_night": {"n": 54141, "start_hour": 0, "end_hour": 5, "share": 0.1547,
+             "top_contacts": [{"contact": "Callie", "late_night": 610}]}}
+        facts = self.d("get_activity_patterns", r, "how much do I text after midnight?")
+        self.assertIn("54141", facts[0])
+        self.assertIn("Callie", facts[0])
 
 
 class BadRouteTest(AppleChatTest):
@@ -522,6 +698,37 @@ class GroundArgsTest(unittest.TestCase):
         self.assertEqual(out, {"contact_id": 7})
         out = chat_apple._ground_args({"contact_id": 7}, "q", "earlier we found contact_id 7", [])
         self.assertEqual(out, {"contact_id": 7})
+
+    def test_invented_enum_filter_dropped_kept_when_asked(self):
+        def g(a, q):
+            return chat_apple._ground_args(a, q, "", [])
+        # A hallucinated kind that empties the tool -> dropped; limit survives.
+        self.assertEqual(g({"limit": 5, "kind": "loose_threads", "status": "open"},
+                           "anyone I owe a reply to?"), {"limit": 5})
+        # A spurious reaction_type / voiceprint subject -> dropped.
+        self.assertEqual(g({"reaction_type": "laugh"}, "which tapback do I use most?"), {})
+        self.assertEqual(g({"scope": "all", "subject": "them"},
+                           "describe my texting style"), {"scope": "all"})
+        # ... but a genuinely-asked narrowing survives.
+        self.assertEqual(g({"reaction_type": "laugh"}, "how many laugh reactions?"),
+                         {"reaction_type": "laugh"})
+        # Shape args (ngram/is_from_me) are never grounded -- '2' won't match "two-word".
+        self.assertEqual(g({"ngram": 2, "is_from_me": True}, "two-word phrases I say most"),
+                         {"ngram": 2, "is_from_me": True})
+
+
+class StripScratchpadTagsTest(unittest.TestCase):
+    def test_strips_leaked_provenance_lines_only(self):
+        t = ('**[resolved] "Jill" -> contact_id=168**\n'
+             '[derived] 1 tense stretch detected.\n\nThe pattern was volume collapse.')
+        out = chat_apple._strip_scratchpad_tags(t)
+        self.assertNotIn("[resolved]", out)
+        self.assertNotIn("[derived]", out)
+        self.assertIn("volume collapse", out)   # ordinary prose kept
+
+    def test_no_tags_is_a_noop(self):
+        t = "You reply faster than Jill."
+        self.assertEqual(chat_apple._strip_scratchpad_tags(t), t)
 
 
 class ExtractNamesTest(unittest.TestCase):
