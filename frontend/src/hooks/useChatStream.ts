@@ -64,6 +64,12 @@ export function useChatStream() {
       abortRef.current = controller
       let resolvedId = conversationId
       let finalReply: string | null = null
+      // Whether an `epilogue` frame arrived this turn. If it did, `done.reply`
+      // has the support block folded in (that folding is for the CLI/eval return
+      // value), so we must NOT adopt it over the streamed tokens -- the epilogue
+      // already renders as its own distinct callout and would otherwise show
+      // twice. See the epilogue/done handling below.
+      let gotEpilogue = false
 
       try {
         const res = await fetch('/api/chat', {
@@ -106,6 +112,7 @@ export function useChatStream() {
               }))
               break
             case 'epilogue':
+              gotEpilogue = true
               patch((m) => ({ ...m, epilogue: ev.text }))
               break
             case 'retry':
@@ -121,13 +128,16 @@ export function useChatStream() {
           }
         }
 
-        // `done.reply` is authoritative (buffered wellbeing turns arrive whole).
+        // `done.reply` is authoritative (buffered wellbeing turns arrive whole)
+        // -- EXCEPT when an epilogue was folded into it: there the streamed
+        // tokens already hold the model body without the block, and the epilogue
+        // renders separately, so adopting done.reply would duplicate the block.
         patch((m) =>
           m.status === 'error'
             ? m
             : {
                 ...m,
-                content: finalReply ?? m.content,
+                content: gotEpilogue ? m.content : (finalReply ?? m.content),
                 status: 'done',
               },
         )

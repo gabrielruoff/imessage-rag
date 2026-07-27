@@ -19,7 +19,10 @@ function ThemeToggle() {
       {theme === 'dark' ? (
         <svg viewBox="0 0 24 24" className="h-[18px] w-[18px]" aria-hidden>
           <path
-            fill="currentColor"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
             d="M12 4V2m0 20v-2m8-8h2M2 12h2m13.66 5.66 1.41 1.41M4.93 4.93l1.41 1.41m0 11.32-1.41 1.41M19.07 4.93l-1.41 1.41M12 7a5 5 0 1 0 0 10 5 5 0 0 0 0-10Z"
           />
         </svg>
@@ -49,7 +52,7 @@ function HealthDot() {
           data ? (ok ? 'bg-emerald-500' : 'bg-danger') : 'bg-faint',
         )}
       />
-      <span className="max-w-[16rem] truncate font-mono">{data?.model ?? '…'}</span>
+      <span className="max-w-[16rem] truncate text-[11px]">{data?.model ?? '…'}</span>
     </div>
   )
 }
@@ -146,7 +149,7 @@ export default function App() {
             <span className="text-[15px] font-semibold tracking-tight text-ink">
               iMessage RAG
             </span>
-            <span className="hidden font-mono text-[11px] text-faint sm:inline">
+            <span className="hidden text-[11px] text-faint sm:inline">
               local · private
             </span>
           </div>

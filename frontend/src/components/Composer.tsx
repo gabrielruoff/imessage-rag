@@ -46,8 +46,8 @@ export function Composer({
       <div
         className={cn(
           'mx-auto flex max-w-3xl items-end gap-2 rounded-2xl border border-line',
-          'bg-surface px-3 py-2 shadow-sm transition-colors',
-          'focus-within:border-accent/50 focus-within:ring-2 focus-within:ring-accent-soft',
+          'bg-surface px-3 py-2 shadow-sm transition-[border-color,box-shadow]',
+          'focus-within:border-accent/40 focus-within:shadow-[0_0_0_3px_var(--accent-soft)]',
         )}
       >
         <Textarea
@@ -81,7 +81,7 @@ export function Composer({
             className={cn(
               'grid h-9 w-9 shrink-0 place-items-center rounded-xl transition-all',
               'bg-accent text-accent-ink hover:brightness-110 active:brightness-95',
-              'disabled:opacity-40 disabled:hover:brightness-100',
+              'disabled:bg-surface-2 disabled:text-faint disabled:hover:brightness-100',
             )}
           >
             <svg viewBox="0 0 24 24" className="h-[18px] w-[18px]" aria-hidden>
