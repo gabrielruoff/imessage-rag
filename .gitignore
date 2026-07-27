@@ -1,10 +1,10 @@
 .idea/
 data/
 source_data/
-imessage_analysis.db
-imessage_analysis.db-journal
-imessage_analysis.db-wal
-imessage_analysis.db-shm
+imessage_analysis*.db
+imessage_analysis*.db-journal
+imessage_analysis*.db-wal
+imessage_analysis*.db-shm
 .venv/
 
 # compiled Apple Foundation Models shim (build artifact of `make apple-shim`)
