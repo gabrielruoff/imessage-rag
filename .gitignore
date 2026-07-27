@@ -38,3 +38,11 @@ packaging/dist/
 build/
 dist/
 *.spec
+
+# web layer
+frontend/node_modules/
+frontend/dist/
+app.db
+app.db-journal
+app.db-wal
+app.db-shm

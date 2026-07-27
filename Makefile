@@ -354,6 +354,29 @@ wrapped:  ## Year-in-review HTML report (ARGS='--year 2025')
 	@$(REQUIRE_OLLAMA)
 	.venv/bin/python3 wrapped.py $(ARGS)
 
+# --- Web layer (optional API + frontend) -------------------------------------
+# The FastAPI backend (api/) and Vite/React frontend (frontend/) are an optional
+# UI over the same imessage_analysis.db. Deps install separately from the core
+# CLIs -- Python web deps via `make api-install`, JS via `make web-install` --
+# so a plain clone stays offline and minimal. Host/port take env overrides
+# (API_HOST/API_PORT) so the same target serves loopback-only by default.
+.PHONY: api-install api-dev web-install web-dev web-build
+
+api-install:  ## Install the web-API Python deps (requirements-api.txt) into .venv
+	.venv/bin/python -m pip install -r requirements-api.txt
+
+api-dev:  ## Run the FastAPI backend with reload (API_HOST/API_PORT override)
+	.venv/bin/python3 -m uvicorn api.main:app --reload --host $${API_HOST:-127.0.0.1} --port $${API_PORT:-8000}
+
+web-install:  ## Install the frontend npm dependencies
+	npm --prefix frontend install
+
+web-dev:  ## Run the Vite frontend dev server
+	npm --prefix frontend run dev
+
+web-build:  ## Build the frontend for production
+	npm --prefix frontend run build
+
 # --- Analytics eval (evalkit) ------------------------------------------------
 # EVAL_RUN_ID names the results dir under eval/results/; override to re-check or
 # re-report an existing run: `make eval EVAL_RUN_ID=20260717T120000-baseline`.

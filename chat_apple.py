@@ -26,6 +26,7 @@ import json
 import re
 
 import applefm
+import chat_floor  # feature: wellbeing -- the single-sourced floor (arm/strip/dedupe/fold)
 import config
 import tool_schemas
 import wellbeing  # feature: wellbeing -- dependency-free (stats + re), no config/Ollama pulled
@@ -435,16 +436,19 @@ def _fill_args(name, question, summary, scratchpad):
     return _ground_args(data, question, summary, scratchpad)
 
 
-def _execute(chat, name, args, seen_calls, wb_state):
+def _execute(chat, name, args, seen_calls, floor):
     """EXEC stage: run the query_tools function behind `name` locally, reusing
     chat.py's registry. Mirrors chat.run_turn's guards -- an exact-repeat
     (name, args) call is short-circuited to a note rather than re-run, an unknown
     name and any exception both become a digestible {"error": ...}. The executed
     call is echoed to chat.console and offered to the _recorder hook.
 
-    `wb_state` is the per-turn wellbeing dict (see run_turn); this stage applies
-    chat.run_turn's code-level floor before the result is digested (chat.py's
-    equivalent lives inline in its tool loop)."""
+    `floor` is the per-turn chat_floor.TurnFloor (see run_turn); this stage applies
+    chat.run_turn's code-level wellbeing floor before the result is digested via
+    the SAME shared helper the Ollama path uses -- it arms the whole-reply sanitize
+    on get_language_trajectory, collects any reserved `_epilogue`, and strips both
+    `_epilogue` and the duplicate `support_block` from the result the model sees
+    (code-delivery directives, never data to narrate)."""
     call_key = (name, json.dumps(args, sort_keys=True, default=str))
     fn = chat.TOOL_FUNCTIONS.get(name)
     recorded = False
@@ -464,21 +468,9 @@ def _execute(chat, name, args, seen_calls, wb_state):
             result = fn(**args)
         except Exception as e:
             result = {"error": str(e)}
-    # --- feature: wellbeing (parity with chat.run_turn) ---
-    # (a) Once get_language_trajectory has run this turn, arm the whole-reply
-    # condition-name sanitize for the answer stream. (b) Pull any tool's reserved
-    # `_epilogue` (the code-emitted support block) into wb_state and strip it --
-    # AND the duplicate `support_block` -- from the result BEFORE it is digested,
-    # so neither the crisis directive nor its text reaches the model's context or
-    # gets narrated as data. Both are code-delivery directives, not data.
-    if name == "get_language_trajectory":
-        wb_state["sanitize"] = True
-    if isinstance(result, dict) and isinstance(result.get("_epilogue"), str) \
-            and result["_epilogue"].strip():
-        wb_state["epilogues"].append(result["_epilogue"])
-        result = {k: v for k, v in result.items()
-                  if k not in ("_epilogue", "support_block")}
-    # --- end feature: wellbeing ---
+    # feature: wellbeing (parity with chat.run_turn) -- arm sanitize + strip the
+    # epilogue/support_block via the single-sourced floor, BEFORE digest.
+    result = floor.note_tool(name, result)
     # Offer the (wellbeing-stripped) result to the eval capture hook, only for a
     # genuinely executed call (a duplicate/unknown made no round trip to attach
     # to). Mirrors the pre-exec _recorder so the two align 1:1 by order.
@@ -674,18 +666,17 @@ def _answer(chat, question, summary, scratchpad, show_model_header, model,
     return ""
 
 
-def _emit_epilogues(chat, reply, epilogues):
-    """Print each collected epilogue verbatim after the reply and fold it into
-    the returned string (so `chat.py -p` and evalkit transcripts capture the
-    code-emitted support text), mirroring chat.run_turn._emit_epilogues. A no-op
-    when nothing was collected, so non-wellbeing turns are byte-for-byte
-    unchanged. Identical epilogues are de-duplicated (order preserved)."""
-    if not epilogues:
-        return reply
-    block = "\n\n".join(dict.fromkeys(epilogues))
-    chat.console.print()
-    chat.console.print(block, markup=False)
-    return f"{reply}\n\n{block}" if reply else block
+def _emit_epilogues(chat, reply, floor):
+    """Print the collected epilogue block verbatim after the reply and fold it
+    into the returned string (so `chat.py -p` and evalkit transcripts capture the
+    code-emitted support text), mirroring chat.run_turn's epilogue handling. A
+    no-op when nothing was collected, so non-wellbeing turns are byte-for-byte
+    unchanged. Dedupe + folding live in the shared chat_floor.TurnFloor."""
+    block = floor.epilogue_block()
+    if block:
+        chat.console.print()
+        chat.console.print(block, markup=False)
+    return floor.fold_epilogues(reply)
 
 
 # --- Deterministic name->id pre-resolution (before the staged loop) ----------
@@ -1831,10 +1822,10 @@ def run_turn(messages, show_model_header=True, model=None):
         chat.console.print(f"  [route] intent -> {first_action}", style="dim cyan",
                            markup=False)
     # Per-turn wellbeing floor, carried through _execute (parity with
-    # chat.run_turn): `sanitize` arms the whole-reply condition-name scrub once
-    # get_language_trajectory has run; `epilogues` collects code-emitted support
-    # blocks to print verbatim after the reply.
-    wb_state = {"sanitize": False, "epilogues": []}
+    # chat.run_turn, same shared helper): arms the whole-reply condition-name
+    # scrub once get_language_trajectory has run, and collects code-emitted
+    # support blocks to print verbatim after the reply.
+    floor = chat_floor.TurnFloor()
     no_progress = 0
     for _ in range(config.APPLE_MAX_TOOL_ITERATIONS):
         forced = first_action is not None
@@ -1855,7 +1846,7 @@ def run_turn(messages, show_model_header=True, model=None):
             code_filled_scope = True
         else:
             args = _fill_args(action, question, summary, scratchpad)
-        result = _execute(chat, action, args, seen_calls, wb_state)
+        result = _execute(chat, action, args, seen_calls, floor)
         # A forced (deterministically-routed) tool is the RIGHT tool; when the FM
         # arg-filler decorates it with a spurious shape arg that errors it (an
         # unsupported is_from_me/granularity value), retry once with only the
@@ -1871,7 +1862,7 @@ def run_turn(messages, show_model_header=True, model=None):
                 and isinstance(result, dict) and result.get("error")):
             kept = {k: v for k, v in args.items() if k in _RETRY_KEEP_KEYS}
             if kept != args:  # only retry when a shape arg can actually be shed
-                result = _execute(chat, action, kept, seen_calls, wb_state)
+                result = _execute(chat, action, kept, seen_calls, floor)
         derived = []
         if not _is_dud(result):  # never let a duplicate/error note enter the scratchpad
             derived = _derive_summary_facts(action, result, question)
@@ -1896,12 +1887,12 @@ def run_turn(messages, show_model_header=True, model=None):
                     if _FAULT_QUESTION_RE.search(question) else None)
     if fault_answer is not None:
         reply = _render_stream(chat, iter([fault_answer]), show_model_header, model,
-                               sanitize=wb_state["sanitize"])
+                               sanitize=floor.sanitize)
     else:
         reply = _answer(chat, question, summary, scratchpad, show_model_header, model,
-                        sanitize=wb_state["sanitize"])
+                        sanitize=floor.sanitize)
     # Support resources must survive even a degraded/empty answer, so emit the
     # epilogue regardless of `reply` (fold into the returned string too).
-    reply = _emit_epilogues(chat, reply, wb_state["epilogues"])
+    reply = _emit_epilogues(chat, reply, floor)
     messages.append({"role": "assistant", "content": reply})
     return reply

@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>iMessage RAG</title>
+    <!-- Resolve the stored/system theme into a class before first paint so the
+         page never flashes the wrong palette. Mirrors useTheme (same storage
+         key). -->
+    <script>
+      ;(function () {
+        try {
+          var k = 'imessage-rag-theme'
+          var v = localStorage.getItem(k)
+          var dark =
+            v === 'dark' ||
+            (v !== 'light' &&
+              window.matchMedia('(prefers-color-scheme: dark)').matches)
+          var root = document.documentElement
+          root.classList.toggle('dark', dark)
+          root.style.colorScheme = dark ? 'dark' : 'light'
+        } catch (e) {
+          /* localStorage/matchMedia unavailable — fall through to CSS default */
+        }
+      })()
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

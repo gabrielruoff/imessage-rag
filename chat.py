@@ -20,6 +20,7 @@ from rich.live import Live
 from rich.markdown import Markdown
 
 import applefm
+import chat_floor
 import config
 import ollama
 import query_tools
@@ -441,70 +442,117 @@ def _cap_tool_result(result, result_json):
         cut //= 2
 
 
-def run_turn(messages, show_model_header=True, model=None):
-    """Run one user turn to completion, including any tool-call round trips.
+class _CliProducer:
+    """The per-request model-turn step for the CLI + eval path.
 
-    All MAX_TOOL_ITERATIONS iterations may call tools. If that budget is
-    exhausted -- or the model stalls out with a reply that has neither
-    content nor tool calls -- one final request is made with the tools
-    withheld and a final-turn note folded into the system prompt, forcing an
-    answer out of whatever was already gathered."""
-    global _SANITIZE_REPLY  # feature: wellbeing
-    if config.is_apple_model(model or CHAT_MODEL):
-        # The Apple Foundation Models window (a fixed 4,096 tokens) is far too
-        # small for this native tool loop; chat_apple stages the turn instead.
-        # Imported lazily to avoid an import cycle (chat_apple imports chat).
-        import chat_apple
+    Routes through the module-global ``ollama_chat_stream`` -- resolved at call
+    time -- so the eval runner's recorder wrapper and the unit-test fakes that
+    monkeypatch ``chat.ollama_chat_stream`` still apply. It yields no ``token``
+    events: token-by-token rendering stays inside ``ollama_chat_stream``'s rich
+    ``Live`` (untouched by this refactor). ``stream_once`` is a generator so the
+    core can drive both producers uniformly with ``yield from``."""
 
-        return chat_apple.run_turn(messages, show_model_header=show_model_header, model=model)
+    def __init__(self, show_model_header=True):
+        self.show_model_header = show_model_header
+
+    def stream_once(self, messages, tools, model, sanitize_armed):
+        # feature: wellbeing -- arm the whole-reply scrub exactly as the old loop
+        # did: set the module flag immediately before each stream call (the eval
+        # runner + unit tests observe it here). Set on EVERY call so it never
+        # leaks across turns.
+        global _SANITIZE_REPLY
+        _SANITIZE_REPLY = sanitize_armed
+        # tools=None on the final tools-withheld turn; OLLAMA_TOOLS otherwise
+        # (passed by the core). ollama_chat_stream is a module global -- the eval
+        # runner and tests patch it right here.
+        message = ollama_chat_stream(
+            messages, tools=tools, show_model_header=self.show_model_header, model=model
+        )
+        return message
+        yield  # unreachable -- marks this a generator so `yield from` is uniform
+
+
+class _SseProducer:
+    """The per-request model-turn step for the SSE/web path.
+
+    Streams token deltas straight from ``ollama.chat_stream`` (bypassing
+    ``ollama_chat_stream`` and its rich rendering -- so the SSE path does not go
+    through the eval seam, which is fine: eval only drives ``run_turn``). On a
+    wellbeing turn (``sanitize_armed``) it enters buffered mode: it accumulates
+    the reply silently and, once the stream completes, scrubs the WHOLE reply and
+    emits it as a single ``token`` -- the SSE analog of the CLI's held-back Live
+    render, so no unsanitized condition name in any sentence ever crosses the
+    wire."""
+
+    def stream_once(self, messages, tools, model, sanitize_armed):
+        role = "assistant"
+        content = ""
+        tool_calls = None
+        for msg in ollama.chat_stream(messages, tools, model=model):
+            role = msg.get("role", role)
+            if msg.get("tool_calls"):
+                tool_calls = msg["tool_calls"]
+            piece = msg.get("content", "")
+            if piece:
+                content += piece
+                # Hold every delta on a wellbeing turn until the whole reply is
+                # sanitized below; never stream partial, unsanitized content.
+                if not sanitize_armed:
+                    yield {"type": "token", "text": piece}
+        if sanitize_armed and content:
+            content, _redacted = chat_floor.sanitize_reply(content)
+            yield {"type": "token", "text": content}
+        result = {"role": role, "content": content}
+        if tool_calls:
+            result["tool_calls"] = tool_calls
+        return result
+
+
+def _finish_turn(floor, reply):
+    """Emit the terminal events: the deduped epilogue block (if any), then
+    ``done`` carrying the final reply with the epilogue folded in -- the string
+    ``run_turn`` returns and eval transcripts capture."""
+    block = floor.epilogue_block()
+    if block:
+        yield {"type": "epilogue", "text": block}
+    yield {"type": "done", "reply": floor.fold_epilogues(reply)}
+
+
+def _run_turn_core(messages, model, producer):
+    """The shared tool-call loop for one user turn, transport-agnostic.
+
+    ``producer.stream_once(messages, tools, model, sanitize_armed)`` performs ONE
+    model round-trip: it may yield ``token`` events (SSE only) and returns the
+    assembled ``{role, content, tool_calls}`` dict. This core mutates ``messages``
+    in place, yields ``tool_call`` / ``retry`` / ``epilogue`` / ``done`` events,
+    runs the exact-repeat guard and the wellbeing floor (via ``chat_floor``), and
+    -- once the MAX_TOOL_ITERATIONS budget is exhausted or the model stalls with
+    an empty non-tool reply -- makes one tools-withheld final request. It never
+    touches ``rich`` or ``ollama_chat_stream`` directly; those live in the
+    producer, so the CLI and SSE paths share every correctness-critical step and
+    cannot silently diverge."""
+    floor = chat_floor.TurnFloor()
     seen_calls = set()
-    # --- feature: wellbeing ---
-    # Generic out-of-band epilogue channel (any tool may return a reserved
-    # `_epilogue` string; we print it verbatim after the reply) + the wellbeing
-    # whole-reply sanitize arm. Both re-initialized per turn; nothing below
-    # is reordered -- these are read at the fenced points that follow.
-    epilogues = []          # verbatim text tools ask run_turn to append after the reply
-    sanitize_reply = False  # armed once get_language_trajectory has run this turn
-
-    def _emit_epilogues(reply):
-        """Print each collected epilogue verbatim after the reply and fold it
-        into the returned string (so eval transcripts capture the code-emitted
-        text). A no-op when nothing was collected, so non-wellbeing turns are
-        byte-for-byte unchanged. Identical epilogues are de-duplicated (order
-        preserved) so a turn that calls several conflict tools -- each returning
-        the same disclaimer -- appends it once, not once per tool."""
-        if not epilogues:
-            return reply
-        deduped = list(dict.fromkeys(epilogues))
-        block = "\n\n".join(deduped)
-        console.print()
-        console.print(block, markup=False)
-        return f"{reply}\n\n{block}" if reply else block
-    # --- end feature: wellbeing ---
     for _ in range(MAX_TOOL_ITERATIONS):
-        _SANITIZE_REPLY = sanitize_reply  # feature: wellbeing
         try:
-            message = ollama_chat_stream(
-                messages, show_model_header=show_model_header, model=model
+            message = yield from producer.stream_once(
+                messages, OLLAMA_TOOLS, model, floor.sanitize
             )
         except ollama.OllamaResponseError as e:
-            # Typically the model emitted a tool call Ollama couldn't parse
-            # (e.g. reasoning text leaking into the tool-call channel). The
-            # failed request consumed nothing from `messages`, so re-send it
-            # and let the model re-sample; the retry spends one iteration of
-            # the tool budget, so a persistently failing model still falls
-            # through to the tools-withheld final request below.
-            console.print(f"  [{e}; retrying]", style="dim red", markup=False)
+            # Typically a tool call Ollama couldn't parse. The failed request
+            # consumed nothing from `messages`, so re-send and let the model
+            # re-sample; the retry spends one iteration of the budget, so a
+            # persistently failing model still falls through to the final request.
+            yield {"type": "retry", "error": str(e)}
             continue
         messages.append(message)
         tool_calls = message.get("tool_calls")
         if not tool_calls:
             if message.get("content"):
-                return _emit_epilogues(message["content"])  # feature: wellbeing
-            # Empty content AND no tool calls: the model stalled out (seen on
-            # aggregate questions it had no tool for). Drop the empty
-            # assistant message and fall through to the same final-turn
-            # request budget exhaustion uses.
+                yield from _finish_turn(floor, message["content"])
+                return
+            # Empty content AND no tool calls: the model stalled. Drop the empty
+            # assistant message and fall through to the tools-withheld final turn.
             messages.pop()
             break
 
@@ -512,9 +560,8 @@ def run_turn(messages, show_model_header=True, model=None):
             name = call["function"]["name"]
             args = call["function"]["arguments"]
             fn = TOOL_FUNCTIONS.get(name)
-            # Exact-repeat guard: burning an iteration re-running an identical
-            # call never adds information (the eval sweep saw 10 identical
-            # calls in one turn) -- point the model back at the earlier result.
+            # Exact-repeat guard: re-running an identical call never adds
+            # information -- point the model back at the earlier result.
             call_key = (name, json.dumps(args, sort_keys=True, default=str))
             if call_key in seen_calls:
                 result = {
@@ -531,22 +578,11 @@ def run_turn(messages, show_model_header=True, model=None):
                     result = fn(**args)
                 except Exception as e:
                     result = {"error": str(e)}
-            # --- feature: wellbeing ---
-            # (a) Once get_language_trajectory has run this turn, arm whole-reply
-            # sanitization for every later stream call (the narration reply).
-            # (b) Collect any tool's reserved `_epilogue` and strip it -- AND the
-            # duplicate `support_block` crisis text -- from the result the model
-            # sees: both are code-delivery directives (the epilogue is printed
-            # verbatim after the reply), not data the model should narrate from.
-            # Generic: any tool may use `_epilogue`.
-            if name == "get_language_trajectory":
-                sanitize_reply = True
-            if isinstance(result, dict) and isinstance(result.get("_epilogue"), str) \
-                    and result["_epilogue"].strip():
-                epilogues.append(result["_epilogue"])
-                result = {k: v for k, v in result.items()
-                          if k not in ("_epilogue", "support_block")}
-            # --- end feature: wellbeing ---
+            # feature: wellbeing -- arm whole-reply sanitize on the trajectory
+            # tool (by name, even for a duplicate/error result) and strip any
+            # `_epilogue`/`support_block` from the result the model sees. The
+            # count/cap below run on the STRIPPED result.
+            result = floor.note_tool(name, result)
             if isinstance(result, list):
                 count = len(result)
             elif isinstance(result, dict) and isinstance(result.get("rows"), list):
@@ -554,35 +590,135 @@ def run_turn(messages, show_model_header=True, model=None):
             else:
                 count = "ok"
             result_json = _cap_tool_result(result, json.dumps(result))
-            # markup=False: the literal "[tool call]" label and any brackets in
-            # the tool arguments must print verbatim -- rich's markup parser
-            # would otherwise silently eat "[tool call]" and mangle bracketed
-            # args. style still applies.
-            console.print(
-                f"  [tool call] {name}({args}) -> {count}"
-                f" (~{_estimate_tokens(result_json)} tokens)",
-                style="dim cyan",
-                markup=False,
-            )
+            yield {
+                "type": "tool_call",
+                "name": name,
+                "arguments": args,
+                "count": count,
+                "tokens_est": _estimate_tokens(result_json),
+            }
             messages.append({"role": "tool", "content": result_json})
 
-    # Budget exhausted, or the model returned an empty non-tool reply.
-    # gemma4's Ollama renderer keeps only the *first* system
-    # message and drops later ones, so the note has to be folded into the system
-    # prompt rather than appended as its own turn. Extend messages[0] as found
-    # rather than rebuilding from SYSTEM_PROMPT -- callers may seed a system
-    # prompt with extra context that must survive into this request.
+    # Budget exhausted, or the model returned an empty non-tool reply. gemma4's
+    # Ollama renderer keeps only the *first* system message, so the final-turn
+    # note is folded into messages[0] rather than appended as its own turn.
+    # Extend messages[0] as found -- callers may seed a system prompt with extra
+    # context that must survive into this request.
     if messages and messages[0]["role"] == "system":
         head, rest = messages[0]["content"], messages[1:]
     else:
         head, rest = SYSTEM_PROMPT, messages
     final_messages = [{"role": "system", "content": head + "\n\n" + FINAL_TURN_NOTE}] + rest
-    _SANITIZE_REPLY = sanitize_reply  # feature: wellbeing
-    message = ollama_chat_stream(
-        final_messages, tools=None, show_model_header=show_model_header, model=model
-    )
+    message = yield from producer.stream_once(final_messages, None, model, floor.sanitize)
     messages.append(message)
-    return _emit_epilogues(message.get("content", ""))  # feature: wellbeing
+    yield from _finish_turn(floor, message.get("content", ""))
+
+
+def run_turn(messages, show_model_header=True, model=None):
+    """Run one user turn to completion, including any tool-call round trips.
+
+    All MAX_TOOL_ITERATIONS iterations may call tools. If that budget is
+    exhausted -- or the model stalls out with a reply that has neither
+    content nor tool calls -- one final request is made with the tools
+    withheld and a final-turn note folded into the system prompt, forcing an
+    answer out of whatever was already gathered.
+
+    Consumes the shared ``_run_turn_core`` generator via ``_CliProducer`` and
+    renders each event to the rich console exactly as before -- the tool-call
+    notice, the dim-red retry line, and the verbatim epilogue -- returning the
+    final reply string. Behavior (and the eval / unit-test seams) is unchanged."""
+    if config.is_apple_model(model or CHAT_MODEL):
+        # The Apple Foundation Models window (a fixed 4,096 tokens) is far too
+        # small for this native tool loop; chat_apple stages the turn instead.
+        # Imported lazily to avoid an import cycle (chat_apple imports chat).
+        import chat_apple
+
+        return chat_apple.run_turn(messages, show_model_header=show_model_header, model=model)
+    reply = ""
+    for event in _run_turn_core(messages, model, _CliProducer(show_model_header)):
+        etype = event["type"]
+        if etype == "tool_call":
+            # markup=False: the literal "[tool call]" label and any brackets in
+            # the tool arguments must print verbatim -- rich's markup parser
+            # would otherwise silently eat "[tool call]" and mangle bracketed
+            # args. style still applies.
+            console.print(
+                f"  [tool call] {event['name']}({event['arguments']}) -> {event['count']}"
+                f" (~{event['tokens_est']} tokens)",
+                style="dim cyan",
+                markup=False,
+            )
+        elif etype == "retry":
+            console.print(f"  [{event['error']}; retrying]", style="dim red", markup=False)
+        elif etype == "epilogue":
+            # feature: wellbeing -- print the code-emitted support block verbatim
+            # after the reply (the reply was already streamed live).
+            console.print()
+            console.print(event["text"], markup=False)
+        elif etype == "done":
+            reply = event["reply"]
+    return reply
+
+
+def run_turn_events(messages, model=None):
+    """Run one user turn to completion, yielding structured events for a
+    streaming (SSE/web) consumer instead of printing to a console.
+
+    Yields dicts: ``{"type": "token", "text"}`` (a content delta),
+    ``{"type": "tool_call", "name", "arguments", "count", "tokens_est"}``,
+    ``{"type": "retry", "error"}``, ``{"type": "epilogue", "text"}`` (the verbatim
+    support block), and a terminal ``{"type": "done", "reply"}``. ``messages`` is
+    mutated in place exactly as ``run_turn`` does, and ``done.reply`` equals
+    ``run_turn``'s return value (sanitized, with the epilogue folded in). The
+    wellbeing floor is enforced identically: on a wellbeing turn the reply is
+    buffered and scrubbed before any ``token`` is emitted.
+
+    The apple backend cannot stream tokens through the shared core (its staged
+    orchestrator has no per-request model-turn step), so it degrades to a buffered
+    single-shot -- ``tool_call`` events, then one ``token`` with the whole reply,
+    then ``done``. Transport errors other than ``OllamaResponseError`` propagate
+    out of this generator; the web layer catches them and emits a terminal error
+    frame."""
+    if config.is_apple_model(model or CHAT_MODEL):
+        yield from _run_turn_events_apple(messages, model)
+        return
+    yield from _run_turn_core(messages, model, _SseProducer())
+
+
+def _run_turn_events_apple(messages, model):
+    """Buffered single-shot apple path for ``run_turn_events``.
+
+    ``chat_apple``'s staged route/fill/exec/digest/answer orchestration has no
+    per-request model-turn step, so token-level streaming isn't available there.
+    Instead: install ``chat_apple._recorder`` to capture each executed tool call,
+    silence ``chat.console`` (the pattern the eval runner uses) so nothing leaks to
+    the server terminal, run ``chat_apple.run_turn`` (which re-enforces the SAME
+    wellbeing floor itself -- the returned reply is already sanitized and any
+    epilogue already folded in), then emit the buffered ``tool_call`` events
+    followed by the whole reply as one ``token`` and ``done``."""
+    global console
+    import chat_apple
+
+    tool_events = []
+
+    def _record(name, arguments):
+        tool_events.append({
+            "type": "tool_call", "name": name, "arguments": arguments,
+            "count": "ok", "tokens_est": 0,
+        })
+
+    prev_recorder = chat_apple._recorder
+    prev_console = console
+    chat_apple._recorder = _record
+    console = Console(quiet=True)
+    try:
+        reply = chat_apple.run_turn(messages, show_model_header=False, model=model)
+    finally:
+        chat_apple._recorder = prev_recorder
+        console = prev_console
+    for event in tool_events:
+        yield event
+    yield {"type": "done", "reply": reply}
 
 
 def main(argv=None):
