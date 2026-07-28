@@ -1284,9 +1284,9 @@ resolved per run from `config.is_apple_model`). Four phases under one deadline
    distilled rows with the rest.
 
 Phases 1–2 are corpus-wide by design (the kNN vote has to generalize, so the
-scope flags deliberately don't reach them). Phase 2 is deterministic kNN and
-runs to completion; **phase 1 is LLM work and is capped like phase 3** — see
-"Phase 1 is not preamble" below. Phase 3 writes `source='llm'`, which is what
+scope flags deliberately don't reach them). **Every phase is capped**, phase 2
+included — see "Phase 1 is not preamble" and "Phase 2 is not free" below.
+Phase 3 writes `source='llm'`, which is what
 wakes the valence-trusting readers (conflict corroboration, the nudge Stage-0
 exclusion, voiceprint tone) for exactly the chunks the budget reached.
 `--upgrade-distilled` is rejected with `hybrid`: hybrid *is* a
@@ -1303,6 +1303,13 @@ falsified it in measurement, and both are now closed:
 - "Dispatch stops at the deadline" ignored the pool's own backlog, which is
   worth minutes, not the "one group" the comment claimed.
 
+Review of PR #42 found two more exemptions of exactly the same shape, both
+reproduced and both now closed — phase 2 was ungated (below), and the gate's
+"there is nothing to estimate from before the first completion" fallback let
+the first wave of every phase go out blind, which on a 2-min budget meant
+4.4 min of actual work. Together they are the difference between the promise
+being *argued* and being *measured*.
+
 ### Phase 1 is not preamble: batch it, then cap it
 
 Measured 2026-07-27, `ANNOTATE_BUDGET_MINUTES=8`, qwen3.5:4b, 25,029-chunk
@@ -1310,8 +1317,9 @@ corpus with 450 existing seeds: the 350-seed top-up dispatched **one chunk per
 request** (`_seed_chunks` built `[[row] for row in sample]`) and cost
 **641.9 s = 10.7 min at 1.83 s/chunk**. Phase 2 was genuinely cheap
 (`_classify_chunks` 0.01 s with nothing pending, `backfill_confidence` 17.9 s
-for 24,229 rows), 3a/3b never dispatched a single call, and the run ended at
-11.0 min against an 8-min budget. On a fresh corpus (800 seeds) that
+for 24,229 rows **against the ~800-seed pool of the day** — see "Phase 2 is not
+free" for what that qualifier hides), 3a/3b never dispatched a single call, and
+the run ended at 11.0 min against an 8-min budget. On a fresh corpus (800 seeds) that
 extrapolates to ~24 min — the whole 25-min default — leaving the tier
 indistinguishable from `distilled` with a bigger seed pool.
 
@@ -1340,6 +1348,41 @@ that `SystemExit`, prints the per-phase summary and a resume hint, and returns.
 Anything else the kNN phases raise (no `chunk_vectors`, no `embed_dim`) still
 propagates, since no rerun fixes those.
 
+### Phase 2 is not free either: O(rows x seeds)
+
+The first cut left the kNN phases ungated because they are deterministic and
+`backfill_confidence` had measured 17.9 s. That number was taken against an
+~800-seed pool, and the pass is **O(n_distilled x n_seeds)** — one vec0
+`MATCH ... k=?` per row against a `temp.seed_vectors` holding *every*
+`source='llm'` row. Re-measured 2026-07-28 on the same 25,029-chunk corpus and
+machine, varying only the pool:
+
+| seed pool | rows | wall | rows/s |
+|---|---|---|---|
+| 450 | 24,579 | **14.6 s** | 1,688 |
+| 4,416 | 20,613 | **82.0 s** | 251 |
+
+A 6.7x per-row slowdown for a 9.8x wider pool — and the pool widens with every
+run of this tier, because phase 3 writes `source='llm'`. End to end that made a
+1-min budget take 1.3 min and buy nothing.
+
+Both passes now take the run deadline and stop at it (checked on a 256-row
+stride, which is under a second of work at any measured rate). They were always
+resumable — `_classify_chunks` only looks at chunks with no annotation,
+`backfill_confidence` only at rows whose confidence is NULL — so stopping short
+just defers.
+
+The trap, and the reason this is not a one-line change: `hybrid_chunks` used to
+detect a Ctrl-C inside phase 2 by *counting leftover rows*
+(`_knn_work_pending`) and skipping phase 3 when it found any. Gate phase 2
+without touching that and a deadline-stopped phase 2 disables every LLM upgrade
+forever — the exact failure the tier exists to avoid. Both passes now report
+`stopped` and `interrupted` through a caller-owned dict instead, which is
+exact, cheaper (it deletes two full aggregate scans per run) and cannot drift
+from the passes' own `todo` queries. Measured after: a 1-min budget lands at
+**1.0 min** with the backfill stopping at 15,616 of 20,613 rows, and the next
+run finishes the remaining 4,997 **and reaches phase 3a**.
+
 ### The deadline has to reserve the pool's drain
 
 `annotate._pooled` keeps `2 × workers` groups in flight (one when sequential),
@@ -1356,10 +1399,52 @@ groups, and reserves `(in_flight / workers) × mean_group_seconds` — the pool'
 backlog retiring `workers` at a time. Measuring *latency under the run's own
 concurrency* is what makes it self-correcting on a serializing Ollama, where
 four concurrent requests each measure ~4× a lone one and dividing by `workers`
-puts the throughput back. Before the first completion there is nothing to
-measure and it falls back to the plain check: the first dispatch of a phase can
-only ever be made blind. No config knob — it is an accounting rule, not a
+puts the throughput back. No config knob — it is an accounting rule, not a
 preference.
+
+**"The first dispatch of a phase can only ever be made blind" was wrong, and it
+was the whole residual overshoot.** With nothing measured, `reserve()` returned
+`0.0`, so the gate waved through groups until `_pooled` was holding its
+`2 × workers` ceiling — 64 chunks at batch 8 — and only then got an estimate,
+by which point the work was already committed. Reproduced on the reference
+corpus with phases 1–2 both no-ops, so the clock was entirely phase 3's:
+
+| budget | before | after (cold) | after (rerun) |
+|---|---|---|---|
+| 2 min | **4.4 min**, 72 event + 0 confidence | 0.0 min, 0 + 0 | — |
+| 6 min | 5.8 min, 80 event + **0** confidence | 3.3 min, 40 + 0 | **4.8 min, 32 + 32** |
+
+The fix is memory, not a guess: `_load_group_rate`/`_save_group_rate` carry the
+measured seconds-per-request across runs in `ingest_state`, keyed
+`annotate_group_seconds:<phase>:<model>:b<batch>:w<workers>`. All four parts of
+the key matter — the reserve is denominated in *latency*, which batch and
+workers both move, and the phases are genuinely different populations (a group
+of 8 averaged **106.4 s** on the event candidates against **70.6 s** on the
+confidence upgrades, whose chunks are a fifth the length). One shared estimator
+would let whichever phase ran first anchor the others wrong in both directions,
+which is also why the earlier "one `_GroupRate` for the whole run" is gone.
+
+Two details that measurement forced:
+
+- **What crosses runs is the slowest group, not the mean.** Carrying the mean
+  forward was tried and measured *worse*: a run whose event phase averaged
+  106.4 s met 148 s on the next run, under-reserved, and landed at 6.8 min on a
+  6-min budget. The failure here is one-sided — under-buying is recovered by a
+  rerun, an overrun breaks the only promise the tier makes — so the stored
+  number is `max`, while the live mean still wins inside a run.
+- **A cold DB still needs a prior.** `_COLD_GROUP_SECONDS_PER_CHUNK = 5.3`
+  (× batch × workers ⇒ 169.6 s at the defaults) is sized to the slowest phase
+  measured, not the average: slowest group 160.3 s seeding, 152.9–198.1 s on
+  event upgrades, 77.7–107.3 s on confidence upgrades. It governs only until
+  the first group completes.
+
+**The consequence to state plainly, because the docs did not:** one LLM request
+is the smallest unit that can be dispatched, so a phase whose share of the
+clock is under one request's latency buys *nothing*. That is correct — starting
+work that cannot finish is what "wall-clock budget" is supposed to rule out —
+but it means budgets under roughly five minutes buy no upgrades at all, and
+`_run_upgrades` now prints why and names the knob. The 25-minute default is
+clear of the floor by 5×.
 
 ### Measured basis (2026-07-27, this machine, warm model)
 
@@ -1387,27 +1472,29 @@ Two preset consequences, both against the grain of the older tiers:
   Ollama serializes.
 
 Those planning numbers were optimistic. Re-measured on the production path
-after the deadline fixes (8-min budget, 25,029-chunk corpus, `ANNOTATE_WORKERS=4`):
-1.5–2.6 s/chunk seeding, 5.6 s/chunk on the event upgrades (their chunks are
-~1,900 chars and a batch of 8 often comes back covering only some ids, so
-single-chunk fallbacks follow), ~1.6 s/chunk on the confidence upgrades (median
-363 chars). The run bought **128 LLM-annotated chunks in 9.2 min**, so the
-25/50-min defaults extrapolate to roughly **350–800 per run**, not 800–1,200. A
-cold model load needs no allowance: the deadline absorbs it and simply buys
-fewer upgrades.
+after the deadline fixes, per *request* rather than per chunk, because a
+request is the unit the gate can actually decline (25,029-chunk corpus,
+`ANNOTATE_WORKERS=4`, batch 8, 2026-07-28):
 
-Measured end-to-end, `ANNOTATE_BUDGET_MINUTES=8` on qwen3.5:4b:
-
-| | before the fixes | after |
+| phase | mean latency / request of 8 | slowest seen |
 |---|---|---|
-| total wall | 11.0 min | **9.2 min** |
-| phase 1 (seeds) | 641.9 s, 350 seeds, unbounded | 208.1 s, 80 seeds, capped |
-| phase 3 upgrades | **0 — never dispatched** | 48 |
+| 1 seed top-up | — (160 seeds in the 25% share of a 24-min budget) | 160.3 s |
+| 3a event upgrades (~1,900-char chunks) | 106.4 s | 198.1 s |
+| 3b confidence upgrades (median ~360 chars) | 70.6 s | 107.3 s |
 
-The residual +1.2 min is phase 1's blind first wave (208 s against a 120 s cap):
-`_pooled` submits `2 × workers` groups in one instant before any timing exists,
-and at batch 8 that is 64 chunks of work the gate cannot decline. Shrinking it
-would mean changing `_pooled`'s backlog rule for every tier.
+3a is the expensive one because a batch of 8 long chunks often comes back
+covering only some ids, and every miss costs its own single-chunk request. A
+6-min budget bought **32 event + 32 confidence upgrades**, so the 25-min
+default extrapolates to roughly **250–350 upgrades per run** plus up to ~160
+seeds. A cold model load needs no allowance: the deadline absorbs it and simply
+buys fewer upgrades.
+
+Measured end-to-end on a fresh copy of the reference DB (450 existing seeds, no
+`knn_confidence` column yet), `ANNOTATE_BUDGET_MINUTES=6`: **3.4 min used** —
+schema self-healed, seed pass declined (its 90 s share is under one request and
+it says so), 24,579 rows confidence-backfilled, **32 event + 40 confidence**
+upgrades committed. At `ANNOTATE_BUDGET_MINUTES=24` on the same DB the seed
+pass does clear the floor and drew **160 seeds** inside its 25% share.
 
 ### `_APPLE_ANNOTATE_CHAR_BUDGET`: 12,000 → 8,000 → 2,000 (global, every tier)
 
@@ -1514,6 +1601,44 @@ embeddings are projected once through a deterministic sparse
 Johnson–Lindenstrauss matrix to 32 dims, which keeps the whole draw at ~4.5 s in
 pure CPython against a budget measured in tens of minutes.
 
+### The seed target counts sampler draws, not `source='llm'` rows
+
+`_seed_chunks` sized its top-up from `SELECT COUNT(*) ... WHERE source = 'llm'`.
+Every phase-3 upgrade is a `source='llm'` row, so **the tier's own output
+satisfied its own seed target.** Reproduced on the reference corpus (4,416
+`llm` rows): phase 1 printed `seed pool: 4416 LLM annotations (target 800,
+labeling 0 more)` on every run, and `ANNOTATE_HYBRID_SEED_TARGET` plus the
+whole of `annotate_sampling.py` never executed again.
+
+Worse than a dead knob: phase-3 rows are drawn from the top-20 dyads, filtered
+by a gratitude/good-news lexicon and by lowest kNN confidence, so the pool
+`_build_seed_index` votes with drifts toward exactly the non-representative
+shape `_seed_chunks`' own docstring warns about — and the module added to blunt
+that bias is the thing that stops running.
+
+Fixed with a `hybrid_seeds` counter in `ingest_state`, via a `counter_key`
+argument that defaults to `None` (the distilled tier is unchanged). **Not a new
+`source` value**, which was the other option: every valence-trusting reader in
+the tree keys on `source = 'llm'` — `query_tools/`, `conflict_detect.py`,
+`loose_ends.py`, `nudge_detectors.py`, `voiceprint.py`, `drift.py`,
+`wrapped_sections.py`, `eval/`, plus `schema.py`/`reset_db.py` — and a third
+value would mean touching all of them just to keep seeds visible. A counter
+touches none.
+
+Two properties that make the counter safe: it is **clamped** to the real
+`COUNT(source='llm')`, so a hand-emptied `chunk_annotations` cannot leave it
+vouching for seeds that no longer exist; and `reset_db.py` already clears
+`ingest_state` wholesale, so a reset zeroes it along with the annotations it
+described.
+
+The consequence, stated because `config.py` and `.env.example` now have to say
+it: a corpus already annotated by another tier **will** pay for
+`ANNOTATE_HYBRID_SEED_TARGET` sampler seeds, spread over several runs at 25% of
+each budget. That is the intent — the target is about the *shape* of the pool,
+not its size — and it is bounded: once the counter reaches the target the
+sampler is done for good. Measured before/after on the same DB:
+`labeling 0 more` → `labeling 800 more`.
+
 ### The event prefilter: 1.72× more events per LLM call
 
 Events are the one label kNN structurally cannot produce (`source='distilled'`
@@ -1551,7 +1676,53 @@ The `--terms`-only `_ensure_curate_failures` helper generalized into
 `_ensure_column(con, table, column)`, which runs the canonical (idempotent,
 `PRAGMA table_info`-gated) `schema.create_schema` migration rather than keeping
 a second, drifting copy of the DDL. `hybrid_chunks` and `distill_chunks` both
-call it before their first write, and before the `--dry-run` branches: a dry run
-that crashes on a missing column reports nothing, and the migration touches
-schema, never data. `tests/test_annotate_hybrid.py` regression-tests both tiers
-against a DB with the column dropped.
+call it before their first write. `tests/test_annotate_hybrid.py`
+regression-tests both tiers against a DB with the column dropped.
+
+**Correction (PR #42 review): it must not run under `--dry-run`.** The first
+cut called it before the dry-run branches, reasoning that a preview which
+crashes on a missing column reports nothing and that the migration touches
+schema, never data. The second half is false: `create_schema` also rescans
+`reactions` for the old part-guid prefix and rewrites the rows it finds
+(`schema.py`), so a preview became the one write-free path that wrote —
+reproduced on a copy of the real DB, where `--quality hybrid --dry-run`
+committed the new column while printing "no LLM calls, no writes". It now takes
+a `dry_run` flag and *returns False* instead of migrating, and the two dry-run
+readers degrade: the backfill counts every distilled row as pending (it is),
+and the phase-3b preview orders by `chunk_id` instead of the column that does
+not exist yet. `--terms` is deliberately left alone — its own dry run still
+migrates `curate_failures`, which is pre-existing behavior and outside this
+change; README says so.
+
+### Two smaller review fixes worth recording
+
+**Phase 3b no longer materializes a corpus it cannot dispatch.** With no
+`--limit`, `_low_confidence_rows` fetched every in-scope distilled row *with
+its full chunk text* — 14,995 rows / 9.5 MB / ~26 MB resident on the reference
+corpus — and then the gate could decline all of it. The fetch is now skipped
+outright when the deadline has already passed, and otherwise capped at
+`_LOW_CONF_FETCH_CAP = 5000`: at the fastest rate measured for this phase even
+an hour of budget buys ~1,600 rows, and they arrive lowest-confidence-first, so
+the cap can only ever drop rows the run was never going to reach. The reported
+candidate count comes from the textless `COUNT` so the cap never understates
+the scope.
+
+**One Ctrl-C, one exit code.** The tier had three: phase 1 raised
+`SystemExit(1)`, phases 2 and 3 caught the interrupt and returned 0, and
+`db.run_cli`'s conventional 130 was never reached from any of them. `_seed_chunks`
+now takes `interrupt_exit=False` (plus a `stats` dict, since there is no return
+value on that path) so the budgeted caller re-raises into its own handler:
+commit, print the per-phase summary, exit 0 — the same shape as
+`annotate_chunks` and as phase 3. The distilled tier keeps `SystemExit(1)`
+exactly as before.
+
+**Phase 3a's ordering is a documented property, not an accident.**
+`event_candidate_chunk_ids` returns chunk ids ascending and the deadline stops
+the phase mid-list, so one run's event upgrades are a *prefix* — the oldest
+conversations in scope. Reruns advance through the remainder (upgraded rows
+leave the candidate pool), so this is coverage order, not a correctness bug,
+but a user who runs `make annotate-hybrid` once gets events for their oldest
+history and the docs had not said so. Left as-is rather than interleaved:
+every "spread" rule needs a constant with no measured basis, and ascending
+order is what makes a rerun's progress obvious. README and CLAUDE.md now state
+it.

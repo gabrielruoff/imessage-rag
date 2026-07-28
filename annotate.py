@@ -26,10 +26,12 @@ stratified seed top-up (capped at its own share of the budget) and a
 corpus-wide kNN pass first, then LLM upgrades of what kNN can't or probably
 didn't get right -- event candidates first (a distilled row's events are
 always empty), then the lowest-confidence rows -- until the deadline, which it
-self-terminates at and resumes from on a rerun. EVERY LLM phase is gated,
-seeding included, and each stops dispatching a pool-drain early rather than at
-the deadline itself. It is itself a distilled-upgrader, so
---upgrade-distilled does not apply to it (see annotate_hybrid.py).
+self-terminates at and resumes from on a rerun. EVERY phase is gated, seeding
+and the O(rows x seeds) kNN pass included; each stops dispatching a pool-drain
+early rather than at the deadline itself, and each starts from the per-request
+time an earlier run banked in ingest_state so nothing goes out blind. It is
+itself a distilled-upgrader, so --upgrade-distilled does not apply to it (see
+annotate_hybrid.py).
 
 --terms is a separate pipeline, not a --quality tier: it curates dyad_terms
 verdicts, batches ANNOTATE_TERMS_BATCH_SIZE terms per request, and runs with
@@ -256,22 +258,112 @@ class _GroupRate:
     """Thread-safe running mean of per-group wall-clock. Deliberately OUTSIDE
     _DispatchDeadline so the successive phases of one run share what the
     earlier ones measured -- only the first LLM phase of a run has to dispatch
-    blind."""
+    blind.
 
-    def __init__(self):
+    `prior` is what to estimate with BEFORE anything has completed: a value
+    _load_group_rate read back from an earlier run (or the cold constant). A
+    measured mean always wins over it; `mean()` stays measurement-only, so a
+    caller can still tell the two apart."""
+
+    def __init__(self, prior=None):
         self._lock = threading.Lock()
         self._n = 0
         self._total = 0.0
+        self._worst = 0.0
+        self.prior = prior
 
     def record(self, seconds):
         with self._lock:                    # worker threads; a paired update
             self._n += 1
             self._total += seconds
+            self._worst = max(self._worst, seconds)
 
     def mean(self):
         """Mean seconds per group, or None when nothing has completed yet."""
         with self._lock:
             return self._total / self._n if self._n else None
+
+    def worst(self):
+        """Slowest group seen, or None when nothing has completed yet. This is
+        what gets carried to the NEXT run: group latency is noisy (a batched
+        reply that covers only some ids falls back to a single-chunk request
+        per miss, so the same phase measured a 106.4 s mean one run and 148 s
+        the next), and the failure this whole gate exists to prevent is
+        one-sided -- under-buying costs coverage a rerun recovers, overrunning
+        breaks the only promise the tier makes."""
+        with self._lock:
+            return self._worst or None
+
+    def estimate(self):
+        """What to plan with: this run's measurement if there is one, else the
+        prior, else None (nothing to go on)."""
+        return self.mean() or self.prior
+
+
+# Seconds of group LATENCY per chunk to assume when nothing has been measured
+# and nothing was stored -- i.e. the first budgeted run against a given DB.
+# reserve() divides latency by `workers`, so the group estimate is
+# rate x batch_size x workers. Measured 2026-07-28 on the 25,029-chunk corpus
+# (qwen3.5:4b, batch 8, ANNOTATE_WORKERS=4), slowest group per phase: 160.3 s
+# seeding, 152.9-198.1 s on the event upgrades, 77.7-107.3 s on the confidence
+# upgrades. 5.3 x 8 x 4 = 169.6 s covers the slowest two.
+#
+# Sized to the worst phase on purpose. It is a prior, not a prediction: it
+# governs only until the first group of a phase completes, _save_group_rate
+# replaces it per phase with this machine's own number after one run, and an
+# over-estimate makes a run buy LESS rather than overrun -- the safe direction
+# for something whose whole contract is a wall clock. Apple FM is the known
+# over-estimate: _annotation_groups packs its groups by char budget (1-2
+# chunks), not batch_size, so the prior is high there until the first run
+# stores a measurement.
+_COLD_GROUP_SECONDS_PER_CHUNK = 5.3
+
+
+def _group_rate_key(phase, model, batch_size, workers):
+    return f"annotate_group_seconds:{phase}:{model}:b{batch_size}:w{workers}"
+
+
+def _load_group_rate(con, phase, model, batch_size, workers):
+    """A _GroupRate primed with what an earlier run measured for this exact
+    (phase, model, batch, workers) shape.
+
+    Without a prior, reserve() returns 0.0 until the first group completes and
+    _pooled has by then committed 2x workers groups the gate cannot take back:
+    measured 2026-07-28, a 2-min budget landed at 4.4 min and phase 3b was
+    starved to zero. The gate cannot shrink that wave without changing
+    _pooled's backlog rule for every tier -- but it can stop dispatching into
+    it, which is exactly what having an estimate at group #1 buys.
+
+    The key carries batch and workers because the reserve is denominated in
+    group LATENCY, and both change it (4 concurrent requests against a
+    serializing Ollama each measure ~4x a lone one). It carries `phase` because
+    a run's phases have measurably different per-group costs -- measured
+    2026-07-28, a group of 8 averaged 106.4 s on the event candidates against
+    70.6 s on the confidence upgrades, whose chunks are a fifth the length --
+    so one shared estimator would let whichever phase ran first anchor the
+    others wrong in both directions."""
+    raw = get_state(con, _group_rate_key(phase, model, batch_size, workers))
+    try:
+        prior = float(raw) if raw else None
+    except (TypeError, ValueError):
+        prior = None
+    if not prior or prior <= 0:
+        prior = _COLD_GROUP_SECONDS_PER_CHUNK * max(1, batch_size) * max(1, workers)
+    return _GroupRate(prior=prior)
+
+
+def _save_group_rate(con, rate, phase, model, batch_size, workers):
+    """Persist what this run actually measured, so the next one is not blind.
+    Only a MEASURED value is stored -- writing the prior back would freeze a
+    cold guess into the DB where nothing would ever correct it -- and the
+    slowest group rather than the mean, for the reason _GroupRate.worst gives.
+    Within a run the live mean still wins, so the conservative number only
+    governs the dispatches made before this run has measured anything."""
+    worst = rate.worst()
+    if not worst:
+        return
+    set_state(con, _group_rate_key(phase, model, batch_size, workers), repr(worst))
+    con.commit()
 
 
 class _DispatchDeadline:
@@ -288,14 +380,14 @@ class _DispatchDeadline:
     `workers` at a time, i.e. (in_flight / workers) waves of the mean per-group
     wall-clock of the groups that have ALREADY completed.
 
-    Known residual, and the reason `rate` is shared across a run's phases:
     _pooled submits 2x workers groups before it yields the first result, and
-    those submissions all happen in the same instant, so the FIRST phase to run
-    commits to that much work before any estimate exists. Reserving a guess
-    instead would either stall a phase with plenty of time or under-reserve one
-    with none. Passing one _GroupRate through every phase means only the first
-    pays it -- and a budget smaller than that one blind wave cannot be honored
-    by anything short of changing _pooled's backlog rule for every tier.
+    those submissions all happen in the same instant, so a phase with nothing
+    to estimate from commits to that much work whatever the clock says. That
+    is what _GroupRate's `prior` is for: _load_group_rate hands the gate the
+    seconds-per-group an earlier run measured for the same model/batch/workers
+    (falling back to _COLD_GROUP_SECONDS_PER_CHUNK), so reserve() is honest at
+    group #1 and the wave is never committed blind. `rate` is still shared
+    within phase 3 so 3b starts from what 3a measured.
 
     `monotonic` is injected because the deadline and the gate must read the
     SAME clock -- the tier tests patch their module's `time` with a fake one
@@ -327,17 +419,18 @@ class _DispatchDeadline:
 
     def reserve(self):
         """Seconds to drain what this gate still has in flight plus the group
-        about to join it -- 0 before the first completion anywhere in the run.
+        about to join it -- 0 only when the rate has neither a measurement nor
+        a prior to plan with.
 
         Counting the ACTUAL backlog rather than _pooled's 2x workers ceiling
         matters at both ends: a phase starting with an empty pool would
         otherwise reserve two full waves before its very first group and buy
         nothing, while a phase in steady state is holding roughly that ceiling
-        anyway. The mean is over group LATENCY as observed under the run's own
-        concurrency, which is what makes this self-correcting on a serializing
-        Ollama: 4 concurrent requests each measure ~4x a lone one, and dividing
-        by `workers` puts the throughput back."""
-        mean = self.rate.mean()
+        anyway. The estimate is over group LATENCY as observed under the run's
+        own concurrency, which is what makes this self-correcting on a
+        serializing Ollama: 4 concurrent requests each measure ~4x a lone one,
+        and dividing by `workers` puts the throughput back."""
+        mean = self.rate.estimate()
         if not mean:
             return 0.0
         with self._lock:
@@ -411,10 +504,11 @@ def _check_model_guard(con, model, table="chunk_annotations", predicate="1"):
     con.commit()
 
 
-def _ensure_column(con, table, column):
-    """Self-heal a column that postdates DBs already in the wild. annotate.py
-    is reachable without re-running ingest.py -- which is what normally applies
-    migrations -- so a DB from before dyad_terms.curate_failures (--terms) or
+def _ensure_column(con, table, column, dry_run=False):
+    """Self-heal a column that postdates DBs already in the wild, returning
+    whether `column` is present afterwards. annotate.py is reachable without
+    re-running ingest.py -- which is what normally applies migrations -- so a
+    DB from before dyad_terms.curate_failures (--terms) or
     chunk_annotations.knn_confidence (the distilled/hybrid tiers) would die on
     'no such column' instead. Run the canonical migration (idempotent) rather
     than keeping a second, drifting copy of it here.
@@ -425,13 +519,19 @@ def _ensure_column(con, table, column):
     skips it entirely) and worth not having a second, drifting copy of the
     migration here; schema.py stays the only place that DDL lives.
 
-    Called before the --dry-run branches on purpose: a dry run that crashes on
-    a missing column reports nothing, and the migration touches schema, never
-    data (the same order --terms has always used)."""
+    `dry_run=True` skips the migration and returns False instead. --dry-run
+    promises no writes, and that reaction rescan is a data write on a path
+    that would otherwise have none -- so a previewing caller degrades its own
+    reads (the column simply has no values yet) rather than migrating behind
+    the user's back."""
     cols = {row[1] for row in con.execute(f"PRAGMA table_info({table})")}
-    if column not in cols:
-        schema.create_schema(con)
-        con.commit()
+    if column in cols:
+        return True
+    if dry_run:
+        return False
+    schema.create_schema(con)
+    con.commit()
+    return True
 
 
 def _validate_annotation(data):

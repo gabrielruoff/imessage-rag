@@ -12,8 +12,12 @@ LLM budget at the least certain rows; backfill_confidence fills it in for
 distilled rows written before the column existed. _seed_chunks takes an
 optional `sampler` hook so a tier can substitute a smarter draw than the
 default random sample without forking this module, plus `batch_size`/`deadline`
-so a wall-clock-budgeted tier can batch the seed pass and cap what it spends on
-it; all three default to today's distilled behavior exactly.
+/`counter_key`/`interrupt_exit` so a wall-clock-budgeted tier can batch the
+seed pass, cap what it spends on it, count only its OWN draws toward the
+target and keep its own interrupt reporting. Both kNN passes take the same
+optional `deadline`/`stats` -- neither is free (each is one vec0 MATCH per row
+against every seed), so a budgeted caller has to be able to stop them. Every
+one of those defaults is today's distilled behavior exactly.
 """
 
 import json
@@ -24,7 +28,7 @@ import time
 import annotate
 import progress
 from config import ANNOTATE_COMMIT_EVERY, ANNOTATE_KNN_K, ANNOTATE_SEED_TARGET
-from db import get_state
+from db import get_state, set_state
 
 # kNN classification: a candidate emotion label must win at least this share
 # of the neighbours' distance-weighted vote. Chosen on the 2026-07-17
@@ -35,7 +39,8 @@ _KNN_MIN_SEEDS = 100
 
 
 def _seed_chunks(con, model, think, workers, target, dry_run=False, sampler=None,
-                 batch_size=1, deadline=None, rate=None):
+                 batch_size=1, deadline=None, rate=None, counter_key=None,
+                 interrupt_exit=True, stats=None):
     """Top up the LLM-labeled seed pool to `target` rows by annotating a
     random corpus-wide sample (random + corpus-wide so the kNN vote
     generalizes; scope flags deliberately don't apply). Same writes as an
@@ -61,15 +66,39 @@ def _seed_chunks(con, model, think, workers, target, dry_run=False, sampler=None
     whole 8-minute hybrid budget before an upgrade could run. Batching it is
     worth ~20% (1.46 s/chunk at batch 8) -- real but not enough on its own, so
     hybrid passes BOTH its batch size and a share-of-the-budget deadline.
-    `rate` is the run's shared annotate._GroupRate, so the phases that follow
-    inherit what this one measured instead of dispatching blind. All three
-    defaults (1, None, None) are exactly today's behavior."""
+    `rate` is this phase's annotate._GroupRate, primed by annotate.
+    _load_group_rate with what an earlier run measured.
+
+    `counter_key` changes what counts toward `target`: with it, the target is a
+    floor on the seeds THIS pipeline drew (tracked under that ingest_state key)
+    rather than on every source='llm' row in the table. The hybrid tier needs
+    that because its own phase-3 upgrades are 'llm' rows, so counting them made
+    the tier's output satisfy its own seed target -- measured on the reference
+    corpus, 4,416 'llm' rows against a target of 800 printed "labeling 0 more"
+    on every run and the stratified sampler never executed again, which is
+    exactly the inherited-pool bias above going unblunted. Clamped to the real
+    'llm' count so an emptied chunk_annotations cannot leave a counter claiming
+    seeds that no longer exist.
+
+    `interrupt_exit=False` re-raises the KeyboardInterrupt (after committing
+    and reporting) instead of turning it into SystemExit(1), for a caller that
+    owns a multi-phase summary of its own -- and `stats`, a caller-owned dict,
+    carries the committed count out along that path, where there is no return
+    value to carry it.
+
+    All the defaults are exactly today's behavior, so the distilled tier is
+    untouched."""
     n_llm = con.execute(
         "SELECT COUNT(*) FROM chunk_annotations WHERE source = 'llm'"
     ).fetchone()[0]
-    need = max(0, target - n_llm)
-    print(f"seed pool: {n_llm} LLM annotations (target {target}, "
-          f"labeling {need} more)")
+    if counter_key is None:
+        n_seeded = n_llm
+        pool = f"{n_llm} LLM annotations"
+    else:
+        n_seeded = min(n_llm, int(get_state(con, counter_key) or 0))
+        pool = f"{n_seeded} sampled seeds of {n_llm} LLM annotations"
+    need = max(0, target - n_seeded)
+    print(f"seed pool: {pool} (target {target}, labeling {need} more)")
     if dry_run or not need:
         return 0
     pending = annotate._pending_chunks(con, all_chats=True, top_dyads=0, limit=None,
@@ -94,8 +123,11 @@ def _seed_chunks(con, model, think, workers, target, dry_run=False, sampler=None
 
     items = groups if gate is None else gate.dispatchable(groups)
     n_done = n_skipped = 0
+    # A gated pass stops where the clock says, not where the sample ends, so a
+    # total would advertise an ETA for work that was never going to run.
+    total = None if gate is not None else len(sample)
     try:
-        with progress.track("Seeding annotations", total=len(sample),
+        with progress.track("Seeding annotations", total=total,
                             header=False) as p:
             for group, results in annotate._pooled(
                     items, request if gate is None else gate.timed(request),
@@ -112,19 +144,34 @@ def _seed_chunks(con, model, think, workers, target, dry_run=False, sampler=None
                     p.advance()
     except KeyboardInterrupt:
         con.commit()
+        _record_seeds(con, counter_key, n_seeded, n_done, stats)
         print(f"\nInterrupted -- committed {n_done} seed annotations "
               f"({n_skipped} skipped); rerun to resume.")
-        raise SystemExit(1) from None
+        if interrupt_exit:
+            raise SystemExit(1) from None
+        raise
     con.commit()
+    _record_seeds(con, counter_key, n_seeded, n_done, stats)
     # A budgeted caller can stop this pass short, and the pool level is what
     # every later phase depends on -- so say the shortfall out loud rather than
     # letting "Seeded 412" read as "done".
     shortfall = ""
     if gate is not None and gate.stopped:
         shortfall = (f" -- stopped at the seed phase's share of the budget with "
-                     f"{n_llm + n_done} of {target} seeds; rerun to top up")
+                     f"{n_seeded + n_done} of {target} seeds; rerun to top up")
     print(f"Seeded {n_done} annotations ({n_skipped} skipped){shortfall}")
     return n_done
+
+
+def _record_seeds(con, counter_key, n_seeded, n_done, stats=None):
+    """Bank this pass's draws under `counter_key` and report the count out.
+    Run on the interrupt path too: the rows are committed, so a counter that
+    forgot them would buy them a second time on the next run."""
+    if stats is not None:
+        stats["done"] = n_done
+    if counter_key and n_done:
+        set_state(con, counter_key, str(n_seeded + n_done))
+        con.commit()
 
 
 def _knn_predict(con, labels, emb, k):
@@ -212,10 +259,30 @@ def _build_seed_index(con):
             for cid, _emb, val, ej, dep in seeds}
 
 
-def _classify_chunks(con, k, dry_run=False):
+# How often the kNN passes read the clock. Per row would be correct and free
+# next to a ~3 ms vec0 MATCH, but these loops also run ungated (the distilled
+# tier passes no deadline) and a stride keeps the branch off that hot path;
+# 256 rows is well under a second of work at any measured rate.
+_DEADLINE_CHECK_EVERY = 256
+
+
+def _past(deadline, n_done):
+    """True when a gated kNN loop should stop. Checked on a stride, so the
+    overshoot is bounded by _DEADLINE_CHECK_EVERY rows, not by the pass."""
+    return (deadline is not None and n_done % _DEADLINE_CHECK_EVERY == 0
+            and time.monotonic() >= deadline)
+
+
+def _classify_chunks(con, k, dry_run=False, deadline=None, stats=None):
     """kNN-classify every un-annotated chunk that has an embedding, writing
     source='distilled' rows (valence/emotions/depth only -- events need an
-    LLM tier; see --upgrade-distilled)."""
+    LLM tier; see --upgrade-distilled).
+
+    `deadline` stops the loop where the clock says (the pass is resumable --
+    it only ever looks at chunks with no annotation at all -- so the next run
+    picks the rest up). `stats`, when given, is a caller-owned dict this sets
+    'stopped'/'interrupted' in: the two are different news to a budgeted
+    caller, and neither is visible in the row count."""
     _require_chunk_vectors(con)
     todo = con.execute("""
         SELECT v.chunk_id, v.embedding FROM chunk_vectors v
@@ -233,6 +300,10 @@ def _classify_chunks(con, k, dry_run=False):
         with progress.track("Classifying chunks (kNN)", total=len(todo),
                             header=False) as p:
             for chunk_id, emb in todo:
+                if _past(deadline, n_done):
+                    if stats is not None:
+                        stats["stopped"] = True
+                    break
                 valence, emotions, depth, conf = _knn_predict(con, labels, emb, k)
                 con.execute(
                     "INSERT OR REPLACE INTO chunk_annotations"
@@ -248,15 +319,19 @@ def _classify_chunks(con, k, dry_run=False):
                     con.commit()
     except KeyboardInterrupt:
         con.commit()
+        if stats is not None:
+            stats["interrupted"] = True
         print(f"\nInterrupted -- committed {n_done} distilled annotations; "
               f"rerun to resume.")
         return n_done
     con.commit()
-    print(f"Classified {n_done} chunks")
+    tail = "" if n_done == len(todo) else f" of {len(todo)} (out of budget; rerun)"
+    print(f"Classified {n_done} chunks{tail}")
     return n_done
 
 
-def backfill_confidence(con, k, dry_run=False):
+def backfill_confidence(con, k, dry_run=False, deadline=None, stats=None,
+                        has_confidence=True):
     """Fill knn_confidence in for source='distilled' rows that lack it, by
     re-running the same kNN vote (deterministic, no LLM call). Needed because
     _classify_chunks only touches chunks with NO annotation at all, so on a
@@ -269,13 +344,24 @@ def backfill_confidence(con, k, dry_run=False):
     be a different, unrequested change (and would silently move readers that
     trust the existing values). Rows with no chunk_vectors embedding can't be
     scored and are skipped. Returns the number of rows updated -- or, under
-    dry_run, the number it would update."""
+    dry_run, the number it would update.
+
+    `deadline`/`stats` work as in _classify_chunks: the pass is resumable (it
+    only looks at rows whose confidence is still NULL), and it needs the gate
+    because its cost is O(rows x seeds) -- one vec0 MATCH per row against
+    every source='llm' seed. Measured 2026-07-28, same corpus and machine:
+    14.6 s for 24,579 rows against a 450-seed pool (1,688 rows/s) but 82.0 s
+    for 20,613 rows against a 4,416-seed one (251 rows/s), a 6.7x per-row
+    slowdown for a 9.8x wider pool. `has_confidence=False` says the column does not
+    exist yet (only reachable under --dry-run, which no longer migrates), in
+    which case every distilled row is pending by definition."""
     _require_chunk_vectors(con)
     if dry_run:
-        n = con.execute("""
+        unscored = "a.knn_confidence IS NULL" if has_confidence else "1"
+        n = con.execute(f"""
             SELECT COUNT(*) FROM chunk_annotations a
             JOIN chunk_vectors v ON v.chunk_id = a.chunk_id
-            WHERE a.source = 'distilled' AND a.knn_confidence IS NULL
+            WHERE a.source = 'distilled' AND {unscored}
         """).fetchone()[0]
         print(f"{n} distilled rows to backfill with kNN confidence (k={k})")
         return n
@@ -296,6 +382,10 @@ def backfill_confidence(con, k, dry_run=False):
         with progress.track("Backfilling kNN confidence", total=len(todo),
                             header=False) as p:
             for chunk_id, emb in todo:
+                if _past(deadline, n_done):
+                    if stats is not None:
+                        stats["stopped"] = True
+                    break
                 confidence = _knn_predict(con, labels, emb, k)[3]
                 con.execute(
                     "UPDATE chunk_annotations SET knn_confidence = ? "
@@ -307,11 +397,14 @@ def backfill_confidence(con, k, dry_run=False):
                     con.commit()
     except KeyboardInterrupt:
         con.commit()
+        if stats is not None:
+            stats["interrupted"] = True
         print(f"\nInterrupted -- committed {n_done} confidence backfills; "
               f"rerun to resume.")
         return n_done
     con.commit()
-    print(f"Backfilled confidence for {n_done} distilled rows")
+    tail = "" if n_done == len(todo) else f" of {len(todo)} (out of budget; rerun)"
+    print(f"Backfilled confidence for {n_done}{tail} distilled rows")
     return n_done
 
 
@@ -321,6 +414,9 @@ def distill_chunks(con, model, think=None, workers=1,
     """The distilled quality tier: ensure `seed_target` LLM-labeled seeds
     exist, then kNN-classify the rest of the corpus from chunk_vectors."""
     # _classify_chunks writes knn_confidence, which postdates DBs in the wild.
-    annotate._ensure_column(con, "chunk_annotations", "knn_confidence")
+    # A dry run never reaches that write (it returns on the count line), so it
+    # keeps its no-writes promise by skipping the migration entirely.
+    annotate._ensure_column(con, "chunk_annotations", "knn_confidence",
+                            dry_run=dry_run)
     _seed_chunks(con, model, think, workers, seed_target, dry_run=dry_run)
     return _classify_chunks(con, k, dry_run=dry_run)

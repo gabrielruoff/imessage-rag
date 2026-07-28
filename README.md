@@ -203,18 +203,27 @@ back in the right order (and stays sequential even under `make -j`).
     Valence and depth match LLM fidelity, emotions run a little rougher, and
     *events are left empty* — extracting quotes is the one thing the shortcut
     can't do.
-  - `hybrid` buys as much of the above as a *wall clock* allows: a wider
-    stratified seed draw (itself capped at a quarter of the budget — seeding is
-    LLM work too) and the same corpus-wide kNN pass, then real LLM calls that
-    replace distilled rows until `ANNOTATE_BUDGET_MINUTES` runs out — event
-    candidates first (a lexicon prefilter picks the chunks likely to contain
-    good news or thanks, since events are the one label the shortcut can't
-    produce), then the rows the kNN vote was least sure about. Budgeting time
-    rather than a chunk count is what makes it self-terminate instead of
-    overrunning; it commits as it goes and a rerun resumes, topping the seed
-    pool up and buying more upgrades. `--all` / `--top-dyads N` / `--limit`
-    reach only the upgrade phase, and `--upgrade-distilled` is an error with
-    it — upgrading distilled rows is what it already does.
+  - `hybrid` (`make annotate-hybrid`) buys as much of the above as a *wall
+    clock* allows: a wider stratified seed draw
+    (`ANNOTATE_HYBRID_SEED_TARGET`, default 800, capped at a quarter of the
+    budget — seeding is LLM work too) and the same corpus-wide kNN pass, then
+    real LLM calls that replace distilled rows until `ANNOTATE_BUDGET_MINUTES`
+    runs out — event candidates first (a lexicon prefilter picks the chunks
+    likely to contain good news or thanks, since events are the one label the
+    shortcut can't produce; oldest conversations first, and each rerun advances
+    through the list), then the rows the kNN vote was least sure about.
+    Budgeting time rather than a chunk count is what makes it self-terminate
+    instead of overrunning: *every* phase stops at the clock, including the
+    deterministic kNN pass, and each starts from the per-request time an
+    earlier run measured so nothing is dispatched blind. It commits as it goes
+    and a rerun resumes, topping the seed pool up and buying more upgrades.
+    One LLM request is the smallest thing it can buy (~106s for 8
+    event-candidate chunks on the reference machine), so a budget under about
+    five minutes will decline to start work it can't finish and tell you to
+    raise the budget — the 25-minute default is the one to use. `--all` /
+    `--top-dyads N` / `--limit` reach only the upgrade phase, and
+    `--upgrade-distilled` is an error with it — upgrading distilled rows is
+    what it already does.
   - `fast` / `balanced` / `max` are the real-LLM-call-per-chunk tiers (each
     slower and more faithful than the last; hours to days corpus-wide). They
     cover the top `ANNOTATE_TOP_DYADS` chats (default 20) bare, honor `--all`
@@ -238,13 +247,18 @@ back in the right order (and stays sequential even under `make -j`).
 
 (`make annotate-all` passes `--all`, which only changes anything if you've set
 an LLM quality tier — under the default `distilled` both targets already cover
-the whole corpus.)
+the whole corpus. `make annotate-hybrid` runs the wall-clock tier and, unlike
+`make annotate`, does *not* chain the `--terms` pass: term curation is a
+separate pipeline with its own unbudgeted cost, and folding it in would break
+the one thing the budget promises.)
 
 `--dry-run` prints the pending scope and exits without calling Ollama or
-writing anything, which is worth doing before an LLM-tier `--all` to see how
-many chunks you're signing up for. It previews `--retry-failed` too: the
+writing any annotations, which is worth doing before an LLM-tier `--all` to see
+how many chunks you're signing up for. It previews `--retry-failed` too: the
 scope it prints is what the real run would curate, but the unparking itself
-is held back. `--limit N` caps a single run. `annotate.py`
+is held back. (One asterisk: on a database old enough to predate a column
+`--terms` needs, a dry run still applies that one schema migration before it
+can read — the chunk tiers no longer do.) `--limit N` caps a single run. `annotate.py`
 records its model and refuses to mix models into a non-empty
 `chunk_annotations` table (distilled rows count — they inherit the seed
 model's bias), so changing `ANNOTATE_MODEL` means emptying that table first.
@@ -280,8 +294,10 @@ shows who made the cut before anything is generated. Override with
 `--out` (default `wrapped_<year>_<scope>.html`).
 
 Tunables (session gap, late-night hours, `LOCAL_TZ`, dyad-term thresholds,
-annotation quality/workers/seed pool, topic `k`, wrapped roster size) all
-live in `.env` — see `.env.example`.
+annotation quality/workers/seed pools — `ANNOTATE_SEED_TARGET` for `distilled`
+and `ANNOTATE_HYBRID_SEED_TARGET` for `hybrid`, which are deliberately separate
+knobs — topic `k`, wrapped roster size) all live in `.env` — see
+`.env.example`.
 
 ### Progress output
 

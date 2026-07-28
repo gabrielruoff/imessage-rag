@@ -388,7 +388,14 @@ def _vec_readable(con):
     connection normally arrives with sqlite-vec already loaded (db.connect
     loads it by default), but this module is also reachable from a bare
     connection, so it probes and loads on demand -- and gives up quietly if the
-    Python build has no loadable-extension support at all."""
+    Python build has no loadable-extension support at all.
+
+    The load arm catches exactly the ways that can fail: sqlite3.Error (the
+    extension is absent or the vec0 table won't open), AttributeError (a
+    python.org build with no enable_load_extension at all -- see CLAUDE.md's
+    install note) and OSError (the .dylib is missing or unreadable). NOT a bare
+    Exception: degrading level-2 selection to random is the right answer to a
+    missing extension and the wrong one to a bug in this module."""
     if not con.execute(
             "SELECT 1 FROM sqlite_master WHERE name = 'chunk_vectors'").fetchone():
         return False
@@ -400,7 +407,7 @@ def _vec_readable(con):
     try:
         load_vec_extension(con)
         con.execute("SELECT chunk_id FROM chunk_vectors LIMIT 1").fetchone()
-    except Exception:
+    except (sqlite3.Error, AttributeError, OSError):
         return False
     return True
 

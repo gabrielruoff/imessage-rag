@@ -112,7 +112,10 @@ that, and it runs for hours. `annotate.py --quality hybrid` is the bounded-time
 alternative: it upgrades distilled rows until `ANNOTATE_BUDGET_MINUTES` is spent — event
 candidates first, then the least-confident rows — so the same reads light up for the
 chunks that matter most rather than for everything. Substitute it anywhere below when you
-want a demo-able run instead of an overnight one.
+want a demo-able run instead of an overnight one. Leave the budget at its 25-minute
+default for a demo: one LLM request is the smallest thing the tier can buy (~106s for 8
+event-candidate chunks on the reference machine), so a 1- or 2-minute budget correctly
+declines to start anything and just prints why.
 
 ### 0c. The gate cheat-sheet — flip these in `.env` *before* building/demoing
 

@@ -2,15 +2,25 @@
 
 Status: IMPLEMENTED. Kept as design history — but read `docs/DECISIONS.md`
 (2026-07-27 hybrid entry) for what actually shipped, because measurement during
-implementation refuted four of this document's premises:
+implementation and during the PR #42 review refuted five of this document's
+premises:
 
-- **§3 "Phase 1 and 2 … are cheap"** — false. The seed pass measured 641.9 s
-  (10.7 min) for 350 seeds, one chunk per request; an 8-min budget produced an
-  11.0-min run with zero LLM upgrades. Seeding is now batched AND capped at a
-  share of the budget, and every LLM phase is deadline-gated.
+- **§3 "Phase 1 and 2 … are cheap"** — false of *both*. The seed pass measured
+  641.9 s (10.7 min) for 350 seeds, one chunk per request; an 8-min budget
+  produced an 11.0-min run with zero LLM upgrades. Phase 2 is O(rows × seeds)
+  and measured 14.6 s at a 450-seed pool against 82.0 s at 4,416 — a pool the
+  tier itself widens every run. EVERY phase is now deadline-gated, seeding and
+  kNN included, and all of them are resumable.
 - **§3 "bounded overshoot ≈ one group ≈ tens of seconds"** — false.
   `annotate._pooled` holds 2x `ANNOTATE_WORKERS` groups; measured +1.5 to
-  +3.7 min. The gate now reserves a measured drain instead.
+  +3.7 min, and a 2-min budget landed at 4.4. The gate now reserves a measured
+  drain AND remembers the per-request time across runs (`ingest_state`), so no
+  phase dispatches blind. The floor that leaves: one request is the smallest
+  unit, so a budget under ~5 min buys nothing and says so.
+- **§4 "seed target = `COUNT(source='llm')`"** — self-defeating. Phase 3 writes
+  `source='llm'`, so the tier's own upgrades satisfied its own seed target and
+  the stratified sampler stopped running on any previously-annotated corpus.
+  The target now counts a `hybrid_seeds` counter in `ingest_state`.
 - **§2 `_APPLE_ANNOTATE_CHAR_BUDGET` 12000 → 8000** — did not fix the overflow
   it was chosen for (100% batched-call failure at 8,000). It is 2,000, and the
   dominant apple failure turned out to be malformed JSON, not overflow.
@@ -20,7 +30,7 @@ implementation refuted four of this document's premises:
   chat representation.
 
 Two estimates were also off: the event prefilter yields ~20% of in-scope
-chunks, not §3's 5–10%, and a 25-min run buys ~350–800 upgrades, not §2's
+chunks, not §3's 5–10%, and a 25-min run buys ~250–350 upgrades, not §2's
 800–1,200.
 Audience: implementation agents working in parallel. Read this whole document
 before touching code; the **Contracts** section is binding — it is what makes

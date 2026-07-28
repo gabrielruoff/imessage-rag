@@ -24,12 +24,15 @@ Upgraded rows are written source='llm', so every valence-trusting reader
 up for exactly the chunks that matter.
 
 Phases 1-2 are corpus-wide by design (the kNN vote has to generalize, so the
-scope flags deliberately don't reach them). Phase 2 is genuinely cheap and runs
-to completion; phase 1 is NOT -- it is LLM work like phase 3, and measured
-unbounded it consumed a whole 8-minute budget on its own -- so it gets its own
-_SEED_PHASE_SHARE slice of the clock and stops dispatching at it, leaving the
-pool topped up on the next run. Every LLM phase is deadline-gated; only phase 3
-also honors --all/--top-dyads/--limit, like the LLM tiers.
+scope flags deliberately don't reach them). EVERY phase is deadline-gated, not
+just the LLM ones: phase 1 is LLM work like phase 3 (measured unbounded it
+consumed a whole 8-minute budget on its own), so it gets its own
+_SEED_PHASE_SHARE slice of the clock, and phase 2 is deterministic but not
+cheap -- its cost is O(rows x seeds), and on the same corpus and machine it
+measured 14.6 s at a 450-seed pool against 82.0 s at a 4,416-seed one -- so it
+runs against the budget itself.
+Both are resumable, so stopping short only defers work to the next run. Only
+phase 3 also honors --all/--top-dyads/--limit, like the LLM tiers.
 
 annotate.py owns the CLI and calls hybrid_chunks; the shared request/
 validation/write helpers stay in annotate and are resolved late (module-
@@ -89,11 +92,39 @@ _SEED_PHASE_SHARE = 0.25
 # classification would; the remainder goes where kNN is most likely to be
 # WRONG. 3a hands unused time back -- when the candidates run out early, 3b
 # simply inherits the balance.
+#
+# The consequence to know about is the floor underneath both phases: nothing
+# smaller than one group can be dispatched, so a phase whose share is under one
+# group's LATENCY buys nothing at all. Measured 2026-07-28 (qwen3.5:4b, batch
+# 8, 4 workers) a group of 8 cost 106.4 s on the event candidates and 70.6 s on
+# the confidence upgrades, so a 2-min budget correctly declines both phases
+# (and _run_upgrades says why) while 6 min bought 32 of each. The 25-min
+# default is far clear of the floor; the old behavior on a 2-min budget was to
+# commit a blind wave anyway and take 4.4 min over it.
 _EVENT_PHASE_SHARE = 0.60
 
 # Ids per `WHERE id IN (...)` slice. A corpus-wide event prefilter can name
 # thousands of chunks, past SQLite's default 999-variable ceiling.
 _ID_SLICE = 500
+
+# Cap on the phase-3b candidate rows fetched in one run. The fetch carries
+# every row's full chunk TEXT (measured 14,995 rows / 9.5 MB / ~26 MB resident
+# on the reference corpus) and the budget can only ever dispatch a few hundred
+# of them: at the fastest rate measured for this phase (2.2 s/chunk end to
+# end) even an hour buys ~1,600. 5,000 is that with room to spare, and the rows are taken
+# lowest-confidence-first, so the cap only ever drops rows the run was never
+# going to reach.
+_LOW_CONF_FETCH_CAP = 5000
+
+# ingest_state key: how many seeds THIS tier's sampler has drawn. Not
+# COUNT(source='llm'), because phase 3 writes source='llm' too -- counting its
+# own upgrades made the tier satisfy its own seed target, so on the reference
+# corpus (4,416 'llm' rows) the target and the whole stratified sampler were
+# permanently inert. An ingest_state counter rather than a new `source` value:
+# every valence-trusting reader in the repo keys on source='llm', and a third
+# value would mean touching all of them to keep seeds visible. reset_db.py
+# clears ingest_state wholesale, so a reset zeroes this with the annotations.
+_SEED_COUNTER_KEY = "hybrid_seeds"
 
 
 def _resolve_budget_minutes(model, budget_minutes=None):
@@ -136,11 +167,15 @@ _LOW_CONF_FROM = ("FROM chunk_annotations a JOIN chunks c ON c.id = a.chunk_id "
 _LOW_CONF_ORDER = " ORDER BY a.knn_confidence IS NULL, a.knn_confidence"
 
 
-def _low_confidence_rows(con, all_chats, top_dyads, limit=None):
+def _low_confidence_rows(con, all_chats, top_dyads, limit=None,
+                         by_confidence=True):
     """(chunk_id, text) for the in-scope distilled rows the kNN vote was least
-    sure about, least-confident first."""
+    sure about, least-confident first. `by_confidence=False` drops to chunk-id
+    order for the one caller that can meet a DB where the column does not exist
+    yet (--dry-run, which no longer migrates)."""
     clause, params = _scope_clause(all_chats, top_dyads)
-    sql = f"SELECT c.id, c.text {_LOW_CONF_FROM}{clause}{_LOW_CONF_ORDER}"
+    order = _LOW_CONF_ORDER if by_confidence else " ORDER BY a.chunk_id"
+    sql = f"SELECT c.id, c.text {_LOW_CONF_FROM}{clause}{order}"
     if limit is not None:
         sql += " LIMIT ?"
         params = params + [limit]
@@ -169,24 +204,6 @@ def _chunk_rows(con, chunk_ids):
     return rows
 
 
-def _knn_work_pending(con):
-    """True when the Phase-2 passes left work behind -- which here means a
-    Ctrl-C landed inside one of them. Both _classify_chunks and
-    backfill_confidence catch KeyboardInterrupt internally and RETURN, without
-    telling the caller, so without this check the tier would fall straight into
-    the LLM phases the user just asked it to stop. Exact rather than heuristic:
-    both passes drive off these same two todo queries, so a pass that ran to
-    completion always leaves zero."""
-    return bool(con.execute("""
-        SELECT (SELECT COUNT(*) FROM chunk_vectors v
-                  LEFT JOIN chunk_annotations a ON a.chunk_id = v.chunk_id
-                 WHERE a.chunk_id IS NULL)
-             + (SELECT COUNT(*) FROM chunk_annotations a
-                  JOIN chunk_vectors v ON v.chunk_id = a.chunk_id
-                 WHERE a.source = 'distilled' AND a.knn_confidence IS NULL)
-    """).fetchone()[0])
-
-
 def _n_seeds(con):
     """LLM seeds the kNN vote can actually use -- source='llm' rows that HAVE
     an embedding, i.e. exactly what annotate_distill._build_seed_index counts
@@ -204,7 +221,7 @@ def _n_seeds(con):
 
 
 def _run_upgrades(con, rows, model, think, workers, batch_size, deadline,
-                  description, seen, stats, rate=None):
+                  description, seen, stats, rate=None, phase="upgrade"):
     """LLM-re-annotate `rows` ((chunk_id, text)) until they run out or
     `deadline` passes, writing source='llm'. Mirrors annotate_chunks' dispatch
     loop -- same grouping, same _pooled fan-out, same per-row write and commit
@@ -213,9 +230,10 @@ def _run_upgrades(con, rows, model, think, workers, batch_size, deadline,
     The gate is annotate._DispatchDeadline, which stops dispatching a drain's
     worth of time BEFORE the deadline rather than at it: everything already
     handed to the pool still finishes and commits, and at ANNOTATE_WORKERS=4
-    that backlog measured minutes, not "one group". `rate` carries the run's
-    per-group timings across phases, so only the first LLM phase of a run has
-    to dispatch without an estimate.
+    that backlog measured minutes, not "one group". `rate`/`phase` are this
+    phase's estimator and its ingest_state key: annotate._load_group_rate
+    primes it with what an earlier run measured for the same phase, so the
+    first dispatch is not blind, and the finally banks what this one measured.
 
     Counters go into the caller-owned `stats` dict (done/skipped/stopped)
     rather than a return value, so a KeyboardInterrupt propagating out of here
@@ -224,7 +242,12 @@ def _run_upgrades(con, rows, model, think, workers, batch_size, deadline,
     gate = annotate._DispatchDeadline(deadline, workers, time.monotonic, rate)
 
     try:
-        with progress.track(description, total=len(rows), header=False) as p:
+        # total=None deliberately: the deadline, not the candidate list, decides
+        # where this phase stops, and a total would promise an ETA for work that
+        # was never going to run (a stopped phase left the bar at 72/2567). The
+        # phase's own header line already printed the candidate count.
+        with progress.track(description, total=None if rows else 0,
+                            header=False) as p:
             for group, results in annotate._pooled(
                     gate.dispatchable(groups),
                     gate.timed(lambda g: annotate._annotate_group(g, model, think)),
@@ -246,15 +269,25 @@ def _run_upgrades(con, rows, model, think, workers, batch_size, deadline,
                     p.advance()
                     if stats["done"] % config.ANNOTATE_COMMIT_EVERY == 0:
                         con.commit()
-    except KeyboardInterrupt:
-        con.commit()
-        raise
     finally:
-        # In a finally so the caller's summary is accurate on the interrupt
-        # path too -- the gate is the only thing that knows whether candidates
-        # were left undispatched.
+        # Commit in the finally, not just on the KeyboardInterrupt path: an
+        # ollama timeout propagating out of _pooled would otherwise roll back
+        # up to ANNOTATE_COMMIT_EVERY - 1 upgrades the budget had already paid
+        # for. Also where stats["stopped"] lands, so the caller's summary is
+        # accurate on every exit -- the gate is the only thing that knows
+        # whether candidates were left undispatched.
+        con.commit()
         stats["stopped"] = gate.stopped
-    con.commit()
+        annotate._save_group_rate(con, gate.rate, phase, model, batch_size,
+                                  workers)
+    if gate.stopped and not stats["done"] and groups:
+        # Declining every candidate is the correct answer to a budget smaller
+        # than one request, but silence would read as "there was nothing to do".
+        # len(groups[0]), not batch_size: apple packs by char budget instead.
+        print(f"  dispatched nothing: one request of {len(groups[0])} chunks is "
+              f"worth ~{gate.rate.estimate():.0f}s at the measured rate, more "
+              f"than this phase's share of the budget -- raise "
+              f"ANNOTATE_BUDGET_MINUTES")
 
 
 def _preview(rows):
@@ -307,8 +340,11 @@ def hybrid_chunks(con, model, think=False, workers=1, all_chats=False,
         batch_size = annotate.QUALITY_PRESETS["hybrid"][1]
     # Phases 2 and 3b read and write knn_confidence, which postdates DBs in the
     # wild -- and annotate.py is reachable without the ingest.py run that
-    # normally applies migrations.
-    annotate._ensure_column(con, "chunk_annotations", "knn_confidence")
+    # normally applies migrations. Under --dry-run the migration is skipped
+    # (it is a write, and create_schema also rescans reactions) and the two
+    # preview reads below degrade instead.
+    has_conf = annotate._ensure_column(con, "chunk_annotations", "knn_confidence",
+                                       dry_run=dry_run)
     minutes, budget_source = _resolve_budget_minutes(model, budget_minutes)
     k = config.ANNOTATE_KNN_K
     started = time.monotonic()
@@ -327,24 +363,55 @@ def hybrid_chunks(con, model, think=False, workers=1, all_chats=False,
     events = {"done": 0, "skipped": 0, "stopped": False}
     low_conf = {"done": 0, "skipped": 0, "stopped": False}
     seen = set()
-    # One estimator for the whole run: phase 3 then starts from what phase 1
-    # measured instead of committing a blind _pooled wave of its own.
-    rate = annotate._GroupRate()
+    # One estimator per phase, each primed from what an earlier run measured
+    # for this model/batch/workers -- so no phase has to commit a blind _pooled
+    # wave, and none of them anchors another wrong. They really are different
+    # populations: measured 2026-07-28, a group of 8 averaged 106.4 s of
+    # latency on the event candidates (~1,900-char chunks, whose batched
+    # replies often cover only some ids and fall back to single-chunk
+    # requests) against 70.6 s on the confidence upgrades (median ~360 chars).
+    seed_rate = annotate._load_group_rate(con, "seed", model, batch_size, workers)
+    event_rate = annotate._load_group_rate(con, "event", model, batch_size, workers)
+    low_conf_rate = annotate._load_group_rate(con, "lowconf", model, batch_size,
+                                              workers)
 
-    # Phases 1-2: corpus-wide (see the module docstring). Phase 1 is LLM work
-    # and gets a bounded slice of the clock; phase 2 is deterministic kNN and
-    # runs to completion.
+    # Phases 1-2: corpus-wide (see the module docstring). Phase 1 gets a
+    # bounded slice of the clock because it is LLM work; phase 2 runs against
+    # the budget itself -- it is deterministic, but O(rows x seeds), which is
+    # not the same thing as cheap.
     seed_deadline = started + minutes * 60 * _SEED_PHASE_SHARE
     print(f"phase 1: seed top-up (corpus-wide, stratified draw, up to "
           f"{_SEED_PHASE_SHARE:.0%} of the budget)")
-    counts["seeded"] = annotate_distill._seed_chunks(
-        con, model, think, workers, seed_target, dry_run=dry_run,
-        sampler=annotate_sampling.stratified_sample,
-        batch_size=batch_size, deadline=seed_deadline, rate=rate)
-    print("phase 2: kNN classify + confidence backfill (corpus-wide)")
+    seeds = {"done": 0}
     try:
-        counts["classified"] = annotate_distill._classify_chunks(con, k, dry_run=dry_run)
-        counts["backfilled"] = annotate_distill.backfill_confidence(con, k, dry_run=dry_run)
+        counts["seeded"] = annotate_distill._seed_chunks(
+            con, model, think, workers, seed_target, dry_run=dry_run,
+            sampler=annotate_sampling.stratified_sample,
+            batch_size=batch_size, deadline=seed_deadline, rate=seed_rate,
+            counter_key=_SEED_COUNTER_KEY, interrupt_exit=False, stats=seeds)
+    except KeyboardInterrupt:
+        # Ctrl-C ends every phase of this tier the same way -- commit, report,
+        # exit 0 -- rather than phase 1 alone exiting 1 (db.run_cli never even
+        # saw the interrupt, so the tier had three exit codes for one key).
+        counts["seeded"] = seeds["done"]
+        _summary(counts, events, low_conf, minutes, started,
+                 "interrupted during the seed pass; rerun to resume")
+        return counts["seeded"]
+    finally:
+        if not dry_run:
+            annotate._save_group_rate(con, seed_rate, "seed", model, batch_size,
+                                      workers)
+    print("phase 2: kNN classify + confidence backfill (corpus-wide)")
+    knn = {"stopped": False, "interrupted": False}
+    try:
+        counts["classified"] = annotate_distill._classify_chunks(
+            con, k, dry_run=dry_run, deadline=deadline, stats=knn)
+        # Skipped outright when the classify pass already ran out of clock (or
+        # was interrupted): it would only reconfirm that there is no time.
+        if not (knn["stopped"] or knn["interrupted"]):
+            counts["backfilled"] = annotate_distill.backfill_confidence(
+                con, k, dry_run=dry_run, deadline=deadline, stats=knn,
+                has_confidence=has_conf)
     except SystemExit:
         # A seed pass cut short by its share of the budget can leave the pool
         # under annotate_distill._KNN_MIN_SEEDS, where the vote really would be
@@ -363,14 +430,17 @@ def hybrid_chunks(con, model, think=False, workers=1, all_chats=False,
         return counts["seeded"]
     total = counts["seeded"] + counts["classified"]
 
-    if not dry_run and _knn_work_pending(con):
+    # A Ctrl-C inside phase 2 is caught and RETURNED there, not raised, so
+    # without this the tier would fall straight into the LLM phases the user
+    # just asked it to stop.
+    if knn["interrupted"]:
         _summary(counts, events, low_conf, minutes, started,
                  "the kNN phases were interrupted, so no LLM upgrades ran; "
                  "rerun to resume")
         return total
 
     now = time.monotonic()
-    if not dry_run and now >= deadline:
+    if not dry_run and (knn["stopped"] or now >= deadline):
         _summary(counts, events, low_conf, minutes, started,
                  "the budget was spent on phases 1-2, so no LLM upgrades ran; "
                  "rerun to resume")
@@ -398,7 +468,7 @@ def hybrid_chunks(con, model, think=False, workers=1, all_chats=False,
         try:
             _run_upgrades(con, event_rows, model, think, workers, batch_size,
                           events_deadline, "Upgrading event candidates", seen,
-                          events, rate)
+                          events, event_rate, phase="event")
         except KeyboardInterrupt:
             print(f"\nInterrupted -- committed {events['done']} event upgrades "
                   f"({events['skipped']} skipped); rerun to resume.")
@@ -410,20 +480,33 @@ def hybrid_chunks(con, model, think=False, workers=1, all_chats=False,
     # now), but a row it skipped, or one whose write is still uncommitted, would
     # otherwise come back around inside the same run.
     remaining = None if limit is None else max(0, limit - len(seen))
+    left = max(0.0, deadline - time.monotonic())
+    if not dry_run and left <= 0:
+        # Before the fetch, not after: the fetch carries every in-scope row's
+        # full chunk TEXT (9.5 MB / ~26 MB resident on the reference corpus)
+        # and there is nothing left to dispatch it into.
+        print(f"phase 3b: skipped -- no budget left ({scope})")
+        _summary(counts, events, low_conf, minutes, started,
+                 "stopped at a phase deadline with candidates left; rerun to "
+                 "resume (rows already annotated by an LLM are skipped)")
+        return total + events["done"]
+    # The candidate count comes from the textless COUNT, not len(rows): the
+    # fetch below is capped at what a budget could conceivably dispatch, and
+    # reporting the cap would understate the scope.
+    n_low_conf = _low_confidence_count(con, all_chats, top_dyads)
     if dry_run:
-        n_low_conf = _low_confidence_count(con, all_chats, top_dyads)
-        low_conf_rows = _low_confidence_rows(con, all_chats, top_dyads, limit=10)
+        low_conf_rows = _low_confidence_rows(con, all_chats, top_dyads, limit=10,
+                                             by_confidence=has_conf)
     else:
+        fetch = _LOW_CONF_FETCH_CAP if remaining is None else min(
+            _LOW_CONF_FETCH_CAP, remaining + len(seen))
         low_conf_rows = [
-            row for row in _low_confidence_rows(
-                con, all_chats, top_dyads,
-                limit=None if remaining is None else remaining + len(seen))
+            row for row in _low_confidence_rows(con, all_chats, top_dyads,
+                                                limit=fetch)
             if row[0] not in seen
         ]
         if remaining is not None:
             low_conf_rows = low_conf_rows[:remaining]
-        n_low_conf = len(low_conf_rows)
-    left = max(0.0, deadline - time.monotonic())
     print(f"phase 3b: {n_low_conf} low-confidence distilled chunks to upgrade "
           f"({scope}, {_fmt_left(left)} left)")
     if dry_run:
@@ -436,7 +519,7 @@ def hybrid_chunks(con, model, think=False, workers=1, all_chats=False,
     try:
         _run_upgrades(con, low_conf_rows, model, think, workers, batch_size,
                       deadline, "Upgrading low-confidence chunks", seen,
-                      low_conf, rate)
+                      low_conf, low_conf_rate, phase="lowconf")
     except KeyboardInterrupt:
         print(f"\nInterrupted -- committed {low_conf['done']} confidence upgrades "
               f"({low_conf['skipped']} skipped); rerun to resume.")

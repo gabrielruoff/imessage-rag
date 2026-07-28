@@ -259,29 +259,45 @@ ANNOTATE_KNN_K = int(os.getenv("ANNOTATE_KNN_K", "10"))
 # at run time, so config only parses the env int. Budgeting wall clock rather
 # than a chunk count is what makes the tier meet its target BY CONSTRUCTION: it
 # runs to a deadline, so it holds on any hardware and any corpus size, and a
-# faster machine degrades to *more* coverage instead of a blown deadline. Every
-# LLM phase is gated, seeding included, and each stops a pool-drain early --
-# but the run can still land ~15% over on a short budget, because
-# annotate._pooled commits 2x ANNOTATE_WORKERS groups before any timing exists
-# (measured: 9.2 min actual on an 8-min budget).
-# Sizing (measured 2026-07-27, 25,029-chunk corpus, qwen3.5:4b batch 8
-# think=False): 1.5-2.6 s/chunk seeding, 2.3-5.6 s/chunk on the event upgrades,
-# ~1.6 s/chunk on the confidence upgrades -- an 8-min budget measured 128
-# LLM-annotated chunks, so 25 min extrapolates to roughly 350-800 and 50 min on
-# Apple FM to a similar range. A cold model load needs no allowance -- the
-# deadline absorbs it, and it simply buys fewer upgrades.
+# faster machine degrades to *more* coverage instead of a blown deadline.
+# EVERY phase is gated, not just the LLM ones -- the corpus-wide kNN pass is
+# deterministic but costs O(rows x seeds), which measured 14.6 s at a 450-seed
+# pool and 82.0 s at a 4,416-seed one on the same 25,029-chunk corpus. Each
+# phase also stops dispatching a pool-drain early, and starts from the
+# per-group time an earlier run recorded in ingest_state, so nothing is
+# committed blind. Measured 2026-07-28 (qwen3.5:4b, batch 8, ANNOTATE_WORKERS=4):
+# a 1-min budget landed at exactly 1.0 min, a 2-min budget at 0.0 (it correctly
+# declines: see below), and a 6-min budget at 3.4-4.8.
+# Sizing, same run set: an LLM request of 8 chunks costs ~106 s of latency on
+# the event upgrades and ~71 s on the confidence upgrades, so 6 min bought 32
+# event + 40 confidence upgrades and the 25-min default extrapolates to roughly
+# 250-350 per run (plus up to 160 seeds -- measured, at the 25% seed share). A cold model load
+# needs no allowance: the deadline absorbs it and it simply buys fewer upgrades.
+# Floor worth knowing: nothing smaller than one request can be dispatched, so a
+# budget whose phase share is under one request's latency buys NOTHING and says
+# so rather than starting work it cannot finish. Below ~5 minutes that is the
+# common outcome; the tier is built for the 25-min default.
 ANNOTATE_BUDGET_MINUTES = int(os.getenv("ANNOTATE_BUDGET_MINUTES") or "0")
-# LLM-labeled seeds the hybrid tier aims for before its kNN pass. Deliberately
-# a separate knob from ANNOTATE_SEED_TARGET (450): hybrid spends part of its
-# budget on MORE seeds, drawn by annotate_sampling's stratified, embedding-
-# diverse sampler, while the distilled tier's ~90s profile is left exactly as
-# it was. What the sampler buys is ~4x fewer near-duplicate seeds and
-# deterministic proportional chat representation -- NOT better corpus-wide kNN
-# coverage, which measured a wash (see annotate_sampling's docstring and
-# docs/DECISIONS.md 2026-07-27); the extra 350 seeds are what widen the vote.
+# Seeds the hybrid tier's own stratified sampler aims to have drawn before its
+# kNN pass. Deliberately a separate knob from ANNOTATE_SEED_TARGET (450):
+# hybrid spends part of its budget on MORE seeds, drawn by annotate_sampling's
+# stratified, embedding-diverse sampler, while the distilled tier's ~90s
+# profile is left exactly as it was. What the sampler buys is ~4x fewer
+# near-duplicate seeds and deterministic proportional chat representation --
+# NOT better corpus-wide kNN coverage, which measured a wash (see
+# annotate_sampling's docstring and docs/DECISIONS.md 2026-07-27); the extra
+# seeds are what widen the vote.
+# Counted against a `hybrid_seeds` counter in ingest_state, NOT against
+# COUNT(source='llm'): the tier's own phase-3 upgrades are 'llm' rows, so
+# counting those let its output satisfy its own target and the sampler stopped
+# running (measured on a corpus with 4,416 'llm' rows: "labeling 0 more" on
+# every run, forever). The consequence to expect is that a corpus already
+# annotated by another tier still pays for this many sampler seeds -- the
+# target is about the SHAPE of the pool, not its size.
 # A TARGET, not a per-run quota: seeding gets a bounded slice of the budget
-# (annotate_hybrid._SEED_PHASE_SHARE, 25%), so on a fresh corpus the pool fills
-# over ~3 runs while every run still spends the rest on upgrades.
+# (annotate_hybrid._SEED_PHASE_SHARE, 25%), so the pool fills over several runs
+# while every run still spends the rest on upgrades. reset_db clears the
+# counter with the rest of ingest_state.
 ANNOTATE_HYBRID_SEED_TARGET = int(os.getenv("ANNOTATE_HYBRID_SEED_TARGET", "800"))
 
 # --- Dyad-term curation (annotate.py --terms) -------------------------------

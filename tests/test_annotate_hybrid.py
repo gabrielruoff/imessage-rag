@@ -256,6 +256,10 @@ class HybridFixture(DBFixture):
         self.con.executemany(
             "INSERT INTO chunk_annotations(chunk_id, valence, emotions_json, depth, "
             "events_json, source) VALUES (?, ?, ?, ?, ?, ?)", annotations)
+        # The pre-existing 'llm' rows stand in for seeds this tier's sampler
+        # already drew: hybrid's seed target counts that counter, not every
+        # source='llm' row (phase 3 writes those too).
+        set_state(self.con, annotate_hybrid._SEED_COUNTER_KEY, str(_SEEDS))
         self.con.commit()
 
     @contextlib.contextmanager
@@ -307,15 +311,15 @@ class TestDeadline(HybridFixture):
         self.assertLessEqual(clock.now - 1000.0, 60.0)
 
     def test_deadline_spent_in_the_knn_phases_skips_the_llm_upgrades(self):
-        # Phase 2 is never cut short, so a budget it exhausts leaves nothing for
-        # phase 3 -- which must degrade to "no upgrades, rerun", not to an
-        # overrun.
+        # A budget the kNN phases exhaust leaves nothing for phase 3 -- which
+        # must degrade to "no upgrades, rerun", not to an overrun.
         clock = FakeClock()
         llm = FakeLLM(clock=clock, seconds=25.0)
         real_classify = annotate_distill._classify_chunks
 
-        def slow_classify(con, k, dry_run=False):
-            n = real_classify(con, k, dry_run=dry_run)
+        def slow_classify(con, k, dry_run=False, deadline=None, stats=None):
+            n = real_classify(con, k, dry_run=dry_run, deadline=deadline,
+                              stats=stats)
             clock.advance(120.0)
             return n
 
@@ -326,6 +330,66 @@ class TestDeadline(HybridFixture):
         self.assertEqual(llm.order, [])
         self.assertEqual(written, _PENDING_MAIN + _PENDING_OTHER)
         self.assertEqual(self.n_source("llm"), _SEEDS)
+
+    def test_the_knn_passes_stop_at_the_budget_instead_of_running_on(self):
+        # Phase 2 used to be exempt from the deadline on the theory that kNN is
+        # cheap. It is O(rows x seeds): 17.9 s for 24,229 rows against an ~800-
+        # seed pool but 69.5 s for 20,613 against a 4,416-seed one, and a 1-min
+        # budget spent 1.1 min inside it and bought no upgrades at all. Both
+        # passes are resumable, so the gate only defers work to the next run.
+        clock = FakeClock()
+        with self.fake_clock(clock):
+            stats = {"stopped": False, "interrupted": False}
+            n = annotate_distill._classify_chunks(
+                self.con, config.ANNOTATE_KNN_K, deadline=clock.now, stats=stats)
+        self.assertEqual(n, 0)
+        self.assertTrue(stats["stopped"])
+        self.assertEqual(self.n_source("distilled"), 0)
+
+        # ...and with clock left, it classifies as before.
+        stats = {"stopped": False, "interrupted": False}
+        n = annotate_distill._classify_chunks(
+            self.con, config.ANNOTATE_KNN_K, stats=stats)
+        self.assertEqual(n, _PENDING_MAIN + _PENDING_OTHER)
+        self.assertFalse(stats["stopped"])
+
+    def test_the_confidence_backfill_stops_at_the_budget_too(self):
+        annotate_distill._classify_chunks(self.con, config.ANNOTATE_KNN_K)
+        self.con.execute("UPDATE chunk_annotations SET knn_confidence = NULL")
+        self.con.commit()
+        clock = FakeClock()
+        with self.fake_clock(clock):
+            stats = {"stopped": False, "interrupted": False}
+            n = annotate_distill.backfill_confidence(
+                self.con, config.ANNOTATE_KNN_K, deadline=clock.now, stats=stats)
+        self.assertEqual(n, 0)
+        self.assertTrue(stats["stopped"])
+        self.assertIsNone(self.confidence(_EVENT_IDS[0]))
+
+    def test_a_knn_phase_out_of_budget_skips_the_upgrades_not_the_reverse(self):
+        # A stopped (not interrupted) phase 2 must land on the "budget spent"
+        # report -- the bug to avoid is gating phase 2 and having its leftovers
+        # read as an interrupt, which would disable every LLM upgrade forever.
+        clock = FakeClock()
+        llm = FakeLLM(clock=clock, seconds=25.0)
+        real_classify = annotate_distill._classify_chunks
+
+        def stopped_classify(con, k, dry_run=False, deadline=None, stats=None):
+            n = real_classify(con, k, dry_run=dry_run, stats=stats)
+            clock.advance(120.0)
+            if stats is not None:
+                stats["stopped"] = True
+            return n
+
+        with self.fake_clock(clock):
+            with mock.patch.object(annotate_distill, "_classify_chunks",
+                                   stopped_classify):
+                with mock.patch("builtins.print") as printed:
+                    self.hybrid(llm, budget_minutes=1)
+        said = " ".join(str(a) for call in printed.call_args_list for a in call.args)
+        self.assertIn("the budget was spent on phases 1-2", said)
+        self.assertNotIn("were interrupted", said)
+        self.assertEqual(llm.order, [])
 
     def test_the_seed_pass_gets_a_bounded_share_of_the_budget(self):
         # Phase 1 is LLM work, not preamble: measured unbounded it spent 10.7
@@ -476,7 +540,7 @@ class TestResume(HybridFixture):
                          _SEEDS + _PENDING_MAIN + _PENDING_OTHER)
         self.assertEqual(self.n_source("distilled"), 0)
 
-    def test_seed_target_counts_existing_llm_rows(self):
+    def test_seed_target_counts_the_seeds_this_tier_drew(self):
         llm = FakeLLM()
         self.hybrid(llm, seed_target=_SEEDS + 5, limit=0)
         self.assertEqual(len(llm.order), 5)                 # the shortfall only
@@ -485,6 +549,47 @@ class TestResume(HybridFixture):
         again = FakeLLM()
         self.hybrid(again, seed_target=_SEEDS + 5, limit=0)
         self.assertEqual(again.order, [])
+
+    def test_phase_three_upgrades_do_not_count_toward_the_seed_target(self):
+        # Phase 3 writes source='llm' too, so counting every such row made the
+        # tier's own output satisfy its own seed target: on the reference
+        # corpus (4,416 'llm' rows against a target of 800) phase 1 printed
+        # "labeling 0 more" on every run and the stratified sampler -- the
+        # whole point of the knob -- never executed again.
+        llm = FakeLLM()
+        self.hybrid(llm, seed_target=_SEEDS, limit=5)
+        self.assertEqual(len(llm.order), 5)                 # upgrades, not seeds
+        self.assertEqual(self.n_source("llm"), _SEEDS + 5)
+        self.assertEqual(int(get_state(self.con, annotate_hybrid._SEED_COUNTER_KEY)),
+                         _SEEDS)
+
+        again = FakeLLM()
+        self.hybrid(again, seed_target=_SEEDS + 3, limit=0)
+        self.assertEqual(len(again.order), 3)               # the sampler still runs
+
+    def test_the_seed_counter_never_claims_more_than_the_rows_that_exist(self):
+        # An emptied chunk_annotations (reset_db also clears ingest_state, but
+        # a hand-cleared table would not) must not leave the counter vouching
+        # for seeds that are gone.
+        self.con.execute("DELETE FROM chunk_annotations")
+        self.con.commit()
+        llm = FakeLLM()
+        with mock.patch.object(ollama, "chat_once_json", llm):
+            n = annotate_distill._seed_chunks(
+                self.con, _MODEL, False, 1, 3,
+                sampler=lambda con, pending, need: pending[:need],
+                counter_key=annotate_hybrid._SEED_COUNTER_KEY)
+        self.assertEqual(n, 3)
+        self.assertEqual(int(get_state(self.con, annotate_hybrid._SEED_COUNTER_KEY)), 3)
+
+    def test_ctrl_c_in_the_seed_pass_reports_and_returns_like_every_phase(self):
+        # Phase 1 used to raise SystemExit(1) while phases 2 and 3 returned 0,
+        # so one Ctrl-C had three meanings depending on where it landed.
+        llm = FakeLLM(interrupt_after=2)
+        written = self.hybrid(llm, seed_target=_SEEDS + 5, limit=0)
+        self.assertEqual(written, 2)
+        self.assertEqual(self.n_source("llm"), _SEEDS + 2)
+        self.assertEqual(self.n_source("distilled"), 0)     # phase 2 never ran
 
 
 # ---------------------------------------------------------------------------
@@ -831,6 +936,19 @@ class TestEnsureColumnSelfHeal(HybridFixture):
         self.assertEqual(llm.order, [])              # seed pool already full
         self.assert_healed()
 
+    def test_dry_runs_preview_a_pre_column_db_without_migrating_it(self):
+        # The self-heal runs schema.create_schema, which is not schema-only
+        # (it rescans reactions for the old guid prefix and rewrites them), so
+        # calling it under --dry-run made a preview the one write-free path
+        # that wrote. Both tiers now defer it and degrade their reads.
+        for quality in ("hybrid", "distilled"):
+            with self.subTest(quality=quality):
+                with mock.patch.object(ollama, "chat_once_json") as llm:
+                    annotate.main(["--quality", quality, "--dry-run"])
+                llm.assert_not_called()
+                self.assertNotIn("knn_confidence",
+                                 _columns(self.con, "chunk_annotations"))
+
 
 # ---------------------------------------------------------------------------
 # CLI surface
@@ -1001,6 +1119,86 @@ class TestDispatchDeadline(unittest.TestCase):
         first.timed(lambda group: clock.advance(40.0))("group")
         second = annotate._DispatchDeadline(1000.0, 1, clock.monotonic, rate)
         self.assertEqual(second.reserve(), 40.0)
+
+    def test_a_prior_makes_the_very_first_dispatch_honest(self):
+        # The blind wave is the residual overshoot: _pooled commits 2x workers
+        # groups before any timing exists, measured as a 2-min budget landing
+        # at 2.6 min with phase 3b starved to zero. A prior from an earlier run
+        # closes it -- the gate can decline before ever measuring anything.
+        clock = FakeClock(0.0)
+        gate = annotate._DispatchDeadline(30.0, 4, clock.monotonic,
+                                          annotate._GroupRate(prior=40.0))
+        self.assertEqual(gate.reserve(), 40.0)
+        self.assertEqual(list(gate.dispatchable(["a", "b"])), [])
+        self.assertTrue(gate.stopped)
+
+    def test_a_measurement_always_beats_the_prior(self):
+        clock = FakeClock(0.0)
+        rate = annotate._GroupRate(prior=40.0)
+        gate = annotate._DispatchDeadline(1000.0, 1, clock.monotonic, rate)
+        gate.timed(lambda group: clock.advance(10.0))("group")
+        self.assertEqual(rate.mean(), 10.0)         # mean stays measurement-only
+        self.assertEqual(gate.reserve(), 10.0)
+
+
+class TestGroupRateMemory(DBFixture):
+    """The prior is carried across runs in ingest_state, so only a DB that has
+    never run this model/batch/workers combination dispatches on a guess."""
+
+    def test_a_measured_rate_primes_the_next_run(self):
+        rate = annotate._GroupRate()
+        rate.record(40.0)
+        annotate._save_group_rate(self.con, rate, "upgrade", _MODEL, 8, 4)
+        primed = annotate._load_group_rate(self.con, "upgrade", _MODEL, 8, 4)
+        self.assertIsNone(primed.mean())            # nothing measured yet...
+        self.assertEqual(primed.estimate(), 40.0)   # ...but not blind either
+
+    def test_the_slowest_group_is_what_crosses_runs_not_the_mean(self):
+        # Group latency is noisy enough between runs (a 106.4 s mean measured
+        # 148 s the next run) that carrying the mean forward under-reserves and
+        # overruns. The failure is one-sided: under-buying is recovered by a
+        # rerun, an overrun breaks the tier's only promise.
+        rate = annotate._GroupRate()
+        for seconds in (10.0, 90.0, 20.0):
+            rate.record(seconds)
+        self.assertEqual(rate.mean(), 40.0)
+        annotate._save_group_rate(self.con, rate, "upgrade", _MODEL, 8, 4)
+        primed = annotate._load_group_rate(self.con, "upgrade", _MODEL, 8, 4)
+        self.assertEqual(primed.estimate(), 90.0)
+        # ...and within a run the live mean still wins over it.
+        primed.record(30.0)
+        self.assertEqual(primed.estimate(), 30.0)
+
+    def test_an_unmeasured_rate_is_never_stored(self):
+        # Storing the prior back would freeze a cold guess into the DB.
+        annotate._save_group_rate(self.con, annotate._GroupRate(prior=99.0),
+                                  "upgrade", _MODEL, 8, 4)
+        self.assertIsNone(get_state(
+            self.con, annotate._group_rate_key("upgrade", _MODEL, 8, 4)))
+
+    def test_the_key_separates_phase_model_batch_and_workers(self):
+        # Group LATENCY is what the reserve is denominated in, and all four
+        # move it -- a seed group is not an upgrade group, and 4 concurrent
+        # requests against a serializing Ollama each measure ~4x a lone one.
+        rate = annotate._GroupRate()
+        rate.record(40.0)
+        annotate._save_group_rate(self.con, rate, "upgrade", _MODEL, 8, 4)
+        cold = annotate._COLD_GROUP_SECONDS_PER_CHUNK
+        for phase, model, batch, workers in (("seed", _MODEL, 8, 4),
+                                             ("upgrade", "other", 8, 4),
+                                             ("upgrade", _MODEL, 1, 4),
+                                             ("upgrade", _MODEL, 8, 1)):
+            with self.subTest(phase=phase, batch=batch, workers=workers):
+                primed = annotate._load_group_rate(self.con, phase, model,
+                                                   batch, workers)
+                self.assertEqual(primed.estimate(), cold * batch * workers)
+
+    def test_a_corrupt_stored_rate_falls_back_to_the_cold_prior(self):
+        set_state(self.con, annotate._group_rate_key("upgrade", _MODEL, 8, 4),
+                  "not-a-number")
+        primed = annotate._load_group_rate(self.con, "upgrade", _MODEL, 8, 4)
+        self.assertEqual(primed.estimate(),
+                         annotate._COLD_GROUP_SECONDS_PER_CHUNK * 8 * 4)
 
 
 class TestSeedBatching(HybridFixture):

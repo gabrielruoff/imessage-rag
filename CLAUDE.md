@@ -34,18 +34,24 @@ Full design history, schema rationale, and data forensics:
   ~`ANNOTATE_SEED_TARGET` seed then kNN-classifies the whole corpus from
   `chunk_vectors` (fast; events left empty). `hybrid` = a stratified
   `ANNOTATE_HYBRID_SEED_TARGET` seed draw + that same kNN pass (both corpus-wide),
-  then LLM upgrades — event-candidate chunks first, lowest-`knn_confidence` next —
-  until the `ANNOTATE_BUDGET_MINUTES` wall-clock deadline; budgeted in TIME not
-  chunks, so it self-terminates and a rerun resumes, the scope flags reach only
-  the upgrade phase, and `--upgrade-distilled` is an error with it (hybrid IS
-  one). EVERY LLM phase is deadline-gated, seeding included (capped at 25% of
-  the budget — unbatched and uncapped it measured 10.7 min of an 8-min run), and
-  each stops dispatching a pool-drain early so the run lands near its budget
-  (~15% over on a short one: `_pooled` commits 2x`ANNOTATE_WORKERS` groups
-  before any timing exists). LLM tiers (`fast`/`balanced`/`max`) scope to top
-  `ANNOTATE_TOP_DYADS`,
-  honor `--all`, and with `--upgrade-distilled` re-annotate kNN rows (how events
-  get filled). `--terms` is a SEPARATE pipeline (below), not a `--quality` tier.
+  then LLM upgrades — event-candidate chunks first (chunk-id ascending, so one
+  run covers the oldest history and reruns advance), lowest-`knn_confidence`
+  next — until the `ANNOTATE_BUDGET_MINUTES` wall-clock deadline; budgeted in
+  TIME not chunks, so it self-terminates and a rerun resumes, the scope flags
+  reach only the upgrade phase, and `--upgrade-distilled` is an error with it
+  (hybrid IS one). EVERY phase is deadline-gated, including the deterministic
+  kNN pass (O(rows × seeds): 14.6 s at a 450-seed pool vs 82.0 s at 4,416) and
+  seeding (also capped at 25% of the budget — unbatched and uncapped it
+  measured 10.7 min of an 8-min run). Each phase starts from the per-request
+  time an earlier run banked in `ingest_state`, so nothing is dispatched blind;
+  the floor is that ONE request is the smallest dispatchable unit (~106 s for 8
+  event chunks), so a budget under ~5 min buys nothing and says so. Its seed
+  target counts a `hybrid_seeds` counter, NOT `source='llm'` rows — the tier's
+  own upgrades are `llm` rows and counting them switched its sampler off
+  permanently. LLM tiers (`fast`/`balanced`/`max`) scope to top
+  `ANNOTATE_TOP_DYADS`, honor `--all`, and with `--upgrade-distilled`
+  re-annotate kNN rows (how events get filled). `--terms` is a SEPARATE
+  pipeline (below), not a `--quality` tier.
 - Curate dyad terms: `python3 annotate.py --terms [--limit N] [--retry-failed]
   [--dry-run]` — its own pipeline; passing `--quality` is an error. Batches
   `ANNOTATE_TERMS_BATCH_SIZE` terms/request (never spanning chats), runs
@@ -170,9 +176,17 @@ ingest_state(key, value)          -- last_message_rowid for --since-last, plus
                                   -- drift_params_hash + drift_annotations_hash +
                                   -- drift_sessions_hash,
                                   -- voiceprint_max_message_id,
-                                  -- eval_gate:<task> (F4 gate verdicts), and
+                                  -- eval_gate:<task> (F4 gate verdicts),
                                   -- nudges_reconnect_ack (durable dormant-tie
-                                  -- reconnect opt-in; unset hides those rows)
+                                  -- reconnect opt-in; unset hides those rows),
+                                  -- hybrid_seeds (seeds --quality hybrid's own
+                                  -- sampler has drawn -- its phase-3 upgrades
+                                  -- are source='llm' too, so COUNT(llm) would
+                                  -- let the tier satisfy its own seed target),
+                                  -- and annotate_group_seconds:<phase>:<model>:
+                                  -- b<batch>:w<workers> (slowest LLM request
+                                  -- seen, so the next budgeted run's first
+                                  -- dispatch is not blind)
 sessions(id, chat_id, first_message_id, last_message_id, first_date,
          last_date, n_messages, n_from_me, initiator_handle_id,
          initiator_is_me, ender_handle_id, ender_is_me)
@@ -385,7 +399,13 @@ chunk_vectors                     -- sqlite-vec vec0 table: chunk_id ->
   availability) so the first `respond` skips cold-load, amortized across the
   session. The `annotate_model` and `embed_model`/`embed_dim` guards apply to
   apple exactly as to Ollama. Batch `--terms` is unclamped on apple — set a small
-  `ANNOTATE_TERMS_BATCH_SIZE`.
+  `ANNOTATE_TERMS_BATCH_SIZE`. Batch ANNOTATION is clamped instead: on apple
+  `annotate._annotation_groups` ignores `batch_size` and packs by
+  `_APPLE_ANNOTATE_CHAR_BUDGET` chars, now 2,000 (one `CHUNK_MAX_CHARS`, down
+  from 12,000) — a GLOBAL change, so `fast`/`balanced`/`max` on apple pack ~6x
+  smaller and measured 1.7–3.5x faster per chunk, because a batched apple
+  request usually fails whatever its size and each failure costs a single-chunk
+  retry per id.
 - Don't modify or read files in `tests/` unless the task is about tests.
 
 ## Conventions
