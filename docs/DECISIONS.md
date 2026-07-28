@@ -1261,3 +1261,297 @@ resolve and does NOT set the flag, so genuine closes still reconcile — the
 exemption only defers to the next clean run, never resolves wrongly. (A hard
 socket timeout instead raises and crashes the run before the reconcile/commit
 step, so it can't silently over-resolve; left as-is.)
+
+## 2026-07-27: `--quality hybrid` — annotation on a wall-clock budget
+
+Between `distilled` (~90 s once seeded, kNN everywhere, **no events**) and
+`fast` (~16 h corpus-wide on this machine) there was nothing. `hybrid` fills
+the gap, and its defining choice is that it is specified in **wall clock, not
+chunks**: `ANNOTATE_BUDGET_MINUTES` (empty/0 → 25 on Ollama, 50 on Apple FM,
+resolved per run from `config.is_apple_model`). Four phases under one deadline
+(`annotate_hybrid.hybrid_chunks`):
+
+1. **seed top-up** — widen the LLM seed pool to `ANNOTATE_HYBRID_SEED_TARGET`
+   (800) with `annotate_sampling.stratified_sample` instead of distilled's
+   `random.sample`, batched like any other LLM phase and capped at
+   `_SEED_PHASE_SHARE` (25%) of the budget.
+2. **kNN classify + confidence backfill** — the distilled pass, corpus-wide,
+   now also writing `chunk_annotations.knn_confidence`.
+3. **3a event upgrades** — LLM-re-annotate the chunks
+   `annotate_events.event_candidate_chunk_ids` flags, up to 60% of the time
+   left after phase 2.
+4. **3b confidence upgrades** — LLM-re-annotate the lowest-`knn_confidence`
+   distilled rows with the rest.
+
+Phases 1–2 are corpus-wide by design (the kNN vote has to generalize, so the
+scope flags deliberately don't reach them). Phase 2 is deterministic kNN and
+runs to completion; **phase 1 is LLM work and is capped like phase 3** — see
+"Phase 1 is not preamble" below. Phase 3 writes `source='llm'`, which is what
+wakes the valence-trusting readers (conflict corroboration, the nudge Stage-0
+exclusion, voiceprint tone) for exactly the chunks the budget reached.
+`--upgrade-distilled` is rejected with `hybrid`: hybrid *is* a
+distilled-upgrader.
+
+**The runtime promise is structural, and the first cut of it did not hold.**
+The intent — stop dispatching at a monotonic deadline, so the target (< 30 min
+on qwen3.5:4b, < 1 h on Apple FM) is met by construction on any hardware and
+any corpus size — is right, but two exemptions in the first implementation
+falsified it in measurement, and both are now closed:
+
+- Phase 1 was exempt from the deadline on the theory that it was cheap. It is
+  not; unbatched it spent 10.7 min of an 8-min budget, and phase 3 never ran.
+- "Dispatch stops at the deadline" ignored the pool's own backlog, which is
+  worth minutes, not the "one group" the comment claimed.
+
+### Phase 1 is not preamble: batch it, then cap it
+
+Measured 2026-07-27, `ANNOTATE_BUDGET_MINUTES=8`, qwen3.5:4b, 25,029-chunk
+corpus with 450 existing seeds: the 350-seed top-up dispatched **one chunk per
+request** (`_seed_chunks` built `[[row] for row in sample]`) and cost
+**641.9 s = 10.7 min at 1.83 s/chunk**. Phase 2 was genuinely cheap
+(`_classify_chunks` 0.01 s with nothing pending, `backfill_confidence` 17.9 s
+for 24,229 rows), 3a/3b never dispatched a single call, and the run ended at
+11.0 min against an 8-min budget. On a fresh corpus (800 seeds) that
+extrapolates to ~24 min — the whole 25-min default — leaving the tier
+indistinguishable from `distilled` with a bigger seed pool.
+
+Two changes, both in `annotate_distill._seed_chunks`, both no-ops at their
+defaults so `distilled` is untouched:
+
+- **`batch_size`** (default 1). Hybrid passes its preset's 8. `batch_size == 1`
+  deliberately keeps building `[[row] for row in sample]` literally rather than
+  calling `annotate._annotation_groups`, because that helper's apple branch
+  ignores `batch_size` and packs by char budget — routing the seed pass through
+  it unconditionally would have silently re-batched the *distilled* tier on
+  Apple FM.
+- **`deadline`** (default None = today's ungated behavior). Hybrid passes
+  `_SEED_PHASE_SHARE = 0.25` of the budget. A pass cut short says so in its own
+  "Seeded N annotations" line (with the pool level against the target), and the
+  next run tops up.
+
+The 25% split is sized from the measured numbers: 0.25 × 25 min = 6.2 min, and
+a fresh 800-seed pool at the measured batched seed rate costs well under that,
+so the cap normally never binds; when it does bind (a slow machine, Apple FM),
+it binds on the phase the tier does *not* exist for. Consequence handled in
+`hybrid_chunks`: a seed pass cut short on a fresh DB can leave the pool under
+`annotate_distill._KNN_MIN_SEEDS` (100), where `_build_seed_index` rightly
+refuses. The floor is not weakened — the *outcome* is: `hybrid_chunks` catches
+that `SystemExit`, prints the per-phase summary and a resume hint, and returns.
+Anything else the kNN phases raise (no `chunk_vectors`, no `embed_dim`) still
+propagates, since no rerun fixes those.
+
+### The deadline has to reserve the pool's drain
+
+`annotate._pooled` keeps `2 × workers` groups in flight (one when sequential),
+and every one of them still finishes, writes and commits after the generator
+stops yielding. So "check the clock before each dispatch" overshoots by a whole
+drain. Measured at the default `ANNOTATE_WORKERS=4`, batch 8: **+1.5 min on a
+5-min budget, +2.0 min on 2 min, +3.7 min on a 1-min apple budget** — and phase
+3a blew its own 60% sub-deadline the same way (72 s allotted, 239.7 s spent),
+starving 3b to zero upgrades in one run.
+
+`annotate._DispatchDeadline` (shared by phase 1 and phase 3) stops dispatching
+a drain early instead. It wraps the per-group request to measure completed
+groups, and reserves `(in_flight / workers) × mean_group_seconds` — the pool's
+backlog retiring `workers` at a time. Measuring *latency under the run's own
+concurrency* is what makes it self-correcting on a serializing Ollama, where
+four concurrent requests each measure ~4× a lone one and dividing by `workers`
+puts the throughput back. Before the first completion there is nothing to
+measure and it falls back to the plain check: the first dispatch of a phase can
+only ever be made blind. No config knob — it is an accounting rule, not a
+preference.
+
+### Measured basis (2026-07-27, this machine, warm model)
+
+Corpus: 25,029 chunks, avg 693 chars (median 293); top-20 dyads = 19,483 chunks.
+
+| Config | s/chunk (warm) |
+|---|---|
+| qwen3.5:4b, batch 8, `think=False` | **1.1–1.4** |
+| qwen3.5:4b, batch 16/24, `think=False` | 1.9–2.6 |
+| qwen3.5:4b, batch 8, `think='low'` | **times out** |
+| qwen3.5:4b, 4 workers × batch 8 | 2.4 |
+| Apple FM, char-budgeted batch (8–10 chunks) | 2.6–5.6 |
+
+Two preset consequences, both against the grain of the older tiers:
+
+- **`QUALITY_PRESETS["hybrid"] = (False, 8)` — `think=False`, not `'low'`.**
+  `fast`/`balanced` use `'low'` because they were tuned on gpt-oss, which has
+  real effort levels. qwen3.5:4b is a *toggle* model: `'low'` is merely truthy
+  there, so it buys a full reasoning pass and the request times out. This is
+  the `think` tri-state gotcha (an effort level is not portable) showing up as
+  a preset, not a bug.
+- **Batch stays 8.** 16 and 24 measured *worse* per chunk (1.9–2.6 s vs
+  1.1–1.4 s): the longer prompt costs more than the saved round-trips. Workers
+  are kept plumbed but bought nothing here (2.4 s/chunk at 4 × 8) because this
+  Ollama serializes.
+
+Those planning numbers were optimistic. Re-measured on the production path
+after the deadline fixes (8-min budget, 25,029-chunk corpus, `ANNOTATE_WORKERS=4`):
+1.5–2.6 s/chunk seeding, 5.6 s/chunk on the event upgrades (their chunks are
+~1,900 chars and a batch of 8 often comes back covering only some ids, so
+single-chunk fallbacks follow), ~1.6 s/chunk on the confidence upgrades (median
+363 chars). The run bought **128 LLM-annotated chunks in 9.2 min**, so the
+25/50-min defaults extrapolate to roughly **350–800 per run**, not 800–1,200. A
+cold model load needs no allowance: the deadline absorbs it and simply buys
+fewer upgrades.
+
+Measured end-to-end, `ANNOTATE_BUDGET_MINUTES=8` on qwen3.5:4b:
+
+| | before the fixes | after |
+|---|---|---|
+| total wall | 11.0 min | **9.2 min** |
+| phase 1 (seeds) | 641.9 s, 350 seeds, unbounded | 208.1 s, 80 seeds, capped |
+| phase 3 upgrades | **0 — never dispatched** | 48 |
+
+The residual +1.2 min is phase 1's blind first wave (208 s against a 120 s cap):
+`_pooled` submits `2 × workers` groups in one instant before any timing exists,
+and at batch 8 that is 64 chunks of work the gate cannot decline. Shrinking it
+would mean changing `_pooled`'s backlog rule for every tier.
+
+### `_APPLE_ANNOTATE_CHAR_BUDGET`: 12,000 → 8,000 → 2,000 (global, every tier)
+
+Measuring the apple path turned up a pre-existing defect rather than a hybrid
+one — and the first fix for it (12,000 → 8,000, chosen from 3 overflows in 18
+chunks) **did not work**. At 8,000, measured on the real applefm corpus,
+14 of 18 batched calls (78%) came back unusable, 7+ raised
+`context_overflow`, and 6 of 66 chunks (~10%) were lost when the single-chunk
+fallback failed too. Re-measured on the production path
+(`_annotate_group`: batch, then a single-chunk retry for every id the batch
+missed) over spread samples of both phase-3 populations:
+
+| budget | batched-call failure | `context_overflow` | chunks dropped | s/chunk |
+|---|---|---|---|---|
+| 8,000 | 9/9 = **100%** | 4 / 48 chunks | 1 (2%) | 4.3–5.2 |
+| 4,000 | 6/7 = 86% | 1 / 24 chunks | 1 (4%) | 5.5 |
+| 2,000 | 10/14 = 71% | 3 / 144 chunks | 5 (3%) | 1.6–4.1 |
+
+Two things the earlier note got wrong. The window covers **prompt *and*
+response**, so ~8,000 chars of chunk text plus `_ANNOTATE_SYSTEM` +
+`_BATCH_SYSTEM_SUFFIX` plus JSON for 3–5 chunks does not fit. And overflow is
+not even the main failure: dumping the raw replies shows the batched failures
+are **malformed JSON** — `{"a": {...}, {"b": ...}` (an extra brace before the
+second key), ```` ```json ```` fences, `"chunk_<id>"` keys instead of `"<id>"`.
+An apple batched annotate request usually fails *whatever its size*, and each
+failure costs its own wall time **plus** a single-chunk retry for every chunk in
+it. Per-chunk time therefore falls as the budget falls, which is the opposite of
+the usual batching tradeoff.
+
+2,000 is one `CHUNK_MAX_CHARS`: never two full-size chunks in one request, while
+genuinely short chunks still pair up. Residual and **not** fixable by any
+budget: `_char_budget_groups` always emits at least one row, so a chunk larger
+than the budget is still sent alone — 1 chunk in a 32-chunk sample (3%)
+reproducibly overflows on its own, because ~2 kB of emoji/non-Latin text
+tokenizes far worse than the ~4 chars/token English rule of thumb. That row is
+lost for the run and retried on the next one.
+
+This constant is shared by **all** tiers (`annotate._annotation_groups`), so the
+change is global: `fast`/`balanced`/`max` on apple all pack smaller and measured
+1.7–3.5× faster per chunk. It stays a module constant, not a config knob — it is
+a property of the FM window, not something a user tunes.
+
+**Open, not fixed here:** apple batched annotation is ~90% wasted work at every
+budget measured. Making it pay would mean constrained decoding
+(`applefm.respond(..., schema=...)`) or a per-chunk apple request path, both of
+which change behavior for every tier and belong in their own change.
+
+### `chunk_annotations.knn_confidence` (new nullable REAL)
+
+`_knn_predict` returns a 4th value: `mean(w) * (1 - clamp(weighted std of the
+neighbours' valence, 0, 1))`, where `w = max(1e-6, 1 - d)` are the existing
+distance weights. High only when the neighbours were both **close** and **in
+agreement**, deterministic, and bounded to [0, 1] by construction (cosine
+distance is 0..2, so every `w` ≤ 1) rather than by clipping.
+
+NULL semantics are load-bearing and the reason the column has no DEFAULT: NULL
+on `source='llm'` rows (an LLM label needs no self-assessment) and on distilled
+rows written before the column existed. Any numeric default would invent a
+ranking signal. Phase 3b sorts `knn_confidence IS NULL, knn_confidence`, so
+unscored rows stay eligible but sort last. An LLM upgrade goes through
+`_write_annotation`'s `INSERT OR REPLACE`, which does not name the column — so
+upgrading a distilled row correctly clears its confidence back to NULL.
+`annotate_distill.backfill_confidence` scores pre-existing distilled rows
+(UPDATE of that column *only* — relabeling committed valence/emotions/depth
+would be a different, unrequested change), because `_classify_chunks` touches
+only chunks with no annotation at all, which on any machine that has already
+run `distilled` is none of them.
+
+### The stratified seed sampler: what it actually buys
+
+The plan predicted "higher kNN fidelity corpus-wide". **It does not, and that
+claim should not be repeated.** Measured at need=800 against the full corpus
+(768-dim nomic embeddings, 532 chats), probing with *every* chunk rather than a
+sample:
+
+| metric | `random.sample` | stratified |
+|---|---|---|
+| mean distance to nearest seed | 0.1503 | 0.1496 (−0.4%) |
+| mean distance to the 10 nearest seeds (k = `ANNOTATE_KNN_K`) | 0.1830 | 0.1857 (**1.4% worse**) |
+
+At 768 dimensions, 800 seeds over 25k chunks are already spread near-uniformly
+by chance and no selection rule moves the average. An earlier 3,000-probe run
+showed an ~11.5% covering-radius win; it did not survive full-corpus probing and
+was sampling noise. Two real, smaller wins remain, and they are the whole
+justification for the module:
+
+- **~4× fewer redundant seeds.** Seeds whose nearest *other* seed is within
+  0.02 cosine — a near-duplicate whose LLM call teaches the vote nothing:
+  22/800 for `random.sample`, 5/800 here. In a tier whose premise is a
+  wall-clock budget, recovering a few percent of the seed calls from duplicated
+  work is worth ~4.5 s of preamble.
+- **Deterministic, exactly proportional chat representation.** Over 25
+  `random.sample` draws the number of chats represented ranged 92–117, summed
+  deviation from proportional was 208.9 ± 12.0 rows, and the worst single-chat
+  miss was 31.6 rows on the dominant dyad. The largest-remainder allocation here
+  is deterministic and lands every chat within 1 row of proportional.
+
+Two implementation notes worth keeping. The plan specified greedy
+farthest-point selection; measured, FPS walks the convex hull and fills the pool
+with outliers (nearest-seed 0.1455 → 0.1624, k=10 mean 0.1830 → 0.2102), so the
+module uses **k-means++ D-squared sampling** instead — still reaches empty
+regions, stays density-aware. And there is no numpy (it is not a dependency):
+embeddings are projected once through a deterministic sparse
+Johnson–Lindenstrauss matrix to 32 dims, which keeps the whole draw at ~4.5 s in
+pure CPython against a budget measured in tens of minutes.
+
+### The event prefilter: 1.72× more events per LLM call
+
+Events are the one label kNN structurally cannot produce (`source='distilled'`
+⇒ `events_json='[]'`), so phase 3a exists to buy them — but the budget covers
+only a few hundred chunks of 25k, and asking the LLM which chunks to look at
+would spend the exact resource being rationed. `EVENT_CANDIDATE_PATTERNS`
+(`function_words.py`, ~38 lowercase, wildcard-free substrings) is the
+deterministic shortlist; `annotate_events` matches them in one OR'd LIKE pass
+(0.71 s scoped / 0.76 s corpus-wide; 38 separate per-pattern scans measured
+4.9 s).
+
+Scored against the 450 chunks this corpus had already LLM-annotated, whose
+event base rate is **48.4%** (the annotator is liberal): **83.3% precision,
+32.1% recall** — i.e. 1.72× as many events per LLM call as spending the budget
+at random. Recall is capped by the annotator counting bare affection ("Love
+you", "Nice") as an event; no lexicon reaches those.
+
+Correcting the plan's estimate: it guessed a **5–10%** chunk-level yield, and
+the real figure is **~20%** (20.5% inside the top-20 dyads, 19.0% corpus-wide).
+The unit is the chunk, not the message — a chunk spans ~14 messages, so a
+pattern firing on 1.3% of messages lights up ~14% of chunks. `"thank"` alone
+accounts for most of that; it is kept broad because measured alone it is the
+single most precise pattern in the set (86.0%), and narrowing it to
+`"thank you"`/`"thanks for"`/… drops recall 32.1% → 25.2% for no precision gain
+(83.3% → 82.1%). Dropping it entirely does land the yield at the plan's 7.7% —
+at 14.7% recall. The pool size is not the run's bound; phase 3a's time cap is,
+so the filter's job is to raise event density, not to shrink the pool.
+
+### Self-heal: `annotate._ensure_column`
+
+`knn_confidence` postdates DBs in the wild, and `annotate.py` is reachable
+without the `ingest.py` run that normally applies migrations — so both kNN
+tiers crashed on `no such column` against an existing DB during integration.
+The `--terms`-only `_ensure_curate_failures` helper generalized into
+`_ensure_column(con, table, column)`, which runs the canonical (idempotent,
+`PRAGMA table_info`-gated) `schema.create_schema` migration rather than keeping
+a second, drifting copy of the DDL. `hybrid_chunks` and `distill_chunks` both
+call it before their first write, and before the `--dry-run` branches: a dry run
+that crashes on a missing column reports nothing, and the migration touches
+schema, never data. `tests/test_annotate_hybrid.py` regression-tests both tiers
+against a DB with the column dropped.

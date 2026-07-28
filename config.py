@@ -221,6 +221,10 @@ ANNOTATE_COMMIT_EVERY = int(os.getenv("ANNOTATE_COMMIT_EVERY", "50"))
 # reasoning effort), 'balanced' (low effort, ~3x faster, agreement with
 # 'max' within the model's own run-to-run noise but fewer events found)
 # and 'fast' (low effort + batched requests, ~4-8x faster, noisier labels).
+# 'hybrid' sits between the two extremes (~90s distilled vs ~16h fast): a
+# stratified seed draw plus the same corpus-wide kNN pass, then LLM upgrades
+# of the event-candidate and lowest-kNN-confidence chunks until
+# ANNOTATE_BUDGET_MINUTES is spent.
 ANNOTATE_QUALITY = (os.getenv("ANNOTATE_QUALITY", "") or "distilled").strip().lower()
 # Fine-grained preset overrides (empty/0 = use the preset's value).
 # ANNOTATE_THINK becomes Ollama's `think`: 'low'/'medium'/'high' for
@@ -249,6 +253,36 @@ ANNOTATE_WORKERS = int(os.getenv("ANNOTATE_WORKERS", "4"))
 # nearest seed neighbours that vote for each classified chunk.
 ANNOTATE_SEED_TARGET = int(os.getenv("ANNOTATE_SEED_TARGET", "450"))
 ANNOTATE_KNN_K = int(os.getenv("ANNOTATE_KNN_K", "10"))
+# The hybrid preset's wall-clock budget, in minutes. Empty/0 = unset, and
+# annotate_hybrid.py resolves a per-backend default (25 on Ollama, 50 on Apple
+# FM) through is_apple_model(model) -- that default depends on the model chosen
+# at run time, so config only parses the env int. Budgeting wall clock rather
+# than a chunk count is what makes the tier meet its target BY CONSTRUCTION: it
+# runs to a deadline, so it holds on any hardware and any corpus size, and a
+# faster machine degrades to *more* coverage instead of a blown deadline. Every
+# LLM phase is gated, seeding included, and each stops a pool-drain early --
+# but the run can still land ~15% over on a short budget, because
+# annotate._pooled commits 2x ANNOTATE_WORKERS groups before any timing exists
+# (measured: 9.2 min actual on an 8-min budget).
+# Sizing (measured 2026-07-27, 25,029-chunk corpus, qwen3.5:4b batch 8
+# think=False): 1.5-2.6 s/chunk seeding, 2.3-5.6 s/chunk on the event upgrades,
+# ~1.6 s/chunk on the confidence upgrades -- an 8-min budget measured 128
+# LLM-annotated chunks, so 25 min extrapolates to roughly 350-800 and 50 min on
+# Apple FM to a similar range. A cold model load needs no allowance -- the
+# deadline absorbs it, and it simply buys fewer upgrades.
+ANNOTATE_BUDGET_MINUTES = int(os.getenv("ANNOTATE_BUDGET_MINUTES") or "0")
+# LLM-labeled seeds the hybrid tier aims for before its kNN pass. Deliberately
+# a separate knob from ANNOTATE_SEED_TARGET (450): hybrid spends part of its
+# budget on MORE seeds, drawn by annotate_sampling's stratified, embedding-
+# diverse sampler, while the distilled tier's ~90s profile is left exactly as
+# it was. What the sampler buys is ~4x fewer near-duplicate seeds and
+# deterministic proportional chat representation -- NOT better corpus-wide kNN
+# coverage, which measured a wash (see annotate_sampling's docstring and
+# docs/DECISIONS.md 2026-07-27); the extra 350 seeds are what widen the vote.
+# A TARGET, not a per-run quota: seeding gets a bounded slice of the budget
+# (annotate_hybrid._SEED_PHASE_SHARE, 25%), so on a fresh corpus the pool fills
+# over ~3 runs while every run still spends the rest on upgrades.
+ANNOTATE_HYBRID_SEED_TARGET = int(os.getenv("ANNOTATE_HYBRID_SEED_TARGET", "800"))
 
 # --- Dyad-term curation (annotate.py --terms) -------------------------------
 # Terms are their own pipeline, NOT a --quality tier: classifying one term is

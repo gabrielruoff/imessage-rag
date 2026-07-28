@@ -19,6 +19,18 @@ reasoning path. --upgrade-distilled lets an LLM tier re-annotate distilled
 rows (the way to fill in events for chats that matter). LLM passes fan out
 over ANNOTATE_WORKERS concurrent requests (~2x with a parallel Ollama).
 
+'hybrid' sits between the two, and is budgeted in WALL CLOCK rather than
+chunks (ANNOTATE_BUDGET_MINUTES; default 25 min on Ollama, 50 on apple),
+which is what makes its runtime promise hold on any machine and corpus: a
+stratified seed top-up (capped at its own share of the budget) and a
+corpus-wide kNN pass first, then LLM upgrades of what kNN can't or probably
+didn't get right -- event candidates first (a distilled row's events are
+always empty), then the lowest-confidence rows -- until the deadline, which it
+self-terminates at and resumes from on a rerun. EVERY LLM phase is gated,
+seeding included, and each stops dispatching a pool-drain early rather than at
+the deadline itself. It is itself a distilled-upgrader, so
+--upgrade-distilled does not apply to it (see annotate_hybrid.py).
+
 --terms is a separate pipeline, not a --quality tier: it curates dyad_terms
 verdicts, batches ANNOTATE_TERMS_BATCH_SIZE terms per request, and runs with
 its own think (ANNOTATE_TERMS_THINK, default false -- reasoning about a
@@ -28,7 +40,8 @@ dyad_terms.curate_failures rather than retried by every later run;
 --retry-failed unparks.
 
 Usage (chunks): annotate.py [--all | --top-dyads N] [--limit N]
-                   [--model NAME] [--quality distilled|fast|balanced|max]
+                   [--model NAME]
+                   [--quality distilled|hybrid|fast|balanced|max]
                    [--upgrade-distilled] [--dry-run]
 Usage (terms):  annotate.py --terms [--limit N] [--model NAME]
                    [--retry-failed] [--dry-run]
@@ -37,9 +50,12 @@ Usage (terms):  annotate.py --terms [--limit N] [--model NAME]
 
 import argparse
 import json
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import annotate_distill
+import annotate_hybrid
 import config
 import ollama
 import progress
@@ -70,21 +86,57 @@ DB_PATH = TARGET_DB
 # omits the flag: the model's default reasoning. Measured on gpt-oss:20b:
 # max ~8.6s/chunk, balanced ~3s, fast ~1-2s. 'distilled' uses its tuple only
 # for the LLM seed pass; the rest of the corpus is kNN-classified.
+# 'hybrid' is the one preset measured on a TOGGLE model (qwen3.5:4b,
+# 2026-07-27), and both of its numbers come out differently: think=False, not
+# 'low', because an effort level is not portable -- 'low' is merely *truthy*
+# there, buying a full reasoning pass that times out the request; and batch 8,
+# because 16/24 measured WORSE per chunk (1.9-2.6s vs 1.1-1.4s), the bigger
+# prompt costing more than the saved round-trips. Its tuple covers the seed
+# pass and the phase-3 LLM upgrades; everything else is kNN-classified.
 QUALITY_PRESETS = {
     "max": (None, 1),
     "balanced": ("low", 1),
     "fast": ("low", 8),
     "distilled": ("low", 1),
+    "hybrid": (False, 8),
 }
 
 # Apple backend: batch by chunk-text chars, not a fixed row count. The FM
-# window is a fixed 4,096 tokens (~16k chars), and a request over it is
-# silently dropped, not rejected -- so the batched-annotation prompt has to be
-# packed under a char budget rather than the Ollama batch_size. ~12k chars of
-# chunk text leaves headroom for _ANNOTATE_SYSTEM + _BATCH_SYSTEM_SUFFIX and
-# the JSON reply inside the window. A module constant, not a config knob: it is
-# a property of the FM window, not something a user tunes.
-_APPLE_ANNOTATE_CHAR_BUDGET = 12000
+# window is a fixed 4,096 tokens covering PROMPT AND RESPONSE, and a request
+# over it raises rather than answering -- so the batched-annotation prompt has
+# to be packed under a char budget rather than the Ollama batch_size.
+#
+# 2,000, down from 8,000 (itself down from 12,000). Measured 2026-07-27 on the
+# real applefm corpus, running the production path (_annotate_group: batch,
+# then a single-chunk retry for every id the batch missed) over spread samples:
+#
+#   budget  batched-call failure  context_overflow  dropped  s/chunk
+#    8,000        9/9 = 100%         4 / 48 chunks   1 (2%)   4.3-5.2
+#    4,000        6/7 =  86%         1 / 24 chunks   1 (4%)   5.5
+#    2,000     10/14 =  71%          3 / 144 chunks  5 (3%)   1.6-4.1
+#
+# Two things that measurement says and the older comment did not. First, the
+# 8,000 budget did NOT stop the overflow it was chosen to stop (7+ overflows and
+# 6 of 66 chunks lost in the full runs). Second, the dominant batched-call
+# failure on this backend is not overflow at all: dumping the raw replies shows
+# malformed JSON ('{"a": {...}, {"b": ...}', ```json fences, "chunk_<id>" keys),
+# so a batched apple request usually fails whatever its size -- and every
+# failure costs its own wall time PLUS the single-chunk retries. That makes a
+# smaller budget strictly cheaper, which is why per-chunk time falls as the
+# budget does. 2,000 is one CHUNK_MAX_CHARS: never two full-size chunks in one
+# request, while genuinely short chunks still pair up.
+#
+# Residual, and not fixable here: _char_budget_groups always emits at least one
+# row, so a chunk bigger than the budget is still sent alone and can still
+# overflow. Measured, 1 chunk in a 32-chunk sample (3%) does so reproducibly --
+# ~2 kB of emoji/non-Latin text tokenizes far worse than the ~4 chars/token
+# English rule of thumb. That one row is lost for the run and retried the next.
+#
+# Shared by every tier (annotate._annotation_groups), so the reduction is
+# global: fast/balanced/max on apple all pack smaller and measured 1.7-3.5x
+# faster per chunk. A module constant, not a config knob: it is a property of
+# the FM window, not something a user tunes.
+_APPLE_ANNOTATE_CHAR_BUDGET = 2000
 
 EVENT_KINDS = ("good_news", "gratitude")
 RESPONSE_CLASSES = (
@@ -200,6 +252,116 @@ def _pooled(items, request_fn, workers):
                 f.cancel()
 
 
+class _GroupRate:
+    """Thread-safe running mean of per-group wall-clock. Deliberately OUTSIDE
+    _DispatchDeadline so the successive phases of one run share what the
+    earlier ones measured -- only the first LLM phase of a run has to dispatch
+    blind."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._n = 0
+        self._total = 0.0
+
+    def record(self, seconds):
+        with self._lock:                    # worker threads; a paired update
+            self._n += 1
+            self._total += seconds
+
+    def mean(self):
+        """Mean seconds per group, or None when nothing has completed yet."""
+        with self._lock:
+            return self._total / self._n if self._n else None
+
+
+class _DispatchDeadline:
+    """Deadline gate for a _pooled dispatch loop, sized so the groups still in
+    flight when it stops dispatching DRAIN inside the deadline.
+
+    Testing `now >= deadline` before each dispatch is not enough. _pooled holds
+    up to 2x workers groups (one when sequential) and every one of them still
+    finishes, is written and is committed after the generator stops yielding.
+    Measured 2026-07-27 at ANNOTATE_WORKERS=4, batch 8, qwen3.5:4b: +1.5 min
+    past a 5-min budget, +2.0 min past 2 min, +3.7 min past a 1-min apple
+    budget -- minutes, not the "one group, tens of seconds" the first cut
+    assumed. So the gate reserves that drain: the pool retires its backlog
+    `workers` at a time, i.e. (in_flight / workers) waves of the mean per-group
+    wall-clock of the groups that have ALREADY completed.
+
+    Known residual, and the reason `rate` is shared across a run's phases:
+    _pooled submits 2x workers groups before it yields the first result, and
+    those submissions all happen in the same instant, so the FIRST phase to run
+    commits to that much work before any estimate exists. Reserving a guess
+    instead would either stall a phase with plenty of time or under-reserve one
+    with none. Passing one _GroupRate through every phase means only the first
+    pays it -- and a budget smaller than that one blind wave cannot be honored
+    by anything short of changing _pooled's backlog rule for every tier.
+
+    `monotonic` is injected because the deadline and the gate must read the
+    SAME clock -- the tier tests patch their module's `time` with a fake one
+    that only advances when a fake LLM charges it.
+    """
+
+    def __init__(self, deadline, workers, monotonic=time.monotonic, rate=None):
+        self.deadline = deadline
+        self.workers = max(1, workers)
+        self.stopped = False
+        self.rate = rate if rate is not None else _GroupRate()
+        self._monotonic = monotonic
+        self._lock = threading.Lock()
+        self._dispatched = 0
+        self._finished = 0
+
+    def timed(self, request_fn):
+        """Wrap the per-group request so completions feed both the shared rate
+        and THIS gate's outstanding count."""
+        def run(group):
+            started = self._monotonic()
+            try:
+                return request_fn(group)
+            finally:
+                self.rate.record(self._monotonic() - started)
+                with self._lock:
+                    self._finished += 1
+        return run
+
+    def reserve(self):
+        """Seconds to drain what this gate still has in flight plus the group
+        about to join it -- 0 before the first completion anywhere in the run.
+
+        Counting the ACTUAL backlog rather than _pooled's 2x workers ceiling
+        matters at both ends: a phase starting with an empty pool would
+        otherwise reserve two full waves before its very first group and buy
+        nothing, while a phase in steady state is holding roughly that ceiling
+        anyway. The mean is over group LATENCY as observed under the run's own
+        concurrency, which is what makes this self-correcting on a serializing
+        Ollama: 4 concurrent requests each measure ~4x a lone one, and dividing
+        by `workers` puts the throughput back."""
+        mean = self.rate.mean()
+        if not mean:
+            return 0.0
+        with self._lock:
+            outstanding = max(0, self._dispatched - self._finished) + 1
+        # At least one wave: a lone group takes a full latency however many
+        # workers are idle.
+        return max(1.0, outstanding / self.workers) * mean
+
+    def dispatchable(self, groups):
+        """Yield from `groups` until the reserved drain would cross the
+        deadline. _pooled consumes its items on the CALLER's thread (its
+        documented contract), so a generator that simply stops yielding is
+        exactly the semantics wanted: the clock is read immediately before a
+        group is handed to the pool, and everything already dispatched still
+        completes and commits."""
+        for group in groups:
+            if self._monotonic() + self.reserve() >= self.deadline:
+                self.stopped = True
+                return
+            with self._lock:
+                self._dispatched += 1
+            yield group
+
+
 # ---------------------------------------------------------------------------
 # Chunk annotation
 # ---------------------------------------------------------------------------
@@ -247,6 +409,29 @@ def _check_model_guard(con, model, table="chunk_annotations", predicate="1"):
             raise SystemExit(1)
     set_state(con, "annotate_model", model)
     con.commit()
+
+
+def _ensure_column(con, table, column):
+    """Self-heal a column that postdates DBs already in the wild. annotate.py
+    is reachable without re-running ingest.py -- which is what normally applies
+    migrations -- so a DB from before dyad_terms.curate_failures (--terms) or
+    chunk_annotations.knn_confidence (the distilled/hybrid tiers) would die on
+    'no such column' instead. Run the canonical migration (idempotent) rather
+    than keeping a second, drifting copy of it here.
+
+    Scope note: create_schema does more than the one ALTER -- it re-runs the
+    DDL scripts, recreates the FTS triggers and rescans reactions for the
+    old guid prefix. That's a one-off (the PRAGMA gate means the next run
+    skips it entirely) and worth not having a second, drifting copy of the
+    migration here; schema.py stays the only place that DDL lives.
+
+    Called before the --dry-run branches on purpose: a dry run that crashes on
+    a missing column reports nothing, and the migration touches schema, never
+    data (the same order --terms has always used)."""
+    cols = {row[1] for row in con.execute(f"PRAGMA table_info({table})")}
+    if column not in cols:
+        schema.create_schema(con)
+        con.commit()
 
 
 def _validate_annotation(data):
@@ -371,6 +556,16 @@ def _char_budget_groups(pending, budget):
     return groups
 
 
+def _annotation_groups(pending, model, batch_size):
+    """Split (chunk_id, text) rows into request-sized groups: apple packs by a
+    char budget (its fixed window makes a row count the wrong unit), every
+    other backend keeps exact row-count batching. One home for the branch so a
+    tier can never batch apple by row count by accident."""
+    if config.is_apple_model(model):
+        return _char_budget_groups(pending, _APPLE_ANNOTATE_CHAR_BUDGET)
+    return [pending[i:i + batch_size] for i in range(0, len(pending), batch_size)]
+
+
 def annotate_chunks(con, model, all_chats=False, top_dyads=ANNOTATE_TOP_DYADS,
                     limit=None, dry_run=False, think=None, batch_size=1,
                     workers=1, upgrade_distilled=False):
@@ -395,12 +590,7 @@ def annotate_chunks(con, model, all_chats=False, top_dyads=ANNOTATE_TOP_DYADS,
         return 0
     _check_model_guard(con, model)
 
-    # Apple packs by a char budget (its window makes a fixed row count the
-    # wrong unit); every other backend keeps the exact row-count batching.
-    groups = (_char_budget_groups(pending, _APPLE_ANNOTATE_CHAR_BUDGET)
-              if config.is_apple_model(model)
-              else [pending[i:i + batch_size]
-                    for i in range(0, len(pending), batch_size)])
+    groups = _annotation_groups(pending, model, batch_size)
     n_done = n_skipped = 0
     try:
         with progress.track("Annotating chunks", total=len(pending),
@@ -532,23 +722,6 @@ def _term_groups(con, rows, batch_size):
         yield group
 
 
-def _ensure_curate_failures(con):
-    """dyad_terms.curate_failures postdates DBs already in the wild, and
-    --terms is reachable without re-running ingest.py -- which is what
-    normally applies migrations. Self-heal through the canonical migration
-    (idempotent) instead of dying on 'no such column'.
-
-    Scope note: create_schema does more than the one ALTER -- it re-runs the
-    DDL scripts, recreates the FTS triggers and rescans reactions for the
-    old guid prefix. That's a one-off (the PRAGMA gate means the next run
-    skips it entirely) and worth not having a second, drifting copy of the
-    migration here; schema.py stays the only place dyad_terms' DDL lives."""
-    cols = {row[1] for row in con.execute("PRAGMA table_info(dyad_terms)")}
-    if "curate_failures" not in cols:
-        schema.create_schema(con)
-        con.commit()
-
-
 def _report_parked(parked, max_failures):
     """Name the terms this run parked. The header printed the pre-existing
     parked count, but a long run scrolls it away -- and a term going quiet
@@ -563,7 +736,7 @@ def _report_parked(parked, max_failures):
 def curate_terms(con, model, limit=None, dry_run=False, think=False, workers=1,
                  batch_size=1, max_failures=ANNOTATE_TERMS_MAX_FAILURES,
                  retry_failed=False):
-    _ensure_curate_failures(con)
+    _ensure_column(con, "dyad_terms", "curate_failures")
     if retry_failed and dry_run:
         # --dry-run promises no writes, and unparking during a *preview* is
         # worse than a stray write: the preview spends the parking state, so
@@ -748,11 +921,14 @@ def main(argv=None):
     parser.add_argument("--quality", choices=sorted(QUALITY_PRESETS), default=None,
                         help="speed/quality tradeoff: distilled = LLM seed sample + "
                              "kNN classify the rest from embeddings (~1 min corpus-"
-                             "wide once seeded; no events); max = one chunk per "
-                             "request at the model's default reasoning effort; "
-                             "balanced = low reasoning effort (~3x faster than max); "
-                             "fast = low effort + several chunks per request "
-                             f"(~4-8x faster) (default {ANNOTATE_QUALITY})")
+                             "wide once seeded; no events); hybrid = distilled from a "
+                             "wider stratified seed pool, then LLM-upgrade the event "
+                             "candidates and the least-confident rows until a "
+                             "wall-clock budget runs out (ANNOTATE_BUDGET_MINUTES); "
+                             "max = one chunk per request at the model's default "
+                             "reasoning effort; balanced = low reasoning effort (~3x "
+                             "faster than max); fast = low effort + several chunks per "
+                             f"request (~4-8x faster) (default {ANNOTATE_QUALITY})")
     parser.add_argument("--upgrade-distilled", action="store_true",
                         help="LLM tiers only: also re-annotate kNN-classified "
                              "(source='distilled') rows in scope, filling in events")
@@ -774,9 +950,13 @@ def main(argv=None):
         parser.error("--quality does not apply to --terms (term curation has "
                      "no fidelity tiers); use ANNOTATE_TERMS_THINK / "
                      "ANNOTATE_TERMS_BATCH_SIZE to tune it")
-    if args.upgrade_distilled and (quality == "distilled" or args.terms):
-        parser.error("--upgrade-distilled only applies to the LLM chunk tiers "
-                     "(--quality fast/balanced/max)")
+    # hybrid is rejected alongside distilled because it IS a distilled-upgrader:
+    # its phase 3 re-annotates distilled rows by construction, so the flag would
+    # be asking for behavior it already has.
+    if args.upgrade_distilled and (quality in ("distilled", "hybrid") or args.terms):
+        parser.error("--upgrade-distilled only applies to the per-chunk LLM tiers "
+                     "(--quality fast/balanced/max); distilled does no LLM upgrade "
+                     "pass at all, and hybrid already upgrades distilled rows")
     if args.retry_failed and not args.terms:
         parser.error("--retry-failed only applies to --terms")
     con = _connect()
@@ -795,6 +975,19 @@ def main(argv=None):
             annotate_distill.distill_chunks(con, model, think=think,
                                             workers=ANNOTATE_WORKERS,
                                             dry_run=args.dry_run)
+        elif quality == "hybrid":
+            # Its kNN phases are corpus-wide like distilled's; the scope flags
+            # (and --limit) reach only the deadline-gated LLM upgrade phases.
+            annotate_hybrid.hybrid_chunks(
+                con, model,
+                think=think,
+                workers=ANNOTATE_WORKERS,
+                all_chats=args.all,
+                top_dyads=args.top_dyads or ANNOTATE_TOP_DYADS,
+                limit=args.limit,
+                dry_run=args.dry_run,
+                batch_size=batch_size,
+            )
         else:
             annotate_chunks(
                 con, model,

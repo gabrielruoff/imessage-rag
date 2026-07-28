@@ -199,6 +199,69 @@ COMMON_WORDS = STOPWORDS | frozenset("""
     http https www com org net
 """.split())
 
+# Cheap deterministic prefilter for annotate.py's two EVENT_KINDS. kNN
+# distillation structurally cannot produce events (a source='distilled' row
+# always has events_json='[]'), so events are exactly the label the hybrid tier
+# must spend real LLM calls on -- and LLM time is the scarce resource it
+# rations. These substrings pick the chunks worth spending it on; the LLM still
+# makes the call, so this is a recall-first net, not a classifier. Lowercase
+# substrings (SQLite LIKE folds ASCII case for free, and annotate_events.py
+# matches raw), deliberately free of LIKE wildcards (% and _) so the query
+# needs no ESCAPE clause.
+#
+# Precision/recall, measured 2026-07-27 over a 350k-message / 25k-chunk corpus,
+# scored against the 450 chunks that corpus had already LLM-annotated (48.4% of
+# them carry >= 1 event -- the annotator is liberal, which is the base rate to
+# beat). The unit that matters is the CHUNK, not the message: a chunk spans ~14
+# messages, so a pattern firing on 1% of messages lights up ~10% of chunks.
+#  - The set selects 19.0% of chunks corpus-wide (20.5% inside the top-20
+#    dyads) at 83.3% precision and 32.1% recall -- 1.72x the base rate per LLM
+#    call. Recall is capped by the annotator counting bare affection ("Love
+#    you", "Nice", "Ok") as an event; no lexicon reaches those, and they are
+#    not the moments worth buying.
+#  - "thank" is kept broad on purpose. It alone selects 14.3% of chunks (1.3%
+#    of messages) and is dominated by perfunctory "ok thanks" -- yet measured
+#    alone it is the single most precise pattern here (86.0%), and narrowing it
+#    to "thank you"/"thanks for"/"thank u"/... drops recall 32.1% -> 25.2% for
+#    NO precision gain (83.3% -> 82.1%). Dropping it entirely lands the yield
+#    at 7.7% (what the hybrid plan guessed) but at 14.7% recall. A terse thanks
+#    is gratitude expressed, and gratitude is half of EVENT_KINDS.
+#  - Kept despite noise: "so excited"/"finally got"/"guess what" are
+#    anticipation or news-prefaces rather than news, and "engaged"/"promot"/
+#    "hired" also match "engaged with your core", "promotional", "we hired a
+#    plumber" -- but each costs < 0.5% of chunks and the true positives are
+#    top-tier events with no other lexical signature.
+#  - Dropped as hopeless: "passed" and every narrowing of it -- 265 messages,
+#    of which the exam sense was ~0 ("passed out", "passed the exit", and
+#    "passed away", which points at grief, the opposite of good news);
+#    "accepted" (mostly automated tax/appointment notices); "i made it"
+#    ("made it home safe"); "we got" and "i got the" (1.7% and 0.8% of chunks,
+#    almost all "we got food"); "aced"/"ily"/"i won" (substrings of
+#    placed/faced, family/easily, i won't).
+#  - "re the best" is not a typo: it is the one wildcard-free substring that
+#    catches "you're the best", "you’re the best" (the curly apostrophe iOS
+#    actually types, and the reason the ASCII form matches almost nothing) and
+#    "youre the best" at once.
+# Pool size is not the run's bound -- Phase 3a's time cap is -- so the filter's
+# job is to raise the event density of what the budget reaches, not to shrink
+# the pool to the budget.
+EVENT_CANDIDATE_PATTERNS = {
+    "gratitude": (
+        "thank", "thx", "thnx", "tysm", "ty sm", "appreciate", "grateful",
+        "re the best", "owe you", "owe u", "means a lot",
+    ),
+    "good_news": (
+        "congrat", "great news", "good news", "big news", "guess what",
+        "got the job", "got the offer", "got an offer", "new job", "hired",
+        "i got in", "we got in", "got accepted", "promot", "engaged",
+        "pregnant", "graduated", "so excited", "so proud", "proud of you",
+        "proud of u", "happy for you", "finally got", "we did it",
+        # Praise responses: the other half of a good-news moment (and what
+        # fills the prompt's response_class field) is the reply to it.
+        "good job", "nice job", "well done",
+    ),
+}
+
 # GoEmotions taxonomy (Demszky et al. 2020), minus 'neutral' -- the label
 # set annotate.py's output is validated against.
 EMOTION_LABELS = (

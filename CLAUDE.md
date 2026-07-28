@@ -27,15 +27,25 @@ Full design history, schema rationale, and data forensics:
   dateless/system rows for that run)
 - Chat: `python3 chat.py` (REPL) or `chat.py -p "..."` (one-shot; prints only
   the reply, exit 1 if Ollama is unreachable).
-- Annotate chunks: `make annotate` / `make annotate-all`, or `python3
-  annotate.py [--all | --top-dyads N] [--limit N]
-  [--quality distilled|fast|balanced|max] [--upgrade-distilled] [--dry-run]` —
-  resumable, Ctrl-C safe. Default `distilled` = LLM-labels a ~`ANNOTATE_SEED_TARGET`
-  seed then kNN-classifies the whole corpus from `chunk_vectors` (fast; events
-  left empty). LLM tiers (`fast`/`balanced`/`max`) scope to top
-  `ANNOTATE_TOP_DYADS`, honor `--all`, and with `--upgrade-distilled` re-annotate
-  kNN rows (how events get filled). `--terms` is a SEPARATE pipeline (below), not
-  a `--quality` tier.
+- Annotate chunks: `make annotate` / `make annotate-all` / `make annotate-hybrid`,
+  or `python3 annotate.py [--all | --top-dyads N] [--limit N]
+  [--quality distilled|hybrid|fast|balanced|max] [--upgrade-distilled]
+  [--dry-run]` — resumable, Ctrl-C safe. Default `distilled` = LLM-labels a
+  ~`ANNOTATE_SEED_TARGET` seed then kNN-classifies the whole corpus from
+  `chunk_vectors` (fast; events left empty). `hybrid` = a stratified
+  `ANNOTATE_HYBRID_SEED_TARGET` seed draw + that same kNN pass (both corpus-wide),
+  then LLM upgrades — event-candidate chunks first, lowest-`knn_confidence` next —
+  until the `ANNOTATE_BUDGET_MINUTES` wall-clock deadline; budgeted in TIME not
+  chunks, so it self-terminates and a rerun resumes, the scope flags reach only
+  the upgrade phase, and `--upgrade-distilled` is an error with it (hybrid IS
+  one). EVERY LLM phase is deadline-gated, seeding included (capped at 25% of
+  the budget — unbatched and uncapped it measured 10.7 min of an 8-min run), and
+  each stops dispatching a pool-drain early so the run lands near its budget
+  (~15% over on a short one: `_pooled` commits 2x`ANNOTATE_WORKERS` groups
+  before any timing exists). LLM tiers (`fast`/`balanced`/`max`) scope to top
+  `ANNOTATE_TOP_DYADS`,
+  honor `--all`, and with `--upgrade-distilled` re-annotate kNN rows (how events
+  get filled). `--terms` is a SEPARATE pipeline (below), not a `--quality` tier.
 - Curate dyad terms: `python3 annotate.py --terms [--limit N] [--retry-failed]
   [--dry-run]` — its own pipeline; passing `--quality` is an error. Batches
   `ANNOTATE_TERMS_BATCH_SIZE` terms/request (never spanning chats), runs
@@ -116,7 +126,7 @@ import callers need (`DB_PATH`/`embed_texts` are patchable package attributes).
 
 | Area | Files |
 |---|---|
-| Entry CLIs | `chat.py` (tool-calling loop; dispatches `chat_apple.py` on apple), `ingest.py`, `annotate.py` (+`annotate_distill.py`, the distilled kNN tier), `topics.py`, `wrapped.py` (+`wrapped_sections.py`/`wrapped_sections_suite.py` builders, `wrapped_html.py` shell+generic renderer/`wrapped_visuals.py` feature cards), `reset_db.py` |
+| Entry CLIs | `chat.py` (tool-calling loop; dispatches `chat_apple.py` on apple), `ingest.py`, `annotate.py` (+`annotate_distill.py` the distilled kNN tier, `annotate_hybrid.py` the wall-clock-budgeted hybrid tier — with `annotate_sampling.py` its stratified seed draw and `annotate_events.py` its event prefilter), `topics.py`, `wrapped.py` (+`wrapped_sections.py`/`wrapped_sections_suite.py` builders, `wrapped_html.py` shell+generic renderer/`wrapped_visuals.py` feature cards), `reset_db.py` |
 | Ingest / derived builders | `chunking.py`, `sessions.py`, `lexicon_build.py` (`person_period_lexicon`+`dyad_terms`), `schema.py` (DDL + migration), `function_words.py` (LSM lexicon + regexes) — all run by `ingest.py` |
 | Suite pipelines (standalone CLI + `make` target, after annotate) | `loose_ends.py` (+`nudge_detectors.py`, the six detectors) → `loose_threads`; `drift.py` → `dyad_drift` (opt-in); `voiceprint.py` → `person_voiceprint`; `conflict_detect.py` → `conflicts`/`conflict_signals` |
 | Shared libs | `config.py` (all env settings), `db.py` (sqlite helpers, `load_vec_extension`, `iso_to_day`, `get_state`/`set_state`, `connect_default`/`run_cli`), `ollama.py` (+`applefm.py`), `embeddings.py` (doc/query prefixes, dim detect), `progress.py` (`track`), `stats.py` (robust-stats primitives), `consent.py` (`is_consented`/`is_denied`), `wellbeing.py` (change-point core + `sanitize_condition_names`/`support_block`) |
@@ -186,8 +196,14 @@ dyad_terms(chat_id, term, lift, n_uses, first_message_id,
                                   -- --retry-failed), so a rebuild must not
                                   -- reset the count to 0
 chunk_annotations(chunk_id, valence, emotions_json, depth, events_json,
-         source)                  -- batch annotations (annotate.py); source
-                                  -- 'llm' or 'distilled' (kNN, empty events)
+         source, knn_confidence)  -- batch annotations (annotate.py); source
+                                  -- 'llm' or 'distilled' (kNN, empty events).
+                                  -- knn_confidence 0..1 = how close AND how
+                                  -- unanimous that row's kNN neighbours were;
+                                  -- NULL on 'llm' rows (an LLM label needs no
+                                  -- self-assessment) and on distilled rows
+                                  -- written before the column existed; hybrid
+                                  -- LLM-upgrades lowest-confidence first
 topics(cluster_id, label, n_chunks); chunk_topics(chunk_id, cluster_id)
                                   -- k-means topic clusters (topics.py)
 loose_threads(id, kind, chat_id, handle_id, anchor_message_id, anchor_date,
@@ -273,13 +289,18 @@ chunk_vectors                     -- sqlite-vec vec0 table: chunk_id ->
   `topic_model_k` guard is warn-only.
 - `chunk_annotations.source='distilled'` (kNN) rows always have `events_json=[]`
   (events can't be distilled — LLM-only), so event-based aggregates undercount
-  until an LLM tier with `--upgrade-distilled` has covered the chats in question.
+  until an LLM tier with `--upgrade-distilled` has covered the chats in question
+  — or a `--quality hybrid` run, whose phase 3a spends its budget on exactly the
+  lexicon-flagged event candidates (measured 83.3% precision / 32.1% recall, so
+  it raises event coverage, it does not complete it).
 - Valence-dependent reads trust ONLY `source='llm'` rows; distilled (kNN) rows
   are never consumed for a high-stakes read. Conflict corroboration, the nudge
   Stage-0 valence exclusion, and the voiceprint tone field all read llm-only and
   degrade honestly (conflict writes `corroboration='none'` and still detects; a
   dyad with no llm chunks is simply not valence-excluded; `tone_*` reads NULL).
-  Run `annotate.py --quality balanced --upgrade-distilled` to light them.
+  Run `annotate.py --quality balanced --upgrade-distilled` to light them, or
+  `--quality hybrid` to light as many as a wall-clock budget buys (it writes
+  `source='llm'` too, so the same readers wake up for the chunks it reached).
 - The F4 eval gate decides whether a pipeline's high-stakes labels ship.
   `eval_gate_passed(con, task, cls)` resolves clearance by precedence: an owner
   verdict in `ingest_state` under `eval_gate:<task>` (from `eval.evalkit gate`) >

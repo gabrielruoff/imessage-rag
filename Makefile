@@ -1,5 +1,5 @@
 .PHONY: help bootstrap source-data env doctor \
-        ingest annotate annotate-all topics pipeline eval eval-dry \
+        ingest annotate annotate-all annotate-hybrid topics pipeline eval eval-dry \
         chat wrapped \
         lint test check reset-db \
         install install-ollama ollama-start ollama-stop apple-shim
@@ -261,6 +261,17 @@ annotate-all:  ## Like annotate, but over every chunk in the corpus
 	@$(REQUIRE_OLLAMA)
 	.venv/bin/python3 annotate.py --all
 	.venv/bin/python3 annotate.py --terms
+
+# The wall-clock-budgeted tier: a stratified seed draw + corpus-wide kNN, then
+# LLM upgrades of the event-candidate and least-confident chunks until
+# ANNOTATE_BUDGET_MINUTES is spent. Deliberately NOT chained with --terms the
+# way `annotate` is: --terms is a separate pipeline with its own (unbudgeted)
+# cost, and the whole point of this target is a run that finishes inside a
+# known wall-clock window. Curate terms with `make annotate` or
+# `annotate.py --terms` when you actually want to pay for them.
+annotate-hybrid:  ## Annotate on a wall-clock budget (ANNOTATE_BUDGET_MINUTES)
+	@$(REQUIRE_OLLAMA)
+	.venv/bin/python3 annotate.py --quality hybrid
 
 topics:  ## Cluster embedded chunks into topics and label them
 	@$(REQUIRE_OLLAMA)

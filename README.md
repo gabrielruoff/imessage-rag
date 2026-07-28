@@ -203,13 +203,25 @@ back in the right order (and stays sequential even under `make -j`).
     Valence and depth match LLM fidelity, emotions run a little rougher, and
     *events are left empty* — extracting quotes is the one thing the shortcut
     can't do.
+  - `hybrid` buys as much of the above as a *wall clock* allows: a wider
+    stratified seed draw (itself capped at a quarter of the budget — seeding is
+    LLM work too) and the same corpus-wide kNN pass, then real LLM calls that
+    replace distilled rows until `ANNOTATE_BUDGET_MINUTES` runs out — event
+    candidates first (a lexicon prefilter picks the chunks likely to contain
+    good news or thanks, since events are the one label the shortcut can't
+    produce), then the rows the kNN vote was least sure about. Budgeting time
+    rather than a chunk count is what makes it self-terminate instead of
+    overrunning; it commits as it goes and a rerun resumes, topping the seed
+    pool up and buying more upgrades. `--all` / `--top-dyads N` / `--limit`
+    reach only the upgrade phase, and `--upgrade-distilled` is an error with
+    it — upgrading distilled rows is what it already does.
   - `fast` / `balanced` / `max` are the real-LLM-call-per-chunk tiers (each
-    slower and more faithful than the last; hours to days corpus-wide), and
-    the only source of events. They cover the top `ANNOTATE_TOP_DYADS` chats
-    (default 20) bare, honor `--all` / `--top-dyads N`, and with
-    `--upgrade-distilled` also replace distilled rows in scope — so an
-    overnight `--quality fast --upgrade-distilled` is how events get filled
-    in for the chats that matter.
+    slower and more faithful than the last; hours to days corpus-wide). They
+    cover the top `ANNOTATE_TOP_DYADS` chats (default 20) bare, honor `--all`
+    / `--top-dyads N`, and with `--upgrade-distilled` also replace distilled
+    rows in scope — so an overnight `--quality fast --upgrade-distilled` is
+    how events get filled in exhaustively for the chats that matter, where
+    `hybrid` fills in as many as its budget covers.
 - `--terms` instead curates `dyad_terms` verdicts, which is what gives
   `get_word_trends` its inside-joke section. It's a mode switch, so a bare run
   never touches terms — this is the second run you need. It is *not* a

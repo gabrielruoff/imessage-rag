@@ -107,6 +107,13 @@ conflict corroboration reads `'none'`, the nudge Stage-0 valence exclusion doesn
 and voiceprint `tone_*` is NULL. This is honest-degrade, not a bug — see each feature's
 **Good to know**.
 
+Every `--quality balanced --upgrade-distilled` line below is the *exhaustive* way to do
+that, and it runs for hours. `annotate.py --quality hybrid` is the bounded-time
+alternative: it upgrades distilled rows until `ANNOTATE_BUDGET_MINUTES` is spent — event
+candidates first, then the least-confident rows — so the same reads light up for the
+chunks that matter most rather than for everything. Substitute it anywhere below when you
+want a demo-able run instead of an overnight one.
+
 ### 0c. The gate cheat-sheet — flip these in `.env` *before* building/demoing
 
 `make env` scaffolds `.env` from `.env.example` (all values commented, every default
