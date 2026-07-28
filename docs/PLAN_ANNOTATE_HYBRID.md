@@ -32,6 +32,7 @@ premises:
 Two estimates were also off: the event prefilter yields ~20% of in-scope
 chunks, not §3's 5–10%, and a 25-min run buys ~250–350 upgrades, not §2's
 800–1,200.
+
 Audience: implementation agents working in parallel. Read this whole document
 before touching code; the **Contracts** section is binding — it is what makes
 parallel work safe.
