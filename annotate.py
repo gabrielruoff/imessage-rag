@@ -1055,7 +1055,15 @@ def _report_parked(parked, max_failures):
 def curate_terms(con, model, limit=None, dry_run=False, think=False, workers=1,
                  batch_size=1, max_failures=ANNOTATE_TERMS_MAX_FAILURES,
                  retry_failed=False):
-    _ensure_column(con, "dyad_terms", "curate_failures")
+    # dry_run is forwarded so a preview keeps the no-writes promise on a DB
+    # from before the column (the migration is a write, and create_schema also
+    # rescans reactions -- same contract as the distilled/hybrid callers).
+    # has_failures is False only under --dry-run: the real path migrates, so
+    # every read past the dry-run return below can rely on the column. A
+    # pre-column DB has no recorded failures, which is what each degraded read
+    # says: nothing parked, nothing to unpark, every unverdicted term pending.
+    has_failures = _ensure_column(con, "dyad_terms", "curate_failures",
+                                  dry_run=dry_run)
     if retry_failed and dry_run:
         # --dry-run promises no writes, and unparking during a *preview* is
         # worse than a stray write: the preview spends the parking state, so
@@ -1063,7 +1071,8 @@ def curate_terms(con, model, limit=None, dry_run=False, think=False, workers=1,
         # the loop this pipeline exists to close.
         (n_would,) = con.execute(
             "SELECT COUNT(*) FROM dyad_terms "
-            "WHERE llm_verdict IS NULL AND curate_failures > 0").fetchone()
+            "WHERE llm_verdict IS NULL AND curate_failures > 0"
+        ).fetchone() if has_failures else (0,)
         print(f"--retry-failed: would unpark {n_would} terms (--dry-run: not written)")
     elif retry_failed:
         n_reset = con.execute(
@@ -1078,15 +1087,16 @@ def curate_terms(con, model, limit=None, dry_run=False, think=False, workers=1,
     n_parked = con.execute(
         "SELECT COUNT(*) FROM dyad_terms "
         "WHERE llm_verdict IS NULL AND curate_failures >= ?", (max_failures,)
-    ).fetchone()[0]
+    ).fetchone()[0] if has_failures else 0
     # --retry-failed lifts the ceiling: after the unpark above every term sits
     # at 0 anyway, and under --dry-run (which skipped the unpark) the preview
     # must still show the scope the real run would take.
     ceiling = float("inf") if retry_failed else max_failures
+    parked_filter = "AND curate_failures < ? " if has_failures else ""
     sql = ("SELECT chat_id, term FROM dyad_terms "
-           "WHERE llm_verdict IS NULL AND curate_failures < ? "
+           f"WHERE llm_verdict IS NULL {parked_filter}"
            "ORDER BY chat_id, term")
-    params = [ceiling]
+    params = [ceiling] if has_failures else []
     if limit is not None:
         sql += " LIMIT ?"
         params.append(limit)

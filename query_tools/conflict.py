@@ -74,13 +74,23 @@ _PARTIAL_LABELING_EPILOGUE = (
 # marker is the same degrade-honestly discipline the llm-vs-distilled
 # annotation readers follow: without it `labeled_signal_turns: 0` reads as
 # evidence of absence for a window nothing ever looked at.
+#
+# One transitional state keeps both notes honest on a migrated DB: a window
+# labeled by the pre-budget pipeline carries its signal rows but a NULL
+# labeled_at (the migration deliberately does not invent a stamp -- see
+# schema.py), so labeled=false with labeled_signal_turns > 0 is possible until
+# a budgeted run re-reaches it. Those labels are real; the notes say so rather
+# than asserting an equivalence the data briefly violates.
 _UNLABELED_SCOPE_NOTE = (
     "{n_unlabeled} of {total} detected windows in scope have NOT been through "
     "per-turn escalation labeling yet (it runs on a wall-clock budget, "
     "strongest windows first; rerunning the conflict pipeline extends "
     "coverage). On a row with labeled=false, labeled_signal_turns=0 means NOT "
     "ANALYZED -- not 'analyzed and nothing escalatory found' -- and topic / "
-    "reconciliation are unset for the same reason. The deterministic evidence "
+    "reconciliation are unset for the same reason. (A labeled=false row that "
+    "still shows labeled_signal_turns > 0 was labeled by an earlier version of "
+    "the pipeline that recorded no completion stamp: those labels are real, "
+    "and a future budgeted run will refresh them.) The deterministic evidence "
     "(signals, signal_count, corroboration) is complete for every row."
 )
 _LABELED_NOTE = "labels are eval-gated bands (tentative/likely), not certainties"
@@ -89,8 +99,11 @@ _UNLABELED_NOTE = (
     "runs on a wall-clock budget, strongest windows first; rerunning the "
     "conflict pipeline extends coverage), so zero signal turns here means NOT "
     "ANALYZED, not 'analyzed and nothing escalatory found' -- and topic is "
-    "unset for the same reason. Its deterministic evidence (peak_signal, "
-    "corroboration, off_text_flag) is complete either way."
+    "unset for the same reason. If signal turns ARE present despite this, they "
+    "were written by an earlier version of the pipeline that recorded no "
+    "completion stamp: real labels, refreshed by a future budgeted run. Its "
+    "deterministic evidence (peak_signal, corroboration, off_text_flag) is "
+    "complete either way."
 )
 
 

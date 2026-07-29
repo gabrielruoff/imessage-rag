@@ -967,7 +967,9 @@ def label_top_conflicts(con, model, n=None, max_label_turns=CONFLICT_MAX_LABEL_T
 
       * `n` None labels every unlabeled window; an int stops after that many
         (the `--label-top N` contract: weaker windows stay detected-but-
-        unlabeled).
+        unlabeled). The slice is taken over the UNLABELED windows, so on a
+        rerun the same N buys the next N down the ranking rather than
+        re-visiting stamped ones.
       * `deadline` is an absolute time on the injected `monotonic` clock (None
         = unbounded). Before each window the loop asks whether the estimated
         cost of ITS turns still fits; before each call inside the window it
@@ -1214,8 +1216,10 @@ def main(argv=None):
                        help="BUDGETED path: detect all windows, but label only the "
                             "N strongest (by signal count, corroboration, dislikes, "
                             "peak gap); weaker windows stay detected-but-unlabeled. "
-                            "The wall-clock budget still applies on top -- pass "
-                            "--budget-minutes 0 for N as the only cap. "
+                            "N counts UNLABELED windows, so a rerun labels the NEXT "
+                            "N down the ranking rather than re-visiting the same "
+                            "top N. The wall-clock budget still applies on top -- "
+                            "pass --budget-minutes 0 for N as the only cap. "
                             "Bounds LLM calls to N * max-label-turns.")
     args = parser.parse_args(argv)
     if args.no_llm and args.budget_minutes is not None:
