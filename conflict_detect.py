@@ -41,6 +41,15 @@ What it does, per 1:1 chat (group chats are out for v1):
          the row is SUPPRESSED,
        * survivors render as BANDS (tentative/likely), never a raw float.
 
+Step 2 is the only expensive part, so it runs on a WALL-CLOCK BUDGET
+(CONFLICT_BUDGET_MINUTES, default 25) rather than a fixed call count -- the
+same contract as annotate.py's --quality hybrid tier: detection covers every
+chat, then the strongest windows are labeled first until the deadline, and a
+rerun continues down the ranking (conflicts.labeled_at is the resume marker).
+That is what makes the runtime promise hold on a bigger corpus or a slower
+machine, where a tuned constant would not. `--budget-minutes 0` restores the
+unbounded path.
+
 The `conflict_model` ingest_state key guards against mixing label models in
 one conflicts table (same shape as annotate_model / embed_model).
 """
@@ -50,17 +59,20 @@ import bisect
 import datetime
 import json
 import statistics
+import time
 
 import ollama
 import progress
 import schema
 import stats
 from config import (
+    CONFLICT_BUDGET_MINUTES,
     CONFLICT_LABEL_CONF_FLOOR,
     CONFLICT_LATENCY_FRAC,
     CONFLICT_LATENCY_Q_HOURS,
     CONFLICT_MAX_LABEL_TURNS,
     CONFLICT_MIN_SIGNALS,
+    CONFLICT_MIN_TURN_CHARS,
     CONFLICT_MIN_VALENCE_DROP,
     CONFLICT_MODEL,
     CONFLICT_OFF_TEXT_GAP_HOURS,
@@ -68,6 +80,7 @@ from config import (
     CONFLICT_TIMEOUT,
     CONFLICT_VOLUME_COLLAPSE,
     TARGET_DB,
+    has_effort_levels,
 )
 from db import connect_default, get_state, run_cli, set_state
 from eval.evalkit.gates import eval_gate_passed
@@ -138,6 +151,36 @@ def _connect():
 
 
 # ---------------------------------------------------------------------------
+# Think resolution (the pipeline default, not a change to the tri-state)
+# ---------------------------------------------------------------------------
+
+# What an unset CONFLICT_THINK resolves to on a model that reads
+# 'low'/'medium'/'high' as a reasoning-EFFORT level (config.has_effort_levels).
+# To every other model an effort string is merely truthy and buys a FULL
+# reasoning pass, which is the failure this whole resolver exists to prevent.
+_THINK_EFFORT = "low"
+
+
+def _resolve_think(model):
+    """The think value this pipeline labels with. An explicit CONFLICT_THINK
+    (or an explicit CHAT_THINK it inherits) always wins and passes through
+    untouched; only a genuinely UNSET one is resolved here.
+
+    Unset means None at the config seam, i.e. "omit the flag" -- and on a
+    thinking-capable model omitting it buys a full reasoning pass on every
+    single turn: measured 2026-07-28 on qwen3.5:4b, 197 s per labeling call
+    against 2.2 s with think=False. Nothing about a one-JSON-object turn
+    classification wants a reasoning pass, so the PIPELINE default becomes
+    False (an effort level on the models that have them), exactly as
+    annotate._resolve_quality does for its presets. The tri-state itself is
+    untouched: None still means "omit" at the ollama.py seam, and
+    config._think / CHAT_THINK keep their meanings."""
+    if CONFLICT_THINK is not None:
+        return CONFLICT_THINK
+    return _THINK_EFFORT if has_effort_levels(model) else False
+
+
+# ---------------------------------------------------------------------------
 # LLM turn classification (mockable: the write path takes classify_fn)
 # ---------------------------------------------------------------------------
 
@@ -169,6 +212,56 @@ def _classify_turn(text, model, think):
     return _validate_turn(data)
 
 
+def _is_labelable(text):
+    """Whether a turn can carry an escalation signal at all. Under
+    CONFLICT_MIN_TURN_CHARS (whitespace stripped) or with no alphanumeric
+    character in it (emoji/punctuation/tapback-ish), the answer is always
+    `neutral` -- and on this corpus ~70% of labels come back neutral anyway,
+    each costing a whole request to say nothing. Read as a module global so a
+    test can patch the threshold."""
+    t = (text or "").strip()
+    return len(t) >= CONFLICT_MIN_TURN_CHARS and any(ch.isalnum() for ch in t)
+
+
+def _select_turns(seg, max_turns, peak_id=None):
+    """The <= max_turns turns of one window worth spending LLM calls on, as
+    [(message_id, is_from_me, text)] in CHRONOLOGICAL order (the labels read as
+    a sequence downstream, so they are never emitted peak-outward).
+
+    Two rules, in order:
+      * the lexical prescreen (_is_labelable) drops turns that cannot carry a
+        signal -- it mostly matters in the big windows, since the median window
+        has only 4 candidate turns to begin with;
+      * what is left is taken as a contiguous span CENTERED on the window's
+        peak_gap_message_id -- the message left hanging, i.e. the escalation
+        moment the deterministic finder actually keyed on. The old head slice
+        (`[:max_turns]`) provably misses it: windows in this corpus run to
+        1,940 candidate turns.
+    A window with no peak id, or whose peak turn is not in this segment, falls
+    back to the chronological head. When the peak turn is dropped by the
+    prescreen the span still centers on WHERE it was, so the neighbours that
+    survive are the ones around the escalation."""
+    kept = [(i, m) for i, m in enumerate(seg) if _is_labelable(m["text"])]
+    turns = [(m["id"], m["is_from_me"], m["text"]) for _i, m in kept]
+    if max_turns is not None and max_turns <= 0:
+        return []
+    if max_turns is None or len(turns) <= max_turns:
+        return turns
+
+    anchor = next((n for n, (_i, m) in enumerate(kept) if m["id"] == peak_id), None)
+    if anchor is None and peak_id is not None:
+        # The peak turn itself was prescreened out (a long silence is often
+        # answered by a one-word line): anchor on its POSITION instead, so the
+        # span still lands on the escalation rather than on the window's head.
+        seg_pos = next((i for i, m in enumerate(seg) if m["id"] == peak_id), None)
+        if seg_pos is not None:
+            anchor = sum(1 for i, _m in kept if i < seg_pos)
+    if anchor is None:
+        return turns[:max_turns]
+    start = min(max(0, anchor - max_turns // 2), len(turns) - max_turns)
+    return turns[start:start + max_turns]
+
+
 def gate_classifier(con, items):
     """Production classifier wired into eval.evalkit.gates.TASKS for the
     owner-run `python -m eval.evalkit gate conflict_labels` path
@@ -177,11 +270,15 @@ def gate_classifier(con, items):
     needs Ollama (owner-run, never in hermetic tests). Resolved lazily via its
     dotted-path string, so importing gates never pulls this module in."""
     out = {}
+    # The resolved value, not the raw CONFLICT_THINK: the gate path is the same
+    # one-JSON-object classification as the label pass, so leaving it on the
+    # unset (= omit the flag) default would make owner gating 90x slow too.
+    think = _resolve_think(CONFLICT_MODEL)
     for it in items:
         data = ollama.chat_once_json(
             [{"role": "system", "content": _GATE_SYSTEM},
              {"role": "user", "content": (it.get("text") or "")[:1500]}],
-            model=CONFLICT_MODEL, think=CONFLICT_THINK, timeout=CONFLICT_TIMEOUT,
+            model=CONFLICT_MODEL, think=think, timeout=CONFLICT_TIMEOUT,
             retry_nudge=_GATE_NUDGE,
         )
         cls = data.get("class") if isinstance(data, dict) else None
@@ -434,15 +531,30 @@ def _resolve_label(pred_class, four_way_cleared):
     return pred_class
 
 
-def _label_turns(con, conflict_id, turns, classify_fn, four_way_cleared):
+class _BudgetExhausted(Exception):
+    """Raised by _label_turns when `should_stop` fires mid-window. A window is
+    the unit that gets stamped labeled_at, so a half-labeled one must not be
+    committed: the caller rolls back its partial signal rows and leaves the
+    window unlabeled for the next run to buy whole."""
+
+
+def _label_turns(con, conflict_id, turns, classify_fn, four_way_cleared,
+                 should_stop=None):
     """Classify + gate each candidate turn, writing the survivors. Returns
     (n_written, survivor_label_classes). A class the F4 gate has not cleared
     writes ZERO rows (suppressed); a below-floor confidence is dropped; an
-    explicit model abstain is stored (band NULL) but is not escalation."""
+    explicit model abstain is stored (band NULL) but is not escalation.
+
+    `should_stop` is the budgeted caller's per-call deadline check, consulted
+    BEFORE each request; when it fires this raises _BudgetExhausted rather than
+    returning a partial result, so the window-level contract (all of its turns
+    or none of them) is not something each caller has to re-implement."""
     floor = CONFLICT_LABEL_CONF_FLOOR
     n_written = 0
     survivors = []
     for mid, is_from_me, text in turns:
+        if should_stop is not None and should_stop():
+            raise _BudgetExhausted
         pred = classify_fn(text)
         cls, top2, conf = pred["class"], pred["top2"], pred["confidence"]
         excerpt = (text or "")[:200]
@@ -492,23 +604,56 @@ def _consecutive_runs(hot_flags):
     return runs
 
 
+def _now_iso():
+    """Unlabeled-UTC ISO stamp, the same shape as every date column here (and
+    the same tz-aware-then-dropped construction ingest.py/loose_ends.py use --
+    datetime.utcnow() is deprecated)."""
+    return (datetime.datetime.now(datetime.timezone.utc)
+            .replace(tzinfo=None).isoformat(timespec="seconds"))
+
+
+# Ids per `WHERE id IN (...)` slice, under SQLite's default 999-variable
+# ceiling -- one long-running chat can hold more stale windows than that.
+_ID_SLICE = 500
+
+
+def _drop_conflicts(con, chat_id, keep=()):
+    """Delete this chat's conflicts (and their signals) EXCEPT `keep`."""
+    stale = [r[0] for r in con.execute(
+        "SELECT id FROM conflicts WHERE chat_id = ?", (chat_id,)).fetchall()
+        if r[0] not in keep]
+    for i in range(0, len(stale), _ID_SLICE):
+        block = stale[i:i + _ID_SLICE]
+        ph = ",".join("?" * len(block))
+        con.execute(f"DELETE FROM conflict_signals WHERE conflict_id IN ({ph})", block)
+        con.execute(f"DELETE FROM conflicts WHERE id IN ({ph})", block)
+
+
 def detect_chat(con, chat_id, corpus_end, classify_fn, model, label=True,
                 max_label_turns=CONFLICT_MAX_LABEL_TURNS):
-    """Detect + write every conflict in one 1:1 chat (delete-then-rewrite, so
-    re-runs are idempotent). Returns the number of conflicts written. With
-    label=False the deterministic windows are still written but the per-turn
-    escalation labeling (the only LLM work) is skipped -- no conflict_signals,
-    no topic. max_label_turns caps the LLM-labeled turns per window."""
+    """Detect + write every conflict in one 1:1 chat. Returns the number of
+    conflicts written. With label=False the deterministic windows are still
+    written but the per-turn escalation labeling (the only LLM work) is skipped
+    -- no conflict_signals, no topic. max_label_turns caps the LLM-labeled
+    turns per window (selected by _select_turns, peak-anchored).
+
+    Re-runs are idempotent by RECONCILING rather than by deleting and
+    rewriting: a window whose (first_date, last_date) is unchanged keeps its
+    row id, its conflict_signals, its topic and its labeled_at stamp, and only
+    its deterministic columns are refreshed; windows that no longer exist are
+    dropped with their signals. The distinction matters because every budgeted
+    run re-detects all 787 chats before labeling -- a delete-then-rewrite would
+    throw away the labels the previous run's budget bought, and no rerun could
+    ever extend coverage. An already-labeled window is therefore NOT re-labeled
+    here; changing the window (new messages) is what makes it a candidate
+    again, and clearing the table is what forces a wholesale re-label."""
     sessions = _load_sessions(con, chat_id)
     messages = _load_messages(con, chat_id)
-    # Idempotent rewrite: drop this chat's prior conflicts (+ their signals).
-    old = [r[0] for r in con.execute(
-        "SELECT id FROM conflicts WHERE chat_id = ?", (chat_id,)).fetchall()]
-    if old:
-        ph = ",".join("?" * len(old))
-        con.execute(f"DELETE FROM conflict_signals WHERE conflict_id IN ({ph})", old)
-        con.execute("DELETE FROM conflicts WHERE chat_id = ?", (chat_id,))
+    prior = {(r["first_date"], r["last_date"]): r for r in con.execute(
+        "SELECT id, first_date, last_date, labeled_at FROM conflicts "
+        "WHERE chat_id = ?", (chat_id,)).fetchall()}
     if len(sessions) == 0 or len(messages) < 2:
+        _drop_conflicts(con, chat_id)
         return 0
 
     gap = _reply_gaps(messages, corpus_end)
@@ -521,6 +666,7 @@ def detect_chat(con, chat_id, corpus_end, classify_fn, model, label=True,
     hot_flags = [bool(fired) for fired, _meta in per_session]
 
     n_written = 0
+    kept_ids = set()
     for i, j in _consecutive_runs(hot_flags):
         first_date = sessions[i]["first_date"]
         last_date = sessions[j]["last_date"]
@@ -565,41 +711,77 @@ def detect_chat(con, chat_id, corpus_end, classify_fn, model, label=True,
             "band_likely_cutpoint": band_cut,
         }
 
-        cur = con.execute(
-            "INSERT INTO conflicts(chat_id, first_date, last_date, "
-            "start_session_id, end_session_id, topic, peak_signal_json, "
-            "corroboration, off_text_flag, source) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (chat_id, first_date, last_date, sessions[i]["id"], sessions[j]["id"],
-             None, json.dumps(peak_signal), corrob, int(bool(off_flag)), "llm"),
-        )
-        conflict_id = cur.lastrowid
+        existing = prior.get((first_date, last_date))
+        if existing is None:
+            cur = con.execute(
+                "INSERT INTO conflicts(chat_id, first_date, last_date, "
+                "start_session_id, end_session_id, topic, peak_signal_json, "
+                "corroboration, off_text_flag, source) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (chat_id, first_date, last_date, sessions[i]["id"], sessions[j]["id"],
+                 None, json.dumps(peak_signal), corrob, int(bool(off_flag)), "llm"),
+            )
+            conflict_id = cur.lastrowid
+            already_labeled = False
+        else:
+            # Same window, recomputed evidence: refresh the deterministic
+            # columns in place and keep id/topic/labeled_at (and, through the
+            # id, this window's conflict_signals).
+            conflict_id = existing["id"]
+            already_labeled = existing["labeled_at"] is not None
+            con.execute(
+                "UPDATE conflicts SET start_session_id = ?, end_session_id = ?, "
+                "peak_signal_json = ?, corroboration = ?, off_text_flag = ?, "
+                "source = ? WHERE id = ?",
+                (sessions[i]["id"], sessions[j]["id"], json.dumps(peak_signal),
+                 corrob, int(bool(off_flag)), "llm", conflict_id),
+            )
+        kept_ids.add(conflict_id)
 
-        if label:
+        if label and not already_labeled:
             seg = [m for m in messages
                    if first_dt <= _dt(m["date"]) <= last_dt and m["text"]]
-            turns = [(m["id"], m["is_from_me"], m["text"]) for m in seg][:max_label_turns]
+            turns = _select_turns(seg, max_label_turns, peak_id)
+            # Belt and braces: an unlabeled window should have no signals, but
+            # a re-label must never stack a second set on top of a first.
+            con.execute("DELETE FROM conflict_signals WHERE conflict_id = ?",
+                        (conflict_id,))
             _n_labels, survivors = _label_turns(con, conflict_id, turns, classify_fn,
                                                 four_way_cleared)
-            if survivors:
-                topic = statistics.mode(survivors)
-                con.execute("UPDATE conflicts SET topic = ? WHERE id = ?",
-                            (topic, conflict_id))
+            # labeled_at is stamped even with zero survivors: the window WAS
+            # processed, and the signal rows are not the marker.
+            con.execute("UPDATE conflicts SET topic = ?, labeled_at = ? WHERE id = ?",
+                        (statistics.mode(survivors) if survivors else None,
+                         _now_iso(), conflict_id))
         n_written += 1
+    _drop_conflicts(con, chat_id, keep=kept_ids)
     return n_written
 
 
 def detect_conflicts(con, model, classify_fn=None, limit=None, dry_run=False,
-                     label=True, max_label_turns=CONFLICT_MAX_LABEL_TURNS):
+                     label=True, max_label_turns=CONFLICT_MAX_LABEL_TURNS,
+                     think=None, stats=None):
     """Sweep every 1:1 chat (via _restrict_to_direct_chats -- F3). classify_fn
     is the injectable label path (default: the real LLM); tests pass a stub.
     label=False is the deterministic-only fast path: windows are written but the
     per-turn LLM labeling is skipped (zero Ollama calls), so the model guard and
-    classifier are never touched."""
+    classifier are never touched. `think` None resolves through _resolve_think
+    (an unset CONFLICT_THINK must not reach the request as "omit the flag").
+
+    `stats`, when given, is filled with this pass's out-of-band facts (the
+    annotate_hybrid convention -- a return value can't carry them without
+    breaking every caller): `chat_ids`, the chats actually scanned, so a
+    --limit run can scope the labeling phase to them; and `interrupted`, since
+    a Ctrl-C is caught HERE and a two-phase caller that could not tell would
+    walk straight into a full budget of LLM traffic the user just stopped."""
+    if stats is None:
+        stats = {}
+    stats.setdefault("interrupted", False)
     all_ids = [r[0] for r in con.execute("SELECT id FROM chats ORDER BY id").fetchall()]
     direct = _restrict_to_direct_chats(con, all_ids)
     if limit is not None:
         direct = direct[:limit]
+    stats["chat_ids"] = list(direct)
     scope = f"(model {model})" if label else "(deterministic only -- no labeling)"
     print(f"{len(direct)} direct (1:1) chats to scan for conflicts {scope}")
     if dry_run:
@@ -611,7 +793,8 @@ def detect_conflicts(con, model, classify_fn=None, limit=None, dry_run=False,
     if label:
         _check_model_guard(con, model)
         if classify_fn is None:
-            classify_fn = lambda text: _classify_turn(text, model, CONFLICT_THINK)  # noqa: E731
+            think = _resolve_think(model) if think is None else think
+            classify_fn = lambda text: _classify_turn(text, model, think)  # noqa: E731
 
     corpus_end = _corpus_end(con)
     total = 0
@@ -624,6 +807,7 @@ def detect_conflicts(con, model, classify_fn=None, limit=None, dry_run=False,
                 p.advance()
     except KeyboardInterrupt:
         con.commit()
+        stats["interrupted"] = True
         print(f"\nInterrupted -- committed {total} conflicts; rerun to resume.")
         return total
     print(f"Detected {total} conflicts across {len(direct)} chats")
@@ -637,6 +821,15 @@ def detect_conflicts(con, model, classify_fn=None, limit=None, dry_run=False,
 # corroboration -> rank, so an llm-corroborated window outranks a bare one at
 # equal signal count (mirrors the corroboration ladder in _corroboration).
 _CORROB_RANK = {"llm": 2, "weak": 1, "none": 0}
+
+
+def _peak_message_id(peak_signal_json):
+    """The window's peak_gap_message_id -- the message left hanging, which is
+    what _select_turns anchors on -- read back out of the stored evidence."""
+    try:
+        return json.loads(peak_signal_json or "{}").get("peak_gap_message_id")
+    except (ValueError, TypeError):
+        return None
 
 
 def _conflict_strength(peak_signal_json, corroboration):
@@ -655,60 +848,290 @@ def _conflict_strength(peak_signal_json, corroboration):
     )
 
 
-def label_top_conflicts(con, model, n, max_label_turns, classify_fn=None):
-    """Second pass over already-detected windows: label ONLY the N strongest
-    (by _conflict_strength), leaving weaker windows detected-but-unlabeled. This
-    is the budgeted middle tier -- LLM calls are bounded by N * max_label_turns.
-    Assumes a prior deterministic detection pass cleared stale signals (the
-    per-chat delete-then-rewrite in detect_chat), so re-runs stay idempotent.
-    Resumable within a run (commits per window, Ctrl-C safe)."""
+# --- the wall-clock rate estimator -----------------------------------------
+# Per-CALL seconds, not per-group: this loop dispatches one turn at a time and
+# gates before every request, so the whole apparatus annotate needs for its
+# pooled fan-out (drain reserve, thread-safe counters) has nothing to do here.
+# Measured 2026-07-28 on qwen3.5:4b, real turns (median 30 chars): 2.2 s mean /
+# 2.0 s median with think=False.
+_COLD_TURN_SECONDS = 5.0
+# The model's first request of a run pays its load: ~54 s measured for
+# qwen3.5:4b. Reserved once, so a small budget declines the run instead of
+# overrunning it by a minute, and never folded into the rate -- banking it
+# would tell the NEXT run that every call costs a cold load.
+_COLD_LOAD_SECONDS = 60.0
+# Planning margin over the measured mean. Turn latency scales with turn length
+# and the mean is drawn from turns far shorter than the longest ones a window
+# holds. Applied on top of the mean rather than banking the worst call (which
+# is what annotate does): one timed-out request would otherwise freeze
+# CONFLICT_TIMEOUT seconds into ingest_state as "the rate" and every later run
+# would decline to dispatch anything. The reason annotate cannot do this is the
+# blind wave its pool commits before any timing exists; a sequential loop that
+# re-checks the clock before every call has no such wave to protect against.
+_TURN_RATE_SAFETY = 1.5
+
+
+def _turn_rate_key(model):
+    return f"conflict_turn_seconds:{model}"
+
+
+class _TurnRate:
+    """Running mean of per-call wall-clock, priming the deadline arithmetic.
+
+    `prior` is what to plan with before this run has measured anything (what an
+    earlier run banked, else _COLD_TURN_SECONDS). The first completed call is
+    deliberately NOT recorded: it carries the model's cold load, and folding
+    that into the mean would make one run's startup cost look like every
+    future call's price."""
+
+    def __init__(self, prior=None):
+        self.prior = prior or _COLD_TURN_SECONDS
+        self.warm = False
+        self._n = 0
+        self._total = 0.0
+
+    def record(self, seconds):
+        if not self.warm:
+            self.warm = True        # the cold-load call: charged, never counted
+            return
+        self._n += 1
+        self._total += seconds
+
+    def measured(self):
+        """Mean seconds per call, or None when nothing countable has run."""
+        return self._total / self._n if self._n else None
+
+    def per_call(self):
+        return (self.measured() or self.prior) * _TURN_RATE_SAFETY
+
+    def next_call(self):
+        """per_call plus the one-off model load this run has not paid yet."""
+        return self.per_call() + (0.0 if self.warm else _COLD_LOAD_SECONDS)
+
+    def window(self, n_turns):
+        """What labeling a whole window of `n_turns` should cost."""
+        return self.next_call() + max(0, n_turns - 1) * self.per_call()
+
+
+def _load_turn_rate(con, model):
+    """A _TurnRate primed with what an earlier run measured for this model."""
+    raw = get_state(con, _turn_rate_key(model))
+    try:
+        prior = float(raw) if raw else None
+    except (TypeError, ValueError):
+        prior = None
+    return _TurnRate(prior=prior if prior and prior > 0 else None)
+
+
+def _save_turn_rate(con, rate, model):
+    """Bank what this run measured so the next one is not blind. Only a
+    MEASURED value: writing the prior back would freeze a guess into the DB
+    where nothing could ever correct it."""
+    mean = rate.measured()
+    if not mean:
+        return
+    set_state(con, _turn_rate_key(model), repr(mean))
+    con.commit()
+
+
+def _timed(classify_fn, rate, monotonic):
+    """classify_fn wrapped so every SUCCESSFUL call feeds the rate estimator.
+
+    A call that raises is deliberately not recorded. Its duration is not
+    evidence about what a working call costs -- an ollama timeout contributes
+    CONFLICT_TIMEOUT (300 s by default) -- and because the estimate is banked
+    for the NEXT run, recording it would latch: a prior that large makes the
+    gate decline every window, a run that dispatches nothing measures nothing,
+    and a run that measures nothing never overwrites the value that stopped it.
+    A malformed REPLY is a different thing and still counts: _classify_turn
+    returns an abstain for it, so the request really did cost what it cost."""
+    def run(text):
+        started = monotonic()
+        result = classify_fn(text)
+        rate.record(monotonic() - started)
+        return result
+    return run
+
+
+def label_top_conflicts(con, model, n=None, max_label_turns=CONFLICT_MAX_LABEL_TURNS,
+                        classify_fn=None, think=None, deadline=None,
+                        monotonic=time.monotonic, rate=None, chat_ids=None):
+    """Second pass over already-detected windows: label the strongest first (by
+    _conflict_strength), under a wall-clock deadline, a fixed count, or both.
+
+      * `n` None labels every unlabeled window; an int stops after that many
+        (the `--label-top N` contract: weaker windows stay detected-but-
+        unlabeled).
+      * `deadline` is an absolute time on the injected `monotonic` clock (None
+        = unbounded). Before each window the loop asks whether the estimated
+        cost of ITS turns still fits; before each call inside the window it
+        asks again, and a window that runs out mid-way is rolled back rather
+        than committed half-labeled. Nothing is truncated silently -- the
+        summary says how many windows were left.
+      * `chat_ids` restricts the candidates to those chats. None means the
+        whole table, which is what a full run wants -- but a --limit run
+        scanned only some chats, and without this it would spend its budget
+        labeling windows in chats it was told not to touch.
+      * Windows already carrying `labeled_at` are skipped, so a rerun continues
+        down the ranking wherever the last budget ran out. Every processed
+        window is stamped, including one where no label survived the gate.
+
+    Commits per window (Ctrl-C safe) and banks the observed per-call seconds
+    for the next run."""
     _check_model_guard(con, model)
+    if think is None:
+        think = _resolve_think(model)
     if classify_fn is None:
-        classify_fn = lambda text: _classify_turn(text, model, CONFLICT_THINK)  # noqa: E731
+        classify_fn = lambda text: _classify_turn(text, model, think)  # noqa: E731
+    if rate is None:
+        rate = _load_turn_rate(con, model)
     four_way_cleared = all(eval_gate_passed(con, GATE_TASK, h) for h in HORSEMEN)
     rows = con.execute(
-        "SELECT id, chat_id, first_date, last_date, peak_signal_json, corroboration "
-        "FROM conflicts"
+        "SELECT id, chat_id, first_date, last_date, peak_signal_json, "
+        "corroboration, labeled_at FROM conflicts"
     ).fetchall()
-    ranked = sorted(
-        rows,
-        key=lambda r: _conflict_strength(r["peak_signal_json"], r["corroboration"]),
-        reverse=True,
-    )[:max(0, n)]
-    if not ranked:
+    if chat_ids is not None:
+        in_scope = set(chat_ids)
+        rows = [r for r in rows if r["chat_id"] in in_scope]
+    if not rows:
         print("No conflicts to label.")
         return 0
+    ranked = sorted(
+        (r for r in rows if r["labeled_at"] is None),
+        key=lambda r: _conflict_strength(r["peak_signal_json"], r["corroboration"]),
+        reverse=True,
+    )
+    if n is not None:
+        ranked = ranked[:max(0, n)]
+    if not ranked:
+        print(f"All {len(rows)} conflict windows are already labeled.")
+        return 0
+
+    def _out_of_budget(cost):
+        return deadline is not None and monotonic() + cost > deadline
+
+    timed = _timed(classify_fn, rate, monotonic)
+    # Requests actually issued by THIS call -- the honest subject of the
+    # "dispatched nothing" line. Not rate.warm: a caller can hand in a rate
+    # that already paid a cold load, and not `labeled`: a window rolled back
+    # at its per-call gate leaves labeled == 0 having spent real requests.
+    calls = {"n": 0}
+
+    def classify(text):
+        calls["n"] += 1
+        return timed(text)
+
     msg_cache = {}
     labeled = 0
+    stopped = False
     try:
-        with progress.track("Labeling top conflicts", total=len(ranked), header=False) as p:
+        with progress.track("Labeling conflicts", total=len(ranked), header=False) as p:
             for r in ranked:
+                if deadline is not None and monotonic() >= deadline:
+                    # Before the segment build, not just before the request:
+                    # a window whose turns all fail the prescreen costs no LLM
+                    # call but still loads its chat's messages, and the tail of
+                    # the ranking holds enough of them to matter.
+                    stopped = True
+                    break
                 cid = r["chat_id"]
                 if cid not in msg_cache:
                     msg_cache[cid] = _load_messages(con, cid)
                 first_dt, last_dt = _dt(r["first_date"]), _dt(r["last_date"])
                 seg = [m for m in msg_cache[cid]
                        if first_dt <= _dt(m["date"]) <= last_dt and m["text"]]
-                turns = [(m["id"], m["is_from_me"], m["text"]) for m in seg][:max_label_turns]
-                _n, survivors = _label_turns(con, r["id"], turns, classify_fn, four_way_cleared)
-                if survivors:
-                    con.execute("UPDATE conflicts SET topic = ? WHERE id = ?",
-                                (statistics.mode(survivors), r["id"]))
+                peak_id = _peak_message_id(r["peak_signal_json"])
+                turns = _select_turns(seg, max_label_turns, peak_id)
+                if turns and _out_of_budget(rate.window(len(turns))):
+                    stopped = True
+                    break
+                # A window labeled before conflicts.labeled_at existed carries
+                # signals but no stamp, so this pass will re-label it: replace
+                # its rows rather than stacking a second set on top.
+                con.execute("DELETE FROM conflict_signals WHERE conflict_id = ?",
+                            (r["id"],))
+                try:
+                    _n, survivors = _label_turns(
+                        con, r["id"], turns, classify, four_way_cleared,
+                        should_stop=lambda: _out_of_budget(rate.next_call()))
+                except _BudgetExhausted:
+                    # Partial window: drop its signal rows (nothing else is
+                    # uncommitted -- the loop commits per window) and leave it
+                    # unlabeled for the next run to buy whole.
+                    con.rollback()
+                    stopped = True
+                    break
+                con.execute("UPDATE conflicts SET topic = ?, labeled_at = ? WHERE id = ?",
+                            (statistics.mode(survivors) if survivors else None,
+                             _now_iso(), r["id"]))
                 labeled += 1
                 con.commit()
                 p.advance()
     except KeyboardInterrupt:
-        con.commit()
-        print(f"\nInterrupted -- labeled {labeled} of top {len(ranked)}; rerun to resume.")
+        # Rollback, not commit: every completed window committed on its own, so
+        # the only uncommitted rows are a half-labeled window's -- and stamping
+        # nothing means the next run buys it whole.
+        con.rollback()
+        print(f"\nInterrupted -- labeled {labeled} of {len(ranked)}; rerun to resume.")
         return labeled
-    print(f"Labeled top {labeled} of {len(rows)} conflict windows "
-          f"(<= {len(ranked) * max_label_turns} LLM calls budgeted)")
+    except BaseException:
+        # Same contract for an ollama timeout or a transport RuntimeError as
+        # for the deadline stop: a window is all of its turns or none of them.
+        # Without this the _save_turn_rate commit below would persist the
+        # half-labeled window on its way out, unstamped -- signals a reader
+        # would treat as this window's complete labeling.
+        con.rollback()
+        raise
+    finally:
+        _save_turn_rate(con, rate, model)
+
+    # Counted from the rows this call was scoped to, not from a fresh
+    # corpus-wide COUNT: under `chat_ids` the two differ, and reporting the
+    # whole table's backlog for a scoped run would be a different number than
+    # the one the sentence promises.
+    left = sum(1 for r in rows if r["labeled_at"] is None) - labeled
+    if stopped:
+        if not calls["n"]:
+            # Declining every window is the right answer to a budget smaller
+            # than one window, but silence would read as "nothing to do".
+            print(f"  dispatched nothing: one window of up to {max_label_turns} turns "
+                  f"is worth ~{rate.window(max_label_turns):.0f}s at the measured "
+                  f"rate, more than the budget left -- raise CONFLICT_BUDGET_MINUTES")
+        print(f"Labeled {labeled} conflict windows, then stopped at the deadline -- "
+              f"{left} of {len(rows)} still unlabeled; rerun to resume.")
+    else:
+        print(f"Labeled {labeled} of {len(rows)} conflict windows "
+              f"({left} left unlabeled)")
     return labeled
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+def _resolve_budget_minutes(budget_minutes=None):
+    """(minutes, provenance) for the run's wall-clock budget. Precedence:
+    --budget-minutes > CONFLICT_BUDGET_MINUTES > the config default, the same
+    caller > env > default order annotate_hybrid._resolve_budget_minutes uses.
+
+    0 means UNBUDGETED in both places, where annotate's hybrid tier reads 0 as
+    "unset": there the budget IS the tier, here it is additive, so switching it
+    off has to restore the unbounded path rather than fall back to a default."""
+    if budget_minutes is not None:
+        return max(0, budget_minutes), "--budget-minutes"
+    return max(0, CONFLICT_BUDGET_MINUTES), "CONFLICT_BUDGET_MINUTES"
+
+
+def _conflicts_ready(con):
+    """Whether the conflict tables exist AND carry the resume column -- both
+    are things create_schema self-heals, and conflict_detect is reachable
+    without the ingest.py run that normally applies migrations."""
+    if not con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='conflicts'"
+    ).fetchone():
+        return False
+    return "labeled_at" in {row[1] for row in con.execute("PRAGMA table_info(conflicts)")}
+
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
@@ -722,8 +1145,14 @@ def main(argv=None):
                         help="print the scan scope and exit without LLM calls or writes")
     parser.add_argument("--max-label-turns", type=int, metavar="N", default=None,
                         help=f"cap LLM-labeled turns per conflict (default "
-                             f"{CONFLICT_MAX_LABEL_TURNS}); lower = fewer LLM calls, "
-                             f"coarser labels")
+                             f"{CONFLICT_MAX_LABEL_TURNS}, peak-anchored); lower = "
+                             f"fewer LLM calls, coarser labels")
+    parser.add_argument("--budget-minutes", type=int, metavar="N", default=None,
+                        help=f"wall-clock minutes this run may spend, detection "
+                             f"included (default {CONFLICT_BUDGET_MINUTES} from "
+                             f"CONFLICT_BUDGET_MINUTES). Labels the strongest windows "
+                             f"first and stops at the deadline; rerun to continue down "
+                             f"the ranking. 0 = no budget (label every window)")
     speed = parser.add_mutually_exclusive_group()
     speed.add_argument("--no-llm", action="store_true",
                        help="FAST path: write the deterministic conflict windows "
@@ -736,27 +1165,70 @@ def main(argv=None):
                             "peak gap); weaker windows stay detected-but-unlabeled. "
                             "Bounds LLM calls to N * max-label-turns.")
     args = parser.parse_args(argv)
+    if args.no_llm and args.budget_minutes is not None:
+        parser.error("--budget-minutes has nothing to bound with --no-llm "
+                     "(that path makes zero LLM calls)")
 
+    # The clock starts here, not in the labeling loop: detection is part of what
+    # the budget promises, so the deadline has to cover it.
+    started = time.monotonic()
     model = args.model or CONFLICT_MODEL
+    think = _resolve_think(model)
+    minutes, budget_source = _resolve_budget_minutes(args.budget_minutes)
+    max_turns = args.max_label_turns or CONFLICT_MAX_LABEL_TURNS
     con = _connect()
     try:
-        # Self-heal a DB that predates the conflict tables (create_schema is
-        # idempotent) -- conflict_detect is reachable without re-running ingest.
-        if not con.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='conflicts'"
-        ).fetchone():
+        # Self-heal a DB that predates the conflict tables or the labeled_at
+        # resume column (create_schema is idempotent) -- conflict_detect is
+        # reachable without re-running ingest. Skipped under --dry-run, which
+        # promises no writes and never reads either (annotate._ensure_column
+        # degrades the same way): create_schema is DDL plus a reaction rescan.
+        if not args.dry_run and not _conflicts_ready(con):
             schema.create_schema(con)
-        max_turns = args.max_label_turns or CONFLICT_MAX_LABEL_TURNS
-        if args.label_top is not None:
-            # Two-phase: fast deterministic detection over all chats, then label
-            # only the N strongest windows (the rest stay detected-but-unlabeled).
-            detect_conflicts(con, model, limit=args.limit, dry_run=args.dry_run,
-                             label=False, max_label_turns=max_turns)
+            con.commit()
+        # Two-phase whenever there is LLM work to bound: fast deterministic
+        # detection over all chats, then label the strongest windows under
+        # whichever caps apply (a wall clock, a fixed N, or both). With neither
+        # -- `--budget-minutes 0` and no --label-top -- the legacy single-phase
+        # path labels every window as it detects it.
+        if not args.no_llm and (minutes or args.label_top is not None):
             if not args.dry_run:
-                label_top_conflicts(con, model, args.label_top, max_turns)
+                budget = (f"{minutes:g} min budget ({budget_source})" if minutes
+                          else "no budget (--budget-minutes 0)")
+                top = f", top {args.label_top} windows" if args.label_top is not None else ""
+                print(f"conflict labeling: {budget}, model {model}, think {think!r}, "
+                      f"<= {max_turns} turns/window{top}")
+            # Pre-seeded rather than read with .get(): these are the two facts
+            # the labeling phase needs from the detection pass, and a stand-in
+            # detect_conflicts that fills neither should degrade to the
+            # unscoped, uninterrupted defaults rather than raise.
+            detected = {"interrupted": False, "chat_ids": None}
+            detect_conflicts(con, model, limit=args.limit, dry_run=args.dry_run,
+                             label=False, max_label_turns=max_turns, stats=detected)
+            if detected["interrupted"]:
+                # detect_conflicts catches Ctrl-C and returns normally, so
+                # without this the key that stopped the (cheap, deterministic)
+                # detection pass would start a full budget of LLM traffic.
+                print("Stopped before labeling; rerun to resume.")
+            elif not args.dry_run:
+                label_top_conflicts(con, model, n=args.label_top,
+                                    max_label_turns=max_turns, think=think,
+                                    deadline=started + minutes * 60 if minutes else None,
+                                    # --limit scoped the detection pass, so it
+                                    # has to scope the labeling pass too, or the
+                                    # budget goes to chats this run excluded.
+                                    # `is not None`, not truthiness: --limit 0
+                                    # scans no chats, and falling back to the
+                                    # corpus-wide default there would label the
+                                    # whole table -- the exact failure this
+                                    # scoping exists to prevent.
+                                    chat_ids=(detected["chat_ids"]
+                                              if args.limit is not None else None))
+                print(f"  used {(time.monotonic() - started) / 60.0:.1f} minutes")
         else:
             detect_conflicts(con, model, limit=args.limit, dry_run=args.dry_run,
-                             label=not args.no_llm, max_label_turns=max_turns)
+                             label=not args.no_llm, max_label_turns=max_turns,
+                             think=think)
     finally:
         con.close()
 

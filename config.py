@@ -626,7 +626,9 @@ VOICEPRINT_BURST_GAP_SECONDS = int(os.getenv("VOICEPRINT_BURST_GAP_SECONDS") or 
 # Deterministic tense-stretch finder + eval-gated escalation labels. Per-
 # pipeline model knobs follow the STANDARD inherit-from-CHAT rule (CONFLICT_
 # THINK is a plain *_THINK via _think, NOT annotate's empty-means-preset
-# carve-out). Empty CONFLICT_MODEL inherits CHAT_MODEL; recorded in
+# carve-out -- but conflict_detect._resolve_think then reads an UNSET one as
+# False for its own dispatches, since omitting the flag costs ~90x per turn;
+# the seam here is untouched). Empty CONFLICT_MODEL inherits CHAT_MODEL; recorded in
 # ingest_state as `conflict_model` and mixing models in one conflicts table is
 # refused (same guard shape as chunk_annotations' annotate_model).
 CONFLICT_MODEL = os.getenv("CONFLICT_MODEL", "") or CHAT_MODEL
@@ -662,9 +664,28 @@ CONFLICT_TRACE_SIM_THRESHOLD = float(os.getenv("CONFLICT_TRACE_SIM_THRESHOLD") o
 # CONFLICT_MIN_SIGNALS: distinct deterministic signals a window must trip to
 # be written (latency_withdrawal / one_sided_session / dislike_run /
 # volume_collapse). CONFLICT_MAX_LABEL_TURNS: per-conflict cap on LLM-labeled
-# turns (cost + prompt-size safety).
+# turns (cost + prompt-size safety) -- 6, not the original 12, because turn
+# selection is now peak-anchored (centered on the message left hanging) rather
+# than the first N chronological turns, and the 1,940-turn windows this corpus
+# contains prove the head slice can miss the evidence entirely.
 CONFLICT_MIN_SIGNALS = int(os.getenv("CONFLICT_MIN_SIGNALS") or "2")
-CONFLICT_MAX_LABEL_TURNS = int(os.getenv("CONFLICT_MAX_LABEL_TURNS") or "12")
+CONFLICT_MAX_LABEL_TURNS = int(os.getenv("CONFLICT_MAX_LABEL_TURNS") or "6")
+# Lexical prescreen for label candidates: a turn shorter than this many
+# characters (whitespace stripped), or one with no alphanumeric character at
+# all (emoji/punctuation only), cannot carry an escalation signal and is never
+# sent to the model. Measured 2026-07-28 on this corpus: ~70% of labels come
+# back `neutral`, each costing a full request to say nothing.
+CONFLICT_MIN_TURN_CHARS = int(os.getenv("CONFLICT_MIN_TURN_CHARS") or "15")
+# Wall-clock minutes ONE conflict_detect.py run may spend, measured from the
+# top of main() so the deterministic detection pass counts against it too.
+# The labeling loop stops dispatching when the remaining budget cannot cover
+# the next window, commits, and says what it left behind; a rerun continues
+# down the strength ranking (conflicts.labeled_at is the resume marker). This
+# is what makes the runtime promise hold BY CONSTRUCTION on a bigger corpus
+# instead of by tuned constants. 25 leaves headroom under the 30-minute
+# target for detection (~24 s) and the model's cold load (~54 s). 0 = no
+# budget: label every detected window, however long that takes.
+CONFLICT_BUDGET_MINUTES = int(os.getenv("CONFLICT_BUDGET_MINUTES") or "25")
 # DV-suppression floor for diagnose_conflict (C2 / Master Spec A10, SOFTENED,
 # code-enforced). 'on' (the default) screens the FULL text of every message in
 # a conflict window for high-risk power-and-control markers and, on a hit,

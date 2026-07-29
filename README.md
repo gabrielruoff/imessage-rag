@@ -70,7 +70,9 @@ Keep it that way if you contribute back.
   default. The batch pipelines are less exposed: term curation already ships
   `think=false`, and the annotation `--quality` presets now resolve to `false`
   on a model without reasoning-effort levels (see the `annotate.py` section
-  below). `TOPIC_THINK` / `NUDGES_THINK` / `CONFLICT_THINK` inherit
+  below), as does `conflict_detect.py` — an unset `CONFLICT_THINK` labels with
+  `think=false` (measured 197s vs 2.2s per turn on `qwen3.5:4b`), and an
+  explicit value still wins. `TOPIC_THINK` / `NUDGES_THINK` inherit
   `CHAT_THINK`, so setting it once quiets those too — and `.env.example`
   recommends `false` for each of them regardless, since their output is one
   short label.
