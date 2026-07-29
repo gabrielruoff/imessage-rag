@@ -1832,6 +1832,163 @@ failure mode is a cheaper answer from a model that could have reasoned. Under
 the inverse, an unknown model would be assumed to have effort levels, and the
 failure mode is the 282.6s-per-item hang this change exists to prevent.
 
+## 2026-07-28: `make conflict` on a wall-clock budget (66 h → 25 min)
+
+`make conflict` was documented as a pipeline stage and measured as a **66-hour**
+one. None of it was the detector: the deterministic pass over all 787 direct
+chats costs **24.1 s** and writes **1,305** windows. All of it was the per-turn
+escalation labeling, and it was slow twice over — each call cost far too much,
+and there were far too many calls.
+
+### The borrowed `think`, for the third time: 197 s per call
+
+`CONFLICT_THINK` is a plain `*_THINK` knob, so it inherits `CHAT_THINK`, which
+defaults to `None` — omit the flag, take the model's own default. On
+qwen3.5:4b, a thinking model, that buys a full reasoning pass on every single
+labeling call: **197 s per call against 2.2 s mean / 2.0 s median** (n=24, real
+turns, median 30 chars) with `think=False`. To choose one enum for one text
+message.
+
+This repo has now paid for a borrowed `think` three times (282.6 s per dyad
+term, `--quality fast` inverted into the slowest tier, and this), so the fix has
+the shape the second one established: `conflict_detect._resolve_think(model)`
+reads a genuinely UNSET `CONFLICT_THINK` as `False` *for this pipeline*
+(`'low'` on the `config.has_effort_levels` family), while an explicit value —
+`CONFLICT_THINK` or the `CHAT_THINK` it inherits — still passes through
+untouched. The tri-state itself is not touched: `None` still means "omit the
+flag" at the `ollama.py` seam, and `config._think`/`CHAT_THINK` keep their
+meanings. What changed is one pipeline's default. The resolved value is threaded
+through `detect_conflicts`, `label_top_conflicts` **and** `gate_classifier`,
+because all three used to close over `CONFLICT_THINK` directly and a single
+missed seam leaves that path 90x slow.
+
+That is a ~90x speedup and it is not enough. At the old
+`CONFLICT_MAX_LABEL_TURNS=12` this corpus wants **6,670** calls: **4.1 h**, on
+the same "stage of `make pipeline`" that is supposed to finish while you watch.
+
+### The budget is denominated in TIME, not windows
+
+A window count is not a runtime promise. Per-call latency moves with turn
+length, model and machine, and the windows themselves are wildly uneven —
+47,457 candidate turns across 1,305 windows, **min 1 / median 4 / mean 36.4 /
+max 1,940**. "Label the top 90" therefore says nothing about wall clock, which
+is exactly the failure `--label-top` shipped with. So `conflict_detect.py`
+borrows `--quality hybrid`'s contract instead: `CONFLICT_BUDGET_MINUTES`
+(default **25**, `--budget-minutes N` overriding it, `0` = no deadline), clocked
+from the top of `main()` so the detection pass spends it too. A bare run is
+two-phase — detect every chat, then label the **strongest** windows first
+(`_conflict_strength`: signal count → corroboration → dislike volume → peak
+reply gap) until the deadline. It stops dispatching rather than overrunning,
+commits per window, and prints how many windows were labeled versus left. It
+composes with `--label-top N` (both caps apply) and is an error with `--no-llm`,
+which has no LLM work to bound.
+
+Two things deliberately not done, both measured first: request **batching**
+(12-turn batched requests measured **2.25 s/turn — no speedup at all**, being
+output-token-bound, with 4 of 8 replies unparseable) and **parallel workers**
+(this Ollama serializes). A sequential loop that re-checks the clock before
+every single call is not a compromise here; it is the whole reason this gate is
+a few lines against `annotate._DispatchDeadline`'s pool arithmetic.
+
+### The cold load is reserved once and never banked
+
+The model's first request of a run pays its load — **~54 s** measured for
+qwen3.5:4b. `_TurnRate.next_call()` adds `_COLD_LOAD_SECONDS` (60.0) to the
+estimate until the run has completed one call, so a budget too small to cover a
+window *declines* it rather than overrunning by a minute. But the first
+completed call is charged and never *counted*: `record()` flips `warm` and
+returns without touching the mean. The distinction matters because the mean is
+banked for the next run, and folding a one-off startup cost into it would tell
+every future run that every call costs a cold load.
+
+### `conflict_turn_seconds:<model>`, and why a failed call is not recorded
+
+Per-call seconds bank in `ingest_state` under `conflict_turn_seconds:<model>`
+(the `annotate_group_seconds:...` precedent), so a run is never planning blind:
+the banked mean primes the estimator, the live mean takes over once this run has
+measured anything, and both are multiplied by `_TURN_RATE_SAFETY` (1.5) because
+turn latency scales with turn length and the measured mean comes from turns far
+shorter than the longest ones a window holds. Only a *measured* value is written
+back — banking the prior would freeze a guess where nothing could correct it.
+
+What crosses runs here is the **mean**, not annotate's max. Annotate needs the
+worst case because its pool commits a blind wave before any timing exists; a
+sequential loop that gates before every request has no such wave to protect
+against.
+
+A call that **raises** is deliberately never recorded, and that exclusion is
+load-bearing rather than tidy. Its duration is not evidence about what a working
+call costs — an Ollama timeout contributes `CONFLICT_TIMEOUT`, 300 s by
+default — and because the number is banked for the *next* run, it latches: a
+prior that large makes the gate decline every window, a run that dispatches
+nothing measures nothing, and a run that measures nothing never overwrites the
+value that stopped it. A malformed *reply* is a different thing and still
+counts: `_classify_turn` returns an abstain for it, so the request really did
+cost what it cost.
+
+### `labeled_at` is stamped even when no label survived
+
+`conflicts.labeled_at` (nullable, idempotent migration in `schema.create_schema`)
+is the resume marker, and the marker is the **stamp**, never the presence of
+`conflict_signals` rows. A window's labels pass the F4 eval gate (only cleared
+classes are written) and `CONFLICT_LABEL_CONF_FLOOR`, so a window that was
+processed exactly as intended can legitimately end with zero rows. Keying resume
+on rows would make every one of those windows a candidate again on every rerun,
+forever — real requests re-spent on work already done, ahead of windows nobody
+has looked at yet. So "processed" is what is recorded. The converse case
+is handled too: a window labeled before the column existed carries signals and
+no stamp, so the labeling loop deletes its signal rows before re-labeling rather
+than stacking a second set on the first.
+
+### Reconcile the window, don't rewrite it
+
+`detect_chat` used to delete a chat's conflicts and write them fresh. Under a
+budget that is fatal, and not subtly: **every** budgeted run re-detects all 787
+chats before it labels anything, so a delete-then-rewrite would discard exactly
+the labels the previous run's 25 minutes bought, and no rerun could ever extend
+coverage past one budget's worth. (The plan document said the rewrite would
+"naturally clear" `labeled_at` and treated that as a feature — see the status
+header on `docs/PLAN_CONFLICT_HYBRID.md`.)
+
+`detect_chat` now reconciles, keyed on `chat_id` + `first_date` + `last_date`: a
+window whose boundaries are unchanged keeps its row id, its `conflict_signals`,
+its topic and its `labeled_at` stamp while its deterministic columns are
+refreshed in place; windows that no longer exist are dropped with their signals.
+Two things that buys beyond resumability — stable `conflict_id`s across runs
+(they are what a user types at `get_conflict` and what `conflict_signals` hangs
+off), and an already-labeled window is not re-labeled by a detection pass.
+Changing the window is what makes it a candidate again; emptying the table is
+what forces a wholesale re-label.
+
+### `CONFLICT_MAX_LABEL_TURNS` 12 → 6, because selection is peak-anchored
+
+Halving the per-window ceiling is what lets a 25-minute budget reach further
+down the ranking, and it is only safe because the six turns are now the *right*
+six — the cap binds on the big windows, which is where the evidence hides. The
+old selection took the first N turns chronologically; against a 1,940-turn
+window that provably misses the evidence. Selection is now anchored on the
+window's `peak_gap_message_id` — the message left hanging is the escalation
+moment — taking a contiguous span around it, emitted in chronological order
+(the labels read as a sequence), falling back to the head when a window has no
+peak id. Ahead of the cap, a lexical prescreen drops turns that cannot carry an
+escalation signal at all: under `CONFLICT_MIN_TURN_CHARS` (15) after stripping
+whitespace, or no alphanumeric character anywhere. About 70% of labels come back
+`neutral`, each costing a full request to say nothing, and the median window has
+only 4 candidate turns — so the prescreen bites where it should, on the big
+windows.
+
+### Measured (2026-07-28, reference corpus, qwen3.5:4b)
+
+350,216 messages / 787 direct chats / 1,305 detected windows. A bare run at the
+25-minute default finished in **24m53s** and labeled **211** windows;
+`--budget-minutes 3` finished in **2m58s**; a rerun preserved every previously
+labeled window and advanced down the strength ranking.
+
+211 of 1,305 in one run is the honest shape of the promise, and it is worth
+stating plainly: `make conflict` is now a stage you can run inside a demo, full
+corpus coverage is a handful of reruns, and neither of those sentences was true
+of a 66-hour run that had to be completed or abandoned whole.
+
 ## 2026-07-28: annotation throughput, round 2
 
 Four independent changes and one negative result, all against the same

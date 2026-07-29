@@ -73,7 +73,30 @@ Full design history, schema rationale, and data forensics:
   `make drift` (`drift.py` → `dyad_drift`; LLM-free, opt-in `DRIFT_ENABLED`,
   default off — `make drift-purge` tears it down), `make voiceprint`
   (`voiceprint.py` → `person_voiceprint`; LLM-free), `make conflict`
-  (`conflict_detect.py` → `conflicts`/`conflict_signals`; Ollama only for labels).
+  (`conflict_detect.py [--budget-minutes N] [--label-top N]
+  [--max-label-turns N] [--no-llm] [--limit N] [--dry-run]` →
+  `conflicts`/`conflict_signals`; Ollama only for the per-turn labels). A bare
+  `make conflict` is two-phase and budgeted in TIME, like `--quality hybrid`:
+  deterministic detection over ALL 1:1 chats (~24 s on the reference corpus,
+  unchanged), then per-turn labeling of the STRONGEST windows first
+  (`_conflict_strength`: signal count → corroboration → dislikes → peak gap)
+  until the `CONFLICT_BUDGET_MINUTES` (default 25) wall-clock deadline, clocked
+  from the top of `main` so detection spends it too. It stops dispatching when
+  the remainder can't cover the next window, commits, and prints how many
+  windows were labeled vs left; a rerun continues down the ranking, skipping
+  windows already stamped `conflicts.labeled_at` (stamped even when every label
+  was suppressed, and preserved when an unchanged window re-detects).
+  `--budget-minutes N` overrides the env (flag > env > default), `0` = the
+  unbudgeted legacy path (label every detected window), it composes with
+  `--label-top N` (both caps apply), and it is an ERROR with `--no-llm` (no LLM
+  work to budget). Turn selection is peak-anchored on `peak_gap_message_id`
+  (not the first N chronological turns) and prescreened by
+  `CONFLICT_MIN_TURN_CHARS` (default 15; a shorter or alphanumeric-free turn
+  can't carry an escalation signal and is never dispatched), so
+  `CONFLICT_MAX_LABEL_TURNS` now defaults to 6, not 12. Per-call seconds bank in
+  `ingest_state` under `conflict_turn_seconds:<model>` so the deadline
+  arithmetic is never blind, and an unset `CONFLICT_THINK` resolves to `False`
+  for this pipeline (197 s → 2.2 s per call — see the `think` gotcha).
 - Everything, in order: `make pipeline`
   (ingest → annotate → nudges → drift → voiceprint → conflict → topics). MUST
   stay serial (written to under `make -j` too): they hold a SQLite write lock
@@ -192,10 +215,15 @@ ingest_state(key, value)          -- last_message_rowid for --since-last, plus
                                   -- sampler has drawn -- its phase-3 upgrades
                                   -- are source='llm' too, so COUNT(llm) would
                                   -- let the tier satisfy its own seed target),
-                                  -- and annotate_group_seconds:<phase>:<model>:
+                                  -- annotate_group_seconds:<phase>:<model>:
                                   -- b<batch>:w<workers> (slowest LLM request
                                   -- seen, so the next budgeted run's first
-                                  -- dispatch is not blind)
+                                  -- dispatch is not blind), and
+                                  -- conflict_turn_seconds:<model> (the same
+                                  -- banking for conflict_detect's budgeted
+                                  -- labeling: observed seconds per per-turn
+                                  -- call, so its deadline arithmetic starts
+                                  -- primed instead of guessing)
 sessions(id, chat_id, first_message_id, last_message_id, first_date,
          last_date, n_messages, n_from_me, initiator_handle_id,
          initiator_is_me, ender_handle_id, ender_is_me)
@@ -265,12 +293,20 @@ person_voiceprint(member_key, counterpart_key, scope, avg_msg_len,
                                   -- only); full rebuild, guarded by
                                   -- voiceprint_max_message_id
 conflicts(id, chat_id, first_date, last_date, start_session_id, end_session_id,
-         topic, peak_signal_json, corroboration, off_text_flag, source)
-                                  -- deterministic conflict episodes
+         topic, peak_signal_json, corroboration, off_text_flag, source,
+         labeled_at)              -- deterministic conflict episodes
                                   -- (conflict_detect.py; 1:1 only); corroboration
                                   -- 'none'|'weak'|'llm' (valence, source='llm'
                                   -- only); source guarded by conflict_model. NO
-                                  -- role/aggressor/status column by design (C2)
+                                  -- role/aggressor/status column by design (C2).
+                                  -- labeled_at (nullable) is the budgeted
+                                  -- labeling pass's resume marker: stamped once
+                                  -- a window's labels commit -- INCLUDING a
+                                  -- window where every label was suppressed, so
+                                  -- the presence of conflict_signals rows is NOT
+                                  -- the marker -- and preserved (with the labels)
+                                  -- when an unchanged window re-detects, so each
+                                  -- budgeted run extends coverage
 conflict_signals(id, conflict_id, message_id, actor_is_me, label_class,
          top2_labels_json, band, excerpt)
                                   -- per-turn escalation labels for a conflict;
@@ -388,11 +424,16 @@ chunk_vectors                     -- sqlite-vec vec0 table: chunk_id ->
   `'low'` on gpt-oss — without it `--quality fast` would be the SLOWEST tier on
   the default model. `None` and explicit `True`/`False` pass through untouched
   (the tri-state survives) and an explicit `ANNOTATE_THINK` always wins.
-  `CHAT_THINK` deliberately still defaults to `None`, so on the thinking-capable
-  default chat model thinking is ON for `chat.py` — a speed/quality call for the
-  user (routing across ~32 tools may genuinely want it), remedied with
-  `CHAT_THINK=false`. Never route one pipeline's `think` into another —
-  `--terms` owns `ANNOTATE_TERMS_THINK` and rejects `--quality`.
+  `conflict_detect` carves itself out the same way: an unset `CONFLICT_THINK`
+  resolves to `False` (`'low'` on gpt-oss) for that pipeline instead of
+  inheriting `CHAT_THINK`'s `None`, because omitting the flag made every
+  per-turn labeling call a full reasoning pass (197 s vs 2.2 s measured on
+  qwen3.5:4b); an explicit `CONFLICT_THINK` still wins and passes through
+  untouched. `CHAT_THINK` deliberately still defaults to `None`, so on the
+  thinking-capable default chat model thinking is ON for `chat.py` — a
+  speed/quality call for the user (routing across ~32 tools may genuinely want
+  it), remedied with `CHAT_THINK=false`. Never route one pipeline's `think` into
+  another — `--terms` owns `ANNOTATE_TERMS_THINK` and rejects `--quality`.
 - `TOPIC_LABEL_SAMPLES` defaults to 30: label samples are ranked by similarity to
   the cluster centroid, and a big cluster's most central chunks are its shortest
   ("ok", "yeah"); raising it past ~30 risks the context window (an oversized

@@ -165,13 +165,26 @@ grievance excerpts. A code-enforced DV floor watches the window text.
 - `CONFLICT_DV_SCREEN` is **on** by default (leave it); `chat.py --no-dv-screen` bypasses
   the role read for one run.
 
-**Build the data.**
+**Build the data.** `make conflict` is two-phase and budgeted in **wall clock**, like
+`--quality hybrid`: it detects windows across every 1:1 chat (~24 s on the reference
+corpus), then labels the *strongest* windows first until `CONFLICT_BUDGET_MINUTES`
+(default **25**) is spent, and prints how many it labeled versus left. One run does not
+label the whole corpus — the reference run labeled **211 of 1,305** detected windows in
+24m53s — but a rerun resumes down the strength ranking, so coverage grows a run at a time.
 
 ```bash
-make conflict                                  # populate conflicts / conflict_signals (Ollama for label pass)
+make conflict                                  # detect everywhere, then label the strongest windows for ~25 min
+.venv/bin/python3 conflict_detect.py --budget-minutes 3  # shorter run; resumes where the last one stopped
+make conflict-fast                             # deterministic windows only (--no-llm): zero Ollama calls, unchanged
 .venv/bin/python3 conflict_detect.py --dry-run # optional: how many 1:1 chats will be scanned, no writes
 .venv/bin/python3 conflict_detect.py --limit 5 # optional faster demo: first 5 direct chats
 ```
+
+`--budget-minutes 0` drops the deadline entirely (label every still-unlabeled window,
+however long it takes); `--budget-minutes` with `--no-llm` is an error, since that path
+makes no LLM calls to bound. A very small budget can legitimately dispatch *nothing* —
+one window is the smallest unit of work — and it says so, naming the knob, rather than
+looking like "nothing to do".
 
 Run `annotate.py --quality balanced --upgrade-distilled` first if you want
 `corroboration='weak'/'llm'` instead of `'none'`. Detection itself is never blocked by
@@ -183,7 +196,7 @@ missing annotations.
 | Prompt | Tool | What you'll see |
 |---|---|---|
 | `Have I had any tense stretches with <NAME>? Show me the conflicts.` | `find_conflicts` | Ranked conflict episodes for that person's 1:1 chats — each with a `conflict_id`, dates, which signals fired, corroboration, `off_text_flag`. Empty if `make conflict` hasn't run or it's a group chat. |
-| `Open conflict 3 and show me what happened.` | `get_conflict` | One episode's evidence + up to 15 labeled turns rendered as **tentative/likely bands** (never raw scores), each with actor me/them and a verbatim excerpt ≤200 chars. |
+| `Open conflict 3 and show me what happened.` | `get_conflict` | One episode's evidence + its labeled turns rendered as **tentative/likely bands** (never raw scores), each with actor me/them and a verbatim excerpt ≤200 chars. At most `CONFLICT_MAX_LABEL_TURNS` (**6**) turns, peak-anchored on the window's longest unanswered gap rather than its first few messages — and **zero** for a window no run's budget has reached yet. |
 | `Break down conflict 3 — who withdrew, who kept reaching out, and the tone on each side.` | `diagnose_conflict` | A deterministic scorecard: per-side I-vs-you / we-talk ratios, LSM match, opener/last-word roles, peak latency + volume-collapse read, and a **non-blame** demand-withdraw (pursuer vs withdrawer) read. Carries **no** aggressor/who-won verdict. |
 | `I want to apologize to <NAME> about conflict 3. Help me write it.` | `draft_apology` | A **scaffold**, not a finished apology: the ranked Lewicki-6 checklist + your real grievance excerpts pulled verbatim. It won't ghostwrite prose unless you ask again. |
 | `Did my fight with <NAME> (conflict 3) spill into other conversations?` | `trace_conflict_across_chats` | **Only exists if `CONFLICT_TRACE_ENABLED=true`.** The model asks first, then calls with `consent=true`; each link both clears a similarity threshold and literally names the partner. Nothing persisted. |
@@ -201,9 +214,13 @@ One-shot example:
 ```
 
 The deterministic finder facts always render (window count, typical cool-off time,
-windows-with-volume-collapse, a windows-over-time chart). Label-derived stats (top
-horseman, most-repaired relationship, recovery-time trend) appear only for eval-gate-cleared
-classes. Scope one relationship with `--contact <NAME>`; drop `--no-llm` for narration.
+windows-with-volume-collapse, a windows-over-time chart) — detection is corpus-wide in a
+single run, so those are complete after one `make conflict`. Label-derived stats (top
+horseman, most-repaired relationship, recovery-time trend) need **two** things now: an
+eval-gate-cleared class *and* a window some run's labeling budget actually reached. One
+run covers the strongest couple hundred windows, so these thicken with each rerun instead
+of arriving complete. Scope one relationship with `--contact <NAME>`; drop `--no-llm` for
+narration.
 The section is **skipped entirely** (no empty scaffolding) if there's no conflict data in
 scope — so run `make conflict` first.
 
@@ -218,6 +235,10 @@ scope — so run `make conflict` first.
   off (`CONFLICT_DV_SCREEN=off` or `--no-dv-screen`) the role read/scaffold is restored, but
   the hotline **resource footer is still appended** — it is never removed. The scan is
   read-only; the hit is never persisted.
+- **A detected window with no labeled turns is not a bug.** Detection is corpus-wide;
+  labeling is bought with a wall-clock budget, strongest windows first. `find_conflicts`
+  will happily list a window whose `get_conflict` shows zero turns — rerun `make conflict`
+  to extend coverage down the ranking (already-labeled windows are never re-bought).
 - `corroboration='none'` on an all-distilled corpus is correct — light it with the
   `--upgrade-distilled` annotate pass.
 - Escalation labels are eval-gated bands. `conflict_labels` ships a **committed

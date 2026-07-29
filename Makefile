@@ -341,8 +341,11 @@ voiceprint:  ## Build deterministic per-person voiceprints (person_voiceprint)
 # Consumes chunk_annotations (for valence corroboration), so it slots into
 # `pipeline` AFTER annotate. Needs Ollama for the per-turn label pass; the
 # deterministic finding itself does not, and never refuses on a distilled corpus.
+# Budgeted in WALL CLOCK (CONFLICT_BUDGET_MINUTES, default 25): detection covers
+# every chat, then the strongest windows are labeled until the deadline and a
+# rerun continues down the ranking (CONFLICT_BUDGET_MINUTES=0 disables it).
 .PHONY: conflict
-conflict:  ## Detect conflict windows (deterministic) + eval-gated labels
+conflict:  ## Detect conflict windows + label the strongest under a wall-clock budget
 	@$(REQUIRE_OLLAMA)
 	.venv/bin/python3 conflict_detect.py
 

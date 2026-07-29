@@ -235,7 +235,7 @@ def _n_seeds(con):
 
 
 def _run_upgrades(con, rows, model, think, workers, batch_size, deadline,
-                  description, seen, stats, rate=None, phase="upgrade"):
+                  description, seen, stats, rate, phase):
     """LLM-re-annotate `rows` ((chunk_id, text)) until they run out or
     `deadline` passes, writing source='llm'. Mirrors annotate_chunks' dispatch
     loop -- same grouping, same _pooled fan-out, same per-row write and commit
@@ -248,6 +248,9 @@ def _run_upgrades(con, rows, model, think, workers, batch_size, deadline,
     phase's estimator and its ingest_state key: annotate._load_group_rate
     primes it with what an earlier run measured for the same phase, so the
     first dispatch is not blind, and the finally banks what this one measured.
+    Both are required, not defaulted -- an unprimed default _GroupRate would
+    make reserve() 0.0 and let the gate commit a blind wave, which is exactly
+    the failure the estimator exists to prevent.
 
     A COLD prior is re-denominated here, one line after the packing exists,
     because that is the first moment anyone knows how many rows a group of THIS
@@ -306,10 +309,17 @@ def _run_upgrades(con, rows, model, think, workers, batch_size, deadline,
         # Declining every candidate is the correct answer to a budget smaller
         # than one request, but silence would read as "there was nothing to do".
         # len(groups[0]), not batch_size: apple packs by char budget instead.
+        # The estimate is guarded even though every production rate carries a
+        # prior (_load_group_rate falls back to the cold constant): a rate with
+        # nothing to plan with reserves 0.0, so the only way here without one
+        # is a deadline that had already passed -- say that, don't crash on
+        # formatting None.
+        est = gate.rate.estimate()
+        cost = (f"worth ~{est:.0f}s at the measured rate, more than this "
+                f"phase's share of the budget" if est
+                else "more than the time this phase had left")
         print(f"  dispatched nothing: one request of {len(groups[0])} chunks is "
-              f"worth ~{gate.rate.estimate():.0f}s at the measured rate, more "
-              f"than this phase's share of the budget -- raise "
-              f"ANNOTATE_BUDGET_MINUTES")
+              f"{cost} -- raise ANNOTATE_BUDGET_MINUTES")
 
 
 def _preview(rows):
