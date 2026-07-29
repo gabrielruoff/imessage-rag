@@ -1727,6 +1727,15 @@ every "spread" rule needs a constant with no measured basis, and ascending
 order is what makes a rerun's progress obvious. README and CLAUDE.md now state
 it.
 
+**Superseded 2026-07-28 — the order is now pattern-hit count descending, chunk
+id ascending as the tiebreak.** The decision above rests on one objection: that
+any alternative ordering needs a tuning constant with no measured basis. Hit
+count is not such a constant. It is evidence the prefilter has *already
+computed* — the same `LIKE` predicate that decides membership, counted instead
+of existence-tested — so ranking by it introduces no new number to justify, and
+the id tiebreak keeps a rerun's progress exactly as obvious as ascending order
+made it. See "2026-07-28: annotation throughput, round 2" below.
+
 ## 2026-07-28: default `CHAT_MODEL` → `qwen3.5:4b`, and effort levels get translated
 
 Two changes that only make sense together: the default chat model dropped from
@@ -1979,3 +1988,237 @@ labeled window and advanced down the strength ranking.
 stating plainly: `make conflict` is now a stage you can run inside a demo, full
 corpus coverage is a handful of reruns, and neither of those sentences was true
 of a 66-hour run that had to be completed or abandoned whole.
+
+## 2026-07-28: annotation throughput, round 2
+
+Four independent changes and one negative result, all against the same
+constraint — the hybrid tier's budget is a fixed wall clock, so every second
+saved is coverage bought. All
+measurements below are 2026-07-28, `qwen3.5:4b` warm, one machine, batch 8
+unless noted, on the reference corpus: **25,029 chunks**, 19,483 of them inside
+the top-20 dyads, of which the event prefilter flags **2,567 candidates**
+(~20%, averaging ~1,900 chars); the phase-3b low-confidence candidates are much
+shorter, median ~360 chars.
+
+### What a budget actually reaches, and why phase 3a's order is load-bearing
+
+A 25-minute default budget reaches roughly **10–15% of those 2,567
+candidates**. Phase 3a is therefore always a *prefix* of the candidate list,
+and what the ordering decides is not "which chunks eventually" but "which
+chunks ever" for anyone who runs the tier once.
+
+`event_candidate_chunk_ids` now returns **pattern-hit count descending, chunk
+id ascending as the tiebreak** (`GROUP BY m.chunk_id ORDER BY COUNT(*) DESC,
+m.chunk_id`, where the old query was a plain `SELECT DISTINCT ... ORDER BY
+chunk_id`). Hit count is the only evidence this prefilter has that a chunk is
+event-bearing — the lexicon is per-message substrings — so counting the matches
+it was already testing for existence spends the budget on the densest
+candidates instead of the oldest history in scope. That reverses "Phase 3a's
+ordering is a documented property, not an accident" above; the argument for the
+reversal is recorded there.
+
+Two properties survive the change and are worth stating because they are what
+make it safe:
+
+- **Resume is unchanged.** An upgraded chunk is written `source='llm'` and
+  leaves the candidate set entirely, so reruns advance down the ranking exactly
+  as they advanced down the ids.
+- **The ranking survives the fetch.** `annotate_hybrid._chunk_rows` used to
+  `ORDER BY id`, which would have re-sorted the ranking away at the last
+  moment; it now returns rows in the *caller's* order. Its two id oddities are
+  answered deliberately: an id with no `chunks` row is omitted rather than
+  faked (a None-text row reaches the LLM as an empty prompt and burns a
+  request), and a repeated id yields one row at its first position (the tier's
+  contract is a wall clock, so paying twice for one chunk is never the right
+  reading of a duplicate).
+
+The candidate pool's composition is unchanged by the ranking — 63%
+gratitude-only, 22% good-news-only, 15% both — but a density prefix
+structurally favors the both-kinds chunks, since they hit more patterns.
+
+### Free-JSON batching is bimodal, so the schema goes on the retry
+
+| Workload | free-JSON | schema-constrained |
+|---|---|---|
+| Longest event chunks (~2,150 avg chars) | 13.1 / 28.3 s/chunk | 5.4 / 5.9 s/chunk |
+| Typical event chunks (~1,550 avg chars) | 4.6 s/chunk | 7.0 s/chunk |
+| Short distilled chunks (~210 chars) | 3.5 s/chunk | 2.7 (batch 16), 3.2 (batch 24) |
+
+(Two figures in a cell are two runs of the same workload.)
+
+The shape of that table is the finding. Free-JSON is **fastest of anything
+available when the batched reply covers every id it was asked for**, and
+13–28 s/chunk when it does not — because each dropped id used to buy its own
+single-chunk request, each with `chat_once_json`'s own nudge retry. Dropping
+ids correlates with long, event-dense groups, which is exactly the workload
+phase 3a is made of. Schema-constrained decoding has the opposite profile: its
+coverage is guaranteed by construction, but the grammar costs a constant — 7.0
+against free-JSON's 4.6 s/chunk on typical chunks — so it is **not** universally
+faster and does not belong on the fast path.
+
+Hence a three-rung ladder in `annotate._annotate_group`, ordered by what each
+rung costs when it works: batched free-JSON → (only if that reply missed ids)
+**one** schema-constrained request naming exactly the missed ids → per-chunk
+singles for anything still missing. A fully covered batch issues exactly one
+request and nothing else; the worst case becomes roughly one extra ~40–55 s
+request instead of up to `batch_size` sequential singles.
+
+Three details that are decisions rather than mechanics:
+
+- **The schema is built from the validator's own constants.**
+  `_annotation_schema(chunk_ids)` composes `EMOTION_LABELS`, `EVENT_KINDS` and
+  `RESPONSE_CLASSES` into one `properties`/`required` pair per id, so a grammar
+  and `_validate_annotation` cannot drift into disagreeing about what a valid
+  label is. It stays an optimization for *coverage*: `_validate_annotation`
+  still clamps everything, and Ollama's grammar converter enforces an integer
+  range but not a float's, so the numeric bounds are as much documentation as
+  constraint.
+- **`response_class` is nullable via `anyOf`, not a union type or a
+  mixed-type enum.** All three express "one of the four classes, or null"; only
+  `anyOf` is old and portable in the JSON-schema-to-grammar converter Ollama's
+  structured outputs run on, where union types and nulls inside enums are
+  version-dependent.
+- **Failure is total and silent.** A transport error, a timeout, a server that
+  rejects the schema, an unparseable or non-object reply all degrade to
+  "covered nothing" and fall through to the singles, because this runs on a
+  worker thread inside `_pooled` where an escaping exception takes out the
+  group and the worker. `KeyboardInterrupt` is not an `Exception` and still
+  propagates, which is what keeps the tier Ctrl-C safe.
+
+**Apple FM never reaches the middle rung.** Its `format` seam is not a guided
+schema (an empty-`properties` `DynamicGenerationSchema` pins the reply to
+`{}`), so handing `applefm` a dict format is undefined; apple keeps batch →
+singles, and the ladder branches on `config.is_apple_model` rather than hoping.
+
+### The Ollama batch is packed by chars now, too
+
+`_char_budget_groups` grew a `max_rows` argument and `_annotation_groups` now
+packs **both** backends with it: apple by chars alone
+(`_APPLE_ANNOTATE_CHAR_BUDGET`, 2,000, unchanged and no row cap), every other
+backend by `_OLLAMA_ANNOTATE_CHAR_BUDGET = 10,000` **and** `batch_size`.
+
+Nothing on Ollama has to fit a fixed window — `batch_size` already bounds the
+request — so the reason is the table above: a fixed row count lets a group's
+cost swing by roughly 3–6x with chunk length, and the long end of that is where
+the batch drops ids. The swing also poisons the budget, not just the clock:
+`_save_group_rate` banks the **worst** group of a run, so one 28 s/chunk group
+inflates `_DispatchDeadline.reserve()` for the whole *next* run and the gate
+declines dispatches it could have afforded. Capping the worst case is worth
+budget twice. 10,000 chars is ~4–6 of the long chunks while short chunks still
+fill a whole batch of 8, so the fast case is untouched — and `batch_size` in
+the banked-rate key is now explicitly a *maximum*, identifying the packing
+config rather than any group's size.
+
+### Negative result: `OLLAMA_NUM_PARALLEL` does not buy ~2x
+
+`annotate.py`'s docstring claimed concurrent workers were worth "~2x with a
+parallel Ollama". Measured against a second server with `OLLAMA_NUM_PARALLEL=4`:
+**3.9 s/chunk against 4.8 s/chunk sequential, ~1.24x.** This hardware still
+effectively serializes generation, so the concurrency mostly overlaps request
+overhead. `OLLAMA_NUM_PARALLEL` is deliberately left alone and the docstring
+now records the measured number, so the hope is not re-litigated; the levers
+that did pay are the packing and the retry above.
+
+### `ANNOTATE_KNN_INDEX_CAP`: cap the index, never the pool
+
+Both kNN passes (`_classify_chunks`, `backfill_confidence`) cost O(rows ×
+seeds) — one vec0 `MATCH` per row against every indexed seed. Measured on the
+same corpus and machine: **14.6 s at a 450-seed index vs 82.0 s at 4,416**, a
+6.7x per-row slowdown for a 9.8x wider pool. That is not a one-off to wait out:
+the hybrid tier writes `source='llm'` rows on every run, so the pool widens
+forever while the budget it is spent from stays fixed.
+
+`ANNOTATE_KNN_INDEX_CAP` (default 800, `0` = uncapped) bounds the **index**,
+never the pool. Every LLM annotation is still written, still counted toward the
+seed targets, still read by every other consumer; a capped run simply votes off
+a deterministic sample of them. 800 pins the pass near its 450-seed cost
+permanently.
+
+**The determinism contract is the load-bearing part**, because both kNN passes
+rebuild the index inside one run and must vote off the same one.
+`_sample_seed_ids` is pure, and buys that two ways: the ids
+are **sorted** before the draw, so the caller's row order cannot move it, and
+the draw comes from a **fresh `random.Random(0)`**, not the module-global RNG —
+`_seed_chunks` samples from that one, so consuming or reseeding it here would
+change the seed draw as a side effect and make the index depend on how much
+randomness the process had already spent. `_build_seed_index`'s own `SELECT`
+gained an `ORDER BY a.chunk_id` for the same reason (an unordered `SELECT` has
+no stable row order, and the vec0 insert order should be reproducible too), and
+the labels dict is filtered **with** the index from the same list — an id in
+one and not the other is a `KeyError` or a silently dropped vote.
+
+Two boundaries: the `_KNN_MIN_SEEDS` (100) floor check still runs **before** the
+cap and against the **uncapped** pool, so a speed knob can neither invent the
+"not enough seeds" error on a healthy pool nor hide it on a short one; and a cap
+below that floor is silently raised to it, so every vote is drawn from ≥ 100
+seeds whatever the knob says.
+
+**On accuracy — and a claim that did not survive measurement.** The cap does
+not change what a vote is, only which already-stratified seeds are in the urn.
+The plan justified shipping it without a held-out eval by citing "seed-pool
+composition effects of ~1% at k=10". **That number is wrong and is not why
+this shipped.** Measured post-implementation (2,000 held-out chunks
+re-classified at a 4,416 pool, capped vs uncapped): valence r=0.90 (mean
+|Δ| 0.076), depth agreement 85.1%, top-1 emotion agreement **59.1%**, full
+emotion-set agreement 19.2%. Nothing like 1%.
+
+What rescues the decision is the **control**: re-running with a *different*
+800-seed sample disagrees with the first 800-sample by the same margins
+(r=0.90, top-1 58.0%, emotions 17.4%). So the churn is the kNN vote's intrinsic
+sensitivity to seed composition — it was always there, at every pool size — and
+capping perturbs labels **no more than resampling the pool does**. The cap is
+safe in the only sense that matters here: it does not degrade the vote relative
+to the alternative sample it replaces.
+
+The standing mitigation is unchanged and load-bearing: emotions are the label
+the distilled tier already documents as its roughest, and every high-stakes
+read (conflict corroboration, the nudge valence exclusion, voiceprint tone) is
+required to consume `source='llm'` rows only, never distilled ones. Stratifying
+the index sample is deliberately not attempted — the same control says it would
+be chasing noise.
+
+### Post-implementation validation, and two of this round's own premises
+
+Measured after the change landed, same corpus and machine, against copies of
+the reference DB. Three of the plan's four hard criteria were checked; the
+25-min acceptance pass remains the maintainer's.
+
+| Criterion | Result |
+|---|---|
+| Phase 2 ≤ 25 s at a 4,416-seed pool | **met, measured** — 18.0 s capped vs 96.2 s uncapped (5.3×) |
+| Worst Phase-3 group ≤ ~70 s single-stream | **met, measured** — 14.1 s (3a) / 16.6 s (3b) |
+| Apple FM no regression | **met, measured** — dry-run + one real batch clean; schema-retry calls on apple = 0 |
+| ≥ 400 Phase-3 upgrades in 25 min | **extrapolated, not measured** — 284 upgrades in a 7.7-min run projects to ~424–563 |
+
+The §3a mechanism was confirmed directly: across the measured runs the
+free-JSON batch dropped **19 ids in 4 groups, and the schema retry recovered
+19/19 in 4 requests — zero fell through to per-chunk singles.** §3b was
+confirmed by prefix quality rather than by eyeballing ids: the new top-40
+carries **4.9× the pattern hits** of the old chunk-id prefix (3.7× at top-100),
+and the two orderings' top-100 overlap by **one chunk**.
+
+**Premise that did not hold: the 226 s worst group.** This plan's §1 framed the
+worst-group win as 226 s → ~70 s. Re-running the *pre-change* code on the same
+chunks, the worst group measured **37.8 s**, not 226 s — the 226 s figure came
+from a `_save_group_rate` bank written under conditions nobody reproduced. The
+improvement that is actually attributable is **37.8 s → 14.1 s** worst group,
+and 3.00 → 2.34 s/chunk on an identical 24-chunk set (1.28×). Real, and in the
+right direction, but a third of what the headline implied. Recorded because the
+next round should not plan against 226 s either.
+
+**Regression this round introduced: the cold prior is now ~3.6× too high.**
+`_COLD_GROUP_SECONDS_PER_CHUNK` (5.3 × batch × workers = 169.6 s) was
+calibrated when a group was 8 rows and a dropped id cost 8 sequential singles.
+§3d's packing and §3a's retry both cut the real cost: the banked event-phase
+worst group came out at **46.7 s**. Since `_DispatchDeadline.reserve()` plans
+off the prior until a phase's first group completes, phase 3a stopped
+dispatching with **3.4 of its 4.6 minutes unused** on a cold DB — i.e. this
+round made the ranking better while leaving less time to spend on it. The value
+is deliberately left at 5.3: the error is in the safe direction (under-buy, not
+overrun) and self-heals after one run, and retuning it wants its own
+measurement across phases and both backends. It is the first thing to look at
+if a 25-min run misses the ≥400 target.
+
+**Also observed, pre-existing:** on any budget under ~11.3 min the seed phase
+dispatches nothing at all (its share of the budget is smaller than the cold
+prior's reserve), which is why phase 1 is absent from the table above.

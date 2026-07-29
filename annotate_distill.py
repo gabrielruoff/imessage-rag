@@ -16,8 +16,10 @@ default random sample without forking this module, plus `batch_size`/`deadline`
 seed pass, cap what it spends on it, count only its OWN draws toward the
 target and keep its own interrupt reporting. Both kNN passes take the same
 optional `deadline`/`stats` -- neither is free (each is one vec0 MATCH per row
-against every seed), so a budgeted caller has to be able to stop them. Every
-one of those defaults is today's distilled behavior exactly.
+against every INDEXED seed), so a budgeted caller has to be able to stop them.
+ANNOTATE_KNN_INDEX_CAP bounds that second factor: the seed POOL grows without
+limit (the hybrid tier widens it every run) but the index built from it does
+not. Every one of those defaults is today's distilled behavior exactly.
 """
 
 import json
@@ -27,7 +29,12 @@ import time
 
 import annotate
 import progress
-from config import ANNOTATE_COMMIT_EVERY, ANNOTATE_KNN_K, ANNOTATE_SEED_TARGET
+from config import (
+    ANNOTATE_COMMIT_EVERY,
+    ANNOTATE_KNN_INDEX_CAP,
+    ANNOTATE_KNN_K,
+    ANNOTATE_SEED_TARGET,
+)
 from db import get_state, set_state
 
 # kNN classification: a candidate emotion label must win at least this share
@@ -228,22 +235,85 @@ def _require_chunk_vectors(con):
             "or annotate with an LLM tier (--quality fast/balanced/max).")
 
 
+def _sample_seed_ids(seed_ids, cap, floor=_KNN_MIN_SEEDS):
+    """Which of `seed_ids` belong in the temp kNN index: all of them when the
+    cap is off (<= 0) or the pool already fits under it, otherwise a
+    deterministic subset. Pure -- no DB, no writes, no global state.
+
+    `cap` is raised to `floor` before it bites (and the result is never bigger
+    than the pool), so a small cap can shrink the index but can never take it
+    below the same minimum _build_seed_index's pool check enforces: the
+    guarantee that every kNN vote is drawn from >= _KNN_MIN_SEEDS rows holds
+    for any cap value.
+
+    Deterministic AND stable across calls by construction, which the two
+    callers depend on -- _classify_chunks and backfill_confidence each rebuild
+    the index inside one run and must vote off the same one. Two things buy
+    that: the ids are sorted before the draw, so the caller's row order cannot
+    move it, and the draw comes from a fresh random.Random(0) rather than the
+    module-global RNG (_seed_chunks samples from that one; consuming or
+    reseeding it here would silently change the seed draw as a side effect,
+    and would make this sample depend on how much randomness the process had
+    already spent). Stratifying the sample is deliberately not attempted: the
+    pool a tier feeds this is already stratified by its own sampler, and a
+    k=10 vote off an 800-sample of it is the regime the tier ran in when its
+    pools were that size.
+
+    What the cap costs the labels, measured 2026-07-28 rather than assumed
+    (2,000 held-out chunks re-classified at a 4,416 pool, capped vs uncapped):
+    valence r=0.90, depth 85.1%, top-1 emotion 59.1%. The control is what makes
+    that acceptable -- a DIFFERENT 800-sample disagrees with the first by the
+    same margins (r=0.90, top-1 58.0%), so this is the kNN vote's own
+    sensitivity to which seeds are in the urn and not a cost the cap adds.
+    See config.ANNOTATE_KNN_INDEX_CAP; the earlier "~1% at k=10" claim was
+    wrong and is retracted there."""
+    n = min(len(seed_ids), max(cap, floor))
+    if cap <= 0 or n >= len(seed_ids):
+        return set(seed_ids)
+    return set(random.Random(0).sample(sorted(seed_ids), n))
+
+
 def _build_seed_index(con):
     """(Re)build temp.seed_vectors from the source='llm' annotations that have
     embeddings and return their {chunk_id: (valence, emotions, depth)} labels
     -- everything _knn_predict needs. Shared by _classify_chunks and
     backfill_confidence so the two passes can never vote off different
-    indexes."""
+    indexes, which ANNOTATE_KNN_INDEX_CAP preserves: the draw is a pure
+    function of the pool's ids (see _sample_seed_ids), so both callers build
+    the same index from the same pool.
+
+    That cap bounds the INDEX only, never the pool -- every source='llm' row
+    stays written and every other reader still sees all of them. It exists
+    because the kNN passes cost O(rows x seeds), one vec0 MATCH per row
+    against every indexed seed, and the hybrid tier widens the pool on every
+    run: uncapped, this phase gets slower forever (measured 2026-07-28, same
+    corpus and machine: 14.6 s at a 450-seed index vs 82.0 s at 4,416).
+    The labels are filtered WITH the index and from the same list, never
+    separately -- _knn_predict looks its neighbours up in this dict, so an id
+    in one and not the other is a KeyError or a dropped vote."""
     _require_chunk_vectors(con)
+    # ORDER BY: the row order of an unordered SELECT is not guaranteed stable,
+    # and both the sample and the vec0 insert order have to be reproducible
+    # run to run. (_sample_seed_ids sorts its input again, so it is correct
+    # whatever a caller hands it; this makes the whole function reproducible.)
     seeds = con.execute("""
         SELECT a.chunk_id, v.embedding, a.valence, a.emotions_json, a.depth
         FROM chunk_annotations a JOIN chunk_vectors v ON v.chunk_id = a.chunk_id
-        WHERE a.source = 'llm'
+        WHERE a.source = 'llm' ORDER BY a.chunk_id
     """).fetchall()
+    # The floor is a question about the POOL -- "are there enough LLM seeds to
+    # vote with at all" -- so it is checked BEFORE the cap and against the
+    # uncapped count. Capping is a speed knob and must not be able to invent
+    # this error on a healthy pool (nor could a cap hide it: _sample_seed_ids
+    # never returns fewer than _KNN_MIN_SEEDS ids from a pool that has them).
     if len(seeds) < _KNN_MIN_SEEDS:
         raise SystemExit(
             f"only {len(seeds)} LLM seed annotations with embeddings "
             f"(need >= {_KNN_MIN_SEEDS}) -- run the seed pass first")
+    keep = _sample_seed_ids([cid for cid, *_rest in seeds], ANNOTATE_KNN_INDEX_CAP)
+    if len(keep) < len(seeds):
+        print(f"using {len(keep):,} of {len(seeds):,} seeds for the kNN index")
+        seeds = [row for row in seeds if row[0] in keep]
     dim = int(get_state(con, "embed_dim") or 0)
     if not dim:
         raise SystemExit("no embed_dim in ingest_state -- run ingest.py first")
@@ -349,12 +419,15 @@ def backfill_confidence(con, k, dry_run=False, deadline=None, stats=None,
     `deadline`/`stats` work as in _classify_chunks: the pass is resumable (it
     only looks at rows whose confidence is still NULL), and it needs the gate
     because its cost is O(rows x seeds) -- one vec0 MATCH per row against
-    every source='llm' seed. Measured 2026-07-28, same corpus and machine:
-    14.6 s for 24,579 rows against a 450-seed pool (1,688 rows/s) but 82.0 s
-    for 20,613 rows against a 4,416-seed one (251 rows/s), a 6.7x per-row
-    slowdown for a 9.8x wider pool. `has_confidence=False` says the column does not
-    exist yet (only reachable under --dry-run, which no longer migrates), in
-    which case every distilled row is pending by definition."""
+    every INDEXED source='llm' seed. Measured 2026-07-28, same corpus and
+    machine: 14.6 s for 24,579 rows against a 450-seed pool (1,688 rows/s) but
+    82.0 s for 20,613 rows against a 4,416-seed one (251 rows/s), a 6.7x
+    per-row slowdown for a 9.8x wider pool -- which is what
+    ANNOTATE_KNN_INDEX_CAP now bounds (_build_seed_index), so the gate is a
+    backstop rather than the only thing between this pass and the budget.
+    `has_confidence=False` says the column does not exist yet (only reachable
+    under --dry-run, which no longer migrates), in which case every distilled
+    row is pending by definition."""
     _require_chunk_vectors(con)
     if dry_run:
         unscored = "a.knn_confidence IS NULL" if has_confidence else "1"

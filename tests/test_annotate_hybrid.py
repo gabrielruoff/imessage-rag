@@ -702,6 +702,119 @@ class TestBackfillConfidence(HybridFixture):
 
 
 # ---------------------------------------------------------------------------
+# ANNOTATE_KNN_INDEX_CAP -- the ceiling on the kNN index (not the seed pool)
+# ---------------------------------------------------------------------------
+
+class TestSeedIndexSample(unittest.TestCase):
+    """annotate_distill._sample_seed_ids, the pure half of the cap. Both kNN
+    passes cost O(rows x seeds) and the hybrid tier widens the seed POOL on
+    every run, so the INDEX gets a ceiling instead."""
+
+    POOL = list(range(1, 501))
+
+    def test_a_pool_that_already_fits_is_kept_whole(self):
+        self.assertEqual(annotate_distill._sample_seed_ids(self.POOL, 800),
+                         set(self.POOL))
+        self.assertEqual(annotate_distill._sample_seed_ids(self.POOL, len(self.POOL)),
+                         set(self.POOL))
+
+    def test_a_cap_of_zero_or_less_is_uncapped(self):
+        for cap in (0, -1):
+            with self.subTest(cap=cap):
+                self.assertEqual(annotate_distill._sample_seed_ids(self.POOL, cap),
+                                 set(self.POOL))
+
+    def test_the_draw_is_deterministic_and_independent_of_row_order(self):
+        # Both passes of one run rebuild the index and must vote off the same
+        # one, so the draw is a pure function of the ids -- not of the order
+        # the caller's SELECT happened to return them in.
+        first = annotate_distill._sample_seed_ids(self.POOL, 200)
+        second = annotate_distill._sample_seed_ids(list(reversed(self.POOL)), 200)
+        self.assertEqual(len(first), 200)
+        self.assertEqual(first, second)
+        self.assertTrue(first.issubset(self.POOL))
+
+    def test_the_draw_does_not_move_with_the_module_rng(self):
+        # random.Random(0), not the global RNG _seed_chunks samples from:
+        # consuming or reseeding that one here would change the SEED draw as a
+        # side effect, and would make this sample depend on how much
+        # randomness the process had already spent.
+        random.seed(11)
+        first = annotate_distill._sample_seed_ids(self.POOL, 200)
+        random.seed(22)
+        random.random()
+        second = annotate_distill._sample_seed_ids(self.POOL, 200)
+        self.assertEqual(first, second)
+
+    def test_a_cap_below_the_floor_is_raised_to_it(self):
+        # A speed knob must not be able to take the vote below the minimum the
+        # pool check itself enforces.
+        kept = annotate_distill._sample_seed_ids(self.POOL, 5)
+        self.assertEqual(len(kept), annotate_distill._KNN_MIN_SEEDS)
+
+    def test_the_floor_never_invents_seeds_a_short_pool_lacks(self):
+        short = list(range(1, 21))
+        self.assertEqual(annotate_distill._sample_seed_ids(short, 5), set(short))
+
+
+@_NEEDS_VEC
+class TestSeedIndexCap(HybridFixture):
+    """_build_seed_index applying that cap: to the temp vec0 index AND to the
+    label dict, from the same list -- _knn_predict looks its neighbours up in
+    that dict, so an id in one and not the other is a KeyError or a lost
+    vote."""
+
+    def build(self, cap):
+        """(labels, indexed ids, what it printed) for one build at `cap`."""
+        with mock.patch.object(annotate_distill, "ANNOTATE_KNN_INDEX_CAP", cap):
+            with mock.patch("builtins.print") as printed:
+                labels = annotate_distill._build_seed_index(self.con)
+        indexed = {row[0] for row in
+                   self.con.execute("SELECT chunk_id FROM temp.seed_vectors")}
+        said = " ".join(str(a) for call in printed.call_args_list for a in call.args)
+        return labels, indexed, said
+
+    def test_the_cap_bounds_the_index_and_says_so(self):
+        labels, indexed, said = self.build(200)
+        self.assertEqual(len(indexed), 200)
+        self.assertEqual(said, f"using 200 of {_SEEDS:,} seeds for the kNN index")
+        # ...the POOL is untouched: every seed is still a stored annotation.
+        self.assertEqual(self.n_source("llm"), _SEEDS)
+        self.assertEqual(set(labels), indexed)
+
+    def test_both_passes_of_a_run_vote_off_the_same_index(self):
+        first_labels, first_indexed, _ = self.build(200)
+        second_labels, second_indexed, _ = self.build(200)
+        self.assertEqual(first_indexed, second_indexed)
+        self.assertEqual(first_labels, second_labels)
+
+    def test_a_cap_of_zero_reproduces_the_uncapped_index(self):
+        labels, indexed, said = self.build(0)
+        self.assertEqual(len(indexed), _SEEDS)
+        self.assertEqual(set(labels), indexed)
+        self.assertEqual(self.build(_SEEDS + 100)[1], indexed)
+        self.assertNotIn("kNN index", said)
+
+    def test_a_pool_under_the_cap_says_nothing(self):
+        # The line is news only when the cap actually bit.
+        self.assertNotIn("kNN index", self.build(_SEEDS + 50)[2])
+
+    def test_a_cap_below_the_floor_is_raised_to_the_floor(self):
+        _labels, indexed, _said = self.build(5)
+        self.assertEqual(len(indexed), annotate_distill._KNN_MIN_SEEDS)
+
+    def test_the_short_pool_error_is_about_the_pool_not_the_index(self):
+        # The floor check runs BEFORE the cap and against the uncapped count,
+        # so capping can neither invent this error nor hide it.
+        self.con.execute("DELETE FROM chunk_annotations WHERE chunk_id > 50")
+        self.con.commit()
+        for cap in (0, 800, 5):
+            with self.subTest(cap=cap):
+                with self.assertRaises(SystemExit):
+                    self.build(cap)
+
+
+# ---------------------------------------------------------------------------
 # The stratified sampler
 # ---------------------------------------------------------------------------
 
@@ -831,17 +944,31 @@ class TestEventCandidates(DBFixture):
             "VALUES (1, 0.1, '[]', 1, '[]', 'distilled', 0.4)")
         self.con.commit()
 
-    def test_matches_patterns_excludes_llm_rows_and_returns_unique_ascending(self):
+    def test_matches_patterns_excludes_llm_rows_and_ranks_by_hit_count(self):
         ids = annotate_events.event_candidate_chunk_ids(self.con, True, None)
-        # 1 (distilled) and 3 (unannotated) match; 3 matches twice but appears
-        # once; 2 matches nothing; 4 matches but is already 'llm'.
-        self.assertEqual(ids, [1, 3, 5])
+        # 1 (distilled), 3 (unannotated) and 5 match; 2 matches nothing; 4
+        # matches but is already 'llm'. 3 matches TWICE, so it outranks the
+        # one-hit chunks despite its higher id -- the ranking IS the feature:
+        # the caller's deadline stops partway down this list, so the prefix it
+        # can afford has to be the densest candidates rather than the oldest.
+        # 3 still appears exactly once, however many of its messages hit; 1 and
+        # 5 tie at one hit each and the id tiebreak orders them.
+        self.assertEqual(ids, [3, 1, 5])
+
+    def test_the_ranking_survives_the_row_fetch(self):
+        # The SQL ranking is only half the feature. annotate_hybrid._chunk_rows
+        # turns these ids into the (id, text) rows the LLM path wants, and a
+        # re-sort there would hand the budget straight back to chunk-id order
+        # without changing a single assertion above.
+        ids = annotate_events.event_candidate_chunk_ids(self.con, True, None)
+        rows = annotate_hybrid._chunk_rows(self.con, ids)
+        self.assertEqual([chunk_id for chunk_id, _text in rows], [3, 1, 5])
 
     def test_scope_restricted_to_top_dyads(self):
         self.assertEqual(annotate_events.event_candidate_chunk_ids(self.con, False, 1),
-                         [1, 3])
+                         [3, 1])
         self.assertEqual(annotate_events.event_candidate_chunk_ids(self.con, False, 2),
-                         [1, 3, 5])
+                         [3, 1, 5])
 
     def test_llm_annotated_chunk_is_never_a_candidate(self):
         self.assertNotIn(4, annotate_events.event_candidate_chunk_ids(self.con, True, None))
@@ -850,6 +977,49 @@ class TestEventCandidates(DBFixture):
         self.con.commit()
         self.assertEqual(annotate_events.event_candidate_chunk_ids(self.con, True, None),
                          [3, 5])
+
+
+class TestChunkRowFetch(DBFixture):
+    """annotate_hybrid._chunk_rows: the id -> (id, text) fetch behind every
+    phase-3 dispatch. Its ORDER is part of the contract now that its callers
+    hand it a ranking, and its two id oddities are answered deliberately."""
+
+    def setUp(self):
+        super().setUp()
+        self.con.execute(
+            "INSERT INTO chats(id, chat_identifier, display_name, is_group, "
+            "service) VALUES (1, 'chat1', NULL, 0, 'iMessage')")
+        self.con.executemany(
+            "INSERT INTO chunks(id, chat_id, first_message_id, last_message_id, "
+            "first_date, last_date, n_messages, text) "
+            "VALUES (?, 1, NULL, NULL, '2026-01-01T00:00:00', "
+            "'2026-01-01T00:05:00', 1, ?)",
+            [(chunk_id, _chunk_text(chunk_id, _PLAIN)) for chunk_id in range(1, 6)])
+        self.con.commit()
+
+    def ids(self, chunk_ids):
+        return [chunk_id for chunk_id, _text in
+                annotate_hybrid._chunk_rows(self.con, chunk_ids)]
+
+    def test_rows_come_back_in_the_caller_s_order_not_the_table_s(self):
+        self.assertEqual(self.ids([4, 1, 5, 2]), [4, 1, 5, 2])
+
+    def test_the_order_holds_across_the_parameter_safe_slices(self):
+        # The fetch goes out in _ID_SLICE blocks (SQLite's 999-variable
+        # ceiling), so SQL row order is per-block and meaningless -- exactly
+        # the seam where a ranking gets quietly lost.
+        with mock.patch.object(annotate_hybrid, "_ID_SLICE", 2):
+            self.assertEqual(self.ids([5, 3, 1, 4, 2]), [5, 3, 1, 4, 2])
+
+    def test_an_id_with_no_chunk_row_is_omitted_not_faked(self):
+        # A None-text row would reach the LLM as an empty prompt and burn a
+        # request to come back unparseable.
+        self.assertEqual(self.ids([3, 99, 1]), [3, 1])
+
+    def test_a_repeated_id_yields_one_row_at_its_first_position(self):
+        # The tier's whole contract is a wall-clock budget, so paying twice
+        # for the same chunk is never the right reading of a duplicate.
+        self.assertEqual(self.ids([3, 1, 3, 2]), [3, 1, 2])
 
 
 # ---------------------------------------------------------------------------

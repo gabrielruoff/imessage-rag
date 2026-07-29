@@ -285,6 +285,37 @@ ANNOTATE_WORKERS = int(os.getenv("ANNOTATE_WORKERS", "4"))
 # nearest seed neighbours that vote for each classified chunk.
 ANNOTATE_SEED_TARGET = int(os.getenv("ANNOTATE_SEED_TARGET", "450"))
 ANNOTATE_KNN_K = int(os.getenv("ANNOTATE_KNN_K", "10"))
+# Ceiling on how many LLM seeds are loaded into the temporary kNN index that
+# the classify and confidence-backfill passes vote against; 0 = uncapped.
+# It caps the INDEX, never the stored seed pool: every source='llm' row is
+# still written, still counted toward the seed targets, still read by every
+# other consumer -- a capped run simply votes off a deterministic sample of
+# them (annotate_distill._sample_seed_ids, random.Random(0) over the sorted
+# ids, so both passes in a run build the identical index).
+# Why it exists: those passes cost O(rows x seeds) -- one vec0 MATCH per row
+# against every indexed seed. Measured 2026-07-28, same corpus and machine:
+# 14.6 s at a 450-seed index vs 82.0 s at 4,416 (1,688 vs 251 rows/s). That is
+# not a one-off to be waited out: the hybrid tier widens the pool on EVERY run
+# (ANNOTATE_HYBRID_SEED_TARGET below, and its own upgrades are 'llm' rows
+# too), so uncapped this phase gets slower forever while the budget it is
+# spent out of stays fixed.
+# Why 800: it pins the pass near its 450-seed cost (~15-20 s) permanently,
+# and a k=10 vote drawn from an 800-sample of an already-stratified pool is
+# the regime the tier ran in when its pools were that size. What capping
+# actually costs, measured 2026-07-28 (2,000 held-out chunks re-classified at
+# a 4,416 pool, capped vs uncapped): valence r=0.90, depth agrees 85.1%,
+# top-1 emotion 59.1%. Those look alarming until the control: a DIFFERENT
+# 800-sample disagrees with the first by the same margins (r=0.90, top-1
+# 58.0%), so the churn is the kNN vote's own sensitivity to which seeds are in
+# the urn, not something the cap introduces -- capping perturbs labels no more
+# than resampling the pool does. (An earlier draft of this comment claimed
+# "~1% composition effects at k=10"; that number did not survive measurement
+# and is not the basis for shipping this. What is: emotions are the label the
+# distilled tier already documents as its roughest, and a valence/depth read
+# that wants LLM fidelity is required to use source='llm' rows anyway.)
+# Never applied below annotate_distill._KNN_MIN_SEEDS (100), the floor at
+# which the vote stops being meaningful.
+ANNOTATE_KNN_INDEX_CAP = int(os.getenv("ANNOTATE_KNN_INDEX_CAP") or "800")
 # The hybrid preset's wall-clock budget, in minutes. Empty/0 = unset, and
 # annotate_hybrid.py resolves a per-backend default (25 on Ollama, 50 on Apple
 # FM) through is_apple_model(model) -- that default depends on the model chosen

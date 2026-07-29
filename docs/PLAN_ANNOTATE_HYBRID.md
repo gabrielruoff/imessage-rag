@@ -204,6 +204,9 @@ def event_candidate_chunk_ids(con, all_chats, top_dyads):
     """Returns an ordered list[int] of chunk ids in scope whose messages match
     EVENT_CANDIDATE_PATTERNS and whose annotation is absent or
     source='distilled'. Read-only. Order: chunk id ascending."""
+# SUPERSEDED 2026-07-28 (round 2, see docs/DECISIONS.md): the ORDER is now
+# pattern-hit count descending, chunk id ascending as the tiebreak. Everything
+# else in this contract still holds.
 
 # function_words.py (addition — owned by W3)
 EVENT_CANDIDATE_PATTERNS = {"gratitude": (...), "good_news": (...)}
