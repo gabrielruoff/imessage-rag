@@ -871,6 +871,12 @@ _COLD_LOAD_SECONDS = 60.0
 _TURN_RATE_SAFETY = 1.5
 
 
+# Chats whose messages the labeling loop keeps resident at once. The ranking is
+# strength-ordered, so consecutive windows often share a chat (the cache's whole
+# purpose) but the run as a whole walks hundreds of them.
+_MSG_CACHE_CHATS = 16
+
+
 def _turn_rate_key(model):
     return f"conflict_turn_seconds:{model}"
 
@@ -1023,6 +1029,7 @@ def label_top_conflicts(con, model, n=None, max_label_turns=CONFLICT_MAX_LABEL_T
 
     msg_cache = {}
     labeled = 0
+    free = 0
     stopped = False
     try:
         with progress.track("Labeling conflicts", total=len(ranked), header=False) as p:
@@ -1036,6 +1043,13 @@ def label_top_conflicts(con, model, n=None, max_label_turns=CONFLICT_MAX_LABEL_T
                     break
                 cid = r["chat_id"]
                 if cid not in msg_cache:
+                    # Bounded: the ranking is by strength, not by chat, so a
+                    # long run touches hundreds of chats and an unbounded cache
+                    # would hold most of the corpus's message rows resident.
+                    # Evicting the oldest is enough -- consecutive windows from
+                    # one chat still hit, which is all the cache ever bought.
+                    if len(msg_cache) >= _MSG_CACHE_CHATS:
+                        msg_cache.pop(next(iter(msg_cache)))
                     msg_cache[cid] = _load_messages(con, cid)
                 first_dt, last_dt = _dt(r["first_date"]), _dt(r["last_date"])
                 seg = [m for m in msg_cache[cid]
@@ -1065,6 +1079,13 @@ def label_top_conflicts(con, model, n=None, max_label_turns=CONFLICT_MAX_LABEL_T
                             (statistics.mode(survivors) if survivors else None,
                              _now_iso(), r["id"]))
                 labeled += 1
+                if not turns:
+                    # Every turn failed the prescreen, so the model never saw
+                    # this window. It is legitimately processed -- a rerun would
+                    # find the same nothing -- but counting it silently with the
+                    # windows that cost requests would overstate what the budget
+                    # actually bought, which is the one number this tier owes.
+                    free += 1
                 con.commit()
                 p.advance()
     except KeyboardInterrupt:
@@ -1090,6 +1111,9 @@ def label_top_conflicts(con, model, n=None, max_label_turns=CONFLICT_MAX_LABEL_T
     # whole table's backlog for a scoped run would be a different number than
     # the one the sentence promises.
     left = sum(1 for r in rows if r["labeled_at"] is None) - labeled
+    # Windows the prescreen emptied are stamped but never reached the model, so
+    # they are named apart from the ones the budget paid for.
+    free_note = f" ({free} of them had no labelable turn and cost no request)" if free else ""
     if stopped:
         if not calls["n"]:
             # Declining every window is the right answer to a budget smaller
@@ -1097,10 +1121,10 @@ def label_top_conflicts(con, model, n=None, max_label_turns=CONFLICT_MAX_LABEL_T
             print(f"  dispatched nothing: one window of up to {max_label_turns} turns "
                   f"is worth ~{rate.window(max_label_turns):.0f}s at the measured "
                   f"rate, more than the budget left -- raise CONFLICT_BUDGET_MINUTES")
-        print(f"Labeled {labeled} conflict windows, then stopped at the deadline -- "
-              f"{left} of {len(rows)} still unlabeled; rerun to resume.")
+        print(f"Labeled {labeled} conflict windows{free_note}, then stopped at the "
+              f"deadline -- {left} of {len(rows)} still unlabeled; rerun to resume.")
     else:
-        print(f"Labeled {labeled} of {len(rows)} conflict windows "
+        print(f"Labeled {labeled} of {len(rows)} conflict windows{free_note} "
               f"({left} left unlabeled)")
     return labeled
 
@@ -1120,6 +1144,26 @@ def _resolve_budget_minutes(budget_minutes=None):
     if budget_minutes is not None:
         return max(0, budget_minutes), "--budget-minutes"
     return max(0, CONFLICT_BUDGET_MINUTES), "CONFLICT_BUDGET_MINUTES"
+
+
+def _clear_labels(con):
+    """Drop every window's labels so the next pass starts over (--relabel).
+
+    The resume stamp is otherwise a one-way latch, by design: a window is only
+    re-labeled when its dates change. That is right for resuming a budget and
+    wrong for the case where what labeling PRODUCES changed -- a different
+    CONFLICT_MAX_LABEL_TURNS or CONFLICT_MIN_TURN_CHARS, a newly cleared eval
+    gate -- where every stamped window would silently keep the old answer.
+
+    Clears the signals and the topic too, not just the stamp: leaving the rows
+    behind would give a reader a window that reads unlabeled while still
+    carrying labels, and the labeling loop replaces them per window anyway."""
+    n = con.execute(
+        "SELECT COUNT(*) FROM conflicts WHERE labeled_at IS NOT NULL").fetchone()[0]
+    con.execute("DELETE FROM conflict_signals")
+    con.execute("UPDATE conflicts SET labeled_at = NULL, topic = NULL")
+    con.commit()
+    print(f"--relabel: cleared the labels on {n} conflict windows")
 
 
 def _conflicts_ready(con):
@@ -1153,6 +1197,13 @@ def main(argv=None):
                              f"CONFLICT_BUDGET_MINUTES). Labels the strongest windows "
                              f"first and stops at the deadline; rerun to continue down "
                              f"the ranking. 0 = no budget (label every window)")
+    parser.add_argument("--relabel", action="store_true",
+                        help="clear every window's labels (conflict_signals, topic and "
+                             "the labeled_at resume stamp) before running, so the pass "
+                             "starts over. Needed after changing what labeling produces "
+                             "-- CONFLICT_MAX_LABEL_TURNS, CONFLICT_MIN_TURN_CHARS, the "
+                             "eval gate -- since a stamped window is otherwise never "
+                             "revisited")
     speed = parser.add_mutually_exclusive_group()
     speed.add_argument("--no-llm", action="store_true",
                        help="FAST path: write the deterministic conflict windows "
@@ -1163,11 +1214,22 @@ def main(argv=None):
                        help="BUDGETED path: detect all windows, but label only the "
                             "N strongest (by signal count, corroboration, dislikes, "
                             "peak gap); weaker windows stay detected-but-unlabeled. "
+                            "The wall-clock budget still applies on top -- pass "
+                            "--budget-minutes 0 for N as the only cap. "
                             "Bounds LLM calls to N * max-label-turns.")
     args = parser.parse_args(argv)
     if args.no_llm and args.budget_minutes is not None:
         parser.error("--budget-minutes has nothing to bound with --no-llm "
                      "(that path makes zero LLM calls)")
+    # Rejected rather than clamped, both of them: a negative budget would clamp
+    # to 0, which means UNBUDGETED here -- the unbounded run this tier exists to
+    # prevent -- and a non-positive turn cap would select no turns at all while
+    # still stamping every window processed, foreclosing them for good.
+    if args.budget_minutes is not None and args.budget_minutes < 0:
+        parser.error("--budget-minutes cannot be negative (0 disables the budget)")
+    if args.max_label_turns is not None and args.max_label_turns < 1:
+        parser.error("--max-label-turns must be at least 1 (use --no-llm to skip "
+                     "labeling entirely)")
 
     # The clock starts here, not in the labeling loop: detection is part of what
     # the budget promises, so the deadline has to cover it.
@@ -1186,6 +1248,8 @@ def main(argv=None):
         if not args.dry_run and not _conflicts_ready(con):
             schema.create_schema(con)
             con.commit()
+        if args.relabel and not args.dry_run:
+            _clear_labels(con)
         # Two-phase whenever there is LLM work to bound: fast deterministic
         # detection over all chats, then label the strongest windows under
         # whichever caps apply (a wall clock, a fixed N, or both). With neither

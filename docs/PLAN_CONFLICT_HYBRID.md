@@ -1,5 +1,40 @@
 # PLAN: Conflict labeling under a wall-clock budget (hybrid tier for conflict_detect.py)
 
+Status: IMPLEMENTED (commit `8c3f548`). Kept as design history — but read
+`docs/DECISIONS.md` (2026-07-28 conflict-budget entry) for what actually
+shipped, because implementation reversed or invalidated six of this document's
+instructions:
+
+- **§2c "`detect_chat`'s delete-then-rewrite naturally clears it [`labeled_at`]
+  when a chat re-detects"** (lines ~175–176) — the code does the OPPOSITE, and
+  deliberately. `detect_chat` RECONCILES a window in place, keyed on
+  `chat_id` + `first_date` + `last_date`: an unchanged window keeps its row id,
+  its `conflict_signals`, its topic and its `labeled_at` stamp, and only its
+  deterministic columns are refreshed; windows that no longer exist are still
+  dropped with their signals. This is the single most load-bearing deviation,
+  because every budgeted run re-detects all 787 chats *before* it labels
+  anything — under a delete-then-rewrite each run would throw away the labels
+  the previous run's budget bought, and no rerun could ever extend coverage.
+- **Phase 3, test 4: "cleared by `detect_chat`'s rewrite"** (lines ~211–212) —
+  the same reversal. The shipped test asserts the opposite: re-detection
+  PRESERVES an unchanged window's `labeled_at`.
+- **Guardrails: "`--budget-minutes 0` must reproduce today's unbounded labeling
+  path"** (lines ~296–297) — it does not, and should not. Labeling is resumable
+  now, so `--budget-minutes 0` labels every *still-unlabeled* window; a second
+  unbudgeted run labels only what the first left behind rather than re-labeling
+  the corpus. `0` means "no deadline", not "no memory".
+- **`tests/test_conflict_detect.py`** (lines ~201, ~215–216) — no such file.
+  The conflict tests live in `tests/test_conflict.py`.
+- **Phase 1's "add `CONFLICT_THINK=false` to the worktree `.env`"** (lines
+  ~75–88) — redundant, and now actively counterproductive.
+  `conflict_detect._resolve_think` resolves an UNSET `CONFLICT_THINK` to
+  `False` for this pipeline; putting a value in `.env` converts the unset case
+  the code handles into an explicit one that passes through untouched, so the
+  resolver stops applying to it.
+- **The scratchpad DB path** (lines ~62–63) — an absolute path into a different
+  session's scratchpad directory. Stale and environment-specific: make your own
+  copy rather than expecting that one.
+
 Instructions for the implementing agent. Work happens in THIS worktree
 (`.claude/worktrees/annotate-sweet-spot`), which already ships the annotate
 hybrid tier this plan mirrors. Read `docs/PLAN_ANNOTATE_HYBRID.md` and

@@ -278,16 +278,20 @@ class LabelGateTest(_TempDBTest):
 
 
 class ReadToolCapTest(_TempDBTest):
-    def _seed_one_conflict(self, n_signals):
+    def _seed_one_conflict(self, n_signals, labeled=True):
+        # labeled=True stamps labeled_at (what the label pass does for every
+        # window it processes, signals or not); labeled=False leaves the window
+        # detected-but-unlabeled, the state a budgeted run's wall clock leaves.
         con = sqlite3.connect(self.db_path)
         schema.create_schema(con)
         con.execute("INSERT INTO chats(id, is_group) VALUES (1, 0)")
         con.execute(
             "INSERT INTO conflicts(id, chat_id, first_date, last_date, "
-            "peak_signal_json, corroboration, off_text_flag, source) VALUES "
-            "(7, 1, '2026-03-01', '2026-03-02', ?, 'none', 0, 'llm')",
+            "peak_signal_json, corroboration, off_text_flag, source, labeled_at) "
+            "VALUES (7, 1, '2026-03-01', '2026-03-02', ?, 'none', 0, 'llm', ?)",
             (json.dumps({"signals": ["one_sided_session", "dislike_run"],
-                         "signal_count": 2}),))
+                         "signal_count": 2}),
+             "2026-03-03T00:00:00" if labeled else None))
         con.executemany(
             "INSERT INTO conflict_signals(conflict_id, message_id, actor_is_me, "
             "label_class, top2_labels_json, band, excerpt) VALUES "
@@ -360,18 +364,21 @@ class FindConflictsRankingTest(_TempDBTest):
     corroboration outranks raw signal_count."""
 
     def _insert(self, cid, corroboration, signal_count, last_date,
-                topic=None, valence_boost=False):
+                topic=None, valence_boost=False, labeled=True):
+        # labeled=True is the pre-budget world these ranking assertions were
+        # written in (every window had been through the label pass); False is a
+        # window the budgeted pass never reached.
         con = sqlite3.connect(self.db_path)
         schema.create_schema(con)
         con.execute("INSERT OR IGNORE INTO chats(id, is_group) VALUES (1, 0)")
         con.execute(
             "INSERT INTO conflicts(id, chat_id, first_date, last_date, topic, "
-            "peak_signal_json, corroboration, off_text_flag, source) VALUES "
-            "(?, 1, ?, ?, ?, ?, ?, 0, 'llm')",
+            "peak_signal_json, corroboration, off_text_flag, source, labeled_at) "
+            "VALUES (?, 1, ?, ?, ?, ?, ?, 0, 'llm', ?)",
             (cid, last_date, last_date, topic,
              json.dumps({"signals": ["s"] * signal_count, "signal_count": signal_count,
                          "valence_boost": valence_boost}),
-             corroboration))
+             corroboration, "2026-03-09T00:00:00" if labeled else None))
         con.commit()
         con.close()
 
@@ -2222,6 +2229,197 @@ class CliStatsWiringTest(_TempDBTest):
         conflict_detect.main([])
         self.assertEqual(len(self.label.calls), 1)
         self.assertNotIn("Stopped before labeling", _said(self.printed))
+
+
+# --- read tools must not sell "never looked" as "looked and found nothing" ---
+
+
+class LabelingCoverageReadTest(_TempDBTest):
+    """The budgeted tier detects every window but LLM-labels only as many as its
+    wall clock buys, so `conflicts.labeled_at` NULL now covers most of the
+    table. Before it existed, `labeled_signal_turns: 0` could only mean
+    "analyzed, nothing escalatory found"; the read tools have to keep those two
+    apart (the same degrade-honestly rule the llm-vs-distilled readers follow).
+
+    Reuses the seeding helpers above rather than re-inventing them."""
+
+    _seed_one_conflict = ReadToolCapTest._seed_one_conflict
+    _insert = FindConflictsRankingTest._insert
+
+    def _detected_but_unlabeled(self):
+        """What a budgeted run leaves for the windows it never reached: the
+        detector's deterministic evidence, no signal rows, no stamp."""
+        _build_fixture(self.db_path, classify_fn=_stub_criticism)
+        con = self._con()
+        con.execute("DELETE FROM conflict_signals")
+        con.execute("UPDATE conflicts SET labeled_at = NULL, topic = NULL")
+        con.commit()
+        return con
+
+    # -- unlabeled ----------------------------------------------------------
+    def test_find_conflicts_reports_an_unlabeled_window_as_unlabeled(self):
+        self._seed_one_conflict(0, labeled=False)
+        env = query_tools.find_conflicts(chat_id=1)
+        (row,) = env["rows"]
+        self.assertFalse(row["labeled"])
+        self.assertEqual(row["labeled_signal_turns"], 0)
+        self.assertEqual(env["total_matching"], 1)
+        self.assertEqual(env["n_labeled"], 0)
+        # ...and the envelope says what that 0 does (and does not) mean.
+        self.assertIn("1 of 1", env["labeling_note"])
+        self.assertIn("NOT ANALYZED", env["labeling_note"])
+        # The user-facing epilogue carries the same caveat, out-of-band.
+        self.assertIn("does not determine who was at fault", env["_epilogue"])
+        self.assertIn("not have been looked at", env["_epilogue"])
+        # Deterministic evidence is unaffected by the labeling backlog.
+        self.assertEqual(row["signal_count"], 2)
+        self.assertEqual(row["corroboration"], "none")
+
+    def test_get_conflict_reports_an_unlabeled_episode_as_unlabeled(self):
+        self._seed_one_conflict(0, labeled=False)
+        out = query_tools.get_conflict(7)
+        self.assertFalse(out["labeled"])
+        self.assertEqual(out["signals"], [])
+        self.assertEqual(out["signals_total"], 0)
+        self.assertIn("NOT ANALYZED", out["note"])
+        self.assertIn("not have been looked at", out["_epilogue"])
+        self.assertEqual(out["peak_signal"]["signal_count"], 2)  # evidence intact
+
+    def test_a_pass_that_never_labeled_reads_back_as_unlabeled_end_to_end(self):
+        # Same shape via the real detector rather than hand-seeded rows.
+        self._detected_but_unlabeled()
+        env = query_tools.find_conflicts(chat_id=1)
+        (row,) = env["rows"]
+        self.assertFalse(row["labeled"])
+        self.assertEqual(row["labeled_signal_turns"], 0)
+        self.assertFalse(row["reconciliation"])          # topic unset, not 'not repair'
+        self.assertIn("labeling_note", env)
+        self.assertFalse(query_tools.get_conflict(row["conflict_id"])["labeled"])
+
+    # -- labeled, nothing found ---------------------------------------------
+    def test_a_labeled_window_with_zero_signals_is_labeled_with_zero_turns(self):
+        # The legitimate "we looked and found nothing" outcome: every label was
+        # neutral or eval-gate-suppressed, so the window is stamped with no rows.
+        self._seed_one_conflict(0, labeled=True)
+        env = query_tools.find_conflicts(chat_id=1)
+        (row,) = env["rows"]
+        self.assertTrue(row["labeled"])
+        self.assertEqual(row["labeled_signal_turns"], 0)
+        self.assertEqual(env["n_labeled"], 1)
+        self.assertNotIn("labeling_note", env)
+        self.assertNotIn("not have been looked at", env["_epilogue"])
+        out = query_tools.get_conflict(7)
+        self.assertTrue(out["labeled"])
+        self.assertEqual(out["signals_total"], 0)
+        self.assertIn("eval-gated bands", out["note"])   # not the unlabeled note
+        self.assertNotIn("NOT ANALYZED", out["note"])
+
+    # -- labeled, signals found (today's behavior, unchanged) ----------------
+    def test_a_labeled_window_with_signals_is_unchanged(self):
+        self._seed_one_conflict(3, labeled=True)
+        env = query_tools.find_conflicts(chat_id=1)
+        (row,) = env["rows"]
+        self.assertTrue(row["labeled"])
+        self.assertEqual(row["labeled_signal_turns"], 3)
+        self.assertEqual(env["n_labeled"], 1)
+        self.assertNotIn("labeling_note", env)
+        self.assertEqual(env["_epilogue"], conflict_mod._ANALYSIS_DISCLAIMER)
+        out = query_tools.get_conflict(7)
+        self.assertTrue(out["labeled"])
+        self.assertEqual(len(out["signals"]), 3)
+        self.assertIn("eval-gated bands", out["note"])
+        self.assertEqual(out["_epilogue"], conflict_mod._ANALYSIS_DISCLAIMER)
+
+    def test_the_real_label_pass_stamps_what_the_read_tools_report(self):
+        _build_fixture(self.db_path, classify_fn=_stub_criticism)
+        env = query_tools.find_conflicts(chat_id=1)
+        (row,) = env["rows"]
+        self.assertTrue(row["labeled"])
+        self.assertGreater(row["labeled_signal_turns"], 0)
+        self.assertEqual(env["n_labeled"], env["total_matching"])
+        self.assertNotIn("labeling_note", env)
+
+    # -- coverage counting ---------------------------------------------------
+    def test_coverage_counts_the_whole_scope_not_the_returned_page(self):
+        # n_labeled follows total_matching/n_corroborated: the full in-scope
+        # population, not the page, or a limit=1 call would look fully covered.
+        self._insert(1, "llm", 3, "2026-03-01", labeled=True)
+        self._insert(2, "none", 2, "2026-03-02", labeled=False)
+        self._insert(3, "none", 1, "2026-03-03", labeled=False)
+        env = query_tools.find_conflicts(chat_id=1, limit=1)
+        self.assertEqual(len(env["rows"]), 1)
+        self.assertEqual(env["total_matching"], 3)
+        self.assertEqual(env["n_labeled"], 1)
+        self.assertEqual(env["n_corroborated"], 1)       # unchanged by labeling
+        self.assertIn("2 of 3", env["labeling_note"])
+
+    # -- ranking is untouched ------------------------------------------------
+    def test_mixing_labeled_and_unlabeled_does_not_change_the_ranking(self):
+        # test_corroborated_lower_signal_outranks_uncorroborated_higher's
+        # fixture with the corroborated episode UNLABELED: labeling is not a
+        # ranking key -- an unread window is unread evidence, not weak
+        # evidence, and demoting it would bury the rows the note warns about.
+        self._insert(1, "none", 4, "2026-03-02", labeled=True)
+        self._insert(2, "llm", 2, "2026-03-01", labeled=False)
+        rows = query_tools.find_conflicts(chat_id=1)["rows"]
+        self.assertEqual([r["conflict_id"] for r in rows], [2, 1])
+        self.assertEqual([r["labeled"] for r in rows], [False, True])
+
+    def test_the_within_tier_order_survives_a_mixed_labeling_state(self):
+        # test_within_same_corroboration_signal_count_then_recency, relabeled.
+        self._insert(1, "none", 2, "2026-03-01", labeled=False)
+        self._insert(2, "none", 3, "2026-03-01", labeled=True)
+        self._insert(3, "none", 2, "2026-03-05", labeled=False)
+        rows = query_tools.find_conflicts(chat_id=1)["rows"]
+        self.assertEqual([r["conflict_id"] for r in rows], [2, 3, 1])
+
+    # -- a table that predates the column ------------------------------------
+    def _pre_budget_db(self):
+        """A `conflicts` table from BEFORE labeled_at existed -- a DB neither
+        re-ingested nor re-detected since. Reuses the migration test's DDL."""
+        con = sqlite3.connect(self.db_path)
+        con.executescript(_PRE_BUDGET_CONFLICTS_DDL)
+        con.execute("CREATE TABLE chats(id INTEGER PRIMARY KEY, is_group INTEGER)")
+        con.execute("INSERT INTO chats(id, is_group) VALUES (1, 0)")
+        con.execute(
+            "CREATE TABLE conflict_signals(id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "conflict_id INTEGER, message_id INTEGER, actor_is_me INTEGER, "
+            "label_class TEXT, top2_labels_json TEXT, band TEXT, excerpt TEXT)")
+        con.execute(
+            "INSERT INTO conflicts(id, chat_id, first_date, last_date, "
+            "peak_signal_json, corroboration, off_text_flag, source) VALUES "
+            "(7, 1, '2026-03-01', '2026-03-02', ?, 'none', 0, 'llm')",
+            (json.dumps({"signals": ["dislike_run"], "signal_count": 1}),))
+        con.commit()
+        con.close()
+
+    def test_a_table_predating_the_column_degrades_instead_of_raising(self):
+        # Every row there went through the old UNBOUNDED label pass, so
+        # labeled=true is the honest reading -- and `no such column` would be a
+        # crash where _has_conflict_tables promises a graceful read.
+        self._pre_budget_db()
+        env = query_tools.find_conflicts(chat_id=1)
+        (row,) = env["rows"]
+        self.assertTrue(row["labeled"])
+        self.assertEqual(env["n_labeled"], 1)
+        self.assertNotIn("labeling_note", env)
+        out = query_tools.get_conflict(7)
+        self.assertTrue(out["labeled"])
+        self.assertIn("eval-gated bands", out["note"])
+
+    # -- payload discipline --------------------------------------------------
+    def test_result_capped_well_under_limit(self):
+        from config import TOOL_RESULT_MAX_CHARS
+        for cid in range(1, 30):
+            self._insert(cid, "none", 3, f"2026-03-{cid:02d}", labeled=cid % 2 == 0)
+        env = query_tools.find_conflicts(             # a full 25-row page
+            chat_id=1, limit=conflict_mod.MAX_CONFLICT_ROWS)
+        self.assertEqual(len(env["rows"]), conflict_mod.MAX_CONFLICT_ROWS)
+        self.assertIn("labeling_note", env)
+        self.assertLess(len(json.dumps(env)), TOOL_RESULT_MAX_CHARS // 4)
+        unlabeled = query_tools.get_conflict(29)         # odd id -> labeled=False
+        self.assertFalse(unlabeled["labeled"])
+        self.assertLess(len(json.dumps(unlabeled)), TOOL_RESULT_MAX_CHARS // 4)
 
 
 if __name__ == "__main__":
