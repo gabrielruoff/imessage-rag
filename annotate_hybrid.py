@@ -12,10 +12,10 @@ Four phases under ONE deadline:
   2  kNN classify     -- label the whole corpus from chunk_vectors, then
                          backfill knn_confidence onto distilled rows written
                          before that column existed
-  3a event upgrades   -- LLM-re-annotate event-candidate chunks (annotate_events):
-                         events are the one label kNN structurally CANNOT
-                         produce, since every source='distilled' row carries
-                         events_json='[]'
+  3a event upgrades   -- LLM-re-annotate event-candidate chunks (annotate_events),
+                         densest lexicon match first: events are the one label
+                         kNN structurally CANNOT produce, since every
+                         source='distilled' row carries events_json='[]'
   3b confidence upgrades -- LLM-re-annotate the lowest-knn_confidence distilled
                          rows, i.e. where the kNN vote is least likely right
 
@@ -190,18 +190,31 @@ def _low_confidence_count(con, all_chats, top_dyads):
 
 
 def _chunk_rows(con, chunk_ids):
-    """(chunk_id, text) for `chunk_ids`, id-ascending -- the row shape
-    annotate._annotate_group wants. Fetched in parameter-safe slices; the
-    caller's ids arrive ascending (annotate_events' contract), so the slices
-    concatenate already ordered."""
-    rows = []
+    """(chunk_id, text) for `chunk_ids`, in the CALLER'S order -- the row shape
+    annotate._annotate_group wants, and a ranking this must not destroy:
+    annotate_events hands over its candidates densest-first, and the phase
+    deadline stops partway down, so a re-sort here would silently hand the
+    budget back to chunk-id order. The fetch still goes out in parameter-safe
+    _ID_SLICE blocks (a corpus-wide prefilter names thousands of ids, past
+    SQLite's 999-variable ceiling), which means SQL row order is per-block and
+    meaningless; the rows are put back into the input's sequence in python.
+
+    Two edge cases, both deliberate. An id with no `chunks` row is omitted
+    rather than faked: there is no text to annotate, and a None-text row would
+    reach the LLM as an empty prompt and burn a request to come back
+    unparseable. A repeated id yields ONE row, at its first position -- the
+    tier's whole contract is a wall-clock budget, so paying twice for the same
+    chunk is never the right reading of a duplicate."""
+    by_id = {}
     for i in range(0, len(chunk_ids), _ID_SLICE):
         block = list(chunk_ids[i:i + _ID_SLICE])
         placeholders = ",".join("?" * len(block))
-        rows.extend(con.execute(
-            f"SELECT id, text FROM chunks WHERE id IN ({placeholders}) ORDER BY id",
-            block).fetchall())
-    return rows
+        for row in con.execute(
+                f"SELECT id, text FROM chunks WHERE id IN ({placeholders})", block):
+            by_id[row[0]] = row
+    # pop, not [], so a duplicate id contributes only its first occurrence.
+    return [row for row in (by_id.pop(cid, None) for cid in chunk_ids)
+            if row is not None]
 
 
 def _n_seeds(con):
@@ -447,7 +460,9 @@ def hybrid_chunks(con, model, think=False, workers=1, all_chats=False,
         return total
 
     # Phase 3a. The event prefilter already excludes chunks annotated by an LLM,
-    # so a resumed run never re-buys an upgrade it has paid for.
+    # so a resumed run never re-buys an upgrade it has paid for -- and it hands
+    # back what is left ranked by pattern-hit density, so both --limit's prefix
+    # and the deadline's cut take the densest candidates, not the oldest.
     event_ids = annotate_events.event_candidate_chunk_ids(con, all_chats, top_dyads)
     if limit is not None:
         event_ids = event_ids[:limit]

@@ -17,7 +17,12 @@ additionally annotates several chunks per request (~4-8x faster, slightly
 noisier); 'max' is the original one-chunk-per-request, model-default-
 reasoning path. --upgrade-distilled lets an LLM tier re-annotate distilled
 rows (the way to fill in events for chats that matter). LLM passes fan out
-over ANNOTATE_WORKERS concurrent requests (~2x with a parallel Ollama).
+over ANNOTATE_WORKERS concurrent requests, which buys ~1.24x -- NOT the ~2x
+this line used to claim. Measured 2026-07-28 (qwen3.5:4b, batch 8) with
+OLLAMA_NUM_PARALLEL raised to 4: this hardware still effectively serializes
+generation, so the concurrency mostly overlaps request overhead. Recorded so
+nobody re-litigates the hope; OLLAMA_NUM_PARALLEL is deliberately left alone,
+and the levers that DID pay are batch packing and the schema retry below.
 
 'hybrid' sits between the two, and is budgeted in WALL CLOCK rather than
 chunks (ANNOTATE_BUDGET_MINUTES; default 25 min on Ollama, 50 on apple),
@@ -145,6 +150,29 @@ QUALITY_PRESETS = {
 # faster per chunk. A module constant, not a config knob: it is a property of
 # the FM window, not something a user tunes.
 _APPLE_ANNOTATE_CHAR_BUDGET = 2000
+
+# Ollama backend: the same packing idea for a different reason. Nothing here
+# has to fit a fixed window -- batch_size already bounds the request -- but a
+# fixed ROW count lets a group's cost swing with chunk length. Measured
+# 2026-07-28 (qwen3.5:4b, batch 8): ~4.6 s/chunk on typical event chunks
+# (~1,550 avg chars) against 13.1-28.3 s/chunk on the longest ones (~2,150),
+# because a long, event-dense group is exactly where the model starts dropping
+# ids from the batched reply and _annotate_group has to buy them back.
+#
+# That swing does not just cost time, it POISONS the budget: _save_group_rate
+# banks the WORST group of a run, so one 28 s/chunk group inflates
+# _DispatchDeadline.reserve() for the whole next run and the gate declines
+# dispatches it could have afforded. Capping the worst case is therefore worth
+# budget twice -- faster groups AND a smaller reserve. 10,000 chars is ~4-6 of
+# the long chunks (whose latency then clusters instead of tailing) while short
+# chunks still fill a whole batch of 8, so the fast case is untouched.
+#
+# A module constant, not a config knob, exactly like the apple budget above: it
+# is a property of the backend, not something a user tunes. And like it, it is
+# applied in _annotation_groups, so it covers EVERY non-apple tier at once
+# (fast/balanced/max, the distilled seed pass, hybrid's upgrades). Apple's
+# packing is untouched -- it has its own, much smaller budget and no row cap.
+_OLLAMA_ANNOTATE_CHAR_BUDGET = 10_000
 
 EVENT_KINDS = ("good_news", "gratitude")
 RESPONSE_CLASSES = (
@@ -292,11 +320,12 @@ class _GroupRate:
     def worst(self):
         """Slowest group seen, or None when nothing has completed yet. This is
         what gets carried to the NEXT run: group latency is noisy (a batched
-        reply that covers only some ids falls back to a single-chunk request
-        per miss, so the same phase measured a 106.4 s mean one run and 148 s
-        the next), and the failure this whole gate exists to prevent is
-        one-sided -- under-buying costs coverage a rerun recovers, overrunning
-        breaks the only promise the tier makes."""
+        reply that covers only some ids costs an extra request -- the schema
+        retry, or a single-chunk request per miss when that fails too -- so the
+        same phase measured a 106.4 s mean one run and 148 s the next), and the
+        failure this whole gate exists to prevent is one-sided -- under-buying
+        costs coverage a rerun recovers, overrunning breaks the only promise
+        the tier makes."""
         with self._lock:
             return self._worst or None
 
@@ -322,6 +351,25 @@ class _GroupRate:
 # over-estimate: _annotation_groups packs its groups by char budget (1-2
 # chunks), not batch_size, so the prior is high there until the first run
 # stores a measurement.
+#
+# Ollama is now an over-estimate too, and NOT a mild one -- an earlier draft of
+# this comment guessed "mild" and the post-implementation run refuted it. The
+# two changes that landed with _OLLAMA_ANNOTATE_CHAR_BUDGET (groups closing at
+# 4-5 rows on long chunks) and the schema retry (no more 8-singles blowups)
+# together cut the real cost well below what 5.3 x 8 x 4 predicts: measured
+# 2026-07-28 on a cold DB, the banked event-phase worst group came out at
+# 46.7 s against this prior's 169.6 s, a ~3.6x over-estimate. Because
+# _DispatchDeadline.reserve() is computed from the prior until the first group
+# of a phase completes, that cost phase 3a roughly three-quarters of its
+# allotted slice on the first run of a fresh DB (it stopped dispatching with
+# 3.4 of 4.6 minutes unused, which phase 3b then spent instead).
+#
+# Left at 5.3 deliberately, for now. Lowering it trades a self-healing
+# first-run under-buy -- one run banks this machine's real number per phase and
+# every later run plans off that -- for a risk of overrunning the wall clock,
+# which is the one promise the tier makes. Retuning it wants its own
+# measurement across phases and backends, not a division done here; see the
+# round-2 entry in docs/DECISIONS.md.
 _COLD_GROUP_SECONDS_PER_CHUNK = 5.3
 
 
@@ -347,7 +395,17 @@ def _load_group_rate(con, phase, model, batch_size, workers):
     2026-07-28, a group of 8 averaged 106.4 s on the event candidates against
     70.6 s on the confidence upgrades, whose chunks are a fifth the length --
     so one shared estimator would let whichever phase ran first anchor the
-    others wrong in both directions."""
+    others wrong in both directions.
+
+    `batch_size` in the key is a MAXIMUM, not the size of any particular group:
+    _annotation_groups also packs to _OLLAMA_ANNOTATE_CHAR_BUDGET, so a
+    long-chunk phase runs 4-6-row groups under a b8 key. That is fine and is
+    what the key is for -- it identifies the PACKING CONFIG, and every group a
+    run makes under one config is drawn from the same distribution, which is
+    all a per-group estimate needs. Rates banked under an older packing
+    self-heal rather than needing a migration: _save_group_rate stores the
+    worst group of each run unconditionally, so the first run under new packing
+    overwrites whatever the old one left."""
     raw = get_state(con, _group_rate_key(phase, model, batch_size, workers))
     try:
         prior = float(raw) if raw else None
@@ -575,6 +633,82 @@ def _validate_annotation(data):
     return valence, emotions, depth, events
 
 
+def _annotation_object_schema():
+    """JSON Schema for ONE annotation object, built from the very constants
+    _validate_annotation checks against (EMOTION_LABELS, EVENT_KINDS,
+    RESPONSE_CLASSES) so a schema and the validator can never drift apart.
+
+    A fresh dict per call, not a shared module constant: the result is embedded
+    once per chunk id in _annotation_schema, and aliasing one mutable dict into
+    N properties is a footgun for no saving."""
+    return {
+        "type": "object",
+        "properties": {
+            # The numeric bounds are as much documentation as constraint:
+            # Ollama's grammar converter enforces an integer range but not a
+            # float's. That costs nothing, because _validate_annotation clamps
+            # both regardless -- the schema is an optimization for COVERAGE,
+            # never the validation gate.
+            "valence": {"type": "number", "minimum": -1, "maximum": 1},
+            "emotions": {
+                "type": "array",
+                "maxItems": 3,
+                "items": {"type": "string", "enum": list(EMOTION_LABELS)},
+            },
+            "depth": {"type": "integer", "minimum": 1, "maximum": 5},
+            "events": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"type": "string", "enum": list(EVENT_KINDS)},
+                        "excerpt": {"type": "string"},
+                        # "one of the four classes, or null when there was no
+                        # response" -- as anyOf rather than a union
+                        # "type": ["string", "null"] or an enum with a null in
+                        # it. All three express it, but anyOf is the oldest and
+                        # most portable construct in the JSON-schema-to-grammar
+                        # converter Ollama's structured outputs run on, while
+                        # union types and mixed-type enums are version-
+                        # dependent there. _validate_annotation already coerces
+                        # anything outside RESPONSE_CLASSES to None, so this is
+                        # about the model emitting a usable null, not about
+                        # trusting it.
+                        "response_class": {
+                            "anyOf": [
+                                {"type": "string",
+                                 "enum": list(RESPONSE_CLASSES)},
+                                {"type": "null"},
+                            ]
+                        },
+                    },
+                    "required": ["kind", "excerpt", "response_class"],
+                },
+            },
+        },
+        "required": ["valence", "emotions", "depth", "events"],
+    }
+
+
+def _annotation_schema(chunk_ids):
+    """JSON Schema (a dict, for Ollama structured outputs via `format=`)
+    requiring exactly one annotation object per id in `chunk_ids`, keyed by the
+    same str(id) the batched prompt asks for.
+
+    This is what the schema-constrained retry in _annotate_group spends its one
+    request on: coverage of the named ids is guaranteed BY CONSTRUCTION, where
+    a free-JSON batch merely asks for it. Kept to the missed ids only, so the
+    grammar stays small and so does its overhead. Pure -- no I/O, no config
+    reads, deterministic for a given id list -- hence safe to build inside a
+    worker thread."""
+    keys = [str(cid) for cid in chunk_ids]
+    return {
+        "type": "object",
+        "properties": {key: _annotation_object_schema() for key in keys},
+        "required": keys,
+    }
+
+
 def _resolve_event_message_ids(con, chunk_id, events):
     """Attach message_id to each event by exact-substring match of its
     excerpt against the chunk's messages; only an unambiguous (single)
@@ -606,12 +740,80 @@ def _annotate_batch(group, model, think):
             if isinstance(data.get(str(cid)), dict)}
 
 
+def _annotate_schema_retry(rows, model, think):
+    """One SCHEMA-CONSTRAINED request re-asking for exactly the ids a batched
+    free-JSON reply missed; returns {chunk_id: annotation dict} for whatever
+    came back, and {} on any failure at all.
+
+    Why a second batched request instead of going straight to singles: measured
+    2026-07-28 (qwen3.5:4b), free-JSON is bimodal. With full id coverage it is
+    the fastest option there is (~4.6 s/chunk on typical event chunks); when it
+    drops ids -- correlated with long, event-dense chunks -- every miss buys its
+    own single-chunk request, each with chat_once_json's own nudge retry, and
+    the group lands at 13-28 s/chunk. Constrained decoding is NOT universally
+    faster (the grammar costs a constant: 7.0 s/chunk against free-JSON's 4.6
+    on typical chunks), so it does not belong on the fast path -- but its
+    coverage is guaranteed by construction, which is exactly what the retry
+    needs. Worst case becomes roughly one extra ~40-55 s request rather than up
+    to batch_size sequential singles.
+
+    Failure is total and silent by design. The caller's per-chunk fallback is
+    still behind this, so a transport error, a timeout, a server that rejects
+    the schema, a non-dict reply, unparseable content -- all of it has to
+    degrade to "covered nothing" rather than propagate: this runs on a worker
+    thread inside _pooled, where an escaping exception would take out the whole
+    group and the worker with it. KeyboardInterrupt still propagates (it is not
+    an Exception), which is what keeps the tier Ctrl-C safe."""
+    ids = [cid for cid, _text in rows]
+    user = "\n\n".join(f"### chunk {cid}\n{text}" for cid, text in rows)
+    try:
+        reply = ollama.chat_once(
+            [{"role": "system", "content": _ANNOTATE_SYSTEM + _BATCH_SYSTEM_SUFFIX},
+             {"role": "user", "content": user}],
+            model=model, format=_annotation_schema(ids),
+            timeout=ANNOTATE_TIMEOUT, think=think,
+        )
+        # chat_once returns the response's `message` dict (possibly {}), so the
+        # parse is ollama._extract_reply's: json.loads of the assistant
+        # content, nothing cleverer. Deliberately WITHOUT its corrective-nudge
+        # pass -- a grammar-constrained reply cannot come back fenced or with a
+        # preamble, and the per-chunk fallback already is the retry for
+        # anything that somehow does.
+        data = json.loads((reply or {}).get("content") or "")
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {cid: data[str(cid)] for cid in ids
+            if isinstance(data.get(str(cid)), dict)}
+
+
 def _annotate_group(group, model, think):
     """All LLM work for one group of (chunk_id, text) rows: a batched request
-    for a multi-chunk group -- retrying any id it missed with a single-chunk
-    request -- or just the single request for a singleton. Runs on worker
-    threads; returns {chunk_id: annotation dict | None}."""
+    for a multi-chunk group -- then one schema-constrained request naming
+    exactly the ids that reply missed, then a single-chunk request for anything
+    STILL missing -- or just the single request for a singleton. Runs on worker
+    threads; returns {chunk_id: annotation dict | None}.
+
+    The ladder is ordered by what each rung costs when it works. Free-JSON with
+    full coverage is the cheapest thing available and stays the fast path: a
+    fully covered batch issues exactly ONE request and nothing else. The schema
+    retry (see _annotate_schema_retry) caps the failure mode at one extra
+    request instead of one per miss. The per-chunk singles stay underneath as
+    belt and braces for a schema request that errored, timed out or came back
+    unusable -- expected ~never, but the group must still complete.
+
+    Apple FM never reaches the middle rung: its `format` seam is not a guided
+    schema (an empty-properties DynamicGenerationSchema pins the reply to {}),
+    so handing applefm a dict format is undefined. It keeps today's behavior --
+    batch, then a single-chunk request per miss."""
     batched = _annotate_batch(group, model, think) if len(group) > 1 else {}
+    # Only ids a batch actually attempted and missed are worth a schema retry;
+    # a singleton group has had no batched request at all, so its "miss" is
+    # just its first request and belongs on the single-chunk path below.
+    missed = [(cid, text) for cid, text in group if cid not in batched]
+    if len(group) > 1 and missed and not config.is_apple_model(model):
+        batched.update(_annotate_schema_retry(missed, model, think))
     out = {}
     for chunk_id, text in group:
         data = batched.get(chunk_id)
@@ -639,20 +841,28 @@ def _write_annotation(con, chunk_id, data, source="llm"):
     )
 
 
-def _char_budget_groups(pending, budget):
+def _char_budget_groups(pending, budget, max_rows=None):
     """Greedily pack (chunk_id, text) rows into groups whose combined chunk
-    text stays under `budget` chars -- the apple backend's batching unit,
-    since its fixed window makes a row count the wrong measure. Accumulate
-    until the next row would exceed the budget, then start a new group; a
-    single chunk bigger than the budget still gets its own group (>=1 row
-    always), which _annotate_group sends as a singleton, exactly like
-    batch_size 1."""
+    text stays under `budget` chars and -- when `max_rows` is given -- whose row
+    count stays at or under it. Accumulate until the next row would breach
+    either limit, then start a new group; a single chunk bigger than the budget
+    still gets its own group (>=1 row always), which _annotate_group sends as a
+    singleton, exactly like batch_size 1.
+
+    Shared by both backends, for two different reasons. Apple passes no
+    max_rows, because a row count is the wrong measure there at all: its fixed
+    4,096-token window covers prompt AND response, so chars are the only unit
+    that bounds a request. Ollama passes its batch_size, keeping the row cap it
+    has always had, and uses the budget only to stop a group of long chunks
+    from costing several times what a group of short ones does (rationale and
+    numbers: _OLLAMA_ANNOTATE_CHAR_BUDGET)."""
     groups = []
     group = []
     used = 0
     for row in pending:
         text_len = len(row[1] or "")
-        if group and used + text_len > budget:
+        full = max_rows is not None and len(group) >= max_rows
+        if group and (full or used + text_len > budget):
             groups.append(group)
             group, used = [], 0
         group.append(row)
@@ -663,13 +873,16 @@ def _char_budget_groups(pending, budget):
 
 
 def _annotation_groups(pending, model, batch_size):
-    """Split (chunk_id, text) rows into request-sized groups: apple packs by a
-    char budget (its fixed window makes a row count the wrong unit), every
-    other backend keeps exact row-count batching. One home for the branch so a
-    tier can never batch apple by row count by accident."""
+    """Split (chunk_id, text) rows into request-sized groups. Both backends
+    pack by char budget; what differs is the row cap and the reason. Apple has
+    no row cap -- its fixed window makes a row count the wrong unit entirely --
+    while every other backend caps at batch_size and treats the (much larger)
+    budget purely as a ceiling on a group of long chunks. One home for the
+    branch so a tier can never batch a backend by the wrong unit by accident."""
     if config.is_apple_model(model):
         return _char_budget_groups(pending, _APPLE_ANNOTATE_CHAR_BUDGET)
-    return [pending[i:i + batch_size] for i in range(0, len(pending), batch_size)]
+    return _char_budget_groups(pending, _OLLAMA_ANNOTATE_CHAR_BUDGET,
+                               max_rows=max(1, batch_size))
 
 
 def annotate_chunks(con, model, all_chats=False, top_dyads=ANNOTATE_TOP_DYADS,

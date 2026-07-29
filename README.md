@@ -207,10 +207,12 @@ make topics          # cluster + label topics
 Run them one at a time. They can't run in parallel — each holds a SQLite write
 lock across many LLM calls, so a concurrent run dies with `database is locked`.
 (Within one job, LLM requests do fan out: `make ollama-start` runs Ollama with
-4 parallel slots and `annotate.py` keeps `ANNOTATE_WORKERS` requests in flight,
-worth ~2x on the LLM passes.) `make pipeline` runs ingest, annotation, the
-analytical suite (nudges → drift → voiceprint → conflict), and topics back to
-back in the right order (and stays sequential even under `make -j`).
+4 parallel slots and `annotate.py` keeps `ANNOTATE_WORKERS` requests in flight
+— worth ~2x on `gpt-oss:20b`, but only ~1.24x on the default `qwen3.5:4b`,
+where generation still effectively serializes.) `make pipeline` runs ingest,
+annotation, the analytical suite (nudges → drift → voiceprint → conflict), and
+topics back to back in the right order (and stays sequential even under
+`make -j`).
 
 **`annotate.py`** has two modes, and one run only does one of them:
 
@@ -230,8 +232,10 @@ back in the right order (and stays sequential even under `make -j`).
     real LLM calls that replace distilled rows until `ANNOTATE_BUDGET_MINUTES`
     runs out — event candidates first (a lexicon prefilter picks the chunks
     likely to contain good news or thanks, since events are the one label the
-    shortcut can't produce; oldest conversations first, and each rerun advances
-    through the list), then the rows the kNN vote was least sure about.
+    shortcut can't produce; the chunks with the most matches come first, so a
+    short budget buys the densest candidates rather than the oldest, and each
+    rerun advances through the list), then the rows the kNN vote was least
+    sure about.
     Budgeting time rather than a chunk count is what makes it self-terminate
     instead of overrunning: *every* phase stops at the clock, including the
     deterministic kNN pass, and each starts from the per-request time an

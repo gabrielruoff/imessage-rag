@@ -4,6 +4,7 @@ message dicts -- no Ollama, no real DB."""
 
 import json
 import os
+import re
 import sqlite3
 import tempfile
 import unittest
@@ -392,6 +393,256 @@ class TestCurateTerms(AnnotateFixture):
                                return_value=_reply({"verdict": "nickname"})):
             annotate.main(["--terms"])
         self.assertEqual(self.verdict("blorbo"), "nickname")
+
+
+# ---------------------------------------------------------------------------
+# The schema-constrained retry rung
+# ---------------------------------------------------------------------------
+
+_ANNOTATION = {"valence": 0.5, "emotions": ["joy"], "depth": 2, "events": []}
+_CHUNK_ID_RE = re.compile(r"chunk (\d+)")
+
+
+def _chunk_ids_in(content):
+    """Chunk ids a request prompt names, in order, deduplicated. The group
+    texts below name their own id, so a singleton request -- which carries the
+    bare chunk text with no '### chunk <id>' header -- is readable too."""
+    out = []
+    for match in _CHUNK_ID_RE.findall(content):
+        chunk_id = int(match)
+        if chunk_id not in out:
+            out.append(chunk_id)
+    return out
+
+
+class TestAnnotationSchema(unittest.TestCase):
+    """annotate._annotation_schema: the grammar the retry spends its one
+    request on. Coverage of the named ids is guaranteed by CONSTRUCTION here,
+    which is the entire reason the rung exists -- and the enums come from the
+    validator's own constants, so a schema and _validate_annotation cannot
+    drift into disagreeing about what a valid label is."""
+
+    IDS = [7, 12, 3]
+
+    def setUp(self):
+        self.schema = annotate._annotation_schema(self.IDS)
+
+    def test_every_id_is_a_property_and_required(self):
+        keys = [str(chunk_id) for chunk_id in self.IDS]
+        self.assertEqual(self.schema["type"], "object")
+        self.assertEqual(list(self.schema["properties"]), keys)
+        self.assertEqual(self.schema["required"], keys)
+
+    def test_the_enums_are_the_module_s_own_constants(self):
+        obj = self.schema["properties"]["7"]
+        self.assertEqual(obj["properties"]["emotions"]["items"]["enum"],
+                         list(annotate.EMOTION_LABELS))
+        event = obj["properties"]["events"]["items"]
+        self.assertEqual(event["properties"]["kind"]["enum"],
+                         list(annotate.EVENT_KINDS))
+        response_class = event["properties"]["response_class"]["anyOf"]
+        self.assertEqual(response_class[0]["enum"], list(annotate.RESPONSE_CLASSES))
+        # ...and null stays reachable: "there was no response" is a real answer,
+        # not a missing one.
+        self.assertIn({"type": "null"}, response_class)
+
+    def test_the_bounds_are_the_ones_the_validator_clamps_to(self):
+        obj = self.schema["properties"]["7"]
+        self.assertEqual(obj["properties"]["emotions"]["maxItems"], 3)
+        depth = obj["properties"]["depth"]
+        self.assertEqual((depth["type"], depth["minimum"], depth["maximum"]),
+                         ("integer", 1, 5))
+        self.assertEqual(sorted(obj["required"]),
+                         ["depth", "emotions", "events", "valence"])
+
+    def test_it_is_json_serializable(self):
+        # It goes into an Ollama request body, so anything json.dumps cannot
+        # take (a tuple enum, say) would fail at request time -- on a worker
+        # thread, inside the retry's blanket except, where it reads as "the
+        # model covered nothing" and quietly costs a request every group.
+        self.assertEqual(json.loads(json.dumps(self.schema)), self.schema)
+
+    def test_each_id_gets_its_own_object(self):
+        first, second = (self.schema["properties"][key] for key in ("7", "12"))
+        self.assertEqual(first, second)
+        self.assertIsNot(first, second)         # no aliased mutable dict
+
+
+_COVER_ASKED = object()
+
+
+class _LadderLLM:
+    """Fake for both ollama seams _annotate_group uses, with ONE ordered log so
+    a test can assert the ladder's SHAPE rather than a pair of call counts.
+
+    chat_once_json serves the free-JSON rungs (the batched request and the
+    per-chunk singles); chat_once serves the schema-constrained retry and is
+    the only place a dict `format` may ever appear. `schema` is what that retry
+    gets back: _COVER_ASKED (a well-formed reply covering every id it asked
+    for), an Exception to raise, or a canned message dict."""
+
+    def __init__(self, covered=(), schema=_COVER_ASKED):
+        self.covered = set(covered)
+        self.schema = schema
+        self.log = []                           # (rung, ids) in call order
+        self.formats = []                       # every `format` chat_once saw
+
+    def chat_once_json(self, messages, model=None, think=None, timeout=None,
+                       **kwargs):
+        ids = _chunk_ids_in(messages[-1]["content"])
+        if len(ids) > 1:
+            self.log.append(("batch", ids))
+            return {str(chunk_id): dict(_ANNOTATION)
+                    for chunk_id in ids if chunk_id in self.covered}
+        self.log.append(("single", ids))
+        return dict(_ANNOTATION)
+
+    def chat_once(self, messages, model=None, format=None, timeout=None,
+                  think=None):
+        ids = _chunk_ids_in(messages[-1]["content"])
+        self.log.append(("schema", ids))
+        self.formats.append(format)
+        if isinstance(self.schema, BaseException):
+            raise self.schema
+        if self.schema is _COVER_ASKED:
+            return _reply({str(chunk_id): dict(_ANNOTATION) for chunk_id in ids})
+        return self.schema
+
+
+class TestAnnotateGroupLadder(unittest.TestCase):
+    """annotate._annotate_group's batch -> schema retry -> singles ladder,
+    ordered by what each rung costs when it works."""
+
+    GROUP = [(1, "chunk 1: alpha"), (2, "chunk 2: beta"), (3, "chunk 3: gamma")]
+
+    def run_group(self, llm, group=None, model="test-annotate-model"):
+        with mock.patch.object(ollama, "chat_once_json", llm.chat_once_json):
+            with mock.patch.object(ollama, "chat_once", llm.chat_once):
+                return annotate._annotate_group(
+                    self.GROUP if group is None else group, model, False)
+
+    def assertCovered(self, out):
+        self.assertEqual(sorted(out), [1, 2, 3])
+        self.assertTrue(all(isinstance(data, dict) for data in out.values()))
+
+    def test_a_fully_covered_batch_is_exactly_one_request(self):
+        # The fast path stays the fast path: free-JSON with full coverage is
+        # the cheapest thing available, so nothing else may go out behind it.
+        llm = _LadderLLM(covered=(1, 2, 3))
+        out = self.run_group(llm)
+        self.assertEqual(llm.log, [("batch", [1, 2, 3])])
+        self.assertCovered(out)
+
+    def test_a_miss_buys_one_schema_request_and_no_singles(self):
+        # The whole point: two missed ids used to be two more requests.
+        llm = _LadderLLM(covered=(1,))
+        out = self.run_group(llm)
+        self.assertEqual(llm.log, [("batch", [1, 2, 3]), ("schema", [2, 3])])
+        self.assertCovered(out)
+        # ...constrained on exactly the missed ids, so the grammar stays small.
+        self.assertEqual(llm.formats, [annotate._annotation_schema([2, 3])])
+
+    def test_a_failed_schema_request_falls_through_to_singles(self):
+        # Expected ~never, but the group must still complete: the per-chunk
+        # rung stays underneath as belt and braces.
+        for label, schema_reply in (
+                ("transport error", RuntimeError("boom")),
+                ("unparseable content", _reply("not json {")),
+                ("empty reply", {}),
+                ("not a JSON object", _reply("[1, 2]")),
+                ("wrong keys", _reply({"chunk_2": _ANNOTATION}))):
+            with self.subTest(schema=label):
+                llm = _LadderLLM(covered=(1,), schema=schema_reply)
+                out = self.run_group(llm)
+                self.assertEqual(llm.log, [("batch", [1, 2, 3]),
+                                           ("schema", [2, 3]),
+                                           ("single", [2]), ("single", [3])])
+                self.assertCovered(out)
+
+    def test_ctrl_c_in_the_schema_request_still_propagates(self):
+        # The blanket except is `Exception`, deliberately: swallowing a
+        # KeyboardInterrupt here would cost the tier its Ctrl-C safety.
+        llm = _LadderLLM(covered=(1,), schema=KeyboardInterrupt())
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_group(llm)
+
+    def test_apple_never_receives_a_dict_format(self):
+        # applefm's `format` seam is not a guided schema (an empty-properties
+        # DynamicGenerationSchema pins the reply to {}), so a dict format is
+        # undefined there. Apple keeps batch -> singles.
+        llm = _LadderLLM(covered=(1,))
+        out = self.run_group(llm, model="apple")
+        self.assertEqual(llm.log, [("batch", [1, 2, 3]),
+                                   ("single", [2]), ("single", [3])])
+        self.assertEqual(llm.formats, [])
+        self.assertCovered(out)
+
+    def test_a_singleton_group_never_reaches_the_schema_rung(self):
+        # It has had no batched request at all, so its "miss" is just its first
+        # request and belongs on the single-chunk path.
+        llm = _LadderLLM()
+        out = self.run_group(llm, group=[(1, "chunk 1: alpha")])
+        self.assertEqual(llm.log, [("single", [1])])
+        self.assertEqual(sorted(out), [1])
+
+
+# ---------------------------------------------------------------------------
+# Request packing
+# ---------------------------------------------------------------------------
+
+class TestGroupPacking(unittest.TestCase):
+    """annotate._char_budget_groups / _annotation_groups. Both backends pack by
+    a char budget; the row cap and the reason are what differ."""
+
+    def rows(self, *sizes):
+        return [(i, "x" * n) for i, n in enumerate(sizes, start=1)]
+
+    def ids(self, groups):
+        return [[chunk_id for chunk_id, _text in group] for group in groups]
+
+    def test_the_row_cap_and_the_char_budget_both_bind(self):
+        rows = self.rows(*[10] * 6)
+        self.assertEqual(
+            self.ids(annotate._char_budget_groups(rows, 1000, max_rows=4)),
+            [[1, 2, 3, 4], [5, 6]])                     # rows bind
+        self.assertEqual(
+            self.ids(annotate._char_budget_groups(rows, 25, max_rows=4)),
+            [[1, 2], [3, 4], [5, 6]])                   # chars bind first
+
+    def test_a_group_always_has_a_row_and_an_oversized_chunk_still_ships(self):
+        rows = self.rows(10, 50, 10)
+        groups = annotate._char_budget_groups(rows, 25, max_rows=4)
+        self.assertEqual(self.ids(groups), [[1], [2], [3]])
+        self.assertTrue(all(groups))                    # never an empty group
+
+    def test_max_rows_none_is_the_char_only_packing_apple_has_always_had(self):
+        rows = self.rows(*[10] * 6)
+        self.assertEqual(self.ids(annotate._char_budget_groups(rows, 1000)),
+                         [[1, 2, 3, 4, 5, 6]])          # no row cap at all
+        self.assertEqual(
+            annotate._annotation_groups(rows, "apple", 1),
+            annotate._char_budget_groups(rows, annotate._APPLE_ANNOTATE_CHAR_BUDGET))
+
+    def test_ollama_short_chunks_are_still_exact_batch_size_slices(self):
+        # The fast case is untouched: at these lengths the char budget never
+        # bites and the packing is the plain slicing it has always been.
+        rows = self.rows(*[50] * 20)
+        self.assertEqual(annotate._annotation_groups(rows, "test-annotate-model", 8),
+                         [rows[i:i + 8] for i in range(0, 20, 8)])
+
+    def test_ollama_long_chunks_close_a_group_before_batch_size(self):
+        rows = self.rows(*[3000] * 8)
+        groups = annotate._annotation_groups(rows, "test-annotate-model", 8)
+        self.assertEqual(self.ids(groups), [[1, 2, 3], [4, 5, 6], [7, 8]])
+        self.assertTrue(all(
+            sum(len(text) for _chunk_id, text in group)
+            <= annotate._OLLAMA_ANNOTATE_CHAR_BUDGET for group in groups))
+
+    def test_a_batch_size_below_one_is_still_one_row_per_group(self):
+        rows = self.rows(*[10] * 3)
+        self.assertEqual(
+            self.ids(annotate._annotation_groups(rows, "test-annotate-model", 0)),
+            [[1], [2], [3]])
 
 
 if __name__ == "__main__":

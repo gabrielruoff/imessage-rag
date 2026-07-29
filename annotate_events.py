@@ -28,9 +28,11 @@ from function_words import EVENT_CANDIDATE_PATTERNS
 # Flattened once: the frozen contract returns a single kind-agnostic list, and
 # one scan with all patterns OR'd together is ~2x cheaper than a scan per kind.
 # (A future by-kind variant -- so a caller could interleave gratitude and
-# good-news upgrades instead of taking a chunk-id-ordered prefix, which today
-# is 63% gratitude-only, 22% good-news-only, 15% both -- is a 3-line addition:
-# _candidate_ids already takes the pattern tuple as an argument.)
+# good-news upgrades instead of taking a prefix of the one density ranking,
+# which structurally favors the both-kinds chunks because they hit more
+# patterns -- is a 3-line addition: _candidate_ids already takes the pattern
+# tuple as an argument. The candidate pool itself is 63% gratitude-only, 22%
+# good-news-only, 15% both.)
 _ALL_PATTERNS = tuple(p for pats in EVENT_CANDIDATE_PATTERNS.values() for p in pats)
 
 
@@ -47,8 +49,9 @@ def _like_escape(value):
 
 
 def _candidate_ids(con, patterns, all_chats, top_dyads):
-    """Distinct chunk ids in scope with at least one message matching
-    `patterns`, ascending. See event_candidate_chunk_ids for the contract."""
+    """Chunk ids in scope with at least one message matching `patterns`, ranked
+    by how many of the chunk's messages matched (descending), chunk id
+    ascending to break ties. See event_candidate_chunk_ids for the contract."""
     # No LOWER() on either side: SQLite's LIKE already folds case, and only for
     # ASCII -- which is exactly right for these patterns (all ASCII) and is
     # why nobody should "fix" this by wrapping the column, which would cost a
@@ -60,7 +63,7 @@ def _candidate_ids(con, patterns, all_chats, top_dyads):
     # annotation at all or only a distilled one. Rows already source='llm'
     # have their events and must never be paid for twice.
     sql = f"""
-        SELECT DISTINCT m.chunk_id
+        SELECT m.chunk_id
         FROM messages m
         JOIN chunks c ON c.id = m.chunk_id
         LEFT JOIN chunk_annotations a ON a.chunk_id = m.chunk_id
@@ -78,12 +81,37 @@ def _candidate_ids(con, patterns, all_chats, top_dyads):
             GROUP BY chat_id ORDER BY COUNT(*) DESC LIMIT ?)
         """
         params.append(top_dyads)
-    sql += " ORDER BY m.chunk_id"
+    # GROUP BY + COUNT(*) rather than the DISTINCT this used to be: the caller's
+    # deadline stops Phase 3a partway down this list -- a 25-min budget reaches
+    # only ~10-15% of the 2,567 candidates the corpus-wide prefilter yields on
+    # the reference corpus -- so the ORDER BY is what the budget actually buys.
+    # Hit count is the only evidence this prefilter has that a chunk is
+    # event-bearing (the lexicon is per-message substrings), so ranking by it
+    # spends the budget on the densest candidates instead of, as chunk-id order
+    # did, on the oldest history in scope. The id tiebreak keeps the ranking
+    # deterministic across runs, since hit counts tie heavily in the tail.
+    #
+    # COUNT(*) counts MATCHING MESSAGES -- one per message however many patterns
+    # it hits, since the patterns are OR'd into one predicate rather than joined
+    # -- and it cannot fan out: the WHERE has already narrowed the rows to
+    # matching messages, and neither join multiplies them, because chunks.id and
+    # chunk_annotations.chunk_id are both INTEGER PRIMARY KEY (schema.py), so a
+    # message row joins at most one row of each. The exclusion keeps the LEFT
+    # JOIN's meaning either way: a chunk already source='llm' drops out whole,
+    # never at a lower rank.
+    sql += " GROUP BY m.chunk_id ORDER BY COUNT(*) DESC, m.chunk_id"
     return [row[0] for row in con.execute(sql, params)]
 
 
 def event_candidate_chunk_ids(con, all_chats, top_dyads):
     """Returns an ordered list[int] of chunk ids in scope whose messages match
     EVENT_CANDIDATE_PATTERNS and whose annotation is absent or
-    source='distilled'. Read-only. Order: chunk id ascending."""
+    source='distilled'. Read-only.
+
+    Order: pattern-hit count descending, chunk id ascending as the tiebreak.
+    The caller can afford only a fraction of this list per run, so the ranking
+    makes that fraction the DENSEST candidates rather than -- as chunk-id order
+    did -- simply the oldest. Resume semantics are unchanged: an upgraded chunk
+    is written source='llm' and leaves the candidate set entirely, so reruns
+    advance down the ranking exactly as they advanced down the ids."""
     return _candidate_ids(con, _ALL_PATTERNS, all_chats, top_dyads)

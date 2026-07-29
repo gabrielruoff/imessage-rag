@@ -34,13 +34,16 @@ Full design history, schema rationale, and data forensics:
   ~`ANNOTATE_SEED_TARGET` seed then kNN-classifies the whole corpus from
   `chunk_vectors` (fast; events left empty). `hybrid` = a stratified
   `ANNOTATE_HYBRID_SEED_TARGET` seed draw + that same kNN pass (both corpus-wide),
-  then LLM upgrades — event-candidate chunks first (chunk-id ascending, so one
-  run covers the oldest history and reruns advance), lowest-`knn_confidence`
+  then LLM upgrades — event-candidate chunks first (ranked by pattern-hit count
+  DESC, chunk id ASC, so the prefix a budget affords is the DENSEST candidates,
+  not the oldest; reruns still advance because an upgraded row is written
+  `source='llm'` and leaves the candidate set), lowest-`knn_confidence`
   next — until the `ANNOTATE_BUDGET_MINUTES` wall-clock deadline; budgeted in
   TIME not chunks, so it self-terminates and a rerun resumes, the scope flags
   reach only the upgrade phase, and `--upgrade-distilled` is an error with it
   (hybrid IS one). EVERY phase is deadline-gated, including the deterministic
-  kNN pass (O(rows × seeds): 14.6 s at a 450-seed pool vs 82.0 s at 4,416) and
+  kNN pass (O(rows × seeds): 14.6 s at a 450-seed index vs 82.0 s at 4,416,
+  which `ANNOTATE_KNN_INDEX_CAP` now bounds — the index, never the pool) and
   seeding (also capped at 25% of the budget — unbatched and uncapped it
   measured 10.7 min of an 8-min run). Each phase starts from the per-request
   time an earlier run banked in `ingest_state`, so nothing is dispatched blind;
@@ -50,8 +53,11 @@ Full design history, schema rationale, and data forensics:
   own upgrades are `llm` rows and counting them switched its sampler off
   permanently. LLM tiers (`fast`/`balanced`/`max`) scope to top
   `ANNOTATE_TOP_DYADS`, honor `--all`, and with `--upgrade-distilled`
-  re-annotate kNN rows (how events get filled). `--terms` is a SEPARATE
-  pipeline (below), not a `--quality` tier.
+  re-annotate kNN rows (how events get filled). A batched request that comes
+  back missing ids buys ONE schema-constrained retry (`format=` a JSON Schema
+  over exactly the missed ids) before per-chunk singles — every non-apple tier;
+  apple skips that rung, its `format` seam is not a guided schema. `--terms` is
+  a SEPARATE pipeline (below), not a `--quality` tier.
 - Curate dyad terms: `python3 annotate.py --terms [--limit N] [--retry-failed]
   [--dry-run]` — its own pipeline; passing `--quality` is an error. Batches
   `ANNOTATE_TERMS_BATCH_SIZE` terms/request (never spanning chats), runs
