@@ -1923,10 +1923,26 @@ Three details that are decisions rather than mechanics:
   version-dependent.
 - **Failure is total and silent.** A transport error, a timeout, a server that
   rejects the schema, an unparseable or non-object reply all degrade to
-  "covered nothing" and fall through to the singles, because this runs on a
-  worker thread inside `_pooled` where an escaping exception takes out the
-  group and the worker. `KeyboardInterrupt` is not an `Exception` and still
-  propagates, which is what keeps the tier Ctrl-C safe.
+  "covered nothing" and fall through to the singles. The reason is *where* a
+  raise would land, not that it would kill the worker (it would not): `_pooled`
+  hands a worker exception to the future and it surfaces on the **caller's**
+  thread at `done.result()`, aborting the whole phase, group and all, with
+  `_run_upgrades`' `finally` able to commit only what already landed. An Ollama
+  build that will not take a dict `format` has to cost this group its retry,
+  never the run. `_annotate_batch` above it is unguarded by contrast, and
+  correctly: `chat_once_json` returns `None` on a malformed reply rather than
+  raising, so its failures are values. `KeyboardInterrupt` is not an
+  `Exception` and still propagates, which is what keeps the tier Ctrl-C safe.
+- **It resolves `think` through `ollama.effective_think`.** This is the one
+  annotation request that reaches `chat_once` directly — `chat_once_json`
+  hardcodes `format="json"` and cannot carry a dict schema — so it is also the
+  one that can miss the process-wide `think` degradation that seam owns. On a
+  model that answers `think=false` with empty content (gpt-oss) or rejects the
+  option, re-sending the rejected value would fail **every** schema retry for
+  the rest of the run, silently, turning a rung that removes a request per miss
+  into one that adds one. `effective_think` is the degradation's single home;
+  the retry is always downstream of a batched `chat_once_json`, so by the time
+  it runs the flag is already resolved.
 
 **Apple FM never reaches the middle rung.** Its `format` seam is not a guided
 schema (an empty-`properties` `DynamicGenerationSchema` pins the reply to
@@ -2049,18 +2065,49 @@ and 3.00 → 2.34 s/chunk on an identical 24-chunk set (1.28×). Real, and in th
 right direction, but a third of what the headline implied. Recorded because the
 next round should not plan against 226 s either.
 
-**Regression this round introduced: the cold prior is now ~3.6× too high.**
-`_COLD_GROUP_SECONDS_PER_CHUNK` (5.3 × batch × workers = 169.6 s) was
-calibrated when a group was 8 rows and a dropped id cost 8 sequential singles.
-§3d's packing and §3a's retry both cut the real cost: the banked event-phase
-worst group came out at **46.7 s**. Since `_DispatchDeadline.reserve()` plans
-off the prior until a phase's first group completes, phase 3a stopped
-dispatching with **3.4 of its 4.6 minutes unused** on a cold DB — i.e. this
-round made the ranking better while leaving less time to spend on it. The value
-is deliberately left at 5.3: the error is in the safe direction (under-buy, not
-overrun) and self-heals after one run, and retuning it wants its own
-measurement across phases and both backends. It is the first thing to look at
-if a 25-min run misses the ≥400 target.
+**Regression this round introduced, and fixed on review: the cold prior was
+~3.6× too high.** `_COLD_GROUP_SECONDS_PER_CHUNK` (5.3 × batch × workers =
+169.6 s) was calibrated when a group was 8 rows and a dropped id cost 8
+sequential singles. §3d's packing and §3a's retry both cut the real cost: the
+banked event-phase worst group came out at **46.7 s**. Since
+`_DispatchDeadline.reserve()` plans off the prior until a phase's first group
+completes — and `_pooled` submits `2 × workers` groups before the first result
+arrives, so at `ANNOTATE_WORKERS=4` every dispatch decision of a phase can be
+made before anything has been measured — phase 3a stopped dispatching with
+**3.4 of its 4.6 minutes unused** on a cold DB. This round had made the ranking
+better while leaving less time to spend on it.
+
+The fix is a **denominator**, not a retune. The prior's arithmetic is
+seconds-per-chunk × rows-per-group × workers, and `_load_group_rate` was
+supplying `batch_size` for the middle term — but `batch_size` is a *maximum*:
+`_annotation_groups` packs by char budget too, so a real event group is ~5 rows
+and an Apple FM group is 1–2. The dispatch loops already hold the packing they
+built (`_run_upgrades`, `_seed_chunks`), so they now call
+`_GroupRate.denominate` with its mean rows-per-group. Free, no new constant,
+and it corrects the same over-estimate on both backends — the Apple FM one was
+documented and outstanding before this round.
+
+Three properties make that the safe version of this fix rather than an
+optimistic one:
+
+- **It only ever touches a cold prior.** `denominate` is a no-op on a value an
+  earlier run banked, and the live mean beats the prior regardless, so nothing
+  measured is overwritten by arithmetic.
+- **The margin stays one-sided.** At ~5 rows the prior lands at ~106 s against
+  the measured 46.7 s worst group — still ~2.3× conservative, where it had been
+  ~3.6×. Under-buying self-heals after one run; overrunning is the one promise
+  the tier makes.
+- **5.3 itself is unchanged.** Lowering the *constant* would want its own
+  measurement across phases and both backends. Nothing here is a new estimate;
+  it is the existing estimate applied to the group that actually gets sent.
+
+The review's alternative — making `_DispatchDeadline.dispatchable` `continue`
+past a decline instead of `return`ing, so a phase that has since measured a
+real rate resumes dispatching — was **not** taken. That `return` is what
+guarantees a phase stops at all, and un-latching it puts new dispatches
+arbitrarily close to the deadline on the strength of an estimate that has
+already proved too low once. Fixing the denominator gets the same 3.4 minutes
+back without spending the guarantee.
 
 **Also observed, pre-existing:** on any budget under ~11.3 min the seed phase
 dispatches nothing at all (its share of the budget is smaller than the cold

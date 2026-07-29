@@ -96,11 +96,12 @@ _SEED_PHASE_SHARE = 0.25
 # The consequence to know about is the floor underneath both phases: nothing
 # smaller than one group can be dispatched, so a phase whose share is under one
 # group's LATENCY buys nothing at all. Measured 2026-07-28 (qwen3.5:4b, batch
-# 8, 4 workers) a group of 8 cost 106.4 s on the event candidates and 70.6 s on
-# the confidence upgrades, so a 2-min budget correctly declines both phases
-# (and _run_upgrades says why) while 6 min bought 32 of each. The 25-min
-# default is far clear of the floor; the old behavior on a 2-min budget was to
-# commit a blind wave anyway and take 4.4 min over it.
+# 8, 4 workers) after the char packing and the schema retry landed, an event
+# group -- 4-6 chunks, not 8, at ~1,900 chars each -- banked at 46.7 s of
+# latency, so a small budget correctly declines both phases and _run_upgrades
+# prints why rather than leaving that reading as "there was nothing to do". The
+# 25-min default is far clear of the floor; the old behavior on a budget that
+# small was to commit a blind wave anyway and take 4.4 min over a 2-min one.
 _EVENT_PHASE_SHARE = 0.60
 
 # Ids per `WHERE id IN (...)` slice. A corpus-wide event prefilter can name
@@ -248,11 +249,19 @@ def _run_upgrades(con, rows, model, think, workers, batch_size, deadline,
     primes it with what an earlier run measured for the same phase, so the
     first dispatch is not blind, and the finally banks what this one measured.
 
+    A COLD prior is re-denominated here, one line after the packing exists,
+    because that is the first moment anyone knows how many rows a group of THIS
+    phase's chunks actually holds -- _load_group_rate had only batch_size, which
+    is a ceiling the char budget routinely undercuts (see
+    annotate._COLD_GROUP_SECONDS_PER_CHUNK). It costs a sum over groups and
+    touches nothing that was ever measured.
+
     Counters go into the caller-owned `stats` dict (done/skipped/stopped)
     rather than a return value, so a KeyboardInterrupt propagating out of here
     still leaves the caller able to print an accurate per-phase summary."""
     groups = annotate._annotation_groups(rows, model, batch_size)
     gate = annotate._DispatchDeadline(deadline, workers, time.monotonic, rate)
+    gate.rate.denominate(annotate._mean_group_rows(groups))
 
     try:
         # total=None deliberately: the deadline, not the candidate list, decides
@@ -379,10 +388,13 @@ def hybrid_chunks(con, model, think=False, workers=1, all_chats=False,
     # One estimator per phase, each primed from what an earlier run measured
     # for this model/batch/workers -- so no phase has to commit a blind _pooled
     # wave, and none of them anchors another wrong. They really are different
-    # populations: measured 2026-07-28, a group of 8 averaged 106.4 s of
-    # latency on the event candidates (~1,900-char chunks, whose batched
-    # replies often cover only some ids and fall back to single-chunk
-    # requests) against 70.6 s on the confidence upgrades (median ~360 chars).
+    # populations, and it is the CHUNKS that differ: the event candidates
+    # average ~1,900 chars, so annotate._OLLAMA_ANNOTATE_CHAR_BUDGET closes a
+    # group at 4-6 of them, while the confidence upgrades' ~360-char median
+    # fills a whole batch of 8. Measured 2026-07-28 after the schema retry
+    # landed, the worst group cost 14.1 s in 3a against 16.6 s in 3b
+    # single-stream -- similar per GROUP over groups of quite different size,
+    # which is exactly why one shared estimator would mis-plan both.
     seed_rate = annotate._load_group_rate(con, "seed", model, batch_size, workers)
     event_rate = annotate._load_group_rate(con, "event", model, batch_size, workers)
     low_conf_rate = annotate._load_group_rate(con, "lowconf", model, batch_size,

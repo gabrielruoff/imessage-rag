@@ -105,6 +105,24 @@ _JSON_RETRY_NUDGE = (
 _think_unsupported = False
 
 
+def effective_think(think):
+    """The `think` value to actually SEND, given what this process has already
+    learned about the model. Returns `think` unchanged until some request has
+    proved the model can't take it, and None -- omit the flag -- from then on.
+
+    Public because the degradation belongs to the module, not to
+    chat_once_json: a caller that needs chat_once directly (annotate's
+    schema-constrained retry does, since chat_once_json hardcodes
+    format='json' and so cannot carry a dict schema) would otherwise re-send
+    the value the model has already rejected and fail every single time, with
+    no seam to notice through. One home for the rule, both callers.
+
+    Tri-state preserving, and it has to be: None stays None (omit), False
+    stays False (send think: false), _UNSET stays _UNSET (chat_once resolves
+    it to CHAT_THINK). Only the degraded case rewrites anything."""
+    return None if _think_unsupported else think
+
+
 def _extract_reply(reply, messages, retry_nudge):
     """Shared JSON-mode reply handling for chat_once_json here and in applefm
     (which returns the identical {"role","content"} shape): parse the assistant
@@ -156,7 +174,7 @@ def chat_once_json(messages, model=None, retry_nudge=_JSON_RETRY_NUDGE,
             return None
     global _think_unsupported
     for _ in range(2):
-        send_think = None if _think_unsupported else think
+        send_think = effective_think(think)
         # chat_once is resolved as a module global at call time (the tests'
         # patch seam).
         try:
