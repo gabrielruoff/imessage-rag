@@ -64,7 +64,16 @@ API_CORS_ORIGINS = [
 # nomic-embed-text, not the chat model: Ollama 0.32.0 refuses /api/embed for
 # generation models (see "Known environment quirks" in CLAUDE.md).
 EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
-CHAT_MODEL = os.getenv("CHAT_MODEL", "gemma4:26b-a4b-it-qat")
+# qwen3.5:4b: the model every timing default in this repo was measured on (the
+# hybrid tier's budget, its per-request rates, the batch-8 preset), so the
+# numbers in these comments describe the model you actually get. It is also
+# ~4 GB resident against the 26B MoE's ~20 GB, which is what makes those
+# defaults reachable on an ordinary machine. Deliberately NOT changed for
+# embeddings -- EMBED_MODEL is dimensioned into chunk_vectors and switching it
+# is a reset_db + re-ingest (see the embedding-space gotcha in CLAUDE.md).
+# A bigger chat model still routes more precisely across the ~32 retrieval
+# tools; set CHAT_MODEL to taste, and note the *_MODEL vars below inherit it.
+CHAT_MODEL = os.getenv("CHAT_MODEL", "qwen3.5:4b")
 # Chain-of-thought control for thinking-capable chat models (e.g. qwen3):
 # 'false' disables the hidden thinking pass (much faster per tool round-trip),
 # 'true' forces it on. Unset (the default) omits the flag so Ollama uses the
@@ -84,11 +93,33 @@ def _think(name, default=None):
 
 CHAT_THINK = _think("CHAT_THINK")
 
+# Model families that read 'low'/'medium'/'high' as a reasoning-EFFORT LEVEL.
+# Everything else only toggles thinking on or off, and to those models an
+# effort string is merely TRUTHY -- it does not ask for less reasoning, it buys
+# a FULL pass. Measured: 282.6s vs 26.2s per dyad term on gemma4, and a
+# timed-out request on qwen3.5:4b at batch 8. That is why an effort level is
+# not portable, and why the tri-state (None omits the flag, False sends
+# `think: false`) has to survive to the request body.
+#
+# Listing the EFFORT-LEVEL family rather than the toggle ones is deliberate:
+# that set is small and named, while "every model that merely toggles" is
+# unbounded and would drift with each new release. An unlisted model is assumed
+# to toggle, which is the safe direction -- the failure mode is a cheaper
+# answer, not a hung request.
+_EFFORT_LEVEL_MODELS = ("gpt-oss",)
+
+
+def has_effort_levels(name) -> bool:
+    """True when `name` understands 'low'/'medium'/'high' as an effort level
+    rather than as a plain truthy "think harder". See _EFFORT_LEVEL_MODELS."""
+    return isinstance(name, str) and any(
+        family in name.lower() for family in _EFFORT_LEVEL_MODELS)
+
 # --- Apple Foundation Models backend (opt-in) --------------------------------
 # On-device backend via Apple Intelligence (Apple Silicon, macOS 26+), routed
 # through a local Swift shim (`make apple-shim`). Opt in by setting any of the
 # *_MODEL vars -- CHAT_MODEL, ANNOTATE_MODEL, TOPIC_MODEL, WRAPPED_MODEL,
-# EMBED_MODEL -- to the "apple" sentinel; the defaults above stay gemma4/nomic,
+# EMBED_MODEL -- to the "apple" sentinel; the defaults above stay Ollama's,
 # so apple is never on unless asked for. The shim's context window is a fixed
 # 4,096 tokens, so the apple chat path stages many small sessions and digests
 # oversized tool results rather than context-stuffing (see chat_apple.py and
@@ -107,7 +138,7 @@ def is_apple_model(name) -> bool:
 # this file's directory like the DB paths, so it is independent of the CWD.
 APPLE_SHIM_PATH = _resolve(os.getenv("APPLE_SHIM_PATH", "bin/applefm-shim"))
 # Per-tool-result char cap for the apple chat orchestrator. Far below
-# TOOL_RESULT_MAX_CHARS (sized for gemma4's 32k window): the FM window is a
+# TOOL_RESULT_MAX_CHARS (sized for an Ollama model's window): the FM window is a
 # fixed 4,096 tokens, so a result over this is digested down to
 # question-relevant facts, never truncated blind.
 APPLE_TOOL_RESULT_MAX_CHARS = int(os.getenv("APPLE_TOOL_RESULT_MAX_CHARS", "5000"))
@@ -176,7 +207,8 @@ DOUBLE_TEXT_MIN_MINUTES = int(os.getenv("DOUBLE_TEXT_MIN_MINUTES", "10"))
 # larger than the model's context window is silently dropped along with all
 # messages before it, leaving the model only the system prompt -- so an
 # oversized tool result must be cut client-side. ~60k chars of dense JSON is
-# ~20k tokens, comfortably inside the 32k window gemma4 runs with.
+# ~20k tokens, comfortably inside the window the chat models here run with
+# (both the qwen3.5 default and gemma4 report a 262k context length).
 TOOL_RESULT_MAX_CHARS = int(os.getenv("TOOL_RESULT_MAX_CHARS", "60000"))
 
 # --- Analytics: sessions & response dynamics ----------------------------------

@@ -46,7 +46,7 @@ help:  ## Show this help
 # No stdin prompt on purpose: targets that block on input break under CI,
 # under `make -j`, and under any wrapper. The banner is the warning.
 bootstrap:  ## Fresh clone -> working setup: install, Ollama, source data, ingest
-	@echo "This will: create .venv, install Ollama and pull ~15GB of models,"
+	@echo "This will: create .venv, install Ollama and pull ~4GB of models,"
 	@echo "copy your Messages database into source_data/, and run a full ingest."
 	@echo "The ingest is the long pole -- tens of minutes on a large corpus."
 	@echo ""
@@ -457,7 +457,8 @@ install:  ## Create .venv and install pinned deps
 # Ollama setup: the binary, the service, and every model config.py names.
 # Deliberately NOT part of `make install` -- that target is fast, offline and
 # needed for lint/tests/`ingest --no-embed`, none of which touch Ollama, while
-# this one pulls ~15GB and installs a background service.
+# this one pulls the models (~4GB at the defaults, more if CHAT_MODEL is
+# repointed at a bigger one) and installs a background service.
 #
 # brew, not `curl ollama.com/install.sh | sh`: on macOS that script installs
 # /Applications/Ollama.app, which `ollama-start`'s `brew services` cannot

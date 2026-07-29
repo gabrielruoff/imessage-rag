@@ -83,11 +83,17 @@ from function_words import EMOTION_LABELS
 DB_PATH = TARGET_DB
 
 # --quality presets: (think, batch_size). think is Ollama's reasoning-effort
-# control ('low' works on effort-level models like gpt-oss and is tolerated
-# by gemma4; models that reject it fall back to no control mid-run). None
-# omits the flag: the model's default reasoning. Measured on gpt-oss:20b:
-# max ~8.6s/chunk, balanced ~3s, fast ~1-2s. 'distilled' uses its tuple only
-# for the LLM seed pass; the rest of the corpus is kNN-classified.
+# control, written against an EFFORT-LEVEL model: 'low' asks gpt-oss for a
+# cheap reasoning pass, which is what makes balanced ~3x faster than max
+# (measured on gpt-oss:20b: max ~8.6s/chunk, balanced ~3s, fast ~1-2s). To a
+# model that merely toggles thinking -- which the default CHAT_MODEL is -- the
+# same string is only truthy and buys a FULL pass, so _resolve_quality
+# translates it to False there via config.has_effort_levels. Read these tuples
+# as the gpt-oss values; what a toggle model actually gets is the translation.
+# None omits the flag (the model's own default reasoning) and is NEVER
+# translated, so 'max' keeps meaning what it says on every backend.
+# 'distilled' uses its tuple only for the LLM seed pass; the rest of the
+# corpus is kNN-classified.
 # 'hybrid' is the one preset measured on a TOGGLE model (qwen3.5:4b,
 # 2026-07-27), and both of its numbers come out differently: think=False, not
 # 'low', because an effort level is not portable -- 'low' is merely *truthy*
@@ -963,9 +969,25 @@ def curate_terms(con, model, limit=None, dry_run=False, think=False, workers=1,
 # CLI
 # ---------------------------------------------------------------------------
 
-def _resolve_quality(quality):
-    """Preset name -> (think, batch_size), with ANNOTATE_THINK /
-    ANNOTATE_BATCH_SIZE env overrides applied on top."""
+def _resolve_quality(quality, model):
+    """Preset name -> (think, batch_size), with the preset's effort level
+    translated for `model` and the ANNOTATE_THINK / ANNOTATE_BATCH_SIZE env
+    overrides applied on top.
+
+    The presets were written against an effort-level model (gpt-oss:20b), where
+    'low' asks for a CHEAP reasoning pass and is what makes balanced ~3x faster
+    than max. To a model that merely toggles thinking -- which includes the
+    default CHAT_MODEL -- that same string is only truthy and buys a FULL pass:
+    measured 282.6s vs 26.2s per dyad term on gemma4, and a timed-out request
+    on qwen3.5:4b at batch 8. So on those models an effort level resolves to
+    False, which preserves the ladder the tiers actually mean (max = the
+    model's own default reasoning, balanced/fast = none) instead of inverting
+    it into "the fast tier is the slow one".
+
+    Only the preset is translated, and only when the value is an effort STRING:
+    None (omit the flag) and an explicit True/False pass through untouched, so
+    the tri-state survives. An explicit ANNOTATE_THINK always wins -- a user who
+    names a think has said something this cannot second-guess."""
     try:
         think, batch_size = QUALITY_PRESETS[quality]
     except KeyError:
@@ -975,6 +997,8 @@ def _resolve_quality(quality):
         ) from None
     if ANNOTATE_THINK:
         think = _parse_think(ANNOTATE_THINK)
+    elif isinstance(think, str) and not config.has_effort_levels(model):
+        think = False
     if ANNOTATE_BATCH_SIZE:
         batch_size = ANNOTATE_BATCH_SIZE
     return think, max(1, batch_size)
@@ -1069,7 +1093,7 @@ def main(argv=None):
             return
         # Chunk tiers only: --quality is theirs, and resolving it for --terms
         # above is exactly the coupling that made term curation ~11x slow.
-        think, batch_size = _resolve_quality(quality)
+        think, batch_size = _resolve_quality(quality, model)
         if quality == "distilled":
             # Corpus-wide by design; --all/--top-dyads/--limit don't apply.
             annotate_distill.distill_chunks(con, model, think=think,

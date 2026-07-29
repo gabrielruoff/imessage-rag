@@ -977,9 +977,29 @@ class TestHybridCli(DBFixture):
         # model and buys a full reasoning pass. False is a distinct state from
         # None (which omits the flag).
         self.assertEqual(annotate.QUALITY_PRESETS["hybrid"], (False, 8))
-        think, batch_size = annotate._resolve_quality("hybrid")
+        think, batch_size = annotate._resolve_quality("hybrid", "qwen3.5:4b")
         self.assertIs(think, False)
         self.assertEqual(batch_size, 8)
+
+    def test_an_effort_level_preset_is_translated_for_toggle_models_only(self):
+        # The presets were written against gpt-oss, where 'low' asks for a
+        # CHEAP reasoning pass. To a toggle model the same string is only
+        # truthy and buys a FULL one, which would make the "fast" tier the
+        # slowest -- so it resolves to False there and is left alone on an
+        # effort-level model.
+        for quality in ("fast", "balanced"):
+            self.assertEqual(annotate.QUALITY_PRESETS[quality][0], "low")
+            self.assertIs(annotate._resolve_quality(quality, "qwen3.5:4b")[0], False)
+            self.assertEqual(annotate._resolve_quality(quality, "gpt-oss:20b")[0], "low")
+        # None means "omit the flag" and is NOT an effort level: it survives on
+        # every backend, or 'max' would stop meaning the model's own default.
+        self.assertIsNone(annotate._resolve_quality("max", "qwen3.5:4b")[0])
+        self.assertIsNone(annotate._resolve_quality("max", "gpt-oss:20b")[0])
+
+    def test_an_explicit_annotate_think_still_wins_over_the_translation(self):
+        # Naming a think is user intent the translation must not second-guess.
+        with mock.patch.object(annotate, "ANNOTATE_THINK", "low"):
+            self.assertEqual(annotate._resolve_quality("fast", "qwen3.5:4b")[0], "low")
 
     def test_apple_char_budget_is_one_chunk_s_worth_of_text(self):
         # 8k did not stop the 4,096-token FM window overflowing (7+ overflows,

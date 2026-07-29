@@ -52,10 +52,28 @@ Keep it that way if you contribute back.
 - **[Ollama](https://ollama.com)** with the models pulled — `make
   install-ollama` does both (Homebrew install, then pulls every model
   `config.py` names, so it follows your `.env`). By default that is
-  `nomic-embed-text` for embeddings and `gemma4:26b-a4b-it-qat` for
-  chat/annotation. The chat model is a 26B MoE; expect roughly 20 GB of free
-  RAM and seconds-to-minutes per answer. Point `CHAT_MODEL` at something
-  smaller if that's too heavy — see [`.env.example`](.env.example).
+  `nomic-embed-text` for embeddings and `qwen3.5:4b` for chat/annotation:
+  roughly 4 GB resident, and the model every timing default in this repo was
+  measured on, so the runtimes quoted below are the ones you'll actually get.
+  Point `CHAT_MODEL` at something bigger if you want more precise routing
+  across the ~32 retrieval tools — a 26B MoE like `gemma4:26b-a4b-it-qat`
+  wants roughly 20 GB of free RAM and answers in seconds-to-minutes. See
+  [`.env.example`](.env.example) for that and every other knob.
+- **A word on chat latency.** The default chat model is thinking-capable and
+  `CHAT_THINK` is unset, which omits the flag entirely and leaves the model's
+  own default — so thinking is **on** for `chat.py`. That's deliberate:
+  picking the right tool out of ~32 and chaining a couple of them is exactly
+  the work a 4B model benefits from reasoning through, so the accuracy is
+  usually worth the wait. If you'd rather have the speed, one line in `.env`
+  buys it: `CHAT_THINK=false` (measured 3.2s vs 85s per call on `qwen3:4b`).
+  It is a real quality tradeoff, which is why it's your call and not the
+  default. The batch pipelines are less exposed: term curation already ships
+  `think=false`, and the annotation `--quality` presets now resolve to `false`
+  on a model without reasoning-effort levels (see the `annotate.py` section
+  below). `TOPIC_THINK` / `NUDGES_THINK` / `CONFLICT_THINK` inherit
+  `CHAT_THINK`, so setting it once quiets those too — and `.env.example`
+  recommends `false` for each of them regardless, since their output is one
+  short label.
 
 ## Quickstart
 
@@ -117,7 +135,7 @@ already ingested.
 
 On Apple Silicon with **macOS 26+ and Apple Intelligence enabled**, you can run
 the whole thing on Apple's built-in on-device model instead of Ollama — no
-~15 GB of model downloads, no background service. Build the shim once (it
+model downloads at all, no background service. Build the shim once (it
 compiles a small Swift helper with the Command Line Tools; no Xcode):
 
 ```sh
@@ -141,11 +159,13 @@ and set only `CHAT_MODEL=apple`, say). Two things worth knowing:
 - **Switching `EMBED_MODEL` changes the embedding space**, so it needs a
   `make reset-db` + re-ingest (Apple embeddings are 512-dimensional). The DB
   guards this and refuses to silently mix spaces.
-- **The on-device window is small (4,096 tokens)**, so the chat path retrieves
-  in small staged steps under the hood, and a ~3B on-device model routes less
-  precisely across the ~30 retrieval tools than the 26B default — a great
-  zero-setup, fully-private option, at some cost in multi-hop accuracy.
-  Everything still stays on your machine, exactly as with Ollama.
+- **The on-device window is small (4,096 tokens)**, so the chat path can't do
+  native tool-calling at all — it retrieves in small staged steps under the
+  hood. That staging, not model size, is where the accuracy goes: the
+  on-device model is ~3B against a ~4B Ollama default, so this is no longer a
+  small-model-versus-big-model tradeoff, it's a small-*window* one, and
+  multi-hop questions are what suffer. A great zero-setup, fully-private
+  option; everything still stays on your machine, exactly as with Ollama.
 
 ## Analytics
 
@@ -231,6 +251,19 @@ back in the right order (and stays sequential even under `make -j`).
     rows in scope — so an overnight `--quality fast --upgrade-distilled` is
     how events get filled in exhaustively for the chats that matter, where
     `hybrid` fills in as many as its budget covers.
+  - **How much a tier thinks now depends on your model, and this changed.**
+    The presets were written for a model that reads `low`/`medium`/`high` as a
+    reasoning-*effort* level (`gpt-oss`), where `low` is what makes `balanced`
+    cheaper than `max`. Every other model only toggles thinking on or off, and
+    to those the same `low` is merely truthy — it buys a *full* pass, which
+    made the fast tier the slow one. So `annotate.py` now translates: on a
+    model without effort levels (the default `qwen3.5:4b`, `gemma4`, …)
+    `distilled` / `fast` / `balanced` send `think=false`, while on `gpt-oss`
+    they still send `low`. **If you were running those tiers on `gemma4` they
+    used to do a full reasoning pass and now do none** — substantially faster,
+    at whatever that pass was worth. `max` is unaffected (it omits the flag
+    either way), and setting `ANNOTATE_THINK` yourself still overrides
+    everything.
 - `--terms` instead curates `dyad_terms` verdicts, which is what gives
   `get_word_trends` its inside-joke section. It's a mode switch, so a bare run
   never touches terms — this is the second run you need. It is *not* a

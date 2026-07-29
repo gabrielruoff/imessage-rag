@@ -1726,3 +1726,99 @@ history and the docs had not said so. Left as-is rather than interleaved:
 every "spread" rule needs a constant with no measured basis, and ascending
 order is what makes a rerun's progress obvious. README and CLAUDE.md now state
 it.
+
+## 2026-07-28: default `CHAT_MODEL` → `qwen3.5:4b`, and effort levels get translated
+
+Two changes that only make sense together: the default chat model dropped from
+a 26B MoE to a 4B, and `annotate.py` learned that a preset's reasoning-*effort*
+level is not portable to the model it now defaults to.
+
+### The default model: `gemma4:26b-a4b-it-qat` → `qwen3.5:4b`
+
+Every timing default this repo ships was measured on `qwen3.5:4b` — the hybrid
+tier's wall-clock budget and its per-request rates, the batch-8 preset, the
+"~106s for 8 event-candidate chunks" figure the budget gate reasons from. The
+default model was a different one, so the numbers in the comments described a
+machine nobody was running. Naming the measured model as the default closes
+that gap: the runtimes in `config.py`, `README.md` and `.env.example` now
+describe the model you actually get.
+
+The second reason is reach. ~4 GB resident against ~20 GB is the difference
+between "the defaults work on this laptop" and "the defaults are aspirational."
+A bigger `CHAT_MODEL` still routes more precisely across the ~32 retrieval
+tools and remains a one-line `.env` override — the change is which end of that
+tradeoff is the *default*, not which end is available.
+
+**`EMBED_MODEL` deliberately did NOT change.** It stays `nomic-embed-text`.
+Unlike the generation models it is not a preference: `chunk_vectors` is
+dimensioned for it and `ingest_state` guards it, because query-side and
+document-side vectors have to come from one model or retrieval silently
+degrades. Switching it is `reset_db.py` + a full re-ingest, never a restart —
+so a chat-model default change must not drag it along. `ANNOTATE_MODEL` /
+`TOPIC_MODEL` / `WRAPPED_MODEL` are `os.getenv(...) or CHAT_MODEL` and inherit
+the new default automatically, which is the whole point of that rule.
+
+**`CHAT_THINK` also did not change, and that is a tradeoff, not an oversight.**
+It still defaults to `None` — omit the flag, take the model's own default —
+which on a thinking-capable model means thinking is ON for every `chat.py` tool
+round-trip (85s vs 3.2s per call on `qwen3:4b`). Turning it off would be the
+single largest speed win available, and it is deliberately not taken: a 4B
+model choosing among ~32 tools and chaining two or three of them is the case
+where a reasoning pass plausibly earns its cost, and unlike a one-word label
+there is no measurement saying the output is identical either way. So it is
+documented, with the numbers and the one-line `CHAT_THINK=false` remedy, in
+`README.md` and both copies of `.env.example`, and left to the user.
+
+### `config.has_effort_levels` + `annotate._resolve_quality(quality, model)`
+
+The `--quality` presets were written against `gpt-oss:20b` (see the 2026-07-17
+entry): `think="low"` there asks for a *cheap* reasoning pass, and that is the
+entire reason `balanced` beats `max` on wall clock. To a model that merely
+toggles thinking, the same string is only truthy — it does not ask for less
+reasoning, it buys a **full** pass. This repo has measured that twice, and both
+times it was expensive: 282.6s vs 26.2s per dyad term on gemma4 for an
+identical verdict (the term-curation entry above), and a timed-out request on
+qwen3.5:4b at batch 8. With gemma4 as the default this was a latent trap; with
+a 4B toggle model as the default it would have made **`--quality fast` the
+slowest tier in the ladder** — the exact inversion of what the tier names
+promise.
+
+So `config.has_effort_levels(name)` answers "does this model read
+low/medium/high as an effort level", and `_resolve_quality` now takes the model
+and translates the preset through it. Resolved `(think, batch_size)`:
+
+| preset | on `qwen3.5:4b` (new default) | on `gpt-oss:20b` |
+|---|---|---|
+| `max` | `(None, 1)` | `(None, 1)` |
+| `balanced` | `(False, 1)` | `('low', 1)` |
+| `fast` | `(False, 8)` | `('low', 8)` |
+| `distilled` | `(False, 1)` | `('low', 1)` |
+| `hybrid` | `(False, 8)` | `(False, 8)` |
+
+Only the *preset* is translated, and only when its value is an effort STRING.
+`None` (omit the flag) and an explicit `True`/`False` pass through untouched,
+so the tri-state survives to the request body — which matters, because `None`
+and `False` are not the same request and `max` depends on the difference. An
+explicit `ANNOTATE_THINK` still wins over everything: a user who names a think
+has said something the translation has no business second-guessing.
+
+**This is a real behavior change for existing gemma4 users, not only for the
+new default.** On gemma4 — and on any other toggle model — `--quality
+distilled`, `fast` and `balanced` previously sent `think="low"` and therefore
+ran a full reasoning pass on every request. They now send `think=false` and run
+none. Those tiers get substantially faster, and they lose whatever that pass
+was buying; `max` is unaffected. Anyone who wants the old behavior back sets
+`ANNOTATE_THINK=true` (or `low`) explicitly.
+
+### Why the list names the effort-level family, not the toggle ones
+
+`_EFFORT_LEVEL_MODELS = ("gpt-oss",)` is a substring match over model families
+that understand effort levels. The inverse list was the obvious alternative and
+is the wrong shape: the effort-level set is small, named, and changes rarely,
+while "every model that merely toggles thinking" is unbounded and grows with
+every release — it would be stale the week after it was written, and staleness
+there fails *closed on the wrong side*. Under the list as written, an unknown
+model is assumed to toggle, so an effort string resolves to `False`: the
+failure mode is a cheaper answer from a model that could have reasoned. Under
+the inverse, an unknown model would be assumed to have effort levels, and the
+failure mode is the 282.6s-per-item hang this change exists to prevent.

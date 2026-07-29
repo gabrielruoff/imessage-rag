@@ -104,7 +104,9 @@ them into the sqlite-vec `chunk_vectors` table (resumable; each vector carries
 inside the KNN scan, cosine distance). Messages are embedded as chunks, not
 individually (most carry no retrievable meaning alone; ~5–10x fewer vectors).
 
-Models (local, via Ollama): chat `gemma4:26b-a4b-it-qat`, embeddings
+Models (local, via Ollama): chat `qwen3.5:4b` (~4 GB resident, and the model
+every timing default in the repo was measured on — a bigger `CHAT_MODEL` routes
+more precisely across the ~32 tools, at ~20 GB for a 26B MoE), embeddings
 `nomic-embed-text` (Ollama refuses `/api/embed` for generation models, so chat
 can't double as embedder; nomic task prefixes on by default, dim auto-detected).
 Optional Apple Foundation Models backend (`apple` sentinel, `config.is_apple_model`):
@@ -294,7 +296,9 @@ chunk_vectors                     -- sqlite-vec vec0 table: chunk_id ->
   confabulates. Per-row tools cap their row count; `chat.run_turn` caps every
   tool result at `TOOL_RESULT_MAX_CHARS`.
 - gemma4's Ollama renderer honors only the FIRST system message; fold
-  mid-conversation steering into it. Withholding the tool schemas is the only
+  mid-conversation steering into it. (gemma4 is no longer the default
+  `CHAT_MODEL` — this is a gemma4 fact, still load-bearing whenever someone
+  points `CHAT_MODEL` at it.) Withholding the tool schemas is the only
   reliable way to stop a tool call — prompting alone doesn't.
 - `chunk_annotations` is guarded like `chunk_vectors`: `annotate.py` records
   `annotate_model` and refuses a different model while the table is non-empty
@@ -368,8 +372,20 @@ chunk_vectors                     -- sqlite-vec vec0 table: chunk_id ->
   with `think=false` vs 85s on). An effort level is not portable: `think='low'` is
   an effort level only to models that have them (gpt-oss); to gemma4 it is just
   truthy, buying a full reasoning pass (282.6s vs 26.2s per dyad term, same
-  verdict). Never route one pipeline's `think` into another — `--terms` owns
-  `ANNOTATE_TERMS_THINK` and rejects `--quality`.
+  verdict). `config.has_effort_levels` (family list `_EFFORT_LEVEL_MODELS`,
+  currently just `gpt-oss`; the effort family is listed because it is small and
+  named, while "every model that only toggles" is unbounded) is the single home
+  for that, and `annotate._resolve_quality(quality, model)` applies it:
+  a preset's effort STRING resolves to `False` on a non-effort model, so
+  `distilled`/`fast`/`balanced` send `think=False` on qwen3.5:4b/gemma4 and
+  `'low'` on gpt-oss — without it `--quality fast` would be the SLOWEST tier on
+  the default model. `None` and explicit `True`/`False` pass through untouched
+  (the tri-state survives) and an explicit `ANNOTATE_THINK` always wins.
+  `CHAT_THINK` deliberately still defaults to `None`, so on the thinking-capable
+  default chat model thinking is ON for `chat.py` — a speed/quality call for the
+  user (routing across ~32 tools may genuinely want it), remedied with
+  `CHAT_THINK=false`. Never route one pipeline's `think` into another —
+  `--terms` owns `ANNOTATE_TERMS_THINK` and rejects `--quality`.
 - `TOPIC_LABEL_SAMPLES` defaults to 30: label samples are ranked by similarity to
   the cluster centroid, and a big cluster's most central chunks are its shortest
   ("ok", "yeah"); raising it past ~30 risks the context window (an oversized

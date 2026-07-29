@@ -2,8 +2,9 @@
 
 This is an operator runbook for demoing every feature in the **Close Read** analytical
 suite (Waves 0–4) against your **real, already-ingested** iMessage history. Everything
-here is deterministic local compute narrated by a local gemma model — the corpus is
-queried by tool calls, never stuffed into a prompt, and nothing leaves the machine.
+here is deterministic local compute narrated by a local model (`CHAT_MODEL`, by default
+`qwen3.5:4b` on Ollama) — the corpus is queried by tool calls, never stuffed into a
+prompt, and nothing leaves the machine.
 
 Every step below is a copy-pasteable command or an exact chat prompt, with a one-line
 "what you'll see." Where a `make` target exists it's shown first; the underlying
@@ -70,7 +71,8 @@ then annotate and build the pipeline.** The full install steps are here for comp
 
 ```bash
 make install            # create .venv + pinned deps (needs Homebrew Python for sqlite-vec)
-make install-ollama     # brew-install Ollama + pull every model config.py names (~15GB); one-time
+make install-ollama     # brew-install Ollama + pull every model config.py names (a few GB at
+                        #   the defaults, more if you repoint CHAT_MODEL); one-time
 make ollama-start       # ensure the model server is up (brew services)
 make doctor             # venv, deps, Full Disk Access, Ollama + models, source chat.db, analysis DB
 ```
@@ -116,6 +118,15 @@ want a demo-able run instead of an overnight one. Leave the budget at its 25-min
 default for a demo: one LLM request is the smallest thing the tier can buy (~106s for 8
 event-candidate chunks on the reference machine), so a 1- or 2-minute budget correctly
 declines to start anything and just prints why.
+
+**Changed 2026-07-28, and it affects how long these runs take:** the `distilled` / `fast`
+/ `balanced` presets carry a reasoning-*effort* level (`low`), which only `gpt-oss`-family
+models understand as "think less" — to every other model it is merely truthy and buys a
+*full* reasoning pass. `annotate.py` now translates it (`config.has_effort_levels`), so on
+the default `qwen3.5:4b` — and on `gemma4`, where those tiers previously did do a full
+pass — the three tiers send `think=false`. Substantially faster, one fewer reasoning pass.
+`max` is unchanged (it omits the flag on every model), and an explicit `ANNOTATE_THINK`
+still overrides the translation.
 
 ### 0c. The gate cheat-sheet — flip these in `.env` *before* building/demoing
 
