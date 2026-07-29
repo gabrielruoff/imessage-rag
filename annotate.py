@@ -290,9 +290,11 @@ def _pooled(items, request_fn, workers):
 
 class _GroupRate:
     """Thread-safe running mean of per-group wall-clock. Deliberately OUTSIDE
-    _DispatchDeadline so the successive phases of one run share what the
-    earlier ones measured -- only the first LLM phase of a run has to dispatch
-    blind.
+    _DispatchDeadline so the estimator outlives the gate that uses it:
+    _load_group_rate primes one PER PHASE with what an earlier run banked and
+    _save_group_rate writes back what this run measured, so only a phase with
+    nothing banked has to start from the cold constant. Phases do not share an
+    estimator -- their per-group costs differ; see _load_group_rate.
 
     `prior` is what to estimate with BEFORE anything has completed: a value
     _load_group_rate read back from an earlier run (or the cold constant). A
@@ -401,7 +403,14 @@ def _mean_group_rows(groups):
     """Mean rows per group of a packing that has already been built -- the
     denominator _GroupRate.denominate wants, since _annotation_groups' char
     budget can close a group well before batch_size. 0.0 for an empty packing,
-    which denominate() treats as "nothing to say"."""
+    which denominate() treats as "nothing to say".
+
+    The MEAN is deliberately the less conservative choice: a packing's
+    remainder group dilutes it below the typical dispatched group, where
+    _COLD_GROUP_SECONDS_PER_CHUNK was calibrated against WORST groups.
+    Affordable because the rescaled prior still measured ~2.3x over the banked
+    worst group; if a budgeted first run ever overruns its wall clock, making
+    this max(len(group)) is the first knob to reach for."""
     if not groups:
         return 0.0
     return sum(len(group) for group in groups) / len(groups)
@@ -493,8 +502,10 @@ class _DispatchDeadline:
     seconds-per-group an earlier run measured for the same model/batch/workers
     (falling back to _COLD_GROUP_SECONDS_PER_CHUNK, which the dispatch loop then
     denominates in its packing's real rows-per-group), so reserve() is honest at
-    group #1 and the wave is never committed blind. `rate` is still shared
-    within phase 3 so 3b starts from what 3a measured.
+    group #1 and the wave is never committed blind. Each phase brings its OWN
+    `rate` under its own key -- 3a's event groups and 3b's confidence groups
+    are different populations, and one shared estimator would let whichever
+    phase ran first anchor the other wrong (see _load_group_rate).
 
     `monotonic` is injected because the deadline and the gate must read the
     SAME clock -- the tier tests patch their module's `time` with a fake one
