@@ -765,10 +765,16 @@ class TestSeedIndexCap(HybridFixture):
     vote."""
 
     def build(self, cap):
-        """(labels, indexed ids, what it printed) for one build at `cap`."""
+        """(labels, indexed ids, what it printed) for one build at `cap`.
+
+        _last_index_report is reset per build and restored after: it is process
+        state whose only job is to suppress the SECOND identical report inside
+        one run, and every test here but one is asserting what a FIRST build
+        says. The one that cares about the suppression drives it directly."""
         with mock.patch.object(annotate_distill, "ANNOTATE_KNN_INDEX_CAP", cap):
-            with mock.patch("builtins.print") as printed:
-                labels = annotate_distill._build_seed_index(self.con)
+            with mock.patch.object(annotate_distill, "_last_index_report", None):
+                with mock.patch("builtins.print") as printed:
+                    labels = annotate_distill._build_seed_index(self.con)
         indexed = {row[0] for row in
                    self.con.execute("SELECT chunk_id FROM temp.seed_vectors")}
         said = " ".join(str(a) for call in printed.call_args_list for a in call.args)
@@ -787,6 +793,19 @@ class TestSeedIndexCap(HybridFixture):
         second_labels, second_indexed, _ = self.build(200)
         self.assertEqual(first_indexed, second_indexed)
         self.assertEqual(first_labels, second_labels)
+
+    def test_the_second_pass_of_a_run_does_not_repeat_the_index_line(self):
+        # _classify_chunks and backfill_confidence each rebuild the index inside
+        # one hybrid run, so the unguarded print put the same sentence on screen
+        # twice, wedged between two different progress bars. It is news once.
+        with mock.patch.object(annotate_distill, "ANNOTATE_KNN_INDEX_CAP", 200):
+            with mock.patch.object(annotate_distill, "_last_index_report", None):
+                with mock.patch("builtins.print") as printed:
+                    annotate_distill._build_seed_index(self.con)
+                    annotate_distill._build_seed_index(self.con)
+        said = [str(a) for call in printed.call_args_list for a in call.args]
+        self.assertEqual([line for line in said if "kNN index" in line],
+                         [f"using 200 of {_SEEDS:,} seeds for the kNN index"])
 
     def test_a_cap_of_zero_reproduces_the_uncapped_index(self):
         labels, indexed, said = self.build(0)
@@ -1389,6 +1408,72 @@ class TestGroupRateMemory(DBFixture):
         primed = annotate._load_group_rate(self.con, "upgrade", _MODEL, 8, 4)
         self.assertEqual(primed.estimate(),
                          annotate._COLD_GROUP_SECONDS_PER_CHUNK * 8 * 4)
+
+
+class TestColdPriorDenomination(HybridFixture):
+    """The cold prior is arithmetic -- seconds/chunk x rows/group x workers --
+    and _load_group_rate has only batch_size for the middle term, which is a
+    CEILING: _annotation_groups packs by char budget too. Charging it for 8 rows
+    a group does not hold measured a ~3.6x over-estimate on the event phase, and
+    because reserve() plans off the prior until a phase's first group completes,
+    that is time the phase never gets back inside the run."""
+
+    COLD = annotate._COLD_GROUP_SECONDS_PER_CHUNK
+
+    def test_the_mean_row_count_of_a_packing(self):
+        self.assertEqual(annotate._mean_group_rows([]), 0.0)
+        self.assertEqual(annotate._mean_group_rows([[1, 2, 3], [4]]), 2.0)
+
+    def test_a_cold_prior_is_rescaled_to_the_group_that_is_really_sent(self):
+        rate = annotate._load_group_rate(self.con, "event", _MODEL, 8, 4)
+        self.assertEqual(rate.estimate(), self.COLD * 8 * 4)
+        rate.denominate(5.0)
+        self.assertEqual(rate.estimate(), self.COLD * 5.0 * 4)
+
+    def test_a_banked_measurement_is_never_rescaled(self):
+        # Only the arithmetic is re-done. A number an earlier run actually
+        # measured is the ground truth the prior exists to stand in for.
+        measured = annotate._GroupRate()
+        measured.record(40.0)
+        annotate._save_group_rate(self.con, measured, "event", _MODEL, 8, 4)
+        primed = annotate._load_group_rate(self.con, "event", _MODEL, 8, 4)
+        primed.denominate(1.0)
+        self.assertEqual(primed.estimate(), 40.0)
+
+    def test_an_empty_packing_and_a_rate_with_no_prior_say_nothing(self):
+        rate = annotate._load_group_rate(self.con, "event", _MODEL, 8, 4)
+        rate.denominate(0.0)
+        self.assertEqual(rate.estimate(), self.COLD * 8 * 4)
+        blind = annotate._GroupRate()
+        blind.denominate(4.0)
+        self.assertIsNone(blind.estimate())
+
+    def test_a_live_measurement_still_beats_a_denominated_prior(self):
+        rate = annotate._load_group_rate(self.con, "event", _MODEL, 8, 4)
+        rate.denominate(2.0)
+        rate.record(9.0)
+        self.assertEqual(rate.estimate(), 9.0)
+
+    def test_a_phase_denominates_from_the_packing_it_built(self):
+        # End to end, and BEFORE the first dispatch decision: these rows are
+        # long enough that the 10k-char budget closes a group at 2 of them,
+        # nothing like the batch size of 8 the prior was charged for.
+        rows = [(chunk_id, "x" * 4000) for chunk_id in range(1, 9)]
+        rate = annotate._load_group_rate(self.con, "event", _MODEL, 8, 4)
+        self.assertEqual(rate.estimate(), self.COLD * 8 * 4)
+        stats = {"done": 0, "skipped": 0, "stopped": False}
+        clock = FakeClock()
+        with self.fake_clock(clock):
+            with mock.patch("builtins.print"):
+                # A deadline already past, so the gate declines everything and
+                # no request goes out -- the denomination is the only thing
+                # under test, and it has to have happened by then.
+                annotate_hybrid._run_upgrades(
+                    self.con, rows, _MODEL, False, 4, 8, clock.now - 1.0,
+                    "Upgrading", set(), stats, rate, phase="event")
+        self.assertEqual(rate.estimate(), self.COLD * 2.0 * 4)
+        self.assertTrue(stats["stopped"])
+        self.assertEqual(stats["done"], 0)
 
 
 class TestSeedBatching(HybridFixture):

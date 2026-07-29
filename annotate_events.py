@@ -13,14 +13,20 @@ substring). A miss here costs recall, never correctness: the LLM still decides
 what is an event, and the chunks this skips are already kNN-labeled for
 valence/emotions/depth.
 
-Measured on the 350k-message / 25k-chunk corpus (2026-07-27): one SQL pass,
-0.71 s scoped to the top 20 dyads and 0.76 s corpus-wide, selecting 20.5% /
-19.0% of in-scope chunks at 83.3% precision against that corpus's existing LLM
-event labels (1.72x their 48.4% base rate -- see function_words for the full
-scoring). Matching the same rows in Python instead measured 0.6 s but
-materializes every message body, so SQL wins on memory at equal speed; 38
-separate per-pattern scans measured 4.9 s, which is why every pattern goes
-into one OR'd predicate.
+Measured on the 350k-message / 25k-chunk corpus (2026-07-27): one SQL pass
+selecting 20.5% (top 20 dyads) / 19.0% (corpus-wide) of in-scope chunks at
+83.3% precision against that corpus's existing LLM event labels (1.72x their
+48.4% base rate -- see function_words for the full scoring). Those selectivity
+and precision figures still hold exactly: the 2026-07-28 ranking change swapped
+`SELECT DISTINCT` for `GROUP BY`, which reorders the same row set rather than
+changing it.
+
+The timings from that run are NOT restated here, because they were measured
+against the DISTINCT shape and the GROUP BY adds a sort nobody has re-timed.
+What the comparison established is unaffected and is why the query looks the
+way it does: matching the same rows in Python materializes every message body
+for no speed gain, and running the patterns as separate per-pattern scans cost
+several times one OR'd predicate.
 """
 
 from function_words import EVENT_CANDIDATE_PATTERNS

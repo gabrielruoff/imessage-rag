@@ -449,6 +449,12 @@ class TestAnnotationSchema(unittest.TestCase):
     def test_the_bounds_are_the_ones_the_validator_clamps_to(self):
         obj = self.schema["properties"]["7"]
         self.assertEqual(obj["properties"]["emotions"]["maxItems"], 3)
+        # events is the one array whose items are objects with a free-form
+        # string in them, i.e. the only field a grammar can run away on -- and
+        # a runaway costs ANNOTATE_TIMEOUT, which drops the group to singles.
+        # Its ceiling has no measured basis and nothing downstream reads it;
+        # what matters is that there IS one.
+        self.assertIn("maxItems", obj["properties"]["events"])
         depth = obj["properties"]["depth"]
         self.assertEqual((depth["type"], depth["minimum"], depth["maximum"]),
                          ("integer", 1, 5))
@@ -486,6 +492,7 @@ class _LadderLLM:
         self.schema = schema
         self.log = []                           # (rung, ids) in call order
         self.formats = []                       # every `format` chat_once saw
+        self.thinks = []                        # every `think` chat_once saw
 
     def chat_once_json(self, messages, model=None, think=None, timeout=None,
                        **kwargs):
@@ -502,6 +509,7 @@ class _LadderLLM:
         ids = _chunk_ids_in(messages[-1]["content"])
         self.log.append(("schema", ids))
         self.formats.append(format)
+        self.thinks.append(think)
         if isinstance(self.schema, BaseException):
             raise self.schema
         if self.schema is _COVER_ASKED:
@@ -576,6 +584,31 @@ class TestAnnotateGroupLadder(unittest.TestCase):
                                    ("single", [2]), ("single", [3])])
         self.assertEqual(llm.formats, [])
         self.assertCovered(out)
+
+    def test_the_schema_retry_honours_the_think_degradation(self):
+        # chat_once_json owns the process-wide degradation (a model that
+        # rejects `think`, or that answers think=false with EMPTY content --
+        # gpt-oss's signature), and the retry is the one annotation request
+        # that goes to chat_once directly. Re-sending the rejected value would
+        # fail EVERY schema retry for the rest of the run, silently, so the
+        # rung that exists to remove a request per miss would add one instead.
+        llm = _LadderLLM(covered=(1,))
+        with mock.patch.object(ollama, "_think_unsupported", True):
+            out = self.run_group(llm)
+        self.assertEqual(llm.thinks, [None])            # flag omitted...
+        # ...and it is still a schema request, not a degraded free-JSON one.
+        self.assertEqual(llm.formats, [annotate._annotation_schema([2, 3])])
+        self.assertEqual(llm.log, [("batch", [1, 2, 3]), ("schema", [2, 3])])
+        self.assertCovered(out)
+
+    def test_an_undegraded_run_forwards_think_verbatim(self):
+        # The tri-state is not collapsed on the way through: False means "send
+        # think: false", which is NOT the same request as omitting the flag,
+        # and hybrid's preset is exactly False.
+        llm = _LadderLLM(covered=(1,))
+        with mock.patch.object(ollama, "_think_unsupported", False):
+            self.run_group(llm)
+        self.assertEqual(llm.thinks, [False])
 
     def test_a_singleton_group_never_reaches_the_schema_rung(self):
         # It has had no batched request at all, so its "miss" is just its first

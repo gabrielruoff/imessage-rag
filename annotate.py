@@ -290,21 +290,47 @@ def _pooled(items, request_fn, workers):
 
 class _GroupRate:
     """Thread-safe running mean of per-group wall-clock. Deliberately OUTSIDE
-    _DispatchDeadline so the successive phases of one run share what the
-    earlier ones measured -- only the first LLM phase of a run has to dispatch
-    blind.
+    _DispatchDeadline so the estimator outlives the gate that uses it:
+    _load_group_rate primes one PER PHASE with what an earlier run banked and
+    _save_group_rate writes back what this run measured, so only a phase with
+    nothing banked has to start from the cold constant. Phases do not share an
+    estimator -- their per-group costs differ; see _load_group_rate.
 
     `prior` is what to estimate with BEFORE anything has completed: a value
     _load_group_rate read back from an earlier run (or the cold constant). A
     measured mean always wins over it; `mean()` stays measurement-only, so a
     caller can still tell the two apart."""
 
-    def __init__(self, prior=None):
+    def __init__(self, prior=None, cold_per_chunk=None, workers=1):
         self._lock = threading.Lock()
         self._n = 0
         self._total = 0.0
         self._worst = 0.0
         self.prior = prior
+        # Set ONLY when `prior` is the cold constant's arithmetic rather than a
+        # banked measurement, so denominate() can redo that arithmetic against
+        # the packing the caller actually built and can never touch a number an
+        # earlier run really measured.
+        self._cold_per_chunk = cold_per_chunk
+        self._workers = max(1, workers)
+
+    def denominate(self, rows_per_group):
+        """Re-scale a COLD prior to the rows a group actually holds. A no-op on
+        a prior an earlier run banked and on a rate with no prior at all -- and
+        moot once anything has completed, since estimate() takes the measured
+        mean over the prior regardless.
+
+        _load_group_rate has only `batch_size` when it builds the prior, and
+        batch_size is a MAXIMUM: _annotation_groups packs by char budget too, so
+        the real group is ~5 rows on the ~1,900-char event candidates and 1-2 on
+        Apple FM. The dispatch loops know the true number for free -- they built
+        the groups -- and this is where they hand it back. See
+        _COLD_GROUP_SECONDS_PER_CHUNK for what the mis-denomination cost."""
+        if not self._cold_per_chunk or not rows_per_group:
+            return
+        with self._lock:
+            self.prior = (self._cold_per_chunk * max(1.0, rows_per_group)
+                          * self._workers)
 
     def record(self, seconds):
         with self._lock:                    # worker threads; a paired update
@@ -338,39 +364,56 @@ class _GroupRate:
 # Seconds of group LATENCY per chunk to assume when nothing has been measured
 # and nothing was stored -- i.e. the first budgeted run against a given DB.
 # reserve() divides latency by `workers`, so the group estimate is
-# rate x batch_size x workers. Measured 2026-07-28 on the 25,029-chunk corpus
-# (qwen3.5:4b, batch 8, ANNOTATE_WORKERS=4), slowest group per phase: 160.3 s
-# seeding, 152.9-198.1 s on the event upgrades, 77.7-107.3 s on the confidence
-# upgrades. 5.3 x 8 x 4 = 169.6 s covers the slowest two.
+# rate x rows-per-group x workers. Measured 2026-07-28 on the 25,029-chunk
+# corpus (qwen3.5:4b, batch 8, ANNOTATE_WORKERS=4), slowest group per phase:
+# 160.3 s seeding, 152.9-198.1 s on the event upgrades, 77.7-107.3 s on the
+# confidence upgrades. 5.3 x 8 x 4 = 169.6 s covers the slowest two.
 #
 # Sized to the worst phase on purpose. It is a prior, not a prediction: it
 # governs only until the first group of a phase completes, _save_group_rate
 # replaces it per phase with this machine's own number after one run, and an
 # over-estimate makes a run buy LESS rather than overrun -- the safe direction
-# for something whose whole contract is a wall clock. Apple FM is the known
-# over-estimate: _annotation_groups packs its groups by char budget (1-2
-# chunks), not batch_size, so the prior is high there until the first run
-# stores a measurement.
+# for something whose whole contract is a wall clock.
 #
-# Ollama is now an over-estimate too, and NOT a mild one -- an earlier draft of
-# this comment guessed "mild" and the post-implementation run refuted it. The
-# two changes that landed with _OLLAMA_ANNOTATE_CHAR_BUDGET (groups closing at
-# 4-5 rows on long chunks) and the schema retry (no more 8-singles blowups)
-# together cut the real cost well below what 5.3 x 8 x 4 predicts: measured
-# 2026-07-28 on a cold DB, the banked event-phase worst group came out at
-# 46.7 s against this prior's 169.6 s, a ~3.6x over-estimate. Because
-# _DispatchDeadline.reserve() is computed from the prior until the first group
-# of a phase completes, that cost phase 3a roughly three-quarters of its
-# allotted slice on the first run of a fresh DB (it stopped dispatching with
-# 3.4 of 4.6 minutes unused, which phase 3b then spent instead).
+# ROWS-PER-GROUP, not batch_size, is the denominator -- and getting that wrong
+# was expensive. _load_group_rate has only the batch size to work with, but
+# batch_size is a MAXIMUM: _annotation_groups packs by char budget too, closing
+# an Ollama group at ~5 rows on the ~1,900-char event candidates and an Apple FM
+# group at 1-2. Charging the prior for 8 rows a group does not hold measured a
+# ~3.6x over-estimate on the event phase after _OLLAMA_ANNOTATE_CHAR_BUDGET and
+# the schema retry landed (the banked worst group came out at 46.7 s against
+# this prior's 169.6 s), and because reserve() plans off the prior until a
+# phase's FIRST group completes, phase 3a stopped dispatching with 3.4 of its
+# 4.6 minutes unused on a cold DB -- which phase 3b then spent instead. So the
+# dispatch loops call _GroupRate.denominate with the mean rows-per-group of the
+# packing they just built: free (they hold the groups already), no new constant,
+# and it fixes the same over-estimate on both backends at once.
 #
-# Left at 5.3 deliberately, for now. Lowering it trades a self-healing
-# first-run under-buy -- one run banks this machine's real number per phase and
-# every later run plans off that -- for a risk of overrunning the wall clock,
-# which is the one promise the tier makes. Retuning it wants its own
-# measurement across phases and backends, not a division done here; see the
-# round-2 entry in docs/DECISIONS.md.
+# The margin stays one-sided, which is the point: at ~5 rows the prior is
+# ~106 s against that measured 46.7 s worst group, still ~2.3x conservative,
+# and it governs only until the first group completes. 5.3 itself is
+# deliberately unchanged -- lowering the constant trades a self-healing
+# first-run under-buy for a risk of overrunning the wall clock, and would want
+# its own measurement across phases and backends rather than a division done
+# here. See the round-2 entry in docs/DECISIONS.md.
 _COLD_GROUP_SECONDS_PER_CHUNK = 5.3
+
+
+def _mean_group_rows(groups):
+    """Mean rows per group of a packing that has already been built -- the
+    denominator _GroupRate.denominate wants, since _annotation_groups' char
+    budget can close a group well before batch_size. 0.0 for an empty packing,
+    which denominate() treats as "nothing to say".
+
+    The MEAN is deliberately the less conservative choice: a packing's
+    remainder group dilutes it below the typical dispatched group, where
+    _COLD_GROUP_SECONDS_PER_CHUNK was calibrated against WORST groups.
+    Affordable because the rescaled prior still measured ~2.3x over the banked
+    worst group; if a budgeted first run ever overruns its wall clock, making
+    this max(len(group)) is the first knob to reach for."""
+    if not groups:
+        return 0.0
+    return sum(len(group) for group in groups) / len(groups)
 
 
 def _group_rate_key(phase, model, batch_size, workers):
@@ -391,11 +434,12 @@ def _load_group_rate(con, phase, model, batch_size, workers):
     The key carries batch and workers because the reserve is denominated in
     group LATENCY, and both change it (4 concurrent requests against a
     serializing Ollama each measure ~4x a lone one). It carries `phase` because
-    a run's phases have measurably different per-group costs -- measured
-    2026-07-28, a group of 8 averaged 106.4 s on the event candidates against
-    70.6 s on the confidence upgrades, whose chunks are a fifth the length --
-    so one shared estimator would let whichever phase ran first anchor the
-    others wrong in both directions.
+    a run's phases have measurably different per-group costs -- their chunks are
+    different populations, the event candidates averaging ~1,900 chars against
+    the confidence upgrades' ~360 median, so the same batch_size buys a ~5-row
+    group in one phase and a full 8 in the other -- and one shared estimator
+    would let whichever phase ran first anchor the others wrong in both
+    directions.
 
     `batch_size` in the key is a MAXIMUM, not the size of any particular group:
     _annotation_groups also packs to _OLLAMA_ANNOTATE_CHAR_BUDGET, so a
@@ -405,15 +449,22 @@ def _load_group_rate(con, phase, model, batch_size, workers):
     all a per-group estimate needs. Rates banked under an older packing
     self-heal rather than needing a migration: _save_group_rate stores the
     worst group of each run unconditionally, so the first run under new packing
-    overwrites whatever the old one left."""
+    overwrites whatever the old one left.
+
+    The COLD fallback cannot be so relaxed about it, because it is arithmetic
+    rather than a measurement: batch_size is the only size it has here, so the
+    returned rate carries the constant along and a caller that has built its
+    groups calls _GroupRate.denominate with their real mean row count."""
     raw = get_state(con, _group_rate_key(phase, model, batch_size, workers))
     try:
         prior = float(raw) if raw else None
     except (TypeError, ValueError):
         prior = None
-    if not prior or prior <= 0:
-        prior = _COLD_GROUP_SECONDS_PER_CHUNK * max(1, batch_size) * max(1, workers)
-    return _GroupRate(prior=prior)
+    if prior and prior > 0:
+        return _GroupRate(prior=prior)
+    return _GroupRate(
+        prior=_COLD_GROUP_SECONDS_PER_CHUNK * max(1, batch_size) * max(1, workers),
+        cold_per_chunk=_COLD_GROUP_SECONDS_PER_CHUNK, workers=workers)
 
 
 def _save_group_rate(con, rate, phase, model, batch_size, workers):
@@ -449,9 +500,12 @@ class _DispatchDeadline:
     to estimate from commits to that much work whatever the clock says. That
     is what _GroupRate's `prior` is for: _load_group_rate hands the gate the
     seconds-per-group an earlier run measured for the same model/batch/workers
-    (falling back to _COLD_GROUP_SECONDS_PER_CHUNK), so reserve() is honest at
-    group #1 and the wave is never committed blind. `rate` is still shared
-    within phase 3 so 3b starts from what 3a measured.
+    (falling back to _COLD_GROUP_SECONDS_PER_CHUNK, which the dispatch loop then
+    denominates in its packing's real rows-per-group), so reserve() is honest at
+    group #1 and the wave is never committed blind. Each phase brings its OWN
+    `rate` under its own key -- 3a's event groups and 3b's confidence groups
+    are different populations, and one shared estimator would let whichever
+    phase ran first anchor the other wrong (see _load_group_rate).
 
     `monotonic` is injected because the deadline and the gate must read the
     SAME clock -- the tier tests patch their module's `time` with a fake one
@@ -658,6 +712,18 @@ def _annotation_object_schema():
             "depth": {"type": "integer", "minimum": 1, "maximum": 5},
             "events": {
                 "type": "array",
+                # No measured basis, unlike emotions' 3 (which _validate_
+                # annotation also truncates to) -- a ceiling so a grammar
+                # cannot run away. This is the one field whose shape is
+                # unbounded: an array of objects each carrying a free-form
+                # excerpt, i.e. the only thing here that can generate long
+                # enough to hit ANNOTATE_TIMEOUT, which per the ladder costs
+                # the group its retry and drops it to per-chunk singles. A
+                # conversation chunk with more than 8 distinct good-news or
+                # gratitude events is not a case worth keeping the tail open
+                # for; _validate_annotation does not cap events either way, so
+                # nothing downstream depends on this number.
+                "maxItems": 8,
                 "items": {
                     "type": "object",
                     "properties": {
@@ -757,13 +823,32 @@ def _annotate_schema_retry(rows, model, think):
     needs. Worst case becomes roughly one extra ~40-55 s request rather than up
     to batch_size sequential singles.
 
+    This is the one annotation request that reaches ollama.chat_once directly
+    -- chat_once_json hardcodes format='json' and so cannot carry a dict schema
+    -- which means it also has to resolve `think` the way that seam does, via
+    ollama.effective_think. Skipping it would be silently fatal on a model that
+    can't take the value: chat_once_json flips ollama._think_unsupported the
+    first time a request proves that (gpt-oss answers think=false with EMPTY
+    content rather than erroring), and re-sending the rejected value here would
+    fail EVERY schema retry for the rest of the process -- turning a rung that
+    exists to remove a request per miss into one that adds one. The flag is
+    always already resolved by the time this runs: the rung is reachable only
+    behind a batched request, which went through chat_once_json.
+
     Failure is total and silent by design. The caller's per-chunk fallback is
     still behind this, so a transport error, a timeout, a server that rejects
     the schema, a non-dict reply, unparseable content -- all of it has to
-    degrade to "covered nothing" rather than propagate: this runs on a worker
-    thread inside _pooled, where an escaping exception would take out the whole
-    group and the worker with it. KeyboardInterrupt still propagates (it is not
-    an Exception), which is what keeps the tier Ctrl-C safe."""
+    degrade to "covered nothing" rather than propagate. Not because a raise
+    would kill the worker: _pooled hands a worker exception to the future and it
+    surfaces on the CALLER's thread at done.result(), where it aborts the whole
+    PHASE (the group included) and _run_upgrades' finally can only commit what
+    already landed. An Ollama build that will not take a dict `format` -- or a
+    grammar that runs past ANNOTATE_TIMEOUT -- must cost this group its retry,
+    never the run. The rung above (_annotate_batch) is deliberately unguarded by
+    contrast: chat_once_json already returns None rather than raising on a
+    malformed reply, so its failures are values, not exceptions.
+    KeyboardInterrupt still propagates (it is not an Exception), which is what
+    keeps the tier Ctrl-C safe."""
     ids = [cid for cid, _text in rows]
     user = "\n\n".join(f"### chunk {cid}\n{text}" for cid, text in rows)
     try:
@@ -771,7 +856,7 @@ def _annotate_schema_retry(rows, model, think):
             [{"role": "system", "content": _ANNOTATE_SYSTEM + _BATCH_SYSTEM_SUFFIX},
              {"role": "user", "content": user}],
             model=model, format=_annotation_schema(ids),
-            timeout=ANNOTATE_TIMEOUT, think=think,
+            timeout=ANNOTATE_TIMEOUT, think=ollama.effective_think(think),
         )
         # chat_once returns the response's `message` dict (possibly {}), so the
         # parse is ollama._extract_reply's: json.loads of the assistant
@@ -812,7 +897,14 @@ def _annotate_group(group, model, think):
     # a singleton group has had no batched request at all, so its "miss" is
     # just its first request and belongs on the single-chunk path below.
     missed = [(cid, text) for cid, text in group if cid not in batched]
-    if len(group) > 1 and missed and not config.is_apple_model(model):
+    # `model or config.CHAT_MODEL` is how ollama.chat_once itself resolves the
+    # backend, and this guard has to ask the same question the dispatch will:
+    # today they cannot diverge (annotate always passes a resolved model, and
+    # ANNOTATE_MODEL falls back to CHAT_MODEL), but "apple never receives a dict
+    # format" is a boundary, and a boundary that agrees with its seam by
+    # coincidence is one bug away from not being one.
+    if (len(group) > 1 and missed
+            and not config.is_apple_model(model or config.CHAT_MODEL)):
         batched.update(_annotate_schema_retry(missed, model, think))
     out = {}
     for chunk_id, text in group:
@@ -878,8 +970,10 @@ def _annotation_groups(pending, model, batch_size):
     no row cap -- its fixed window makes a row count the wrong unit entirely --
     while every other backend caps at batch_size and treats the (much larger)
     budget purely as a ceiling on a group of long chunks. One home for the
-    branch so a tier can never batch a backend by the wrong unit by accident."""
-    if config.is_apple_model(model):
+    branch so a tier can never batch a backend by the wrong unit by accident --
+    and the backend is resolved exactly as ollama.chat_once resolves it, so the
+    packing and the dispatch can never disagree about which one this is."""
+    if config.is_apple_model(model or config.CHAT_MODEL):
         return _char_budget_groups(pending, _APPLE_ANNOTATE_CHAR_BUDGET)
     return _char_budget_groups(pending, _OLLAMA_ANNOTATE_CHAR_BUDGET,
                                max_rows=max(1, batch_size))

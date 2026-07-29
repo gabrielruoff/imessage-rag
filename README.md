@@ -243,10 +243,10 @@ topics back to back in the right order (and stays sequential even under
     deterministic kNN pass, and each starts from the per-request time an
     earlier run measured so nothing is dispatched blind. It commits as it goes
     and a rerun resumes, topping the seed pool up and buying more upgrades.
-    One LLM request is the smallest thing it can buy (~106s for 8
-    event-candidate chunks on the reference machine), so a budget under about
-    five minutes will decline to start work it can't finish and tell you to
-    raise the budget — the 25-minute default is the one to use. `--all` /
+    One LLM request is the smallest thing it can buy — a request holds 4–6
+    event-candidate chunks and banked at 46.7s on the reference machine — so a
+    budget too small for one will decline to start work it can't finish and
+    tell you to raise the budget; the 25-minute default is the one to use. `--all` /
     `--top-dyads N` / `--limit` reach only the upgrade phase, and
     `--upgrade-distilled` is an error with it — upgrading distilled rows is
     what it already does.
@@ -256,7 +256,10 @@ topics back to back in the right order (and stays sequential even under
     / `--top-dyads N`, and with `--upgrade-distilled` also replace distilled
     rows in scope — so an overnight `--quality fast --upgrade-distilled` is
     how events get filled in exhaustively for the chats that matter, where
-    `hybrid` fills in as many as its budget covers.
+    `hybrid` fills in as many as its budget covers. A batched tier's requests
+    are bounded by *characters* as well as rows, on every backend, so a group
+    of long chunks closes before the batch size — that keeps one slow group
+    from dominating a run, and it applies to the seed pass too.
   - **How much a tier thinks now depends on your model, and this changed.**
     The presets were written for a model that reads `low`/`medium`/`high` as a
     reasoning-*effort* level (`gpt-oss`), where `low` is what makes `balanced`

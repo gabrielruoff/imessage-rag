@@ -115,9 +115,9 @@ alternative: it upgrades distilled rows until `ANNOTATE_BUDGET_MINUTES` is spent
 candidates first, then the least-confident rows — so the same reads light up for the
 chunks that matter most rather than for everything. Substitute it anywhere below when you
 want a demo-able run instead of an overnight one. Leave the budget at its 25-minute
-default for a demo: one LLM request is the smallest thing the tier can buy (~106s for 8
-event-candidate chunks on the reference machine), so a 1- or 2-minute budget correctly
-declines to start anything and just prints why.
+default for a demo: one LLM request is the smallest thing the tier can buy (a request
+holds 4–6 event-candidate chunks and banked at 46.7s on the reference machine), so a
+1- or 2-minute budget correctly declines to start anything and just prints why.
 
 **Changed 2026-07-28, and it affects how long these runs take:** the `distilled` / `fast`
 / `balanced` presets carry a reasoning-*effort* level (`low`), which only `gpt-oss`-family

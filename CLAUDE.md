@@ -47,8 +47,9 @@ Full design history, schema rationale, and data forensics:
   seeding (also capped at 25% of the budget — unbatched and uncapped it
   measured 10.7 min of an 8-min run). Each phase starts from the per-request
   time an earlier run banked in `ingest_state`, so nothing is dispatched blind;
-  the floor is that ONE request is the smallest dispatchable unit (~106 s for 8
-  event chunks), so a budget under ~5 min buys nothing and says so. Its seed
+  the floor is that ONE request is the smallest dispatchable unit (a 10k-char
+  group holds 4-6 event chunks and banked at 46.7 s), so a budget too small for
+  one buys nothing and says so. Its seed
   target counts a `hybrid_seeds` counter, NOT `source='llm'` rows — the tier's
   own upgrades are `llm` rows and counting them switched its sampler off
   permanently. LLM tiers (`fast`/`balanced`/`max`) scope to top

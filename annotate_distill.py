@@ -44,6 +44,14 @@ _KNN_EMOTION_MIN_SCORE = 0.15
 # Fewer LLM seeds than this and the kNN vote is mostly noise -- refuse.
 _KNN_MIN_SEEDS = 100
 
+# The (kept, pool) pair _build_seed_index last reported, so the two rebuilds
+# inside one hybrid run (_classify_chunks, then backfill_confidence) don't print
+# the same sentence twice, wedged between two different progress bars. Process
+# state rather than a caller flag because it is a display concern only: nothing
+# reads it, and a run where the pool really did change between builds still says
+# so.
+_last_index_report = None
+
 
 def _seed_chunks(con, model, think, workers, target, dry_run=False, sampler=None,
                  batch_size=1, deadline=None, rate=None, counter_key=None,
@@ -124,6 +132,13 @@ def _seed_chunks(con, model, think, workers, target, dry_run=False, sampler=None
               if batch_size > 1 else [[row] for row in sample])
     gate = (annotate._DispatchDeadline(deadline, workers, time.monotonic, rate)
             if deadline is not None else None)
+    if gate is not None:
+        # A cold prior is arithmetic over batch_size, which is only a ceiling:
+        # seeds are short so an Ollama group really does hold batch_size of
+        # them, but an apple group holds 1-2 whatever the batch size says. The
+        # packing is built, so hand the gate its real row count (no-op on a
+        # prior an earlier run measured). See annotate._GroupRate.denominate.
+        gate.rate.denominate(annotate._mean_group_rows(groups))
 
     def request(group):
         return annotate._annotate_group(group, model, think)
@@ -312,7 +327,11 @@ def _build_seed_index(con):
             f"(need >= {_KNN_MIN_SEEDS}) -- run the seed pass first")
     keep = _sample_seed_ids([cid for cid, *_rest in seeds], ANNOTATE_KNN_INDEX_CAP)
     if len(keep) < len(seeds):
-        print(f"using {len(keep):,} of {len(seeds):,} seeds for the kNN index")
+        global _last_index_report
+        report = (len(keep), len(seeds))
+        if report != _last_index_report:
+            print(f"using {len(keep):,} of {len(seeds):,} seeds for the kNN index")
+            _last_index_report = report
         seeds = [row for row in seeds if row[0] in keep]
     dim = int(get_state(con, "embed_dim") or 0)
     if not dim:
