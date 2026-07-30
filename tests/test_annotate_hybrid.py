@@ -121,22 +121,36 @@ class FakeClock:
         self.now += seconds
 
 
+class LLMError(RuntimeError):
+    """What an ollama timeout looks like from inside a dispatch loop: an
+    ordinary exception propagating out of _pooled, which is neither a
+    KeyboardInterrupt nor a SystemExit and so hits no handler on the way out."""
+
+
 class FakeLLM:
     """Stand-in for ollama.chat_once_json. Records the chunk ids of every
     request, optionally charges a clock, and can fail chosen chunks (which is
-    how a dispatched-but-unwritten chunk gets tested for re-dispatch)."""
+    how a dispatched-but-unwritten chunk gets tested for re-dispatch).
 
-    def __init__(self, clock=None, seconds=0.0, fail_ids=(), interrupt_after=None):
+    `raise_after` is the other failure mode: `fail_ids` is a reply the caller
+    cannot parse (handled, counted, skipped), while raise_after makes the
+    REQUEST itself blow up mid-pass."""
+
+    def __init__(self, clock=None, seconds=0.0, fail_ids=(), interrupt_after=None,
+                 raise_after=None):
         self.clock = clock
         self.seconds = seconds
         self.fail_ids = set(fail_ids)
         self.interrupt_after = interrupt_after
+        self.raise_after = raise_after
         self.requests = []          # ids per request
         self.order = []             # ids in dispatch order, flattened
 
     def __call__(self, messages, model=None, think=None, timeout=None, **kwargs):
         if self.interrupt_after is not None and len(self.requests) >= self.interrupt_after:
             raise KeyboardInterrupt
+        if self.raise_after is not None and len(self.requests) >= self.raise_after:
+            raise LLMError("request timed out")
         ids = _ids_in(messages[-1]["content"])
         self.requests.append(ids)
         self.order.extend(ids)
@@ -202,6 +216,16 @@ class DBFixture(unittest.TestCase):
         return self.con.execute(
             "SELECT COUNT(*) FROM chunk_annotations WHERE source = ?",
             (source,)).fetchone()[0]
+
+    def committed(self):
+        """A SECOND connection onto the same file, which can see only what the
+        code under test actually COMMITTED. self.con would show its own
+        uncommitted writes too, so it cannot answer "did this survive?"."""
+        con = sqlite3.connect(self.db_path)
+        self.addCleanup(con.close)
+        if _HAS_VEC:
+            load_vec_extension(con)
+        return con
 
 
 @_NEEDS_VEC
@@ -418,6 +442,36 @@ class TestDeadline(HybridFixture):
         self.assertEqual(self.n_source("llm"), 1)
         self.assertEqual(self.n_source("distilled"), 0)  # the floor still holds
 
+    def test_an_expensive_event_prefilter_does_not_eat_phase_3a_s_share(self):
+        # event_candidate_chunk_ids is the run's one unavoidable corpus-wide
+        # `messages` scan, and 3a's share used to be derived from a clock read
+        # BEFORE it: the scan was charged to the phase, which then got a
+        # fraction of the 60% its own header line claimed. Here the scan costs
+        # half the 60s budget, so the two readings differ by 12s -- enough for
+        # two more 5s requests, i.e. every candidate instead of one.
+        self.hybrid(FakeLLM(), limit=0)          # seeds + kNN, no upgrades
+        clock = FakeClock()
+        llm = FakeLLM(clock=clock, seconds=5.0)
+        real_prefilter = annotate_events.event_candidate_chunk_ids
+
+        def slow_prefilter(con, all_chats, top_dyads):
+            ids = real_prefilter(con, all_chats, top_dyads)
+            clock.advance(30.0)
+            return ids
+
+        with self.fake_clock(clock):
+            with mock.patch.object(annotate_events, "event_candidate_chunk_ids",
+                                   slow_prefilter):
+                with mock.patch("builtins.print") as printed:
+                    self.hybrid(llm, budget_minutes=1)
+        said = " ".join(str(a) for call in printed.call_args_list for a in call.args)
+        # Stale `now`: deadline 1036, dispatches at t=1030 only. Re-read after
+        # the scan: deadline 1048, dispatches at t=1030/1035/1040.
+        self.assertIn("event upgrades 3 (0 skipped)", said)
+        self.assertEqual(llm.order[:3], _EVENT_IDS)
+        # ...and the budget as a whole is still respected.
+        self.assertLessEqual(clock.now - 1000.0, 60.0)
+
     def test_a_missing_chunk_vectors_table_still_exits(self):
         # The softened exit is only for the seed floor; a DB with no embeddings
         # at all is a misconfiguration no rerun fixes and must still fail loudly.
@@ -477,6 +531,107 @@ class TestPhaseThree(HybridFixture):
         self.hybrid(llm, limit=2)
         self.assertEqual(llm.order, _EVENT_IDS[:2])
 
+    def test_limit_counts_upgrades_written_not_requests_dispatched(self):
+        # --limit is a work-product cap, not a spend cap (the wall clock is the
+        # spend cap), so a dispatch that came back unparseable -- budget spent,
+        # nothing written -- must not consume it. Counting `seen`, which holds
+        # every DISPATCHED chunk, made --limit 2 deliver one upgrade.
+        self.seed_and_classify()
+        llm = FakeLLM(fail_ids=[_EVENT_IDS[0]])
+        written = self.hybrid(llm, limit=2)
+        # Three requests: two event candidates (the first unusable) and one
+        # low-confidence row that phase 3b buys to make the count up to 2.
+        self.assertEqual(llm.order[:2], _EVENT_IDS[:2])
+        self.assertEqual(len(llm.order), 3)
+        self.assertEqual(written, 2)
+        self.assertEqual(self.n_source("llm"), _SEEDS + 2)
+        # ...and the skipped one is untouched, still distilled, still upgradable.
+        self.assertEqual(self.sources()[_EVENT_IDS[0]], "distilled")
+
+    def test_the_event_fetch_is_capped_and_says_what_it_left(self):
+        # _chunk_rows materializes every candidate's full TEXT, and the
+        # prefilter's ~19-20% hit rate makes that ~50k rows on a corpus 10x the
+        # reference -- ~95 MB held to dispatch a few hundred. The cap is a
+        # prefix of a density ranking, so it drops only rows no budget could
+        # have reached; the repo takes no silent caps, so it prints them.
+        self.seed_and_classify()
+        fetched = []
+        real_fetch = annotate_hybrid._chunk_rows
+
+        def spy(con, chunk_ids):
+            fetched.append(list(chunk_ids))
+            return real_fetch(con, chunk_ids)
+
+        with mock.patch.object(annotate_hybrid, "_EVENT_FETCH_CAP", 2):
+            with mock.patch.object(annotate_hybrid, "_chunk_rows", spy):
+                with mock.patch("builtins.print") as printed:
+                    self.hybrid(FakeLLM())
+        self.assertEqual(fetched, [_EVENT_IDS[:2]])
+        said = " ".join(str(a) for call in printed.call_args_list for a in call.args)
+        # The header still reports the true candidate count, not the cap.
+        self.assertIn("phase 3a: 3 event-candidate chunks", said)
+        self.assertIn("fetching the densest 2 of them; 1 left for a later run",
+                      said)
+        self.assertIn("fetch cap", said)                 # named by cause
+
+    def test_what_the_cap_left_is_counted_against_the_true_candidate_total(self):
+        # The drop count used to be derived AFTER --limit's prefix, so it
+        # reported only what the CAP dropped out of an already-shortened list
+        # and understated the backlog by however much --limit had cut -- by an
+        # unbounded amount (50,000 candidates, --limit 5,000, cap 2,000 printed
+        # "3,000 left" where 48,000 were). Both prefixes shorten the same
+        # densest-first ranking, so they are interchangeable for WHAT runs; the
+        # reporting is what has to name each one's share.
+        self.seed_and_classify()
+        with mock.patch.object(annotate_hybrid, "_EVENT_FETCH_CAP", 1):
+            with mock.patch("builtins.print") as printed:
+                self.hybrid(FakeLLM(), limit=2)
+        said = " ".join(str(a) for call in printed.call_args_list for a in call.args)
+        self.assertIn("phase 3a: 3 event-candidate chunks", said)
+        # 1 fetched of 3 candidates: --limit cut one, the cap cut one more.
+        self.assertIn("fetching the densest 1 of them; 2 left for a later run",
+                      said)
+        self.assertIn("--limit 2", said)
+        self.assertIn("fetch cap", said)
+        # ...and the run does not sign off as having finished the scope.
+        self.assertNotIn("finished every candidate in scope", said)
+        self.assertIn("candidates left over", said)
+
+    def test_a_dry_run_does_not_claim_a_fetch_it_never_makes(self):
+        # The fetch is short-circuited on a dry run (event_rows = []), but the
+        # cap notice printed "fetching ..." regardless -- the one line on a
+        # preview describing an action the preview provably does not perform.
+        # The id preview also came off the CAPPED list, so a cap under 10 clipped
+        # the ten ids it advertises.
+        self.seed_and_classify()
+        fetched = []
+        with mock.patch.object(annotate_hybrid, "_EVENT_FETCH_CAP", 1):
+            with mock.patch.object(annotate_hybrid, "_chunk_rows",
+                                   lambda con, ids: fetched.append(list(ids))):
+                with mock.patch("builtins.print") as printed:
+                    self.hybrid(FakeLLM(), dry_run=True)
+        said = " ".join(str(a) for call in printed.call_args_list for a in call.args)
+        self.assertEqual(fetched, [])
+        self.assertIn("would fetch the densest 1 of them", said)
+        self.assertNotIn("fetching the densest", said)
+        # All three candidates previewed, not the one the (unpaid) cap allows.
+        self.assertIn(f"--dry-run: first chunk ids: "
+                      f"{', '.join(str(c) for c in _EVENT_IDS)}", said)
+
+    def test_a_negative_limit_is_refused_rather_than_inverted(self):
+        # `event_ids[:-1]` is not a prefix of the density ranking -- it drops the
+        # LEAST dense candidate and keeps the rest -- and `max(0, -1 - done)`
+        # then switches phase 3b off, so a stray minus bought a run nobody asked
+        # for. Same rule as the negative budget: refuse, naming the flag.
+        self.seed_and_classify()
+        llm = FakeLLM()
+        with self.assertRaises(SystemExit) as cm:
+            self.hybrid(llm, limit=-1)
+        self.assertIn("--limit", str(cm.exception))
+        self.assertEqual(llm.order, [])
+        # 0 is still a legitimate (empty) run, not an error.
+        self.assertEqual(self.hybrid(FakeLLM(), limit=0), 0)
+
     def test_ctrl_c_commits_what_landed_and_returns_normally(self):
         # Ctrl-C is the other way phase 3 ends early, and it has to behave like
         # the deadline: commit, report, exit 0 -- never lose the upgrades the
@@ -507,6 +662,29 @@ class TestPhaseThree(HybridFixture):
         with self.assertRaises(SystemExit):
             self.hybrid(llm, model="some-other-model")
         self.assertEqual(llm.order, [])
+
+    def test_the_model_guard_refuses_before_any_phase_runs(self):
+        # The guard used to sit at phase 3a. Phase 1 returns before its own
+        # guard call once the seed pool is at target, so a switched
+        # ANNOTATE_MODEL was refused only after the two corpus-wide kNN phases
+        # had spent up to half the budget on a run that was about to abort.
+        # Nothing here has been classified yet: the fixture's rows are all
+        # 'llm' seeds, so a phase 2 that ran would be visible as 40 distilled
+        # rows.
+        set_state(self.con, "annotate_model", _MODEL)
+        self.con.commit()
+        llm = FakeLLM()
+        with mock.patch("builtins.print") as printed:
+            with self.assertRaises(SystemExit):
+                self.hybrid(llm, model="some-other-model")
+        self.assertEqual(llm.order, [])
+        self.assertEqual(self.n_source("distilled"), 0)
+        self.assertEqual(self.n_source("llm"), _SEEDS)
+        # The refusal is the FIRST thing said -- no budget header, no phase
+        # lines ahead of it -- and it did not overwrite the recorded model.
+        said = [str(a) for call in printed.call_args_list for a in call.args]
+        self.assertIn("the model is now some-other-model", said[0])
+        self.assertEqual(get_state(self.con, "annotate_model"), _MODEL)
 
     def test_apple_groups_phase_3_by_char_budget_not_row_count(self):
         # The apple backend's fixed 4,096-token window makes a row count the
@@ -1176,14 +1354,23 @@ class TestHybridCli(DBFixture):
         # truthy and buys a FULL one, which would make the "fast" tier the
         # slowest -- so it resolves to False there and is left alone on an
         # effort-level model.
-        for quality in ("fast", "balanced"):
-            self.assertEqual(annotate.QUALITY_PRESETS[quality][0], "low")
-            self.assertIs(annotate._resolve_quality(quality, "qwen3.5:4b")[0], False)
-            self.assertEqual(annotate._resolve_quality(quality, "gpt-oss:20b")[0], "low")
-        # None means "omit the flag" and is NOT an effort level: it survives on
-        # every backend, or 'max' would stop meaning the model's own default.
-        self.assertIsNone(annotate._resolve_quality("max", "qwen3.5:4b")[0])
-        self.assertIsNone(annotate._resolve_quality("max", "gpt-oss:20b")[0])
+        #
+        # ANNOTATE_THINK is pinned empty because an explicit one WINS over the
+        # translation by design (the test below asserts exactly that), so a
+        # developer .env carrying ANNOTATE_THINK=false made this test assert
+        # its own env instead of the translation. The suite is hermetic.
+        with mock.patch.object(annotate, "ANNOTATE_THINK", ""):
+            for quality in ("fast", "balanced"):
+                self.assertEqual(annotate.QUALITY_PRESETS[quality][0], "low")
+                self.assertIs(
+                    annotate._resolve_quality(quality, "qwen3.5:4b")[0], False)
+                self.assertEqual(
+                    annotate._resolve_quality(quality, "gpt-oss:20b")[0], "low")
+            # None means "omit the flag" and is NOT an effort level: it survives
+            # on every backend, or 'max' would stop meaning the model's own
+            # default.
+            self.assertIsNone(annotate._resolve_quality("max", "qwen3.5:4b")[0])
+            self.assertIsNone(annotate._resolve_quality("max", "gpt-oss:20b")[0])
 
     def test_an_explicit_annotate_think_still_wins_over_the_translation(self):
         # Naming a think is user intent the translation must not second-guess.
@@ -1533,6 +1720,108 @@ class TestSeedBatching(HybridFixture):
         self.assertEqual(n, 5)
 
 
+class TestSeedPassKeepsPaidForWork(HybridFixture):
+    """The seed pass commits and banks its counter in a `finally`, like
+    annotate_hybrid._run_upgrades. An ollama timeout is an ordinary exception
+    propagating out of _pooled: it hits no handler here, so without the finally
+    it rolled back up to ANNOTATE_COMMIT_EVERY - 1 seed rows the budget had
+    already paid for AND left the hybrid_seeds counter behind the rows that DID
+    commit -- so the next run re-bought seeds it already owned, overshooting
+    ANNOTATE_HYBRID_SEED_TARGET at the upgrade phases' expense."""
+
+    def seed_until_it_blows_up(self, **kwargs):
+        llm = FakeLLM(raise_after=3)
+        with mock.patch.object(ollama, "chat_once_json", llm):
+            with self.assertRaises(LLMError):
+                annotate_distill._seed_chunks(
+                    self.con, _MODEL, False, 1, _SEEDS + 10,
+                    sampler=lambda con, pending, need: pending[:need], **kwargs)
+        return llm
+
+    def test_an_llm_error_mid_pass_keeps_the_rows_and_the_counter(self):
+        self.assertGreater(config.ANNOTATE_COMMIT_EVERY, 3)   # else nothing to lose
+        self.seed_until_it_blows_up(
+            counter_key=annotate_hybrid._SEED_COUNTER_KEY)
+        # A second connection: only what was COMMITTED is visible.
+        con = self.committed()
+        self.assertEqual(con.execute(
+            "SELECT COUNT(*) FROM chunk_annotations WHERE source = 'llm'"
+        ).fetchone()[0], _SEEDS + 3)
+        self.assertEqual(
+            int(get_state(con, annotate_hybrid._SEED_COUNTER_KEY)), _SEEDS + 3)
+
+    def test_the_distilled_tier_keeps_its_rows_too_and_moves_no_counter(self):
+        # counter_key=None is the distilled tier's call: same commit, and no
+        # counter touched -- that tier's target is every source='llm' row, so a
+        # hybrid_seeds value it moved would be a number nobody asked it for.
+        self.seed_until_it_blows_up()
+        con = self.committed()
+        self.assertEqual(con.execute(
+            "SELECT COUNT(*) FROM chunk_annotations WHERE source = 'llm'"
+        ).fetchone()[0], _SEEDS + 3)
+        self.assertEqual(
+            int(get_state(con, annotate_hybrid._SEED_COUNTER_KEY)), _SEEDS)
+
+    def test_the_counter_is_not_applied_twice_on_the_success_path(self):
+        # The finally is the ONE place the counter moves; the pre-fix trailing
+        # call after the try/except had to go with it.
+        #
+        # Asserted by COUNTING the calls, not by reading the counter back:
+        # _record_seeds writes an ABSOLUTE value (n_seeded captured before the
+        # loop, plus n_done), so it is idempotent and a resulting-value
+        # assertion passes just as happily against a double application -- it
+        # would assert the implementation back to itself.
+        calls = []
+        real = annotate_distill._record_seeds
+
+        def spy(con, counter_key, n_seeded, n_done, stats=None):
+            calls.append((counter_key, n_seeded, n_done))
+            return real(con, counter_key, n_seeded, n_done, stats)
+
+        llm = FakeLLM()
+        with mock.patch.object(annotate_distill, "_record_seeds", spy):
+            with mock.patch.object(ollama, "chat_once_json", llm):
+                n = annotate_distill._seed_chunks(
+                    self.con, _MODEL, False, 1, _SEEDS + 4,
+                    sampler=lambda con, pending, need: pending[:need],
+                    counter_key=annotate_hybrid._SEED_COUNTER_KEY)
+        self.assertEqual(n, 4)
+        self.assertEqual(
+            calls, [(annotate_hybrid._SEED_COUNTER_KEY, _SEEDS, 4)])
+        self.assertEqual(
+            int(get_state(self.con, annotate_hybrid._SEED_COUNTER_KEY)), _SEEDS + 4)
+
+    def test_ctrl_c_still_reports_and_carries_the_count_out(self):
+        # The interrupt path's own semantics are unchanged by the finally: its
+        # message, interrupt_exit=False re-raising rather than SystemExit(1),
+        # and stats["done"] carrying the committed count out to the caller.
+        stats = {"done": 0}
+        llm = FakeLLM(interrupt_after=2)
+        with mock.patch.object(ollama, "chat_once_json", llm):
+            with mock.patch("builtins.print") as printed:
+                with self.assertRaises(KeyboardInterrupt):
+                    annotate_distill._seed_chunks(
+                        self.con, _MODEL, False, 1, _SEEDS + 10,
+                        sampler=lambda con, pending, need: pending[:need],
+                        counter_key=annotate_hybrid._SEED_COUNTER_KEY,
+                        interrupt_exit=False, stats=stats)
+        self.assertEqual(stats["done"], 2)
+        said = " ".join(str(a) for call in printed.call_args_list for a in call.args)
+        self.assertIn("Interrupted -- committed 2 seed annotations", said)
+        con = self.committed()
+        self.assertEqual(
+            int(get_state(con, annotate_hybrid._SEED_COUNTER_KEY)), _SEEDS + 2)
+
+    def test_an_interrupt_with_the_default_becomes_a_system_exit(self):
+        llm = FakeLLM(interrupt_after=1)
+        with mock.patch.object(ollama, "chat_once_json", llm):
+            with mock.patch("builtins.print"):
+                with self.assertRaises(SystemExit):
+                    annotate_distill._seed_chunks(
+                        self.con, _MODEL, False, 1, _SEEDS + 10,
+                        sampler=lambda con, pending, need: pending[:need])
+
+
 class TestBudgetResolution(unittest.TestCase):
     def test_precedence_caller_then_env_then_backend_default(self):
         resolve = annotate_hybrid._resolve_budget_minutes
@@ -1547,6 +1836,32 @@ class TestBudgetResolution(unittest.TestCase):
                              annotate_hybrid._DEFAULT_BUDGET_MINUTES_APPLE)
             # 0 means "unset" in the argument too -- there is no zero-minute run.
             self.assertEqual(resolve("qwen3.5:4b", 0)[0],
+                             annotate_hybrid._DEFAULT_BUDGET_MINUTES_OLLAMA)
+
+    def test_a_negative_env_budget_is_refused_by_name(self):
+        # Passed through, a negative budget is a deadline already in the past:
+        # every phase declines and the run reports a spent budget, which reads
+        # exactly like a machine too slow to afford one request. Clamping to 0
+        # would be worse -- 0 means "unset" here, so a typo'd -25 would quietly
+        # buy the 25-minute default.
+        resolve = annotate_hybrid._resolve_budget_minutes
+        with mock.patch.object(config, "ANNOTATE_BUDGET_MINUTES", -25):
+            with self.assertRaises(SystemExit) as caught:
+                resolve("qwen3.5:4b")
+            self.assertIn("ANNOTATE_BUDGET_MINUTES", str(caught.exception))
+            # An explicit budget still overrides the env, per the precedence.
+            self.assertEqual(resolve("qwen3.5:4b", 3)[0], 3)
+
+    def test_a_negative_caller_budget_is_refused_too(self):
+        resolve = annotate_hybrid._resolve_budget_minutes
+        with mock.patch.object(config, "ANNOTATE_BUDGET_MINUTES", 0):
+            with self.assertRaises(SystemExit) as caught:
+                resolve("qwen3.5:4b", -1)
+            self.assertIn("budget_minutes", str(caught.exception))
+            # ...and the zero/unset paths are untouched by the check.
+            self.assertEqual(resolve("qwen3.5:4b", 0)[0],
+                             annotate_hybrid._DEFAULT_BUDGET_MINUTES_OLLAMA)
+            self.assertEqual(resolve("qwen3.5:4b")[0],
                              annotate_hybrid._DEFAULT_BUDGET_MINUTES_OLLAMA)
 
 

@@ -149,31 +149,43 @@ def _seed_chunks(con, model, think, workers, target, dry_run=False, sampler=None
     # total would advertise an ETA for work that was never going to run.
     total = None if gate is not None else len(sample)
     try:
-        with progress.track("Seeding annotations", total=total,
-                            header=False) as p:
-            for group, results in annotate._pooled(
-                    items, request if gate is None else gate.timed(request),
-                    workers):
-                for chunk_id, _text in group:
-                    data = results.get(chunk_id)
-                    if data is None:
-                        n_skipped += 1
-                    else:
-                        annotate._write_annotation(con, chunk_id, data)
-                        n_done += 1
-                        if n_done % ANNOTATE_COMMIT_EVERY == 0:
-                            con.commit()
-                    p.advance()
+        try:
+            with progress.track("Seeding annotations", total=total,
+                                header=False) as p:
+                for group, results in annotate._pooled(
+                        items, request if gate is None else gate.timed(request),
+                        workers):
+                    for chunk_id, _text in group:
+                        data = results.get(chunk_id)
+                        if data is None:
+                            n_skipped += 1
+                        else:
+                            annotate._write_annotation(con, chunk_id, data)
+                            n_done += 1
+                            if n_done % ANNOTATE_COMMIT_EVERY == 0:
+                                con.commit()
+                        p.advance()
+        finally:
+            # Every exit path, not just Ctrl-C and success -- the same rule
+            # annotate_hybrid._run_upgrades' finally follows, and for a sharper
+            # reason here. An ollama timeout propagating out of _pooled used to
+            # roll back up to ANNOTATE_COMMIT_EVERY - 1 seed rows the run had
+            # already paid for AND skip the counter update for the ones that had
+            # committed, so the next run re-bought seeds it already owned and
+            # sailed past ANNOTATE_HYBRID_SEED_TARGET -- spending the upgrade
+            # phases' share of the budget on a pool that was already deep
+            # enough. Committed rows and the counter that vouches for them have
+            # to move together or neither number means anything. Runs exactly
+            # once, so the success path below no longer records a second time;
+            # the clamp stays where it always was, in `n_seeded` above.
+            con.commit()
+            _record_seeds(con, counter_key, n_seeded, n_done, stats)
     except KeyboardInterrupt:
-        con.commit()
-        _record_seeds(con, counter_key, n_seeded, n_done, stats)
         print(f"\nInterrupted -- committed {n_done} seed annotations "
               f"({n_skipped} skipped); rerun to resume.")
         if interrupt_exit:
             raise SystemExit(1) from None
         raise
-    con.commit()
-    _record_seeds(con, counter_key, n_seeded, n_done, stats)
     # A budgeted caller can stop this pass short, and the pool level is what
     # every later phase depends on -- so say the shortfall out loud rather than
     # letting "Seeded 412" read as "done".
@@ -187,8 +199,9 @@ def _seed_chunks(con, model, think, workers, target, dry_run=False, sampler=None
 
 def _record_seeds(con, counter_key, n_seeded, n_done, stats=None):
     """Bank this pass's draws under `counter_key` and report the count out.
-    Run on the interrupt path too: the rows are committed, so a counter that
-    forgot them would buy them a second time on the next run."""
+    Called from _seed_chunks' finally, so it runs on the interrupt and the
+    error paths too, not just on success: those rows are committed, and a
+    counter that forgot them would buy them a second time on the next run."""
     if stats is not None:
         stats["done"] = n_done
     if counter_key and n_done:

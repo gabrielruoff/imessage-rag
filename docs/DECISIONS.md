@@ -330,7 +330,18 @@ targeted retrieval.
   about testing itself, or understanding existing coverage is necessary to
   avoid duplicating or breaking it).
 
-## Schema (imessage_analysis.db)
+## Schema — the original ingest layout (2026-07, superseded)
+
+Kept as the design-history snapshot of the pre-chunking schema. The LIVE schema
+— every table, column and `ingest_state` key — is CLAUDE.md's "Schema
+(imessage_analysis.db)" block, and `schema.py` is the DDL of record. This block
+predates `chunks`/`messages.chunk_id`, every derived analytics table
+(`sessions`, `person_period_lexicon`, `dyad_terms`, `chunk_annotations`,
+`topics`/`chunk_topics`, `loose_threads`, `nudge_exclusions`, `dyad_drift`,
+`person_voiceprint`, `conflicts`/`conflict_signals`), the 19 `ingest_state` keys
+the code now writes, and the move from per-message `message_vectors` to
+per-chunk `chunk_vectors` — `message_vectors` no longer has a writer at all and
+survives only in `reset_db.DROP_TABLES`, so an old DB gets cleaned up.
 
 ```
 chats(id, chat_identifier, display_name, is_group, service)
@@ -351,10 +362,15 @@ messages_fts                       -- FTS5 external-content table over messages.
 message_vectors                    -- sqlite-vec vec0 table, message_id -> FLOAT[768]
 ```
 
-Supporting indexes (built in `ingest.py`): `idx_messages_chat_date`,
+Supporting indexes: the set has grown well past the six this snapshot listed
+(`idx_messages_chunk`, `idx_chunks_chat`, `idx_sessions_chat`,
+`idx_chunk_topics_cluster`, `idx_loose_threads_*`, `idx_conflicts_chat`,
+`idx_conflict_signals_conflict`, …). `schema.py`'s `CREATE INDEX` statements are
+the list of record — a second copy here would only have to be re-synced. The
+original six still carry the load they were built for: `idx_messages_chat_date`,
 `idx_messages_handle`, `idx_reactions_target`, plus `idx_handles_identifier`,
-`idx_handles_contact_id`, and `idx_chat_participants_handle` — the last three
-back the name→id / handle→contact resolution joins used by the
+`idx_handles_contact_id`, and `idx_chat_participants_handle`, the last three
+backing the name→id / handle→contact resolution joins used by the
 `search_contact*` / `list_chats` query tools.
 
 ## Known environment quirks
@@ -1483,18 +1499,30 @@ request is the unit the gate can actually decline (25,029-chunk corpus,
 | 3b confidence upgrades (median ~360 chars) | 70.6 s | 107.3 s |
 
 3a is the expensive one because a batch of 8 long chunks often comes back
-covering only some ids, and every miss costs its own single-chunk request. A
-6-min budget bought **32 event + 32 confidence upgrades**, so the 25-min
-default extrapolates to roughly **250–350 upgrades per run** plus up to ~160
-seeds. A cold model load needs no allowance: the deadline absorbs it and simply
-buys fewer upgrades.
+covering only some ids, and every miss costs its own single-chunk request.
 
-Measured end-to-end on a fresh copy of the reference DB (450 existing seeds, no
-`knn_confidence` column yet), `ANNOTATE_BUDGET_MINUTES=6`: **3.4 min used** —
-schema self-healed, seed pass declined (its 90 s share is under one request and
-it says so), 24,579 rows confidence-backfilled, **32 event + 40 confidence**
-upgrades committed. At `ANNOTATE_BUDGET_MINUTES=24` on the same DB the seed
-pass does clear the floor and drew **160 seeds** inside its 25% share.
+**Two different 6-minute runs, on two different DB states** — quoted together
+because the pair is the point, and stated as a pair here because an earlier
+draft of this entry read as one run contradicting itself:
+
+| 6-min run | starting state | wall used | upgrades |
+|---|---|---|---|
+| rerun of the reference DB (the "after (rerun)" cell above) | seeds at target, `knn_confidence` already backfilled, so phases 1–2 were no-ops | 4.8 min | **32 event + 32 confidence** |
+| fresh copy of the reference DB | 450 seeds, no `knn_confidence` column — schema self-healed, seed pass declined (its 90 s share is under one request and it says so), 24,579 rows confidence-backfilled | 3.4 min | **32 event + 40 confidence** |
+
+The fresh copy buys *more* upgrades in *less* wall clock because its seed pool
+is 450 against the reference DB's wider one, and phase 2 is O(rows × seeds). At
+`ANNOTATE_BUDGET_MINUTES=24` on the same fresh copy the seed pass does clear the
+floor and drew **160 seeds** inside its 25% share. A cold model load needs no
+allowance: the deadline absorbs it and simply buys fewer upgrades.
+
+**Superseded 2026-07-28 — the 25-minute extrapolation.** This entry originally
+projected "roughly 250–350 upgrades per run" from those 6-minute runs, on the
+pre-round-2 code. Round 2 measured **284 upgrades in a 7.7-min run**, projecting
+**~424–563** at 25 minutes; that is the number to plan against (see the
+validation table in "2026-07-28: annotation throughput, round 2", where it is
+explicitly labelled extrapolated). Neither figure is an end-to-end 25-minute
+measurement, and `config.py`/`.env.example` now quote only the round-2 one.
 
 ### `_APPLE_ANNOTATE_CHAR_BUDGET`: 12,000 → 8,000 → 2,000 (global, every tier)
 
@@ -1940,6 +1968,19 @@ is handled too: a window labeled before the column existed carries signals and
 no stamp, so the labeling loop deletes its signal rows before re-labeling rather
 than stacking a second set on the first.
 
+**One carve-out, added 2026-07-30, on the READ path only.** On a DB whose
+`conflicts` table predates the column there is no stamp to read, and the old
+fallback was a constant `'pre-budget'` literal that marked *every* window
+labeled — including windows from an old `--no-llm` run nothing ever looked at.
+The read tools now infer `labeled` there from whether the window has stored
+`conflict_signals` rows, with a note saying the DB predates labeling stamps and
+a rerun will stamp properly. The inference is one-way-safe and deliberately
+conservative: signals cannot exist without a labeling pass, but their absence
+stays ambiguous, so a pre-migration window that *was* labeled and legitimately
+produced zero rows now reads "not analyzed" rather than "analyzed and clean".
+That is the safe direction. Wherever the column exists, the invariant above is
+unchanged: the marker is the stamp, never the rows.
+
 ### Reconcile the window, don't rewrite it
 
 `detect_chat` used to delete a chat's conflicts and write them fresh. Under a
@@ -1969,13 +2010,18 @@ old selection took the first N turns chronologically; against a 1,940-turn
 window that provably misses the evidence. Selection is now anchored on the
 window's `peak_gap_message_id` — the message left hanging is the escalation
 moment — taking a contiguous span around it, emitted in chronological order
-(the labels read as a sequence), falling back to the head when a window has no
-peak id. Ahead of the cap, a lexical prescreen drops turns that cannot carry an
-escalation signal at all: under `CONFLICT_MIN_TURN_CHARS` (15) after stripping
-whitespace, or no alphanumeric character anywhere. About 70% of labels come back
-`neutral`, each costing a full request to say nothing, and the median window has
-only 4 candidate turns — so the prescreen bites where it should, on the big
-windows.
+(the labels read as a sequence), falling back — when a window has no peak id —
+to a chronological slice ranked by one length preference (see the 2026-07-30
+entry below). Ahead of the cap, ONE lexical prescreen drops turns with nothing
+to read at all: **no alphanumeric character anywhere** (a tapback, an emoji,
+bare punctuation). **Superseded 2026-07-30:** as first shipped that prescreen
+also dropped turns under `CONFLICT_MIN_TURN_CHARS` (15) stripped chars; the
+length half was removed because it deleted the stonewalling and short-contempt
+class the classifier is explicitly asked to find — see "The length floor was
+deleting stonewalling, so it stopped being a filter". About 70% of labels come
+back `neutral`, each costing a full request to say nothing, and the median
+window has only 4 candidate turns — so the per-window turn cap, not a length
+floor, is what bounds the spend.
 
 ### Measured (2026-07-28, reference corpus, qwen3.5:4b)
 
@@ -1988,6 +2034,11 @@ labeled window and advanced down the strength ranking.
 stating plainly: `make conflict` is now a stage you can run inside a demo, full
 corpus coverage is a handful of reruns, and neither of those sentences was true
 of a 66-hour run that had to be completed or abandoned whole.
+
+**Re-measure after 2026-07-30.** Removing the length prescreen means a window
+whose turns are all terse is now dispatched instead of stamped for free, so
+211 of 1,305 is an upper bound on what the same budget buys today. The number
+has not been re-taken (the fix landed against hermetic tests, no Ollama).
 
 ## 2026-07-28: annotation throughput, round 2
 
@@ -2269,3 +2320,306 @@ back without spending the guarantee.
 **Also observed, pre-existing:** on any budget under ~11.3 min the seed phase
 dispatches nothing at all (its share of the budget is smaller than the cold
 prior's reserve), which is why phase 1 is absent from the table above.
+
+## 2026-07-30: PR #42 review fixes
+
+Seven fixes off the PR #42 review. Five of them reverse or narrow a decision
+recorded above, so each is entered here rather than left in a code comment.
+
+### The length floor was deleting stonewalling, so it stopped being a filter
+
+`_TURN_SYSTEM` defines stonewalling as "withdrawing, shutting down,
+terse/absent non-answers", and contempt covers "k.", "fine.", "whatever" —
+every one of them under a 15-character floor. The prescreen therefore deleted
+the exact class the classifier is asked to find, and the failure compounded: a
+window whose escalation was *entirely* terse withdrawal selected zero turns,
+was stamped `labeled_at` as a free window anyway, and the read tools then
+presented it as analyzed. The stamp is a one-way latch, so that false negative
+survived every rerun until an explicit `--relabel`.
+
+Fixed as the review's option (a). `_is_labelable` drops to the alphanumeric
+test alone — a tapback, an emoji or bare punctuation still gives the model
+nothing to read. `CONFLICT_MIN_TURN_CHARS` survives as a **ranking preference**
+in `_select_turns`' no-anchor fallback: floor-clearing turns take slots first,
+shorter ones fill the rest, and the chosen set is re-sorted chronologically
+before it is returned, so the sequence contract holds on every path. It demotes;
+it never deletes.
+
+Kept as a *threshold partition* rather than a pure length sort on purpose. A
+length-descending sort would already imply the floor, which would leave the knob
+meaning nothing; the partition keeps it a knob, and breaking length ties by
+position means a window of uniformly long turns still yields its head — exactly
+the behavior this branch had when the floor was a filter.
+
+Cost, unmeasured and worth expecting: windows that were stamped for free now
+dispatch up to `CONFLICT_MAX_LABEL_TURNS` requests each, so windows-labeled-per-
+run under a fixed budget may fall. That is the honest direction — the free ones
+were never analyzed — and the wall clock absorbs it by construction, since a
+rerun continues down the ranking.
+
+The residual the fix does not remove — a window whose turns really are all
+tapbacks still yields zero turns and still gets stamped — is answered on the
+**reporting** side, not with a schema change or a new column.
+`query_tools/conflict.py` gained `_LABELED_EMPTY_NOTE` (one episode) and
+`_LABELED_EMPTY_SCOPE_NOTE` (a `find_conflicts` page), both saying the pass
+reads message *text* only, so a stretch carried by tapbacks, by tone, or moved
+off-channel can be looked at and still yield nothing. Zero turns is never a
+positive finding of calm.
+
+### `--relabel` guards before it clears, and is not the model-switch door
+
+`--relabel --model <other>` deleted every `conflict_signals` row in the table
+and *then* raised the `conflict_model` guard, because the guard only fired later
+inside `label_top_conflicts` — every label previous budgets had bought
+destroyed, nothing rebuilt. `_check_model_guard` now runs immediately before
+`_clear_labels`, so the mismatch is refused with the labels still in place.
+
+The alternative — clearing `conflict_signals` and the `conflict_model` state key
+together, making `--relabel` the supported way to switch models — was
+deliberately **not** taken. `--relabel` is the "what labeling PRODUCES changed"
+door (a retuned `CONFLICT_MAX_LABEL_TURNS`/`CONFLICT_MIN_TURN_CHARS`, a newly
+cleared eval gate); the guard's own message already names clearing `conflicts`
+or `reset_db.py` as the model-switch door, and having two doors for it is how a
+destructive one gets taken by accident. Under `--dry-run` neither the guard nor
+the clear runs.
+
+(Superseded in part by the adversarial round below: the `--no-llm` carve-out
+this fix shipped was wrong — that path skips the labeling, not the deletion —
+and the guard now runs before the detection sweep too, in a refuse-only mode
+that leaves `conflict_model` for the pass that actually labels.)
+
+### Negative budgets are refused, not clamped
+
+`conflict_detect._resolve_budget_minutes` clamped with `max(0, ...)`, and 0
+means UNBUDGETED there — so a typo'd `CONFLICT_BUDGET_MINUTES=-25` silently
+bought the unbounded run the CLI already refuses `--budget-minutes -5` for.
+`annotate_hybrid._resolve_budget_minutes` had the mirror-image hole: it passed
+a negative straight through into an already-passed deadline, which declines
+every phase and is indistinguishable from a machine too slow for one request.
+
+Both now raise `SystemExit` naming the knob the value came from, and both
+validate the caller argument as well as the env — a caller-supplied `-5` means
+the same thing even though the parser already refuses it at the CLI. `0` keeps
+its per-pipeline meaning: "unbudgeted" for conflict (the budget is additive
+there, so switching it off must restore the unbounded path), "unset" for hybrid
+(the budget *is* the tier, so 0 falls through to the per-backend default). A
+clamp would have been wrong in hybrid too, for the opposite reason: 0 means
+unset, so a typo'd `-25` would have quietly bought the 25-minute default.
+
+### The pre-migration `labeled` value is derived, not asserted
+
+`query_tools.conflict._labeled_at_select` fell back to a constant `'pre-budget'`
+literal on a `conflicts` table with no `labeled_at` column, marking *every*
+window labeled — including windows an old `--no-llm` run wrote that nothing ever
+looked at. `get_conflict` then reported "we looked and found nothing" about a
+window nothing looked at, the exact misreading the labeled/unlabeled split
+exists to prevent.
+
+The fallback is now `CASE WHEN EXISTS (SELECT 1 FROM conflict_signals ...)`,
+still a constant fragment with no interpolation of user input. One alias detail
+is load-bearing: an unqualified `id` inside that subquery binds to
+`conflict_signals.id`, so the helper takes a **required** table alias and
+`get_conflict` was re-written to `FROM conflicts c WHERE c.id = ?` with fully
+qualified columns. `_PRE_MIGRATION_NOTE` states the remaining ambiguity out
+loud rather than papering over it, and a rerun stamps properly. While in the
+file, the three empty-scope early returns were given the `n_labeled` /
+`n_corroborated` keys the docstring and the tool schema already promised.
+
+### Hybrid: `--limit` counts what was written, not what was sent
+
+Phase 3b derived its `remaining` from `len(seen)` — chunks *dispatched*,
+including ones whose reply came back unparseable — so `--limit N` under-
+delivered against its own docstring. The code was made to match the docstring
+(the review's preference): `remaining = max(0, limit - events["done"])`, with
+`seen` left purely as the dedup set. `--limit` is the **deliverable** cap; the
+wall clock is the **spend** cap, and they are different promises.
+
+One residual is documented in code rather than fixed: a phase-3b reply that
+itself fails to parse still leaves the run one short, because making it up would
+mean dispatching past N — spending budget the flag did not authorize. Exactness
+there would need a success-target inside `_run_upgrades`, which cannot stop
+mid-group cleanly under `_pooled`'s worker backlog.
+
+### Hybrid: three cheaper guarantees
+
+- **The `annotate_model` guard moved to the top of `hybrid_chunks`**, before the
+  budget clock starts and before the `knn_confidence` migration. It used to fire
+  only at phase 3a, and phase 1 only guards when it actually labels — so with
+  the seed pool already at target, a switched `ANNOTATE_MODEL` paid for both
+  corpus-wide kNN phases (up to half the budget) before being refused. The
+  phase-3a call is kept as a local invariant for a future caller that reaches
+  phase 3 directly. Skipped under `--dry-run`: `_check_model_guard` `set_state`s
+  `annotate_model` and commits, and a preview that writes is not a preview.
+- **Phase 3a's candidate fetch is capped at `_EVENT_FETCH_CAP = 2000`** before
+  `_chunk_rows` materializes full chunk text — 3b had been capped for exactly
+  this memory reason since it shipped, and the prefilter's ~19–20% hit rate
+  means a corpus 10× the reference yields ~50k candidates, ~95 MB of text held
+  to dispatch a few hundred rows. The arithmetic says the cap can only bind
+  where the deadline already had: an event group is 4–6 chunks banking 46.7 s at
+  4 workers ≈ 0.5 chunks/s, so an hour spent *entirely* in 3a is ~1,850 upgrades
+  and no run spends an hour there. It is a prefix of a densest-first ranking, so
+  it is lossless in practice, and it prints both the true candidate count and
+  how many it left — no silent caps.
+- **Phase 3a re-reads the clock** after the corpus-wide event prefilter and
+  after the row fetch. `event_candidate_chunk_ids` is the run's one unavoidable
+  full `messages` scan, and deriving `left` from a reading taken before it
+  charged that scan to the phase's own 60% share.
+
+### The seed pass keeps paid-for work
+
+`annotate_distill._seed_chunks` committed and banked the `hybrid_seeds` counter
+on the success and Ctrl-C paths but not on any other exception, where
+`_run_upgrades` had had a `finally` for exactly this reason since it shipped. An
+Ollama timeout propagating out of `_pooled` mid-pass therefore rolled back up to
+`ANNOTATE_COMMIT_EVERY − 1` paid-for seed rows *and* skipped the counter update
+for the rows that had already committed — and a counter behind the real row
+count makes the next run over-buy seeds past `ANNOTATE_HYBRID_SEED_TARGET`, out
+of the upgrade phases' slice.
+
+Both now happen in a `finally` that runs exactly once on every exit path, so the
+success path no longer records twice and the KeyboardInterrupt handler keeps its
+message, its `interrupt_exit` split and its `stats['done']` unchanged. The clamp
+to the real llm-row count is untouched — it lives at the top of the function,
+and the `finally` reads it.
+
+## 2026-07-30: PR #42 review fixes, adversarial-review round
+
+Four reviewers were pointed at the fixes above and asked to refute them. What
+survived verification, and what did not.
+
+### The model guard moved again: before *detection*, and it records nothing
+
+Fix 5 above closed the `--relabel` door only. Two holes were left open, both
+demonstrated:
+
+- **The default invocation.** `detect_chat` calls
+  `_drop_conflicts(con, chat_id, keep=kept_ids)` and commits per chat, deleting
+  a superseded window together with its `conflict_signals` rows — and the guard
+  fired only afterwards, inside `label_top_conflicts`. A plain
+  `conflict_detect.py --model <other>` therefore destroyed labels first. Worse:
+  if the drop emptied `conflicts`, the guard's `COUNT(*)` read 0 and it
+  *accepted* the new model, rewriting `conflict_model` over the wreckage. Any
+  chat whose stored window shifted dates because new messages arrived hits this,
+  which makes it the routine case, not a contrived one.
+- **`--relabel --no-llm --model <other>`.** The `--no-llm` carve-out skipped the
+  guard on a path that still runs `_clear_labels`, while `--relabel`'s help text
+  — added by Fix 5 — promised the guard runs before the clear without
+  qualification. `--no-llm` skips the labeling, not the deletion.
+
+`_check_model_guard` grew a `record=False` mode and `main` calls it that way,
+once, before either destructive step, for every run that labels or relabels.
+Splitting refusal from recording also fixed the third finding of the round: the
+Fix 5 call site did `set_state('conflict_model', model) + commit` before any
+labeling, so a `--relabel` run interrupted during detection (which
+`detect_conflicts` catches and returns from) left the key naming a model that
+had never written a label — and refused the *next* run in its name, offering
+"clear conflicts" as the recovery. Recording stays with the pass that labels;
+the key keeps meaning "the model that labeled these rows".
+
+`--no-llm` alone (no `--relabel`) is still unguarded: it neither labels nor
+deletes globally, so the model flag really is inert there and refusing would
+block a deterministic re-detect over a flag it does not use.
+
+### Two more knobs validated where they are resolved
+
+Fix 6's rule turned out to have two more instances in the same CLI:
+
+- `CONFLICT_MAX_LABEL_TURNS`. `int(getenv(...) or "6")` reads `"0"` as 0, and
+  `args.max_label_turns or CONFLICT_MAX_LABEL_TURNS` passed it through. The flag
+  spelling has always been refused, with the reasoning spelled out in `main` —
+  a non-positive cap selects no turns while every window is still stamped
+  processed — but the env spelling reproduced exactly that at corpus scale, and
+  the printed summary then blamed the prescreen ("had no labelable turn and cost
+  no request"). Now a `SystemExit` naming the knob.
+- `CONFLICT_BUDGET_MINUTES` under `--no-llm`. Fix 6 resolved (and so validated)
+  the budget before the `--no-llm` distinction was made, so a negative env value
+  refused a run the knob cannot affect — on the one path whose parser explicitly
+  says the budget "has nothing to bound". The budget is no longer resolved at
+  all under `--no-llm`.
+
+### `labeled_signal_turns` means one thing in both read tools
+
+`find_conflicts` counted non-abstain rows; `get_conflict` picked its note off
+`COUNT(*)`. An abstain-only window was therefore listed as "labeled but produced
+zero signal turns" and then, on the drill-in the envelope *tells* the caller to
+make, answered with the eval-gated-bands caveat — the warning disappearing at
+precisely the expansion step it had to survive. `get_conflict` now computes both
+counts: `signals_total` still paginates every stored row, and a
+`labeled_signal_turns` field carrying the same definition and the same name as
+the listing decides the note.
+
+Both "nothing to show" states also emit a code-printed `_epilogue` now
+(`_LABELED_EMPTY_EPILOGUE`). The unlabeled sibling has had one since it landed,
+with the file's own comment explaining why — it is the copy the user sees
+regardless of model compliance — and the labeled-but-empty case licenses the
+same false summary ("I checked those stretches and nothing came up"). In the
+scope where every window is labeled and empty, `total == n_labeled`, so the
+unlabeled epilogue never fires to cover it. A framing floor is code, never
+prompt.
+
+### Rejected: ranking the peak-anchored span by length
+
+The reviewer's major finding was that `CONFLICT_MIN_TURN_CHARS` survives only in
+the no-anchor fallback, which is the rare branch, so in the peak-anchored span
+terse filler can crowd out a longer, more substantive turn — with a worked
+example where a criticism two turns past the peak loses its slot to "k." and
+"ok".
+
+Not taken, and the reason is the point of the fix: inside a span centered on the
+escalation moment, the terse turns ARE the stonewalling evidence — that example's
+displacing run is `k / ok / lol / yeah / sure / fine`, a textbook stonewall.
+Preferring length there would re-delete the class this change exists to catch,
+one branch further in. The floor stays where a window has no escalation moment
+to bracket and the slice would otherwise be an arbitrary head. The consequence
+the reviewer identified is real, though, and is now named in `config.py`,
+`.env.example` and CLAUDE.md rather than left to be rediscovered: a long turn
+further from the peak can lose its slot to a terse neighbour.
+
+### Hybrid: reporting that matches what was done
+
+- **Drop accounting is measured against the true candidate count.** `dropped`
+  was computed after `--limit`'s prefix, so it reported only the fetch cap's
+  share of an already-shortened list: 50,000 candidates under `--limit 5000`
+  with a 2,000 cap printed "3,000 left for a later run" where 48,000 were. The
+  candidate count is now taken before either prefix, and the line names which
+  prefix left what.
+- **A dry run says "would fetch".** The fetch is short-circuited on that path
+  (`event_rows = [] if dry_run else _chunk_rows(...)`), but the notice printed
+  "fetching …" anyway — a preview describing an action it provably does not
+  perform. The id preview also came off the capped list, so a cap under 10
+  clipped the ten ids it advertises; it comes off the pre-cap list now.
+- **A negative `--limit` is refused.** It inverted both prefixes it feeds:
+  `event_ids[:-1]` drops the LEAST dense candidate instead of taking a
+  densest-first prefix, and `max(0, limit - done)` then switched phase 3b off, so
+  a stray minus bought a run nobody asked for. (The LLM tiers' `--limit` reaches
+  SQLite as `LIMIT -1` = no limit; that lives in `annotate.py`'s parser and is
+  left as found.)
+- **The closing summary stops claiming it finished.** "finished every candidate
+  in scope with budget to spare" printed even when `--limit` or a fetch cap had
+  left thousands of candidates untouched with minutes unspent — which is exactly
+  where `--limit`'s one-sided residual (a skipped dispatch that the other
+  sub-phase has no candidates to make up) hides. It now reports how many were
+  left and that the clock was not the reason.
+- `_EVENT_FETCH_CAP`'s "no budget can dispatch that many" is a statement about
+  the DEFAULT budget, not a law: `ANNOTATE_BUDGET_MINUTES` has no ceiling, and
+  past ~111 budgeted minutes (2,000 / 0.5 chunks/s / 0.60) the cap rather than
+  the clock is what stops 3a. Its comment says so now.
+
+### Rejected: making `--limit N` exact
+
+`--limit` remains "at most N". Delivering exactly N when a dispatch comes back
+unparseable and the *other* sub-phase has no candidates to make it up from would
+mean dispatching past N — spend the flag did not authorize — or a success target
+inside `_run_upgrades`, which cannot stop mid-group cleanly under `_pooled`'s
+worker backlog. The residual is documented in both directions instead, and the
+summary line above is what makes it visible.
+
+### A test that could not fail
+
+`test_the_counter_is_not_applied_twice_on_the_success_path` asserted the
+resulting counter value, and `_record_seeds` writes an ABSOLUTE value
+(`n_seeded + n_done`, with `n_seeded` captured before the loop) — so it is
+idempotent, and the test passed against a deliberate double application as
+readily as against the fix. It counts `_record_seeds` invocations now. Worth
+generalizing: for an idempotent write, only the call count can prove
+"exactly once".

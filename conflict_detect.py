@@ -213,14 +213,22 @@ def _classify_turn(text, model, think):
 
 
 def _is_labelable(text):
-    """Whether a turn can carry an escalation signal at all. Under
-    CONFLICT_MIN_TURN_CHARS (whitespace stripped) or with no alphanumeric
-    character in it (emoji/punctuation/tapback-ish), the answer is always
-    `neutral` -- and on this corpus ~70% of labels come back neutral anyway,
-    each costing a whole request to say nothing. Read as a module global so a
-    test can patch the threshold."""
-    t = (text or "").strip()
-    return len(t) >= CONFLICT_MIN_TURN_CHARS and any(ch.isalnum() for ch in t)
+    """Whether a turn has any text for the classifier to read at all: it needs
+    one alphanumeric character. An emoji/punctuation/tapback-ish turn carries
+    no lexical signal, and on this corpus ~70% of labels come back `neutral`
+    anyway, each costing a whole request to say nothing.
+
+    Length is deliberately NOT a filter here. `_TURN_SYSTEM` defines
+    stonewalling as "withdrawing, shutting down, terse/absent non-answers" and
+    contempt covers "k.", "fine.", "whatever" -- every one of them under a
+    15-character floor. Screening those out deleted the exact class the
+    classifier is asked to find, and worse: a window whose escalation is
+    ENTIRELY terse withdrawal then selected zero turns, was still stamped
+    labeled_at (the stamp is a one-way latch), and read downstream as
+    "analyzed and clean". CONFLICT_MIN_TURN_CHARS survives as a RANKING
+    preference in _select_turns' no-anchor fallback -- it demotes, it no longer
+    deletes."""
+    return any(ch.isalnum() for ch in (text or ""))
 
 
 def _select_turns(seg, max_turns, peak_id=None):
@@ -229,18 +237,23 @@ def _select_turns(seg, max_turns, peak_id=None):
     a sequence downstream, so they are never emitted peak-outward).
 
     Two rules, in order:
-      * the lexical prescreen (_is_labelable) drops turns that cannot carry a
-        signal -- it mostly matters in the big windows, since the median window
-        has only 4 candidate turns to begin with;
+      * the lexical prescreen (_is_labelable) drops turns with no alphanumeric
+        character -- nothing for the classifier to read -- and nothing else;
       * what is left is taken as a contiguous span CENTERED on the window's
         peak_gap_message_id -- the message left hanging, i.e. the escalation
         moment the deterministic finder actually keyed on. The old head slice
         (`[:max_turns]`) provably misses it: windows in this corpus run to
         1,940 candidate turns.
-    A window with no peak id, or whose peak turn is not in this segment, falls
-    back to the chronological head. When the peak turn is dropped by the
-    prescreen the span still centers on WHERE it was, so the neighbours that
-    survive are the ones around the escalation."""
+    A window with no peak id, or whose peak turn is not in this segment, has no
+    escalation moment to bracket, so it falls back to a chronological slice with
+    ONE ranking preference: turns at or over CONFLICT_MIN_TURN_CHARS are taken
+    before shorter ones, and the chosen set is re-sorted chronologically before
+    it is returned (the sequence contract holds on every path). That is all the
+    floor does now -- a terse "whatever" is a candidate like any other, it just
+    yields its slot to a longer turn when the window has more candidates than
+    the cap. When the peak turn is dropped by the prescreen the span still
+    centers on WHERE it was, so the neighbours that survive are the ones around
+    the escalation."""
     kept = [(i, m) for i, m in enumerate(seg) if _is_labelable(m["text"])]
     turns = [(m["id"], m["is_from_me"], m["text"]) for _i, m in kept]
     if max_turns is not None and max_turns <= 0:
@@ -251,13 +264,21 @@ def _select_turns(seg, max_turns, peak_id=None):
     anchor = next((n for n, (_i, m) in enumerate(kept) if m["id"] == peak_id), None)
     if anchor is None and peak_id is not None:
         # The peak turn itself was prescreened out (a long silence is often
-        # answered by a one-word line): anchor on its POSITION instead, so the
-        # span still lands on the escalation rather than on the window's head.
+        # answered by a tapback or a bare emoji): anchor on its POSITION
+        # instead, so the span still lands on the escalation rather than on the
+        # window's head.
         seg_pos = next((i for i, m in enumerate(seg) if m["id"] == peak_id), None)
         if seg_pos is not None:
             anchor = sum(1 for i, _m in kept if i < seg_pos)
     if anchor is None:
-        return turns[:max_turns]
+        # No escalation moment to bracket: rank by the length preference, then
+        # restore chronological order. `k` breaks length ties by position, so a
+        # window of uniformly long turns still yields its head -- the behavior
+        # this branch had when the floor was a filter.
+        ranked = sorted(range(len(turns)),
+                        key=lambda k: (len((turns[k][2] or "").strip())
+                                       < CONFLICT_MIN_TURN_CHARS, k))
+        return [turns[k] for k in sorted(ranked[:max_turns])]
     start = min(max(0, anchor - max_turns // 2), len(turns) - max_turns)
     return turns[start:start + max_turns]
 
@@ -290,9 +311,23 @@ def gate_classifier(con, items):
 # Model guard (mirrors annotate._check_model_guard)
 # ---------------------------------------------------------------------------
 
-def _check_model_guard(con, model):
+def _check_model_guard(con, model, record=True):
     """Refuse to mix label models within one conflicts table (same shape as
-    the chunk_annotations annotate_model guard). Records the chosen model."""
+    the chunk_annotations annotate_model guard). Records the chosen model.
+
+    `record=False` runs the REFUSAL half only. main() calls it that way before
+    anything destructive happens -- the --relabel clear, and the detection pass,
+    whose _drop_conflicts deletes a superseded window's conflict_signals rows
+    along with it -- because both of those destroy labels the guard exists to
+    protect, and both used to run BEFORE the only guard call (inside
+    label_top_conflicts / detect_conflicts). Detection first was the worse of
+    the two: it can drop the last conflicts row, and a guard that then reads
+    COUNT(conflicts) == 0 accepts the new model and rewrites conflict_model
+    having silently thrown the old labels away. Recording is left to the
+    labeling pass so the key still means "the model that labeled these rows":
+    an early record stamped conflict_model on a run that went on to label
+    nothing (a Ctrl-C during detection, --no-llm), and the next run was refused
+    in the name of a model that had never written a label."""
     prev = get_state(con, "conflict_model")
     if prev and prev != model:
         n = con.execute("SELECT COUNT(*) FROM conflicts").fetchone()[0]
@@ -304,8 +339,9 @@ def _check_model_guard(con, model):
                 f"--model {prev}."
             )
             raise SystemExit(1)
-    set_state(con, "conflict_model", model)
-    con.commit()
+    if record:
+        set_state(con, "conflict_model", model)
+        con.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -1082,11 +1118,16 @@ def label_top_conflicts(con, model, n=None, max_label_turns=CONFLICT_MAX_LABEL_T
                              _now_iso(), r["id"]))
                 labeled += 1
                 if not turns:
-                    # Every turn failed the prescreen, so the model never saw
-                    # this window. It is legitimately processed -- a rerun would
-                    # find the same nothing -- but counting it silently with the
-                    # windows that cost requests would overstate what the budget
+                    # No turn in this window holds a single alphanumeric
+                    # character (all tapbacks/emoji), so the model never saw it.
+                    # It is legitimately processed -- a rerun would find the
+                    # same nothing -- but counting it silently with the windows
+                    # that cost requests would overstate what the budget
                     # actually bought, which is the one number this tier owes.
+                    # The read tools say the same thing on their side: a stamped
+                    # window with zero signal turns is never narrated as a
+                    # positive finding of calm (query_tools.conflict's
+                    # _LABELED_EMPTY_NOTE).
                     free += 1
                 con.commit()
                 p.advance()
@@ -1142,10 +1183,22 @@ def _resolve_budget_minutes(budget_minutes=None):
 
     0 means UNBUDGETED in both places, where annotate's hybrid tier reads 0 as
     "unset": there the budget IS the tier, here it is additive, so switching it
-    off has to restore the unbounded path rather than fall back to a default."""
+    off has to restore the unbounded path rather than fall back to a default.
+
+    A NEGATIVE value is refused, not clamped, from either source. Clamping sent
+    it to 0 = unbudgeted -- the unbounded run this tier exists to prevent, and
+    the exact run the CLI already refuses `--budget-minutes -5` for, so an env
+    typo silently bought what a flag typo is told off for. The message names the
+    knob it came from, mirroring the parser's wording."""
     if budget_minutes is not None:
-        return max(0, budget_minutes), "--budget-minutes"
-    return max(0, CONFLICT_BUDGET_MINUTES), "CONFLICT_BUDGET_MINUTES"
+        if budget_minutes < 0:
+            raise SystemExit(
+                "--budget-minutes cannot be negative (0 disables the budget)")
+        return budget_minutes, "--budget-minutes"
+    if CONFLICT_BUDGET_MINUTES < 0:
+        raise SystemExit("CONFLICT_BUDGET_MINUTES cannot be negative "
+                         "(0 disables the budget)")
+    return CONFLICT_BUDGET_MINUTES, "CONFLICT_BUDGET_MINUTES"
 
 
 def _clear_labels(con):
@@ -1205,7 +1258,10 @@ def main(argv=None):
                              "starts over. Needed after changing what labeling produces "
                              "-- CONFLICT_MAX_LABEL_TURNS, CONFLICT_MIN_TURN_CHARS, the "
                              "eval gate -- since a stamped window is otherwise never "
-                             "revisited")
+                             "revisited. NOT the model-switch door: the conflict_model "
+                             "guard runs BEFORE the clear (on every path, --no-llm "
+                             "included), so --relabel --model <other> is refused with "
+                             "the labels intact")
     speed = parser.add_mutually_exclusive_group()
     speed.add_argument("--no-llm", action="store_true",
                        help="FAST path: write the deterministic conflict windows "
@@ -1240,8 +1296,27 @@ def main(argv=None):
     started = time.monotonic()
     model = args.model or CONFLICT_MODEL
     think = _resolve_think(model)
-    minutes, budget_source = _resolve_budget_minutes(args.budget_minutes)
+    # Not resolved at all under --no-llm: that path makes zero LLM calls, so
+    # there is nothing for a budget to bound (the parser refuses
+    # --budget-minutes there for exactly that reason) -- and resolving it would
+    # let a negative CONFLICT_BUDGET_MINUTES refuse a run the knob cannot
+    # affect. `minutes` stays 0 there, which the branch below ignores anyway.
+    minutes, budget_source = ((0, None) if args.no_llm
+                              else _resolve_budget_minutes(args.budget_minutes))
     max_turns = args.max_label_turns or CONFLICT_MAX_LABEL_TURNS
+    # The env half of the same check the parser makes on --max-label-turns, and
+    # for the same reason (Fix 6's rule: a knob is validated where it is
+    # RESOLVED, not only where a flag supplies it). `int(os.getenv(...) or "6")`
+    # reads "0" as 0, and a non-positive cap makes _select_turns return no turns
+    # at all while label_top_conflicts still stamps every window it processes --
+    # so one bad .env line latches the whole corpus as labeled having dispatched
+    # nothing, and the summary blames the prescreen. Only reachable from the
+    # env: the flag is already refused at parse time.
+    if max_turns < 1:
+        raise SystemExit(
+            f"CONFLICT_MAX_LABEL_TURNS must be at least 1 (got {max_turns}); a "
+            f"non-positive cap labels no turns while still stamping every "
+            f"window as processed. Use --no-llm to skip labeling entirely.")
     con = _connect()
     try:
         # Self-heal a DB that predates the conflict tables or the labeled_at
@@ -1252,6 +1327,29 @@ def main(argv=None):
         if not args.dry_run and not _conflicts_ready(con):
             schema.create_schema(con)
             con.commit()
+        # The guard runs BEFORE anything that can destroy a label, and both
+        # things that can are below it: _clear_labels drops every
+        # conflict_signals row in the table, and the detection pass's
+        # _drop_conflicts deletes a superseded window's signals with the window
+        # (committed per chat). The only guard call used to sit inside
+        # label_top_conflicts / detect_conflicts, i.e. after both -- so
+        # `--relabel --model <other>` destroyed every label the previous budgets
+        # had bought and THEN refused to rebuild any of them, and a plain
+        # mismatched-model run could drop the last conflicts row during
+        # detection and leave the guard reading COUNT(conflicts) == 0, at which
+        # point it accepted the new model over the wreckage.
+        # --relabel is not the model-switch door -- the guard's own message
+        # names clearing conflicts / reset_db.py for that -- it is the "what
+        # labeling PRODUCES changed" door, so a mismatched model is refused
+        # while the labels are still there, --no-llm included: that path skips
+        # the labeling, not the deletion, and the model flag being inert there
+        # is not a reason to let it wipe another model's labels.
+        # record=False: the labeling pass still owns the conflict_model write,
+        # so a run that labels nothing (interrupted detection, --no-llm) leaves
+        # the key exactly as it found it. Idempotent -- the pass calls the guard
+        # again with the same value.
+        if not args.dry_run and (args.relabel or not args.no_llm):
+            _check_model_guard(con, model, record=False)
         if args.relabel and not args.dry_run:
             _clear_labels(con)
         # Two-phase whenever there is LLM work to bound: fast deterministic

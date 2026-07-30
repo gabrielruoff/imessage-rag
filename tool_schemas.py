@@ -729,8 +729,11 @@ TOOL_DEFINITIONS = [
                         "`labeled` false, labeled_signal_turns 0 means NOT ANALYZED "
                         "-- never 'nothing was found' -- so say it has not been "
                         "analyzed rather than implying the stretch was calm. A "
-                        "`labeling_note` appears whenever any in-scope row is "
-                        "unlabeled.",
+                        "`labeled` true row with labeled_signal_turns 0 is not "
+                        "'calm' either -- labeling reads message text only, so a "
+                        "stretch carried by tapbacks or moved off-channel yields "
+                        "nothing to label. A `labeling_note` appears whenever "
+                        "either case is present in scope.",
         "input_schema": {
             "type": "object",
             "properties": {

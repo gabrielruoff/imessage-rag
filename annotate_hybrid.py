@@ -117,6 +117,35 @@ _ID_SLICE = 500
 # going to reach.
 _LOW_CONF_FETCH_CAP = 5000
 
+# The same cap for phase 3a, sized on 3a's own arithmetic rather than copied
+# from 3b's -- the two phases fetch very different rows. An event candidate
+# averages ~1,900 chars (against the confidence rows' ~360 median), so
+# _OLLAMA_ANNOTATE_CHAR_BUDGET closes a group at 4-6 of them, and measured
+# 2026-07-28 (qwen3.5:4b, batch 8, ANNOTATE_WORKERS=4) that group banked a
+# 46.7 s worst latency. Four workers retire a wave of 4 groups per 46.7 s, i.e.
+# ~24 chunks / 46.7 s ~= 0.5 chunks/s. An hour spent ENTIRELY in this phase is
+# therefore ~1,850 upgrades -- and no run spends an hour here at the DEFAULT
+# budget, since 3a gets _EVENT_PHASE_SHARE of 25 min (~460). 2,000 covers even
+# the whole-hour case. That sizing is against the default, not a law:
+# ANNOTATE_BUDGET_MINUTES has no ceiling, so past ~111 budgeted minutes
+# (2,000 / 0.5 chunks/s / 0.60) this cap rather than the clock is what stops
+# 3a. Which is precisely why it prints what it left instead of letting the
+# deadline take the credit -- the printed line names the cap as the cause.
+# Why it has to exist at all: _chunk_rows materializes every id's full chunk
+# TEXT, and the prefilter's ~19-20% hit rate means a corpus 10x the reference
+# yields ~50k candidates -- ~95 MB of text held to dispatch a few hundred rows.
+# The cap is a PREFIX, which is what makes it lossless in practice:
+# annotate_events hands the ids over ranked by pattern-hit density, so the rows
+# it drops are exactly the ones a deadline was never going to reach anyway --
+# the same argument _LOW_CONF_FETCH_CAP's ordering makes. Dropped rows are
+# still printed, never silently discarded.
+# A module constant, not a config knob, for the same reason
+# _DEFAULT_BUDGET_MINUTES_* are: it is a memory ceiling derived from this
+# phase's own measured throughput, not a preference, and the user-facing lever
+# over how much 3a fetches is ANNOTATE_BUDGET_MINUTES. Same for
+# _LOW_CONF_FETCH_CAP.
+_EVENT_FETCH_CAP = 2000
+
 # ingest_state key: how many seeds THIS tier's sampler has drawn. Not
 # COUNT(source='llm'), because phase 3 writes source='llm' too -- counting its
 # own upgrades made the tier satisfy its own seed target, so on the reference
@@ -133,9 +162,29 @@ def _resolve_budget_minutes(model, budget_minutes=None):
     for the header. Precedence: an explicit argument > ANNOTATE_BUDGET_MINUTES
     > the per-backend default. 0 means "unset" in both the argument and the env
     -- there is no such thing as a zero-minute run of this tier -- matching the
-    empty-means-default convention config uses for its other int knobs."""
+    empty-means-default convention config uses for its other int knobs.
+
+    A NEGATIVE value is refused rather than passed through or clamped. Passed
+    through it resolves to a deadline already in the past, which every phase
+    then declines: the run reports "the budget was spent on phases 1-2" and
+    exits 0, indistinguishable from a machine too slow to afford one request.
+    Clamping to 0 would be worse still -- 0 means "unset" here, so a typo'd
+    -25 would silently buy the 25-minute default. Refusing names the knob,
+    mirroring conflict_detect's --budget-minutes check. The env is validated
+    only where it is actually read, so an explicit argument still overrides a
+    bad env exactly as the precedence above says it does."""
+    if budget_minutes is not None and budget_minutes < 0:
+        raise SystemExit(
+            f"budget_minutes cannot be negative (got {budget_minutes}); 0 means "
+            f"'unset' -- the per-backend default")
     if budget_minutes:
         return budget_minutes, "caller"
+    if config.ANNOTATE_BUDGET_MINUTES < 0:
+        raise SystemExit(
+            f"ANNOTATE_BUDGET_MINUTES cannot be negative (got "
+            f"{config.ANNOTATE_BUDGET_MINUTES}); leave it empty or 0 for the "
+            f"per-backend default ({_DEFAULT_BUDGET_MINUTES_OLLAMA} min on "
+            f"Ollama, {_DEFAULT_BUDGET_MINUTES_APPLE} on Apple FM)")
     if config.ANNOTATE_BUDGET_MINUTES:
         return config.ANNOTATE_BUDGET_MINUTES, "ANNOTATE_BUDGET_MINUTES"
     if config.is_apple_model(model):
@@ -353,23 +402,57 @@ def hybrid_chunks(con, model, think=False, workers=1, all_chats=False,
     and its corpus-sized number would drown out the work the budget bought.
 
     budget_minutes/seed_target None (or 0) resolve from config, with the
-    apple-vs-ollama split for the budget. top_dyads None means
-    ANNOTATE_TOP_DYADS. `limit` caps the TOTAL Phase-3 upgrades across 3a+3b.
-    annotate._check_model_guard runs before any Phase-3 write: Phase 1 calls it
-    too, but only when it actually has seeds to label, so Phase 3 must not
-    assume Phase 1 ran.
+    apple-vs-ollama split for the budget; a negative budget is refused rather
+    than clamped (see _resolve_budget_minutes). top_dyads None means
+    ANNOTATE_TOP_DYADS. `limit` caps the TOTAL Phase-3 upgrades WRITTEN across
+    3a+3b -- successes, not dispatches: a chunk whose reply came back
+    unparseable spent budget but produced no annotation, and charging the cap
+    for it made --limit N deliver fewer than N. The budget is the spend cap;
+    --limit is the deliverable cap -- an "at most N", with one one-sided
+    residual: a dispatch that fails to parse is made up out of the OTHER
+    sub-phase's candidates, so when those run out (3b's pool empty, or 3a's
+    ranked list already exhausted) the run lands short of N. Making it up
+    regardless would mean dispatching past N, which is spend the flag did not
+    authorize; a rerun buys the rest. A NEGATIVE limit is refused outright.
+
+    annotate._check_model_guard runs at the TOP, before the budget clock
+    starts, because phases 1-2 can burn half the budget before Phase 3 reaches
+    a guard: Phase 1 calls it too, but only once it actually has seeds to
+    label, so a pool already at target skips it entirely and a switched
+    ANNOTATE_MODEL used to surface minutes later. Phase 3 keeps its own call
+    (below) rather than assuming this one ran.
 
     Deviation from docs/PLAN_ANNOTATE_HYBRID.md §4: `batch_size` is appended to
     the frozen signature (backward-compatibly, at the end). The plan's
     signature omitted it while also requiring that ANNOTATE_BATCH_SIZE and
     _resolve_quality keep working for this tier; re-deriving it here would mean
     a second copy of _resolve_quality. None falls back to the preset's value."""
+    if limit is not None and limit < 0:
+        # Refused, not clamped or passed through, on the same rule as a negative
+        # budget: a negative limit is never a request for anything. Passed
+        # through it silently inverts both of the prefixes it feeds --
+        # `event_ids[:-1]` drops the LEAST dense candidate instead of taking a
+        # densest-first prefix, and `max(0, limit - done)` then switches 3b off
+        # entirely -- so a stray minus bought a run nobody asked for rather than
+        # an error. 0 stays a legitimate (empty) run, as it is for the LLM tiers.
+        raise SystemExit(f"--limit cannot be negative (got {limit}); 0 means "
+                         f"'upgrade nothing', omit it for no cap")
     if top_dyads is None:
         top_dyads = config.ANNOTATE_TOP_DYADS
     if not seed_target:
         seed_target = config.ANNOTATE_HYBRID_SEED_TARGET
     if batch_size is None:
         batch_size = annotate.QUALITY_PRESETS["hybrid"][1]
+    # Before the clock, before the migration, before a single phase runs. Every
+    # other tier reaches its guard within one dispatch of starting; this one has
+    # two corpus-wide phases in front of it, and with the seed pool already at
+    # target neither of them guards (Phase 1 returns before its own call), so a
+    # switched ANNOTATE_MODEL was refused only after the kNN passes had spent up
+    # to half the budget. Skipped under --dry-run for the same reason the
+    # migration is: the guard RECORDS the model it cleared (set_state + commit),
+    # and a preview that writes annotate_model is a preview that wrote.
+    if not dry_run:
+        annotate._check_model_guard(con, model)
     # Phases 2 and 3b read and write knn_confidence, which postdates DBs in the
     # wild -- and annotate.py is reachable without the ingest.py run that
     # normally applies migrations. Under --dry-run the migration is skipped
@@ -483,24 +566,72 @@ def hybrid_chunks(con, model, think=False, workers=1, all_chats=False,
 
     # Phase 3a. The event prefilter already excludes chunks annotated by an LLM,
     # so a resumed run never re-buys an upgrade it has paid for -- and it hands
-    # back what is left ranked by pattern-hit density, so both --limit's prefix
-    # and the deadline's cut take the densest candidates, not the oldest.
+    # back what is left ranked by pattern-hit density, so all three ways this
+    # list gets shortened (--limit's prefix, _EVENT_FETCH_CAP's prefix, the
+    # deadline's cut) keep the densest candidates rather than the oldest.
     event_ids = annotate_events.event_candidate_chunk_ids(con, all_chats, top_dyads)
+    # The TRUE candidate count, taken before either prefix shortens the list --
+    # the same rule 3b's textless COUNT follows, and for the same reason:
+    # reporting a count that a cap already shrank understates the scope. Both
+    # prefixes are then measured against it, so "left for a later run" means
+    # what it says.
+    n_candidates = len(event_ids)
     if limit is not None:
+        # An upper bound on what this sub-phase can deliver, not the cap itself:
+        # --limit counts rows WRITTEN (see phase 3b), and a dispatch that comes
+        # back unparseable writes nothing, so 3b makes up the shortfall out of
+        # its own candidates WHEN IT HAS ANY -- with an empty 3b pool (a scope
+        # whose pending chunks were never embedded, so phase 2 classified
+        # nothing) a skipped 3a dispatch does leave the run short of N. --limit
+        # is an "at most N" cap; the alternative is dispatching past N, which is
+        # work the flag did not authorize. A rerun buys the rest.
         event_ids = event_ids[:limit]
+    # Kept for the --dry-run preview, which must not be clipped to a memory
+    # ceiling it is not paying (the fetch below never runs on that path).
+    scoped_ids = event_ids
+    capped = len(event_ids) > _EVENT_FETCH_CAP
+    if capped:
+        event_ids = event_ids[:_EVENT_FETCH_CAP]
+    left_behind = n_candidates - len(event_ids)
+    # A dry run never fetches: it reports the scope, and pulling every
+    # candidate's text to print ten ids would be the run's most expensive step.
+    event_rows = [] if dry_run else _chunk_rows(con, event_ids)
+    # The clock is re-read HERE, after the prefilter and the fetch, not before
+    # them. event_candidate_chunk_ids is the run's one unavoidable corpus-wide
+    # `messages` scan and _chunk_rows carries every candidate's full text;
+    # deriving this phase's share from the `now` above charged 3a for both, so
+    # on a big corpus the phase silently got a fraction of the 60% the header
+    # line claims it did. (The pre-prefilter `now` still owns the early return
+    # above -- that check has to happen BEFORE paying for the scan.)
+    now = time.monotonic()
     left = max(0.0, deadline - now)
     events_deadline = now + left * _EVENT_PHASE_SHARE
-    print(f"phase 3a: {len(event_ids)} event-candidate chunks to upgrade "
+    print(f"phase 3a: {n_candidates} event-candidate chunks to upgrade "
           f"({scope}, up to {_EVENT_PHASE_SHARE:.0%} of the {_fmt_left(left)} left)")
+    if left_behind:
+        # Named by cause, and counted against the true candidate total: with
+        # --limit in play the cap's own drop is only part of what this run
+        # leaves behind, and reporting the cap's share alone understated the
+        # backlog by however much --limit had already cut. "would fetch" on a
+        # dry run because that path provably fetches nothing (see above) -- a
+        # preview reports what a real run WOULD do, never work it did not do.
+        why = []
+        if limit is not None and n_candidates > limit:
+            why.append(f"--limit {limit}")
+        if capped:
+            why.append(f"the {_EVENT_FETCH_CAP:,}-row fetch cap")
+        taken = (f"the densest {len(event_ids):,} of them" if event_ids
+                 else "none of them")
+        print(f"  {'would fetch' if dry_run else 'fetching'} {taken}; "
+              f"{left_behind:,} left for a later run ({' and '.join(why)})")
     if dry_run:
-        # Ids only: a dry run reports the scope, and pulling every candidate's
-        # text to print ten of them would be the run's most expensive step.
         print(f"--dry-run: first chunk ids: "
-              f"{', '.join(str(cid) for cid in event_ids[:10]) or '(none)'}")
+              f"{', '.join(str(cid) for cid in scoped_ids[:10]) or '(none)'}")
     else:
-        event_rows = _chunk_rows(con, event_ids)
-        # Once, before either sub-phase can write. Phase 1 guards its own
-        # writes, but it returns early when the seed pool is already full.
+        # Again, cheaply: the top-level call above already cleared this run, so
+        # this is one ingest_state read, and it is what keeps the invariant
+        # local to the writes for a future caller that reaches phase 3 without
+        # coming through the top of hybrid_chunks.
         annotate._check_model_guard(con, model)
         try:
             _run_upgrades(con, event_rows, model, think, workers, batch_size,
@@ -512,11 +643,24 @@ def hybrid_chunks(con, model, think=False, workers=1, all_chats=False,
             _summary(counts, events, low_conf, minutes, started, "interrupted")
             return total + events["done"]
 
-    # Phase 3b. Fetching limit+len(seen) rows and filtering afterwards keeps the
-    # cap exact: 3a's writes drop out of this query on their own (they are 'llm'
-    # now), but a row it skipped, or one whose write is still uncommitted, would
-    # otherwise come back around inside the same run.
-    remaining = None if limit is None else max(0, limit - len(seen))
+    # Phase 3b. `limit` counts UPGRADES WRITTEN across both sub-phases, so what
+    # 3a spends of it is events["done"] and not len(seen): `seen` also holds the
+    # chunks 3a dispatched and could not parse, which bought nothing, and
+    # charging them against a work-product cap made --limit N deliver fewer than
+    # N (the wall clock is what caps spending). The residual is one-sided and
+    # symmetrical: a row THIS phase fails to parse leaves the run one short (it
+    # is the last phase -- nothing follows to make it up), and so does a 3a skip
+    # when this phase has no candidates to make it up FROM. Either way the fix
+    # would be to dispatch past N, which is work the flag did not authorize; a
+    # rerun buys it, and the summary line below says candidates were left.
+    #
+    # Fetching remaining+len(seen) rows and filtering afterwards keeps the cap
+    # exact: 3a's writes drop out of this query on their own (they are 'llm'
+    # now), but the rows it dispatched and skipped are still source='distilled'
+    # and would come back around inside the same run. len(seen) is every row 3a
+    # dispatched and so bounds how many of those this query can return -- fetch
+    # that many extra and `remaining` fresh rows always survive the filter.
+    remaining = None if limit is None else max(0, limit - events["done"])
     left = max(0.0, deadline - time.monotonic())
     if not dry_run and left <= 0:
         # Before the fetch, not after: the fetch carries every in-scope row's
@@ -567,8 +711,26 @@ def hybrid_chunks(con, model, think=False, workers=1, all_chats=False,
     # 3b at the budget itself, and either leaving candidates undispatched is the
     # same news to the reader -- there is more to buy, so rerun.
     stopped = events["stopped"] or low_conf["stopped"]
-    _summary(counts, events, low_conf, minutes, started,
-             "stopped at a phase deadline with candidates left; rerun to resume "
-             "(rows already annotated by an LLM are skipped)" if stopped
-             else "finished every candidate in scope with budget to spare")
+    # Candidates this run never even fetched, which is a different sentence from
+    # "the clock ran out": --limit (or the fetch caps) scoped them out while the
+    # budget still had time. Saying "finished every candidate in scope" there
+    # was flatly false, and it hid exactly the shortfall a --limit run wants to
+    # see -- the run can end with minutes unspent and thousands of candidates
+    # untouched.
+    # events["skipped"] comes off the 3b side of the sum: those rows are still
+    # source='distilled' (so n_low_conf counts them) and `seen` filtered them
+    # out of the fetch, but they were DISPATCHED, not scoped out -- counting
+    # them here would blame --limit for an unparseable reply.
+    unfetched = left_behind + max(
+        0, n_low_conf - events["skipped"] - len(low_conf_rows))
+    if stopped:
+        outcome = ("stopped at a phase deadline with candidates left; rerun to "
+                   "resume (rows already annotated by an LLM are skipped)")
+    elif unfetched:
+        outcome = (f"finished everything this run was scoped to, with "
+                   f"{unfetched:,} candidates left over (--limit / the fetch "
+                   f"caps, not the clock); rerun to continue")
+    else:
+        outcome = "finished every candidate in scope with budget to spare"
+    _summary(counts, events, low_conf, minutes, started, outcome)
     return total + events["done"] + low_conf["done"]

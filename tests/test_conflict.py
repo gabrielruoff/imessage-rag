@@ -1138,14 +1138,43 @@ class SelectTurnsTest(unittest.TestCase):
             self._ids(conflict_detect._select_turns(seg, 6, peak_id=1)),
             [1, 2, 3, 4, 5, 6])
 
-    def test_prescreen_drops_short_and_symbol_only_turns(self):
-        seg = [_turn(1, "ok"),                      # under the char floor
+    def test_prescreen_drops_symbol_only_turns_but_keeps_short_ones(self):
+        # The prescreen is an ALPHANUMERIC test and nothing else: a turn with no
+        # letters or digits gives the classifier nothing to read, while a short
+        # one ("ok") is exactly the stonewalling/contempt shape the turn prompt
+        # asks it to find and must still reach the model.
+        seg = [_turn(1, "ok"),                      # short, but alphanumeric
                _turn(2),
                _turn(3, "\U0001f643" * 20),         # long enough, no alnum
                _turn(4, "!" * 20),                  # punctuation only
                _turn(5, "   "),                     # whitespace only
                _turn(6)]
-        self.assertEqual(self._ids(conflict_detect._select_turns(seg, 6)), [2, 6])
+        self.assertEqual(self._ids(conflict_detect._select_turns(seg, 6)), [1, 2, 6])
+
+    def test_a_window_of_only_terse_turns_still_selects_them(self):
+        # The MAJOR case: a window whose escalation is entirely terse
+        # withdrawal. Under the old length floor it selected zero turns, was
+        # stamped labeled_at having dispatched nothing, and read downstream as
+        # "analyzed and clean".
+        seg = [_turn(1, "k."), _turn(2, "whatever"), _turn(3, "fine.")]
+        self.assertEqual(self._ids(conflict_detect._select_turns(seg, 6)), [1, 2, 3])
+        # ...and peak-anchored selection reaches them too.
+        self.assertEqual(self._ids(conflict_detect._select_turns(seg, 2, peak_id=3)),
+                         [2, 3])
+
+    def test_the_char_floor_ranks_the_fallback_slice_instead_of_filtering_it(self):
+        # No peak to bracket and more candidates than the cap: floor-clearing
+        # turns are preferred, the short ones fill what is left, and the result
+        # is chronological on every path. Ids 1..4 are terse, 5..8 are long.
+        seg = [_turn(1, "k."), _turn(2, "no"), _turn(3, "sure"), _turn(4, "fine."),
+               _turn(5), _turn(6), _turn(7), _turn(8)]
+        self.assertEqual(self._ids(conflict_detect._select_turns(seg, 4)),
+                         [5, 6, 7, 8])
+        # More slots than long turns: the terse ones fill the rest rather than
+        # being dropped, and the output stays in chronological order.
+        out = self._ids(conflict_detect._select_turns(seg, 6))
+        self.assertEqual(out, [1, 2, 5, 6, 7, 8])
+        self.assertEqual(out, sorted(out))
 
     def test_no_peak_id_falls_back_to_the_chronological_head(self):
         seg = [_turn(i) for i in range(1, 21)]
@@ -1158,11 +1187,11 @@ class SelectTurnsTest(unittest.TestCase):
                          [1, 2, 3, 4, 5, 6])
 
     def test_a_prescreened_out_peak_still_anchors_on_its_position(self):
-        # A long silence is often answered by a one-word line, so the peak turn
-        # itself is frequently the one the prescreen drops. The span must still
-        # land WHERE it was rather than reverting to the window head.
+        # A long silence is often answered by a tapback or a bare emoji, so the
+        # peak turn itself can be the one the prescreen drops. The span must
+        # still land WHERE it was rather than reverting to the window head.
         seg = [_turn(i) for i in range(1, 21)]
-        seg[14] = _turn(15, "ok")                   # id 15, dropped by the prescreen
+        seg[14] = _turn(15, "\U0001f643")           # id 15, no alnum: prescreened out
         out = self._ids(conflict_detect._select_turns(seg, 6, peak_id=15))
         self.assertEqual(out, [12, 13, 14, 16, 17, 18])
         self.assertNotIn(15, out)
@@ -1336,10 +1365,12 @@ class DeadlineGateTest(_ConflictWindowsTest):
         self.assertIn("dispatched nothing", _said(printed))
 
     def test_a_window_with_no_labelable_turns_is_stamped_without_a_request(self):
-        # The prescreen buys such a window for free -- it is processed, so it
-        # is stamped, and a rerun must not keep re-considering it.
+        # Only an ALPHANUMERIC-free window (all tapbacks/emoji) is free now: it
+        # is processed, so it is stamped, and a rerun must not keep
+        # re-considering it. A terse-but-alphanumeric window is dispatched --
+        # see SelectTurnsTest.test_a_window_of_only_terse_turns_still_selects_them.
         con = self._seed([(1, 2, 2)])
-        con.execute("UPDATE messages SET text = 'ok'")
+        con.execute("UPDATE messages SET text = '\U0001f643\U0001f643'")
         con.commit()
         cls = _Classifier()
         with mock.patch("builtins.print"):
@@ -1349,6 +1380,27 @@ class DeadlineGateTest(_ConflictWindowsTest):
         self.assertEqual(n, 1)
         self.assertEqual(cls.texts, [])
         self.assertIsNotNone(self._stamps(con)[1])
+
+    def test_a_window_of_only_terse_turns_is_dispatched_not_taken_for_free(self):
+        # The stonewalling case, end to end: every turn is under the old
+        # 15-char floor, so the whole window used to be stamped labeled_at
+        # having sent nothing and then read as "analyzed and clean". Terse
+        # withdrawal is what the classifier is asked to find, so it goes out.
+        con = self._seed([(1, 3, 2)])
+        for k, text in enumerate(("k.", "whatever", "fine.")):
+            con.execute("UPDATE messages SET text = ? WHERE id = ?", (text, 100 + k))
+        con.commit()
+        cls = _Classifier()
+        with mock.patch("builtins.print") as printed:
+            n = conflict_detect.label_top_conflicts(con, "test-model",
+                                                    max_label_turns=6,
+                                                    classify_fn=cls)
+        self.assertEqual(n, 1)
+        self.assertEqual(cls.texts, ["k.", "whatever", "fine."])
+        self.assertEqual(self._n_signals(con, 1), 3)
+        self.assertIsNotNone(self._stamps(con)[1])
+        # ...and it is NOT counted among the windows that cost no request.
+        self.assertNotIn("cost no request", _said(printed))
 
     def test_no_deadline_labels_every_window(self):
         # deadline=None is unbudgeted: a call price that would blow any budget
@@ -1614,10 +1666,27 @@ class ResolveBudgetMinutesTest(unittest.TestCase):
         with mock.patch.object(conflict_detect, "CONFLICT_BUDGET_MINUTES", 0):
             self.assertEqual(conflict_detect._resolve_budget_minutes(None)[0], 0)
 
-    def test_a_negative_budget_clamps_to_zero(self):
-        self.assertEqual(conflict_detect._resolve_budget_minutes(-5)[0], 0)
+    def test_a_negative_env_value_is_refused_by_name(self):
+        # Clamping a negative to 0 meant UNBUDGETED here -- the unbounded run
+        # this tier exists to prevent -- so an env typo bought silently what the
+        # CLI refuses `--budget-minutes -5` for outright.
         with mock.patch.object(conflict_detect, "CONFLICT_BUDGET_MINUTES", -9):
-            self.assertEqual(conflict_detect._resolve_budget_minutes(None)[0], 0)
+            with self.assertRaises(SystemExit) as cm:
+                conflict_detect._resolve_budget_minutes(None)
+        self.assertIn("CONFLICT_BUDGET_MINUTES", str(cm.exception))
+        self.assertIn("negative", str(cm.exception))
+
+    def test_a_negative_caller_value_is_refused_by_name(self):
+        with self.assertRaises(SystemExit) as cm:
+            conflict_detect._resolve_budget_minutes(-5)
+        self.assertIn("--budget-minutes", str(cm.exception))
+
+    def test_zero_and_unset_are_unaffected_by_the_negative_check(self):
+        # The documented meanings survive: 0 is unbudgeted, an unset env falls
+        # through to whatever CONFLICT_BUDGET_MINUTES holds.
+        with mock.patch.object(conflict_detect, "CONFLICT_BUDGET_MINUTES", 25):
+            self.assertEqual(conflict_detect._resolve_budget_minutes(0)[0], 0)
+            self.assertEqual(conflict_detect._resolve_budget_minutes(None)[0], 25)
 
 
 # --- labeled_at migration + self-heal ----------------------------------------
@@ -1773,6 +1842,215 @@ class CliWiringTest(_TempDBTest):
         conflict_detect.main(["--dry-run"])
         self.assertTrue(self.detect.only["dry_run"])
         self.assertEqual(self.label.calls, [])
+
+
+class RelabelGuardTest(_TempDBTest):
+    """--relabel is the ONE flag that deletes labels globally, so the model
+    guard has to fire before the deletion. It used to fire only inside
+    label_top_conflicts, i.e. after _clear_labels had already dropped every
+    conflict_signals row: `--relabel --model <other>` destroyed every label the
+    previous budgets had bought and THEN refused to rebuild any of them."""
+
+    def _seeded(self, model="modelA"):
+        con = sqlite3.connect(self.db_path)
+        con.row_factory = sqlite3.Row
+        schema.create_schema(con)
+        con.execute("INSERT INTO chats(id, chat_identifier, is_group, service) "
+                    "VALUES (1, 'chat1', 0, 'iMessage')")
+        con.execute(
+            "INSERT INTO conflicts(id, chat_id, first_date, last_date, "
+            "peak_signal_json, corroboration, off_text_flag, source, topic, "
+            "labeled_at) VALUES (1, 1, '2026-03-01T09:00:00', "
+            "'2026-03-01T10:00:00', '{}', 'none', 0, 'llm', 'criticism', "
+            "'2026-03-02T00:00:00')")
+        con.execute(
+            "INSERT INTO conflict_signals(conflict_id, message_id, actor_is_me, "
+            "label_class, top2_labels_json, band, excerpt) VALUES "
+            "(1, 100, 0, 'criticism', '[\"criticism\"]', 'likely', 'x')")
+        set_state(con, "conflict_model", model)
+        con.commit()
+        con.close()
+
+    @contextlib.contextmanager
+    def _stubbed_main(self):
+        """main() with both passes stubbed out, so only the CLI's own
+        clear/guard ordering is under test."""
+        detect, label = _Recorder(), _Recorder()
+        with mock.patch.object(conflict_detect, "DB_PATH", self.db_path), \
+                mock.patch.object(conflict_detect, "detect_conflicts", detect), \
+                mock.patch.object(conflict_detect, "label_top_conflicts", label), \
+                mock.patch("builtins.print") as printed:
+            yield detect, label, printed
+
+    def _state(self):
+        con = self._con()
+        return {
+            "signals": con.execute(
+                "SELECT COUNT(*) FROM conflict_signals").fetchone()[0],
+            "labeled_at": con.execute(
+                "SELECT labeled_at FROM conflicts").fetchone()[0],
+            "topic": con.execute("SELECT topic FROM conflicts").fetchone()[0],
+            "model": get_state(con, "conflict_model"),
+        }
+
+    def test_a_mismatched_model_is_refused_before_any_label_is_deleted(self):
+        self._seeded(model="modelA")
+        with self._stubbed_main() as (detect, label, printed):
+            with self.assertRaises(SystemExit):
+                conflict_detect.main(["--relabel", "--model", "modelB"])
+        state = self._state()
+        self.assertEqual(state["signals"], 1)            # nothing was destroyed
+        self.assertIsNotNone(state["labeled_at"])
+        self.assertEqual(state["model"], "modelA")       # nor re-recorded
+        self.assertIn("Mixing label models", _said(printed))
+        self.assertEqual(detect.calls, [])
+        self.assertEqual(label.calls, [])
+
+    def test_the_same_model_still_clears_and_relabels(self):
+        # The legitimate flow -- what --relabel exists for (a changed
+        # CONFLICT_MAX_LABEL_TURNS, a newly cleared eval gate) -- is untouched.
+        self._seeded(model="modelA")
+        with self._stubbed_main() as (detect, label, _printed):
+            conflict_detect.main(["--relabel", "--model", "modelA"])
+        state = self._state()
+        self.assertEqual(state["signals"], 0)
+        self.assertIsNone(state["labeled_at"])
+        self.assertIsNone(state["topic"])
+        self.assertEqual(len(detect.calls), 1)
+        self.assertEqual(len(label.calls), 1)            # the pass still runs
+
+    def test_dry_run_neither_clears_nor_guards(self):
+        # --dry-run promises no writes, so it must not delete labels -- and must
+        # not refuse on a model it is never going to label with either.
+        self._seeded(model="modelA")
+        with self._stubbed_main() as (_detect, label, _printed):
+            conflict_detect.main(["--relabel", "--model", "modelB", "--dry-run"])
+        state = self._state()
+        self.assertEqual(state["signals"], 1)
+        self.assertEqual(state["model"], "modelA")
+        self.assertEqual(label.calls, [])
+
+    def test_no_llm_does_not_exempt_the_clear_from_the_guard(self):
+        # --no-llm skips the LABELING, not the deletion: --relabel still drops
+        # every conflict_signals row in the table. The model flag being inert on
+        # that path is not a licence to wipe another model's labels with it --
+        # and --relabel's own help text promises the guard runs before the clear
+        # without qualifying it.
+        self._seeded(model="modelA")
+        with self._stubbed_main() as (detect, label, printed):
+            with self.assertRaises(SystemExit):
+                conflict_detect.main(["--relabel", "--no-llm", "--model", "modelB"])
+        state = self._state()
+        self.assertEqual(state["signals"], 1)            # nothing was destroyed
+        self.assertIsNotNone(state["labeled_at"])
+        self.assertEqual(state["model"], "modelA")
+        self.assertIn("Mixing label models", _said(printed))
+        self.assertEqual(detect.calls, [])
+        self.assertEqual(label.calls, [])
+
+    def test_no_llm_on_the_recorded_model_clears_and_records_nothing(self):
+        # The legitimate --no-llm relabel: same model, so the guard passes, the
+        # clear happens, and conflict_model is left exactly as it was rather
+        # than re-stamped by a run that will never write a label.
+        self._seeded(model="modelA")
+        with self._stubbed_main() as (_detect, label, _printed):
+            conflict_detect.main(["--relabel", "--no-llm", "--model", "modelA"])
+        state = self._state()
+        self.assertEqual(state["signals"], 0)
+        self.assertIsNone(state["labeled_at"])
+        self.assertEqual(state["model"], "modelA")
+        self.assertEqual(label.calls, [])
+
+    def test_a_relabel_that_never_labels_does_not_record_the_model(self):
+        # The guard's early call REFUSES only; recording stays with the pass
+        # that actually labels. Otherwise a --relabel run interrupted during
+        # detection (detect_conflicts catches Ctrl-C and returns) left
+        # conflict_model naming a model that had labeled nothing, and the next
+        # plain run was refused in its name -- with "clear conflicts" as the
+        # offered recovery.
+        con = self._con()
+        schema.create_schema(con)
+        con.execute("INSERT INTO chats(id, chat_identifier, is_group, service) "
+                    "VALUES (1, 'chat1', 0, 'iMessage')")
+        con.commit()
+        with self._stubbed_main() as (_detect, _label, _printed):
+            conflict_detect.main(["--relabel", "--model", "modelB"])
+        self.assertIsNone(get_state(self._con(), "conflict_model"))
+
+    def test_a_mismatched_model_is_refused_before_detection_can_drop_rows(self):
+        # The DEFAULT invocation, not --relabel: detection's _drop_conflicts
+        # deletes a superseded window together with its conflict_signals rows
+        # (committed per chat), and the only guard call used to sit AFTER it --
+        # so a mismatched --model destroyed labels first and, if the drop
+        # emptied the table, the guard then read COUNT(conflicts) == 0 and
+        # accepted the new model over the wreckage.
+        self._seeded(model="modelA")
+        with self._stubbed_main() as (detect, label, printed):
+            with self.assertRaises(SystemExit):
+                conflict_detect.main(["--model", "modelB"])
+        state = self._state()
+        self.assertEqual(state["signals"], 1)
+        self.assertEqual(state["model"], "modelA")
+        self.assertIn("Mixing label models", _said(printed))
+        self.assertEqual(detect.calls, [])               # refused BEFORE the sweep
+        self.assertEqual(label.calls, [])
+
+    def test_no_llm_alone_is_not_guarded_by_the_model_flag(self):
+        # Without --relabel, --no-llm neither labels nor clears, so the model is
+        # genuinely inert: refusing there would block a deterministic re-detect
+        # for a flag it does not use.
+        self._seeded(model="modelA")
+        with self._stubbed_main() as (detect, label, _printed):
+            conflict_detect.main(["--no-llm", "--model", "modelB"])
+        self.assertEqual(self._state()["model"], "modelA")
+        self.assertEqual(len(detect.calls), 1)
+        self.assertEqual(label.calls, [])
+
+
+class EnvKnobValidationTest(_TempDBTest):
+    """A knob is validated where it is RESOLVED, not only where a flag supplies
+    it: the CLI already refuses `--max-label-turns 0` and `--budget-minutes -5`,
+    and the env spellings of both reached the same code unchecked."""
+
+    _stubbed_main = RelabelGuardTest._stubbed_main
+
+    def test_a_non_positive_turn_cap_from_the_env_is_refused_by_name(self):
+        # config parses CONFLICT_MAX_LABEL_TURNS as int(getenv(...) or "6"), so
+        # the string "0" is truthy and yields 0 -- and `args.max_label_turns or
+        # CONFLICT_MAX_LABEL_TURNS` passed it straight through. _select_turns
+        # then returns [] for EVERY window while label_top_conflicts still
+        # stamps each one, so one bad .env line latches the whole corpus as
+        # labeled having dispatched nothing (and the summary blames the
+        # prescreen). Exactly the harm the flag's own parser.error names.
+        with mock.patch.object(conflict_detect, "CONFLICT_MAX_LABEL_TURNS", 0):
+            with self._stubbed_main() as (detect, label, _printed):
+                with self.assertRaises(SystemExit) as cm:
+                    conflict_detect.main([])
+        self.assertIn("CONFLICT_MAX_LABEL_TURNS", str(cm.exception))
+        self.assertEqual(detect.calls, [])
+        self.assertEqual(label.calls, [])
+
+    def test_an_explicit_turn_cap_still_overrides_a_bad_env(self):
+        with mock.patch.object(conflict_detect, "CONFLICT_MAX_LABEL_TURNS", 0):
+            with self._stubbed_main() as (detect, _label, _printed):
+                conflict_detect.main(["--max-label-turns", "4"])
+        self.assertEqual(len(detect.calls), 1)
+
+    def test_no_llm_is_not_refused_by_a_budget_it_cannot_spend(self):
+        # The parser rejects `--no-llm --budget-minutes N` because that path
+        # makes zero LLM calls, so the budget has nothing to bound -- resolving
+        # (and validating) the env on that same run let a bad
+        # CONFLICT_BUDGET_MINUTES refuse a deterministic-only sweep the knob
+        # cannot affect. The env value stays refused on every path that labels.
+        with mock.patch.object(conflict_detect, "CONFLICT_BUDGET_MINUTES", -5):
+            with self._stubbed_main() as (detect, label, _printed):
+                conflict_detect.main(["--no-llm"])
+            self.assertEqual(len(detect.calls), 1)
+            self.assertEqual(label.calls, [])
+            with self._stubbed_main() as (_detect, _label, _printed):
+                with self.assertRaises(SystemExit) as cm:
+                    conflict_detect.main([])
+        self.assertIn("CONFLICT_BUDGET_MINUTES", str(cm.exception))
 
 
 class MainSelfHealTest(_TempDBTest):
@@ -2298,21 +2576,60 @@ class LabelingCoverageReadTest(_TempDBTest):
 
     # -- labeled, nothing found ---------------------------------------------
     def test_a_labeled_window_with_zero_signals_is_labeled_with_zero_turns(self):
-        # The legitimate "we looked and found nothing" outcome: every label was
-        # neutral or eval-gate-suppressed, so the window is stamped with no rows.
+        # The window WAS processed -- every label was neutral, below the floor,
+        # or eval-gate-suppressed -- so it is stamped with no rows. That is
+        # still not a finding of calm (the pass reads message text only, and a
+        # window of tapbacks has nothing to read), so both surfaces say so
+        # instead of letting the 0 pass for "we looked and it was fine".
         self._seed_one_conflict(0, labeled=True)
         env = query_tools.find_conflicts(chat_id=1)
         (row,) = env["rows"]
         self.assertTrue(row["labeled"])
         self.assertEqual(row["labeled_signal_turns"], 0)
         self.assertEqual(env["n_labeled"], 1)
-        self.assertNotIn("labeling_note", env)
+        self.assertIn("1 of 1", env["labeling_note"])
+        self.assertIn("not 'analyzed and calm'", env["labeling_note"])
+        self.assertNotIn("NOT ANALYZED", env["labeling_note"])  # it WAS analyzed
+        # The unlabeled-backlog epilogue is for windows nothing looked at.
         self.assertNotIn("not have been looked at", env["_epilogue"])
         out = query_tools.get_conflict(7)
         self.assertTrue(out["labeled"])
         self.assertEqual(out["signals_total"], 0)
-        self.assertIn("eval-gated bands", out["note"])   # not the unlabeled note
-        self.assertNotIn("NOT ANALYZED", out["note"])
+        self.assertIn("not a finding of calm", out["note"])
+        self.assertNotIn("NOT ANALYZED", out["note"])    # not the unlabeled note
+        # ...and out-of-band on BOTH surfaces, not payload-only. The sibling
+        # unlabeled case has had a code-printed epilogue since it landed,
+        # precisely because a note the model may or may not narrate is not a
+        # framing floor; this case licenses the identical misreading ("I checked
+        # and nothing came up"), and with total == n_labeled the unlabeled
+        # epilogue never fires to cover it.
+        self.assertIn("not a clean bill of health", env["_epilogue"])
+        self.assertIn("not a clean bill of health", out["_epilogue"])
+
+    def test_an_abstain_only_window_reads_the_same_on_both_surfaces(self):
+        # find_conflicts counts labeled_signal_turns as NON-ABSTAIN rows, so an
+        # abstain-only window is "labeled but produced zero signal turns" there.
+        # get_conflict picked its note off COUNT(*) instead, so drilling into
+        # that very row -- the expansion the envelope tells the caller to make
+        # -- answered with the eval-gated-bands caveat and dropped the warning
+        # at the one step it had to survive.
+        self._seed_one_conflict(0, labeled=True)
+        con = self._con()
+        con.executemany(
+            "INSERT INTO conflict_signals(conflict_id, message_id, actor_is_me, "
+            "label_class, top2_labels_json, band, excerpt) VALUES "
+            "(7, ?, 0, 'abstain', '[]', NULL, 'k.')", [(2000,), (2001,)])
+        con.commit()
+        env = query_tools.find_conflicts(chat_id=1)
+        (row,) = env["rows"]
+        self.assertEqual(row["labeled_signal_turns"], 0)
+        self.assertIn("not 'analyzed and calm'", env["labeling_note"])
+        out = query_tools.get_conflict(7)
+        self.assertEqual(out["signals_total"], 2)        # abstains still paginate
+        self.assertEqual(out["labeled_signal_turns"], 0)  # same count, same name
+        self.assertIn("not a finding of calm", out["note"])
+        self.assertNotIn("eval-gated bands", out["note"])
+        self.assertIn("not a clean bill of health", out["_epilogue"])
 
     # -- labeled, signals found (today's behavior, unchanged) ----------------
     def test_a_labeled_window_with_signals_is_unchanged(self):
@@ -2374,9 +2691,11 @@ class LabelingCoverageReadTest(_TempDBTest):
         self.assertEqual([r["conflict_id"] for r in rows], [2, 3, 1])
 
     # -- a table that predates the column ------------------------------------
-    def _pre_budget_db(self):
+    def _pre_budget_db(self, conflict_ids=(7,), with_signals=()):
         """A `conflicts` table from BEFORE labeled_at existed -- a DB neither
-        re-ingested nor re-detected since. Reuses the migration test's DDL."""
+        re-ingested nor re-detected since. Reuses the migration test's DDL.
+        `with_signals` names the windows carrying stored signal rows, which on
+        such a table is the ONLY evidence that a labeling pass ever ran."""
         con = sqlite3.connect(self.db_path)
         con.executescript(_PRE_BUDGET_CONFLICTS_DDL)
         con.execute("CREATE TABLE chats(id INTEGER PRIMARY KEY, is_group INTEGER)")
@@ -2385,27 +2704,70 @@ class LabelingCoverageReadTest(_TempDBTest):
             "CREATE TABLE conflict_signals(id INTEGER PRIMARY KEY AUTOINCREMENT, "
             "conflict_id INTEGER, message_id INTEGER, actor_is_me INTEGER, "
             "label_class TEXT, top2_labels_json TEXT, band TEXT, excerpt TEXT)")
-        con.execute(
-            "INSERT INTO conflicts(id, chat_id, first_date, last_date, "
-            "peak_signal_json, corroboration, off_text_flag, source) VALUES "
-            "(7, 1, '2026-03-01', '2026-03-02', ?, 'none', 0, 'llm')",
-            (json.dumps({"signals": ["dislike_run"], "signal_count": 1}),))
+        for cid in conflict_ids:
+            con.execute(
+                "INSERT INTO conflicts(id, chat_id, first_date, last_date, "
+                "peak_signal_json, corroboration, off_text_flag, source) VALUES "
+                "(?, 1, '2026-03-01', '2026-03-02', ?, 'none', 0, 'llm')",
+                (cid, json.dumps({"signals": ["dislike_run"], "signal_count": 1})))
+            if cid in with_signals:
+                con.execute(
+                    "INSERT INTO conflict_signals(conflict_id, message_id, "
+                    "actor_is_me, label_class, top2_labels_json, band, excerpt) "
+                    "VALUES (?, 1000, 0, 'criticism', '[\"criticism\"]', "
+                    "'likely', 'you never listen')", (cid,))
         con.commit()
         con.close()
 
-    def test_a_table_predating_the_column_degrades_instead_of_raising(self):
-        # Every row there went through the old UNBOUNDED label pass, so
-        # labeled=true is the honest reading -- and `no such column` would be a
-        # crash where _has_conflict_tables promises a graceful read.
-        self._pre_budget_db()
+    def test_a_table_predating_the_column_reads_labeling_off_the_signal_rows(self):
+        # With no labeled_at column, `labeled` is INFERRED PER ROW from stored
+        # signal turns. The old flat 'pre-budget' literal marked EVERY window
+        # labeled -- including windows an old --no-llm run detected and never
+        # labeled -- so the read tools reported "we looked and found nothing"
+        # about windows nothing ever looked at. `no such column` is the other
+        # failure to avoid: _has_conflict_tables promises a graceful read.
+        self._pre_budget_db(conflict_ids=(7, 8), with_signals=(8,))
         env = query_tools.find_conflicts(chat_id=1)
-        (row,) = env["rows"]
-        self.assertTrue(row["labeled"])
+        by_id = {r["conflict_id"]: r for r in env["rows"]}
+        self.assertFalse(by_id[7]["labeled"])            # never labeled
+        self.assertEqual(by_id[7]["labeled_signal_turns"], 0)
+        self.assertTrue(by_id[8]["labeled"])             # signals prove a pass ran
+        self.assertEqual(by_id[8]["labeled_signal_turns"], 1)
         self.assertEqual(env["n_labeled"], 1)
-        self.assertNotIn("labeling_note", env)
-        out = query_tools.get_conflict(7)
-        self.assertTrue(out["labeled"])
-        self.assertIn("eval-gated bands", out["note"])
+        self.assertIn("NOT ANALYZED", env["labeling_note"])
+        self.assertIn("predates the labeling-completion stamp", env["labeling_note"])
+
+    def test_a_pre_migration_episode_says_the_stamp_is_missing(self):
+        self._pre_budget_db(conflict_ids=(7, 8), with_signals=(8,))
+        never = query_tools.get_conflict(7)
+        self.assertFalse(never["labeled"])
+        self.assertEqual(never["signals_total"], 0)
+        self.assertIn("NOT ANALYZED", never["note"])
+        self.assertIn("predates the labeling-completion stamp", never["note"])
+        self.assertEqual(never["peak_signal"]["signal_count"], 1)  # evidence intact
+        labeled = query_tools.get_conflict(8)
+        self.assertTrue(labeled["labeled"])
+        self.assertEqual(labeled["signals_total"], 1)
+        self.assertIn("eval-gated bands", labeled["note"])
+
+    # -- envelope shape ------------------------------------------------------
+    def test_an_empty_scope_envelope_still_carries_the_coverage_counts(self):
+        # find_conflicts' docstring and its JSON schema promise n_corroborated
+        # and n_labeled on EVERY envelope; a caller reading env["n_labeled"]
+        # must not have to special-case a scope that resolved to nothing.
+        self._seed_one_conflict(0, labeled=True)
+        for env in (query_tools.find_conflicts(chat_id=999),      # no such chat
+                    query_tools.find_conflicts(contact_id=12345)):  # no handles
+            self.assertEqual(env["rows"], [])
+            self.assertEqual(env["total_matching"], 0)
+            self.assertEqual(env["n_labeled"], 0)
+            self.assertEqual(env["n_corroborated"], 0)
+
+    def test_a_db_without_the_conflict_tables_returns_the_same_envelope(self):
+        env = query_tools.find_conflicts()      # the temp DB has no tables yet
+        self.assertEqual(env["rows"], [])
+        self.assertEqual(env["n_labeled"], 0)
+        self.assertEqual(env["n_corroborated"], 0)
 
     # -- payload discipline --------------------------------------------------
     def test_result_capped_well_under_limit(self):

@@ -93,8 +93,10 @@ make ingest             # snapshot → normalize → chunk → embed (the long p
 
 ```bash
 make annotate           # LLM chunk annotations (distilled/kNN tier by default) → chunk_annotations
+make annotate-hybrid    # LLM upgrades on a wall-clock budget (ANNOTATE_BUDGET_MINUTES); does NOT chain --terms
 .venv/bin/python3 annotate.py --quality balanced --upgrade-distilled   # upgrade top chats to source='llm'
-make pipeline           # ingest → annotate → nudges → drift → voiceprint → conflict → topics (serial)
+make pipeline           # ingest → annotate → suite → topics (serial)
+make suite              # just the four suite features (nudges → drift → voiceprint → conflict), no re-ingest
 ```
 
 **Why `make pipeline` is strictly serial:** every step holds the SQLite write lock across
@@ -110,14 +112,28 @@ and voiceprint `tone_*` is NULL. This is honest-degrade, not a bug — see each 
 **Good to know**.
 
 Every `--quality balanced --upgrade-distilled` line below is the *exhaustive* way to do
-that, and it runs for hours. `annotate.py --quality hybrid` is the bounded-time
+that, and it runs for hours. `make annotate-hybrid` (= `annotate.py --quality hybrid`) is
+the bounded-time
 alternative: it upgrades distilled rows until `ANNOTATE_BUDGET_MINUTES` is spent — event
 candidates first, then the least-confident rows — so the same reads light up for the
-chunks that matter most rather than for everything. Substitute it anywhere below when you
-want a demo-able run instead of an overnight one. Leave the budget at its 25-minute
+chunks that matter most rather than for everything. (Unlike `make annotate` it does *not*
+chain the `--terms` pass; that pipeline is unbudgeted and would break the wall-clock
+promise.) Substitute it anywhere below when you
+want a demo-able run instead of an overnight one. `--limit N` there caps the upgrades
+actually **written**, not the requests sent: a reply the model came back unparseable on
+spent budget but produced no annotation and doesn't consume the cap.
+
+Leave the budget at its 25-minute
 default for a demo: one LLM request is the smallest thing the tier can buy (a request
-holds 4–6 event-candidate chunks and banked at 46.7s on the reference machine), so a
-1- or 2-minute budget correctly declines to start anything and just prints why.
+holds 4–6 event-candidate chunks and banked at 46.7s on the reference machine), so on a
+1- or 2-minute budget the LLM **upgrade** phases decline to start work they cannot finish
+and print why, naming the knob. That is **not** a no-op run: the seed top-up and the
+corpus-wide kNN classify + confidence backfill are deadline-gated, not skipped — they run
+and **commit whatever they reach**, and the next run resumes from there (measured: a
+1-minute budget landed at exactly 1.0 min with the confidence backfill stopping at 15,616
+of 20,613 rows; the next run finished the remaining 4,997 **and reached phase 3a**). A
+tiny budget therefore buys
+distilled coverage, just no LLM upgrades.
 
 **Changed 2026-07-28, and it affects how long these runs take:** the `distilled` / `fast`
 / `balanced` presets carry a reasoning-*effort* level (`low`), which only `gpt-oss`-family
@@ -170,7 +186,11 @@ grievance excerpts. A code-enforced DV floor watches the window text.
 corpus), then labels the *strongest* windows first until `CONFLICT_BUDGET_MINUTES`
 (default **25**) is spent, and prints how many it labeled versus left. One run does not
 label the whole corpus — the reference run labeled **211 of 1,305** detected windows in
-24m53s — but a rerun resumes down the strength ranking, so coverage grows a run at a time.
+24m53s (measured 2026-07-28, *before* the length prescreen was demoted to a ranking
+preference: windows whose turns were all under 15 characters used to be stamped for free
+and now cost real requests, so expect somewhat fewer windows per run — honestly labeled
+rather than silently skipped. Re-measure before quoting the number again) — but a rerun
+resumes down the strength ranking, so coverage grows a run at a time.
 
 ```bash
 make conflict                                  # detect everywhere, then label the strongest windows for ~25 min
@@ -178,13 +198,26 @@ make conflict                                  # detect everywhere, then label t
 make conflict-fast                             # deterministic windows only (--no-llm): zero Ollama calls, unchanged
 .venv/bin/python3 conflict_detect.py --dry-run # optional: how many 1:1 chats will be scanned, no writes
 .venv/bin/python3 conflict_detect.py --limit 5 # optional faster demo: first 5 direct chats
+.venv/bin/python3 conflict_detect.py --relabel # start labeling over: clears signals + topic + the labeled_at stamp
 ```
 
 `--budget-minutes 0` drops the deadline entirely (label every still-unlabeled window,
 however long it takes); `--budget-minutes` with `--no-llm` is an error, since that path
-makes no LLM calls to bound. A very small budget can legitimately dispatch *nothing* —
+makes no LLM calls to bound; a *negative* value is refused outright, naming the knob it
+came from, rather than clamped to 0 (which would mean unbudgeted). A very small budget can
+legitimately dispatch *nothing* —
 one window is the smallest unit of work — and it says so, naming the knob, rather than
 looking like "nothing to do".
+
+A window is labeled once and then skipped by every later run (`conflicts.labeled_at` is
+the resume marker), so if you retune `CONFLICT_MAX_LABEL_TURNS` / `CONFLICT_MIN_TURN_CHARS`
+or clear a new eval-gate class, `--relabel` is what makes the pass revisit them. It is
+**not** the model-switch door: `--relabel --model <other>` is refused up front, with every
+label the previous budgets bought still intact (the model guard runs *before* the
+deletion — and before the detection sweep, which drops superseded windows together with
+their signal rows, so a plain `--model <other>` is refused up front too). `--no-llm` does
+not exempt the clear from that check; it skips the labeling, not the deletion. Switching
+label models still means emptying `conflicts` or `make reset-db`.
 
 Run `annotate.py --quality balanced --upgrade-distilled` first if you want
 `corroboration='weak'/'llm'` instead of `'none'`. Detection itself is never blocked by
@@ -196,7 +229,7 @@ missing annotations.
 | Prompt | Tool | What you'll see |
 |---|---|---|
 | `Have I had any tense stretches with <NAME>? Show me the conflicts.` | `find_conflicts` | Ranked conflict episodes for that person's 1:1 chats — each with a `conflict_id`, dates, which signals fired, corroboration, `off_text_flag`. Empty if `make conflict` hasn't run or it's a group chat. |
-| `Open conflict 3 and show me what happened.` | `get_conflict` | One episode's evidence + its labeled turns rendered as **tentative/likely bands** (never raw scores), each with actor me/them and a verbatim excerpt ≤200 chars. At most `CONFLICT_MAX_LABEL_TURNS` (**6**) turns, peak-anchored on the window's longest unanswered gap rather than its first few messages — and **zero** for a window no run's budget has reached yet. |
+| `Open conflict 3 and show me what happened.` | `get_conflict` | One episode's evidence + its labeled turns rendered as **tentative/likely bands** (never raw scores), each with actor me/them and a verbatim excerpt ≤200 chars. At most `CONFLICT_MAX_LABEL_TURNS` (**6**) turns, peak-anchored on the window's longest unanswered gap rather than its first few messages — and **zero** in two cases the tool words differently: a window no run's budget has reached (`labeled` false = NOT ANALYZED), and one that *was* labeled but produced no shippable turn (`labeled` true, 0 turns — labeling reads message text only). Neither is a finding of calm. |
 | `Break down conflict 3 — who withdrew, who kept reaching out, and the tone on each side.` | `diagnose_conflict` | A deterministic scorecard: per-side I-vs-you / we-talk ratios, LSM match, opener/last-word roles, peak latency + volume-collapse read, and a **non-blame** demand-withdraw (pursuer vs withdrawer) read. Carries **no** aggressor/who-won verdict. |
 | `I want to apologize to <NAME> about conflict 3. Help me write it.` | `draft_apology` | A **scaffold**, not a finished apology: the ranked Lewicki-6 checklist + your real grievance excerpts pulled verbatim. It won't ghostwrite prose unless you ask again. |
 | `Did my fight with <NAME> (conflict 3) spill into other conversations?` | `trace_conflict_across_chats` | **Only exists if `CONFLICT_TRACE_ENABLED=true`.** The model asks first, then calls with `consent=true`; each link both clears a similarity threshold and literally names the partner. Nothing persisted. |
@@ -235,10 +268,17 @@ scope — so run `make conflict` first.
   off (`CONFLICT_DV_SCREEN=off` or `--no-dv-screen`) the role read/scaffold is restored, but
   the hotline **resource footer is still appended** — it is never removed. The scan is
   read-only; the hit is never persisted.
-- **A detected window with no labeled turns is not a bug.** Detection is corpus-wide;
-  labeling is bought with a wall-clock budget, strongest windows first. `find_conflicts`
-  will happily list a window whose `get_conflict` shows zero turns — rerun `make conflict`
-  to extend coverage down the ranking (already-labeled windows are never re-bought).
+- **A detected window with no labeled turns is not a bug — in two different ways.**
+  Detection is corpus-wide; labeling is bought with a wall-clock budget, strongest windows
+  first. `find_conflicts` will happily list a window whose `get_conflict` shows zero turns
+  and says NOT ANALYZED — rerun `make conflict` to extend coverage down the ranking
+  (already-labeled windows are never re-bought). Separately, a window that **was** labeled
+  can still produce zero signal turns, and the tools say so in their own words: labeling
+  reads message **text** only, so a stretch carried by tapbacks, by tone, or moved
+  off-channel yields nothing to label, and a turn can also fall under
+  `CONFLICT_LABEL_CONF_FLOOR` or be suppressed by the eval gate. Three states, not two:
+  never looked at, looked at with nothing shippable, and labeled with bands. Read the
+  first two off their deterministic evidence, which is complete either way.
 - `corroboration='none'` on an all-distilled corpus is correct — light it with the
   `--upgrade-distilled` annotate pass.
 - Escalation labels are eval-gated bands. `conflict_labels` ships a **committed
@@ -273,6 +313,8 @@ date), plus two off-by-default detectors: `dropped_plan` and `unreciprocated_goo
 make nudges                                       # populate loose_threads (Ollama only for one-line nudge_text)
 .venv/bin/python3 loose_ends.py --dry-run         # optional: candidates/suppressed/written, no writes/Ollama
 .venv/bin/python3 loose_ends.py --acknowledge-reconnect   # ONE-TIME opt-in to reveal dormant_tie nudges
+.venv/bin/python3 loose_ends.py --no-llm          # detect only: SQL detectors, no nudge_text narration
+.venv/bin/python3 loose_ends.py --limit 20        # cap NARRATED threads (detection is unaffected); --model M overrides NUDGES_MODEL
 ```
 
 `make nudges` must run **after** `make annotate` (the Stage-0 valence exclusion reads
@@ -473,6 +515,7 @@ of how a contact might reply or how your past self texted (`simulate_contact`, V
 ```bash
 make voiceprint                                     # populate person_voiceprint (deterministic, no Ollama)
 .venv/bin/python3 voiceprint.py --force             # force full rebuild (e.g. after re-ingest)
+.venv/bin/python3 voiceprint.py --dry-run           # optional: how many rows would be built, no writes
 .venv/bin/python3 annotate.py --quality balanced --upgrade-distilled   # optional: light the low-trust tone_* fields
 ```
 

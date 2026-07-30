@@ -1356,7 +1356,8 @@ def main(argv=None):
     parser.add_argument("--terms", action="store_true",
                         help="curate dyad_terms verdicts instead of annotating chunks")
     parser.add_argument("--limit", type=int, metavar="N", default=None,
-                        help="process at most N rows this run")
+                        help="process at most N rows this run (hybrid: at most N "
+                             "upgrades WRITTEN, not dispatched)")
     parser.add_argument("--model", default=None,
                         help=f"Ollama model (default {ANNOTATE_MODEL})")
     parser.add_argument("--quality", choices=sorted(QUALITY_PRESETS), default=None,

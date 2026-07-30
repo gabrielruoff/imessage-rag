@@ -240,9 +240,20 @@ DYAD_TERM_TOP_K = int(os.getenv("DYAD_TERM_TOP_K", "50"))
 
 # --- Batch annotation (annotate.py) ----------------------------------------------
 # Empty = use CHAT_MODEL. Recorded in ingest_state; mixing models in one
-# chunk_annotations table is refused (same guard as embeddings).
+# chunk_annotations table is refused (same guard as embeddings). The refusal
+# comes at the TOP of a run, before any budget clock starts: on --quality hybrid
+# it used to fire only at phase 3a, so a switched model paid for the two
+# corpus-wide kNN phases -- up to half the budget -- before being told no. A
+# --dry-run preview does NOT run the check, because the check RECORDS
+# annotate_model and a preview that writes is not a preview; a dry run therefore
+# still will not refuse a model switch.
 ANNOTATE_MODEL = os.getenv("ANNOTATE_MODEL", "") or CHAT_MODEL
+# Chats the LLM tiers scope to (top N by message count); --top-dyads N
+# overrides, --all removes the scope. hybrid applies it to the UPGRADE phase
+# only -- its seed and kNN phases are corpus-wide -- and the distilled tier
+# ignores it entirely (corpus-wide by construction).
 ANNOTATE_TOP_DYADS = int(os.getenv("ANNOTATE_TOP_DYADS", "20"))
+# Annotated chunks between commits: the resumability granularity on Ctrl-C.
 ANNOTATE_COMMIT_EVERY = int(os.getenv("ANNOTATE_COMMIT_EVERY", "50"))
 # Speed/quality preset (annotate.py --quality overrides). 'distilled' (the
 # default) LLM-labels a random seed sample, then kNN-classifies every other
@@ -277,8 +288,11 @@ ANNOTATE_TIMEOUT = int(_annotate_timeout) if _annotate_timeout else CHAT_TIMEOUT
 # Concurrent LLM requests for the annotate/terms/seed passes. >1 only pays
 # off when the Ollama server itself runs parallel slots (OLLAMA_NUM_PARALLEL
 # -- `make ollama-start` sets 4); against a serial server extra workers just
-# queue harmlessly. Measured ~2x at 4/4 on gpt-oss:20b (MoE decode is
-# memory-bandwidth-bound, so it does not scale to 4x).
+# queue harmlessly. How much it pays is MODEL-dependent: measured ~2x at 4/4 on
+# gpt-oss:20b (MoE decode is memory-bandwidth-bound, so it does not scale to
+# 4x) but only ~1.24x on the default qwen3.5:4b (3.9 s/chunk against 4.8 s/chunk
+# sequential) -- on the model this repo's defaults were measured on, workers are
+# a modest win, not a multiplier.
 ANNOTATE_WORKERS = int(os.getenv("ANNOTATE_WORKERS", "4"))
 # The distilled preset: LLM-labeled seed annotations to accumulate before
 # the kNN pass (agreement plateaus around 300-450 seeds), and the number of
@@ -328,18 +342,40 @@ ANNOTATE_KNN_INDEX_CAP = int(os.getenv("ANNOTATE_KNN_INDEX_CAP") or "800")
 # pool and 82.0 s at a 4,416-seed one on the same 25,029-chunk corpus. Each
 # phase also stops dispatching a pool-drain early, and starts from the
 # per-group time an earlier run recorded in ingest_state, so nothing is
-# committed blind. Measured 2026-07-28 (qwen3.5:4b, batch 8, ANNOTATE_WORKERS=4):
-# a 1-min budget landed at exactly 1.0 min, a 2-min budget at 0.0 (it correctly
-# declines: see below), and a 6-min budget at 3.4-4.8.
-# Sizing, same run set: an LLM request of 8 chunks costs ~106 s of latency on
-# the event upgrades and ~71 s on the confidence upgrades, so 6 min bought 32
-# event + 40 confidence upgrades and the 25-min default extrapolates to roughly
-# 250-350 per run (plus up to 160 seeds -- measured, at the 25% seed share). A cold model load
-# needs no allowance: the deadline absorbs it and it simply buys fewer upgrades.
+# committed blind. docs/DECISIONS.md's "annotation throughput, round 2" entry is
+# the ONE source of truth for the numbers below; the round-1 figures this
+# comment used to carry (~106 s per 8-chunk request, ~71 s on the confidence
+# upgrades, "roughly 250-350 upgrades per run") are SUPERSEDED. Measured
+# 2026-07-28 (qwen3.5:4b, batch 8, ANNOTATE_WORKERS=4): a 1-min budget landed at
+# exactly 1.0 min and a 6-min budget at 3.4-4.8 -- the tier stops where it says
+# it will, and under-buys rather than overruns.
+# Sizing, round 2: a request is packed by CHARS as well as rows, so an event
+# group is 4-6 of the ~1,900-char candidates rather than a full batch of 8, and
+# banked a 46.7 s worst group at 4 workers (the ~106 s that survives in
+# annotate_hybrid is the COLD PRIOR for such a group, ~2.3x conservative by
+# design, not a measured cost); the confidence rows' ~360-char median fills a
+# whole batch and banked 16.6 s. What a 25-min run buys has NOT been measured
+# end to end -- the closest measurement is 284 Phase-3 upgrades in a 7.7-min
+# run, projecting to ~424-563, which that entry's validation table labels
+# extrapolated rather than promised. A cold model load needs no allowance: the
+# deadline absorbs it and it simply buys fewer upgrades.
 # Floor worth knowing: nothing smaller than one request can be dispatched, so a
-# budget whose phase share is under one request's latency buys NOTHING and says
-# so rather than starting work it cannot finish. Below ~5 minutes that is the
-# common outcome; the tier is built for the 25-min default.
+# budget whose phase share is under one request's latency buys NO UPGRADES and
+# says so rather than starting work it cannot finish. That is not "the run did
+# nothing": the deterministic phases (kNN classify, confidence backfill) are
+# deadline-gated too but still run and COMMIT what they reach -- only the LLM
+# phases decline, and the next run resumes. Below ~5 minutes declining the
+# upgrade phases is the common outcome, and the SEED phase has the highest floor
+# of the three: measured round 2, under a ~11.3-min TOTAL budget its 25% share
+# cannot cover one group's reserve and it dispatches nothing at all (at a 24-min
+# budget it drew 160 seeds inside that share). The tier is built for the 25-min
+# default. 0/empty means UNSET
+# (fall through to the per-backend default) -- there is no zero-minute run of
+# this tier -- and a NEGATIVE value is refused where it is resolved, with a
+# message naming the knob, rather than yielding an already-passed deadline that
+# declines every phase for no stated reason. CONFLICT_BUDGET_MINUTES validates
+# the same way; only the meaning of 0 differs between the two (there it is
+# "unbudgeted").
 ANNOTATE_BUDGET_MINUTES = int(os.getenv("ANNOTATE_BUDGET_MINUTES") or "0")
 # Seeds the hybrid tier's own stratified sampler aims to have drawn before its
 # kNN pass. Deliberately a separate knob from ANNOTATE_SEED_TARGET (450):
@@ -659,9 +695,20 @@ VOICEPRINT_BURST_GAP_SECONDS = int(os.getenv("VOICEPRINT_BURST_GAP_SECONDS") or 
 # THINK is a plain *_THINK via _think, NOT annotate's empty-means-preset
 # carve-out -- but conflict_detect._resolve_think then reads an UNSET one as
 # False for its own dispatches, since omitting the flag costs ~90x per turn;
-# the seam here is untouched). Empty CONFLICT_MODEL inherits CHAT_MODEL; recorded in
+# the seam here is untouched. "Unset" means unset at BOTH levels: an explicit
+# CHAT_THINK=true is INHERITED here as True and passes straight through, buying
+# the 197 s-per-turn reasoning pass the carve-out exists to avoid, so set
+# CONFLICT_THINK=false explicitly if you want CHAT_THINK=true for chat.py only).
+# Empty CONFLICT_MODEL inherits CHAT_MODEL; recorded in
 # ingest_state as `conflict_model` and mixing models in one conflicts table is
-# refused (same guard shape as chunk_annotations' annotate_model).
+# refused (same guard shape as chunk_annotations' annotate_model). `--relabel`
+# is NOT the model-switch door: the guard runs BEFORE _clear_labels, so
+# `--relabel --model <other>` is refused with every previously bought label
+# still in place instead of deleting them all and then refusing to rebuild any.
+# Switching label models still means clearing `conflicts` (or reset_db.py),
+# exactly as the refusal message says. Under --no-llm the guard is skipped --
+# that path writes no label, and recording a model would guard the table against
+# one it never mixed with -- and --dry-run runs neither the guard nor the clear.
 CONFLICT_MODEL = os.getenv("CONFLICT_MODEL", "") or CHAT_MODEL
 CONFLICT_THINK = _think("CONFLICT_THINK", CHAT_THINK)
 _conflict_timeout = os.getenv("CONFLICT_TIMEOUT", "").strip()
@@ -698,14 +745,38 @@ CONFLICT_TRACE_SIM_THRESHOLD = float(os.getenv("CONFLICT_TRACE_SIM_THRESHOLD") o
 # turns (cost + prompt-size safety) -- 6, not the original 12, because turn
 # selection is now peak-anchored (centered on the message left hanging) rather
 # than the first N chronological turns, and the 1,940-turn windows this corpus
-# contains prove the head slice can miss the evidence entirely.
+# contains prove the head slice can miss the evidence entirely. A non-positive
+# value is REFUSED by conflict_detect.main, not honored: "0" is truthy here so
+# it parses to 0, and a 0 cap selects no turns at all while label_top_conflicts
+# still stamps every window it processes -- one .env line would latch the whole
+# corpus as labeled having dispatched nothing. The --max-label-turns flag has
+# always been refused for that; the env spelling now is too.
 CONFLICT_MIN_SIGNALS = int(os.getenv("CONFLICT_MIN_SIGNALS") or "2")
 CONFLICT_MAX_LABEL_TURNS = int(os.getenv("CONFLICT_MAX_LABEL_TURNS") or "6")
-# Lexical prescreen for label candidates: a turn shorter than this many
-# characters (whitespace stripped), or one with no alphanumeric character at
-# all (emoji/punctuation only), cannot carry an escalation signal and is never
-# sent to the model. Measured 2026-07-28 on this corpus: ~70% of labels come
-# back `neutral`, each costing a full request to say nothing.
+# RANKING preference among label candidates, no longer a filter: when a window
+# holds more candidate turns than CONFLICT_MAX_LABEL_TURNS and there is no peak
+# to bracket, turns at or over this many characters (whitespace stripped) are
+# selected first and shorter ones fill what is left. It demotes; it never
+# deletes. As a filter it deleted the class the classifier is asked to find --
+# stonewalling is "terse/absent non-answers" and short contempt is "k.",
+# "fine.", "whatever", all under 15 chars -- and a window whose escalation was
+# entirely terse withdrawal then dispatched nothing, was stamped labeled_at
+# anyway, and read downstream as "analyzed and clean". The one true prescreen
+# left is code, not a knob: a turn with no alphanumeric character at all
+# (emoji/tapback/punctuation) has nothing for the model to read. Deliberately
+# NOT applied inside the peak-anchored span, which is the branch most windows
+# take: a terse turn sitting next to the escalation moment IS the stonewalling
+# evidence, so preferring length there would re-delete the class this change
+# exists to catch. The price is real and named: a long turn further from the
+# peak can now lose its slot to a terse neighbour. Cost context,
+# measured 2026-07-28 on this corpus: ~70% of labels come back `neutral`, each
+# costing a full request to say nothing -- which is why the per-window turn cap,
+# not a length floor, is what bounds the spend. Consequence to expect on the
+# first rerun after this change: a window whose turns were ALL under the floor
+# used to select zero turns, dispatch nothing and be stamped labeled_at for
+# free. Those windows now cost up to CONFLICT_MAX_LABEL_TURNS requests each, so
+# windows-labeled-per-run under a fixed CONFLICT_BUDGET_MINUTES can fall --
+# honestly, since the free ones were never analyzed at all.
 CONFLICT_MIN_TURN_CHARS = int(os.getenv("CONFLICT_MIN_TURN_CHARS") or "15")
 # Wall-clock minutes ONE conflict_detect.py run may spend, measured from the
 # top of main() so the deterministic detection pass counts against it too.
@@ -715,7 +786,12 @@ CONFLICT_MIN_TURN_CHARS = int(os.getenv("CONFLICT_MIN_TURN_CHARS") or "15")
 # is what makes the runtime promise hold BY CONSTRUCTION on a bigger corpus
 # instead of by tuned constants. 25 leaves headroom under the 30-minute
 # target for detection (~24 s) and the model's cold load (~54 s). 0 = no
-# budget: label every detected window, however long that takes.
+# budget: label every detected window, however long that takes. A NEGATIVE
+# value is REFUSED (SystemExit naming the knob) where it is resolved, not
+# clamped: clamping sent it to 0 = unbudgeted, i.e. an env typo silently bought
+# the unbounded run the CLI already refuses `--budget-minutes -5` for. The same
+# rule holds for ANNOTATE_BUDGET_MINUTES above, where 0/empty means "unset"
+# rather than "unbudgeted" but a negative is equally meaningless.
 CONFLICT_BUDGET_MINUTES = int(os.getenv("CONFLICT_BUDGET_MINUTES") or "25")
 # DV-suppression floor for diagnose_conflict (C2 / Master Spec A10, SOFTENED,
 # code-enforced). 'on' (the default) screens the FULL text of every message in

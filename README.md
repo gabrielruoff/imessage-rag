@@ -245,11 +245,20 @@ topics back to back in the right order (and stays sequential even under
     and a rerun resumes, topping the seed pool up and buying more upgrades.
     One LLM request is the smallest thing it can buy — a request holds 4–6
     event-candidate chunks and banked at 46.7s on the reference machine — so a
-    budget too small for one will decline to start work it can't finish and
-    tell you to raise the budget; the 25-minute default is the one to use. `--all` /
-    `--top-dyads N` / `--limit` reach only the upgrade phase, and
-    `--upgrade-distilled` is an error with it — upgrading distilled rows is
-    what it already does.
+    budget too small for one makes the LLM *upgrade* phases decline and name
+    the knob — the seed and kNN phases still run and commit what they reach, so
+    a tiny budget buys distilled coverage rather than nothing; the 25-minute
+    default is the one to use. A *negative* `ANNOTATE_BUDGET_MINUTES` is
+    refused outright rather than silently producing an already-passed deadline.
+    `--all` /
+    `--top-dyads N` / `--limit` reach only the upgrade phase, and there
+    `--limit N` counts upgrades **written**, not requests sent — an unparseable
+    reply spends budget but doesn't consume the cap (the wall clock is the
+    spend cap; `--limit` is the deliverable cap). It is an *at most* N: an
+    unparseable reply is made up out of the other sub-phase's candidates, so
+    when those run out the run lands short and says how many candidates it left.
+    A negative `--limit` is refused. `--upgrade-distilled` is an
+    error with it — upgrading distilled rows is what it already does.
   - `fast` / `balanced` / `max` are the real-LLM-call-per-chunk tiers (each
     slower and more faithful than the last; hours to days corpus-wide). They
     cover the top `ANNOTATE_TOP_DYADS` chats (default 20) bare, honor `--all`
@@ -300,10 +309,17 @@ how many chunks you're signing up for. It previews `--retry-failed` too: the
 scope it prints is what the real run would curate, but the unparking itself
 is held back. (One asterisk: on a database old enough to predate a column
 `--terms` needs, a dry run still applies that one schema migration before it
-can read — the chunk tiers no longer do.) `--limit N` caps a single run. `annotate.py`
+can read — the chunk tiers no longer do.) `--limit N` caps a single run — rows
+processed on the per-chunk LLM tiers and on `--terms`, and on `hybrid` the
+number of upgrades actually **written**. On the default `distilled` tier it is
+accepted and ignored, as are `--all` and `--top-dyads N`: that tier is
+corpus-wide by construction. `annotate.py`
 records its model and refuses to mix models into a non-empty
 `chunk_annotations` table (distilled rows count — they inherit the seed
 model's bias), so changing `ANNOTATE_MODEL` means emptying that table first.
+On `hybrid` that refusal comes at the *top* of the run, before the budget clock
+starts, so a switched model costs no budget (a `--dry-run` preview skips the
+check, since making it would mean writing the model down).
 
 **`topics.py`** needs no flags — one bare run clusters every embedded chunk
 into `TOPIC_K` clusters (default 50) and then labels them. It requires an
@@ -341,6 +357,32 @@ and `ANNOTATE_HYBRID_SEED_TARGET` for `hybrid`, which are deliberately separate
 knobs — topic `k`, wrapped roster size) all live in `.env` — see
 `.env.example`.
 
+### The analytical suite
+
+Four derived-analytics features build on top of ingest + annotate, each a
+standalone CLI and a `make` target, each reading `chunk_annotations` (so run
+them after `make annotate`). `make suite` builds all four in order; `make
+pipeline` calls it between annotate and topics.
+
+```sh
+make nudges        # loose_ends.py -> loose_threads: relationships you let drift (Ollama only for the one-line nudge text)
+make drift         # drift.py -> dyad_drift: per-counterparty relationship drift. OPT-IN: no-ops unless DRIFT_ENABLED=true
+make drift-purge   # wipe dyad_drift + its guard keys (run WHILE setting DRIFT_ENABLED=false)
+make voiceprint    # voiceprint.py -> person_voiceprint: deterministic per-person style profiles, no Ollama
+make conflict      # conflict_detect.py: detect tense 1:1 stretches everywhere, then label the strongest under a ~25-min budget
+make conflict-fast # the same detection with --no-llm: zero Ollama calls
+```
+
+Drift is off by default and silently builds nothing until you set
+`DRIFT_ENABLED=true`; `--purge` runs regardless of the flag, since it is the
+teardown you run *while* turning the feature off. Conflict's label pass is
+budgeted in **time** (`CONFLICT_BUDGET_MINUTES`, default 25) and resumes down
+its strength ranking on each rerun — `--relabel` is what makes it revisit
+windows it already stamped, and it refuses up front if `--model` names a
+different model than the labels were written with. Every flag of all four,
+plus what each surface looks like in chat and in Wrapped, is in the runbook:
+[`docs/DEMO.md`](docs/DEMO.md).
+
 ### Progress output
 
 Every job reports progress as it works. On a terminal that's a live bar with a
@@ -354,6 +396,9 @@ line style, `PROGRESS_STYLE=off` silences progress entirely.
 ```sh
 make                  # list every target
 make doctor           # check venv, Ollama, models, source data, ingested DB
+make suite            # rebuild just the analytical suite: nudges -> drift -> voiceprint -> conflict
+make ollama-start     # start/restart Ollama with 4 parallel slots (restart, not start: the launchctl vars are read only at process start)
+make ollama-stop      # stop the Ollama brew service
 make lint             # ruff check .
 make test             # test suite, no Ollama/chat.db needed
 make check            # everything CI enforces: lint + tests + compile check

@@ -64,6 +64,19 @@ _PARTIAL_LABELING_EPILOGUE = (
     "first) and has not reached every detected stretch yet, so a stretch with "
     "nothing flagged may simply not have been looked at."
 )
+# The same belt-and-braces copy for the OTHER way a stretch shows nothing: the
+# pass did run and produced no shippable label. Its sibling above exists
+# precisely because the model may not narrate a payload-only caveat, and this
+# case licenses the identical misreading ("I checked those stretches and
+# nothing escalatory came up"), so it cannot be left to the model either -- the
+# repo's rule is that a framing floor is code, never prompt. Fixed text, never
+# formatted with counts: the counts live in the model-visible payload.
+_LABELED_EMPTY_EPILOGUE = (
+    " Note: where the escalation pass did run and flagged nothing, that is not "
+    "a clean bill of health -- it reads message text only, so a stretch carried "
+    "by tapbacks, by tone, or by a conversation that moved elsewhere can be "
+    "looked at and still come back empty."
+)
 
 # --- detected-but-unlabeled (the budgeted label pass) ------------------------
 # conflict_detect.py detects every window but LLM-labels only as many as its
@@ -94,6 +107,41 @@ _UNLABELED_SCOPE_NOTE = (
     "(signals, signal_count, corroboration) is complete for every row."
 )
 _LABELED_NOTE = "labels are eval-gated bands (tentative/likely), not certainties"
+# A window CAN be stamped labeled_at having dispatched nothing: the per-turn
+# pass reads message TEXT, so a window whose turns are all tapbacks/emoji has
+# nothing to classify, and a turn that IS classified can still be dropped by the
+# confidence floor or suppressed by the F4 eval gate. "Labeled with zero turns"
+# is therefore not the same claim as "we read this and it was calm", and the
+# note must not let it be read as one -- the same honesty the labeled/unlabeled
+# split exists for, one level in.
+_LABELED_EMPTY_NOTE = (
+    "this episode has been through per-turn escalation labeling and NO turn "
+    "produced a shippable label -- which is not a finding of calm: the pass "
+    "reads message text only, so a stretch carried by tapbacks, by tone, or by "
+    "a conversation that moved off-channel (off_text_flag) can be looked at and "
+    "still yield nothing, and a turn can also be dropped by the confidence "
+    "floor or suppressed by the eval gate. Read this one off its deterministic "
+    "evidence (peak_signal, corroboration, off_text_flag), which is complete."
+)
+_LABELED_EMPTY_SCOPE_NOTE = (
+    "{n_empty} of {total} detected windows in scope WERE labeled but produced "
+    "zero signal turns (labeled=true, labeled_signal_turns=0). That is not "
+    "'analyzed and calm': labeling reads message text only, so a stretch "
+    "carried by tapbacks, by tone, or by a conversation that moved off-channel "
+    "yields nothing to label, and a turn can also fall under the confidence "
+    "floor or be suppressed by the eval gate. Those rows' deterministic "
+    "evidence (signals, signal_count, corroboration) is what found them."
+)
+# Appended to whichever note is emitted on a DB whose `conflicts` table has no
+# labeled_at column at all (see _labeled_at_select): there `labeled` is INFERRED
+# from stored signal rows, so the two states the column exists to separate are
+# only partly separable.
+_PRE_MIGRATION_NOTE = (
+    "(This database predates the labeling-completion stamp, so `labeled` is "
+    "inferred from whether the window has stored signal turns: a window the old "
+    "pipeline looked at and found nothing in is indistinguishable here from one "
+    "it never reached. Rerunning the conflict pipeline stamps them properly.)"
+)
 _UNLABELED_NOTE = (
     "this episode has NOT been through per-turn escalation labeling yet (it "
     "runs on a wall-clock budget, strongest windows first; rerunning the "
@@ -116,18 +164,38 @@ def _has_conflict_tables(con):
     return {"conflicts", "conflict_signals"} <= names
 
 
-def _labeled_at_select(con, prefix=""):
-    """The SELECT fragment that yields a `labeled_at` value, degrading on a
-    `conflicts` table that PREDATES the column (a DB neither re-ingested nor
-    re-detected since the budgeted tier landed): those rows were all written by
-    the old unbounded path, which labeled every window it detected, so a
-    non-NULL literal is the honest reading -- and returning rows beats raising
-    `no such column`, which is the same contract _has_conflict_tables keeps one
-    migration earlier. The fragment is a constant, never user input."""
-    cols = {r[1] for r in con.execute("PRAGMA table_info(conflicts)")}
-    if "labeled_at" in cols:
-        return f"{prefix}labeled_at"
-    return "'pre-budget' AS labeled_at"
+def _predates_labeling_stamps(con):
+    """True when `conflicts` has no labeled_at column at all -- a DB neither
+    re-ingested nor re-detected since the budgeted tier landed. Returning rows
+    beats raising `no such column`, which is the same contract
+    _has_conflict_tables keeps one migration earlier."""
+    return "labeled_at" not in {r[1] for r in con.execute("PRAGMA table_info(conflicts)")}
+
+
+def _labeled_at_select(con, alias):
+    """The SELECT fragment yielding a `labeled_at` value, degrading on a
+    `conflicts` table that predates the column.
+
+    On that path the value is derived from EVIDENCE, not asserted: 'pre-budget'
+    only where the window actually has conflict_signals rows, NULL otherwise. A
+    flat non-NULL literal was wrong in the one direction that matters -- an old
+    `--no-llm` run wrote windows nothing ever labeled, and marking them
+    `labeled` made get_conflict report "we looked and found nothing" about a
+    window nothing looked at, exactly the misreading the labeled/unlabeled split
+    exists to prevent. The inference is one-way-safe: signals cannot exist
+    without a labeling pass, while their absence stays ambiguous (a pass that
+    found nothing looks like no pass) -- which is what _PRE_MIGRATION_NOTE says
+    out loud rather than papering over.
+
+    `alias` is the caller's table alias for `conflicts` and is REQUIRED: the
+    fallback correlates a subquery on `<alias>.id`, and an unqualified `id`
+    there would resolve to the subquery's own conflict_signals.id. The fragment
+    stays a constant -- no user input is ever interpolated."""
+    if not _predates_labeling_stamps(con):
+        return f"{alias}.labeled_at"
+    return ("CASE WHEN EXISTS (SELECT 1 FROM conflict_signals ps "
+            f"WHERE ps.conflict_id = {alias}.id) THEN 'pre-budget' END "
+            "AS labeled_at")
 
 
 def _signals_json(peak_signal_json):
@@ -145,10 +213,14 @@ def _conflict_summary(row):
     find_conflicts SELECT as a GROUP BY aggregate, so this is a pure row->dict
     shaper with no per-row query (was an N+1 COUNT).
 
-    `labeled` mirrors conflicts.labeled_at (see the note above): it is what
-    separates "we looked and found nothing" (labeled true, 0 turns) from "we
-    never looked" (labeled false, 0 turns). This is the ONE place a
-    find_conflicts row dict is built -- keep it that way."""
+    `labeled` mirrors conflicts.labeled_at (see the notes above): it separates
+    "we never looked" (labeled false) from "the pass ran here" (labeled true).
+    It does NOT license reading labeled true + 0 turns as "we looked and found
+    nothing" -- labeling reads message text only, so a stretch carried by
+    tapbacks, by tone, or moved off-channel can be looked at and yield nothing;
+    _LABELED_EMPTY_NOTE / _LABELED_EMPTY_SCOPE_NOTE are what say so to the
+    caller. This is the ONE place a find_conflicts row dict is built -- keep it
+    that way."""
     peak = _signals_json(row["peak_signal_json"])
     n_signal_rows = row["labeled_signal_turns"]
     # A make-up window is one the LLM topic pass labeled 'repair'. Kept explicit
@@ -177,6 +249,17 @@ def _conflict_summary(row):
     }
 
 
+def _empty_conflicts_envelope(order):
+    """find_conflicts' no-rows result. The tool's docstring and its JSON schema
+    promise n_corroborated and n_labeled on EVERY envelope, so the empty-scope
+    early returns carry them too -- a caller that reads env["n_labeled"] must
+    not have to special-case "the scope resolved to nothing"."""
+    env = _envelope([], 0, order)
+    env["n_corroborated"] = 0
+    env["n_labeled"] = 0
+    return env
+
+
 def find_conflicts(chat_id=None, handle_id=None, contact_id=None,
                    date_from=None, date_to=None, limit=10):
     """Detected conflict episodes in scope, ranked so the best-substantiated
@@ -195,21 +278,23 @@ def find_conflicts(chat_id=None, handle_id=None, contact_id=None,
     n_labeled counts the ones whose per-turn escalation labeling has actually
     run: labeling is wall-clock-budgeted, so a row with labeled=false has
     labeled_signal_turns=0 because nothing looked, NOT because nothing was
-    found (a `labeling_note` spells that out whenever any row is unlabeled).
-    Expand one with get_conflict(conflict_id)."""
+    found. A labeled=true row with labeled_signal_turns=0 is not a finding of
+    calm either -- labeling reads message text only. A `labeling_note` spells
+    out whichever of the two is present. Expand one with
+    get_conflict(conflict_id)."""
     limit = max(1, min(int(limit), MAX_CONFLICT_ROWS))
     order = ("corroboration-desc, non-reconciliation-first, signal_count-desc, "
              "most-recent-first")
     with contextlib.closing(_connect()) as con:
         if not _has_conflict_tables(con):
-            return _envelope([], 0, order)
+            return _empty_conflicts_envelope(order)
         chat_ids, empty = _resolve_chat_scope(con, chat_id, handle_id, contact_id)
         if empty:
-            return _envelope([], 0, order)
+            return _empty_conflicts_envelope(order)
         if chat_ids is not None:
             chat_ids = _restrict_to_direct_chats(con, chat_ids)
             if not chat_ids:
-                return _envelope([], 0, order)
+                return _empty_conflicts_envelope(order)
 
         clauses, params = [], []
         if chat_ids is not None:
@@ -225,7 +310,7 @@ def find_conflicts(chat_id=None, handle_id=None, contact_id=None,
         rows = con.execute(
             "SELECT c.id, c.chat_id, c.first_date, c.last_date, c.topic, "
             "c.peak_signal_json, c.corroboration, c.off_text_flag, "
-            f"{_labeled_at_select(con, 'c.')}, "
+            f"{_labeled_at_select(con, 'c')}, "
             "COALESCE(SUM(CASE WHEN s.label_class != 'abstain' THEN 1 ELSE 0 END), 0) "
             "AS labeled_signal_turns "
             "FROM conflicts c "
@@ -233,6 +318,7 @@ def find_conflicts(chat_id=None, handle_id=None, contact_id=None,
             f"{where} GROUP BY c.id", params,
         ).fetchall()
         summaries = [_conflict_summary(r) for r in rows]
+        pre_migration = _predates_labeling_stamps(con)
 
     # Best-substantiated first: tone-corroborated episodes (llm > weak > none)
     # outrank raw signal count, so the ~5% with a corroborated valence drop
@@ -257,15 +343,37 @@ def find_conflicts(chat_id=None, handle_id=None, contact_id=None,
     # evidence, it is unread evidence, and demoting it would hide exactly the
     # rows the note is warning about.
     n_labeled = sum(1 for s in summaries if s["labeled"])
+    # Counted apart from the unlabeled ones: both render as
+    # `labeled_signal_turns: 0`, neither is a finding of calm, but they are
+    # different facts (never looked at vs looked at with nothing readable to
+    # look at) and the note has to say which one a row is.
+    n_labeled_empty = sum(
+        1 for s in summaries if s["labeled"] and not s["labeled_signal_turns"])
     env = _envelope(summaries[:limit], total, order)
     env["n_corroborated"] = n_corroborated
     env["n_labeled"] = n_labeled
     if total:
         env["_epilogue"] = _ANALYSIS_DISCLAIMER
+    notes = []
     if total > n_labeled:
-        env["labeling_note"] = _UNLABELED_SCOPE_NOTE.format(
-            n_unlabeled=total - n_labeled, total=total)
+        notes.append(_UNLABELED_SCOPE_NOTE.format(
+            n_unlabeled=total - n_labeled, total=total))
         env["_epilogue"] += _PARTIAL_LABELING_EPILOGUE
+    if n_labeled_empty:
+        notes.append(_LABELED_EMPTY_SCOPE_NOTE.format(
+            n_empty=n_labeled_empty, total=total))
+        # Out-of-band too, not payload-only: `total == n_labeled` (every window
+        # labeled, all of them empty) is exactly the scope where the branch
+        # above adds nothing and the model is most likely to report "I looked
+        # and it was calm" with no code-emitted correction behind it.
+        env["_epilogue"] += _LABELED_EMPTY_EPILOGUE
+    if notes and pre_migration:
+        # Only alongside a note: on a pre-migration DB where every row carries
+        # signals nothing was inferred wrongly, and an unprompted caveat there
+        # would spend the model's attention on a distinction that does not bite.
+        notes.append(_PRE_MIGRATION_NOTE)
+    if notes:
+        env["labeling_note"] = " ".join(notes)
     return env
 
 
@@ -295,33 +403,66 @@ def get_conflict(conflict_id, offset=0, limit=15):
 
     `labeled` false means the per-turn labeling never ran for this episode
     (wall-clock-budgeted, strongest windows first), so signals_total 0 is
-    unanalyzed, not clean -- the `note` says so."""
+    unanalyzed, not clean -- the `note` says so. `labeled` true with
+    labeled_signal_turns 0 is not "clean" either: labeling reads message text,
+    so a stretch carried by tapbacks or moved off-channel can be looked at and
+    yield nothing. Both cases get their own `note` and their own code-printed
+    epilogue; neither is a calm verdict. labeled_signal_turns counts non-abstain
+    rows, the same quantity find_conflicts lists the episode with;
+    signals_total counts every stored row (abstains included) and is what
+    paginates."""
     conflict_id = int(conflict_id)
     limit = max(1, min(int(limit), MAX_SIGNAL_ROWS))
     offset = max(0, int(offset))
     with contextlib.closing(_connect()) as con:
         if not _has_conflict_tables(con):
             return {"error": "no conflict tables (run conflict_detect.py first)"}
+        # Aliased `c` because _labeled_at_select's pre-migration fallback
+        # correlates a subquery on the conflicts row: an unqualified `id` inside
+        # it would bind to conflict_signals.id instead.
         row = con.execute(
-            "SELECT id, chat_id, first_date, last_date, start_session_id, "
-            "end_session_id, topic, peak_signal_json, corroboration, "
-            f"off_text_flag, source, {_labeled_at_select(con)} "
-            "FROM conflicts WHERE id = ?",
+            "SELECT c.id, c.chat_id, c.first_date, c.last_date, "
+            "c.start_session_id, c.end_session_id, c.topic, c.peak_signal_json, "
+            f"c.corroboration, c.off_text_flag, c.source, "
+            f"{_labeled_at_select(con, 'c')} "
+            "FROM conflicts c WHERE c.id = ?",
             (conflict_id,),
         ).fetchone()
         if row is None:
             return {"error": f"no conflict with id {conflict_id}"}
-        total = con.execute(
-            "SELECT COUNT(*) FROM conflict_signals WHERE conflict_id = ?",
-            (conflict_id,)).fetchone()[0]
+        # Two counts, deliberately: `total` paginates (every stored row is
+        # returned, abstains included), while `n_shippable` -- non-abstain rows,
+        # the SAME definition find_conflicts' labeled_signal_turns uses -- is
+        # what decides which note this window gets. Keying the note off
+        # COUNT(*) made the two tools contradict each other on an abstain-only
+        # window: find_conflicts called it "labeled but produced zero signal
+        # turns", and drilling into that very row -- the expansion the envelope
+        # tells the caller to make -- answered with the bands caveat instead,
+        # dropping the warning at the step it was meant to survive.
+        total, n_shippable = con.execute(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN label_class != 'abstain' "
+            "THEN 1 ELSE 0 END), 0) FROM conflict_signals WHERE conflict_id = ?",
+            (conflict_id,)).fetchone()
         sig_rows = con.execute(
             "SELECT message_id, actor_is_me, label_class, top2_labels_json, "
             "band, excerpt FROM conflict_signals WHERE conflict_id = ? "
             "ORDER BY id LIMIT ? OFFSET ?", (conflict_id, limit, offset),
         ).fetchall()
+        pre_migration = _predates_labeling_stamps(con)
 
     signals = [_signal_row(r) for r in sig_rows]
     labeled = row["labeled_at"] is not None
+    if not labeled:
+        note = _UNLABELED_NOTE
+    elif n_shippable:
+        note = _LABELED_NOTE
+    else:
+        # Labeled with nothing to show: the analyzed-and-clean reading is the
+        # one thing this must not be, so it gets its own wording rather than
+        # the bands caveat (there are no bands to caveat).
+        note = _LABELED_EMPTY_NOTE
+    if pre_migration and not labeled:
+        note += " " + _PRE_MIGRATION_NOTE
     return {
         "conflict_id": row["id"],
         "chat_id": row["chat_id"],
@@ -336,17 +477,27 @@ def get_conflict(conflict_id, offset=0, limit=15):
         "labeled": labeled,
         "signals": signals,
         "signals_total": total,
+        # Named and counted exactly as find_conflicts does, so the row a caller
+        # expanded reports the same number it was listed with (signals_total
+        # can exceed it: abstains are stored and returned, they just are not
+        # findings).
+        "labeled_signal_turns": n_shippable,
         "returned": len(signals),
         "offset": offset,
         "limit": limit,
         "truncated": total > offset + len(signals),
         # An unlabeled episode has no bands to caveat -- it has an absence to
         # explain, and that is the more dangerous of the two to leave unsaid.
-        "note": _LABELED_NOTE if labeled else _UNLABELED_NOTE,
+        # A LABELED one with zero turns has the same absence for a different
+        # reason (see _LABELED_EMPTY_NOTE), so it is not sold as a clean read.
+        "note": note,
         # Code-printed humility disclaimer (stripped from the model's view by
-        # chat.run_turn, appended verbatim after the reply).
-        "_epilogue": (_ANALYSIS_DISCLAIMER if labeled
-                      else _ANALYSIS_DISCLAIMER + _PARTIAL_LABELING_EPILOGUE),
+        # chat.run_turn, appended verbatim after the reply). Both absences get
+        # one: never looked at, and looked at with nothing shippable to show.
+        "_epilogue": _ANALYSIS_DISCLAIMER + (
+            "" if labeled and n_shippable
+            else _PARTIAL_LABELING_EPILOGUE if not labeled
+            else _LABELED_EMPTY_EPILOGUE),
     }
 
 
