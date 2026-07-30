@@ -513,11 +513,20 @@ of how a contact might reply or how your past self texted (`simulate_contact`, V
 **Build the data.**
 
 ```bash
+.venv/bin/python3 annotate.py --quality hybrid      # optional, FIRST: light the low-trust tone_* fields
+                                                    # (--quality balanced --upgrade-distilled also works)
 make voiceprint                                     # populate person_voiceprint (deterministic, no Ollama)
-.venv/bin/python3 voiceprint.py --force             # force full rebuild (e.g. after re-ingest)
 .venv/bin/python3 voiceprint.py --dry-run           # optional: how many rows would be built, no writes
-.venv/bin/python3 annotate.py --quality balanced --upgrade-distilled   # optional: light the low-trust tone_* fields
+.venv/bin/python3 voiceprint.py --force             # force a rebuild the guard would skip (see below)
 ```
+
+Annotate FIRST: the rebuild guard watches new messages *and* the `source='llm'`
+annotations `tone_*` is built from, so an annotate pass on its own is enough to
+make the next `make voiceprint` rebuild. Running it the other way round leaves
+the tone fields empty until you build again. `--force` is for the inputs the
+guard still does not watch — a `SESSION_GAP_MINUTES` retune (which moves every
+opener/closer), a lexicon rebuild, a `VOICEPRINT_*` knob change, or an
+AddressBook re-ingest that re-keys a handle to a contact.
 
 **Demo in chat:**
 
@@ -646,7 +655,9 @@ suppressed/empty output, this is usually why:
 - **Honest degrade on distilled-only annotations.** Valence-dependent reads trust only
   `source='llm'` rows and degrade truthfully (conflict `corroboration='none'`, no nudge
   valence exclusion, NULL voiceprint tone) rather than fabricating. Light them with
-  `annotate.py --quality balanced --upgrade-distilled`.
+  `annotate.py --quality balanced --upgrade-distilled` (or `--quality hybrid` for as
+  many as a wall-clock budget buys), then rerun `make voiceprint` — its rebuild guard
+  watches those annotations, so the run picks them up without `--force`.
 
 ---
 

@@ -37,10 +37,29 @@ confidence gate. feature_std_json carries, per scope, the population std of
 every numeric feature (std==0 omitted), replicated onto each row so a
 downstream z-normalization (V3) reads it off the row without rescanning.
 
-Rebuild + guard: a full rebuild (DELETE + reinsert) gated on ingest_state's
-voiceprint_max_message_id -- unchanged corpus => skip, else rebuild. Like the
-other derived tables, reset_db deletes it and the append-only rule's carve-out
-applies.
+Rebuild + guard: a full rebuild (DELETE + reinsert) gated on TWO ingest_state
+keys -- voiceprint_max_message_id (new messages) and voiceprint_annotations_hash
+(the source='llm' chunk_annotations rows tone_* is built from). The second one
+is not optional: `annotate.py --quality hybrid` and `--upgrade-distilled` both
+flip distilled rows to 'llm' with NO new messages, so on the message-id guard
+alone the run printed "Voiceprints up to date" and kept serving the tone it had
+-- the exact hole drift.py closed for itself with drift_annotations_hash. The
+precise blast radius, since it is narrower than "always": a `make pipeline`
+whose ingest DID add a message rebuilt anyway (voiceprint runs after annotate,
+and the new message moved the other key), so what stayed stale was any run over
+an otherwise-unchanged corpus -- a resumable `--quality hybrid` re-run, or a
+bare `make annotate && make voiceprint` -- until the next run that ingested
+something. Like the other derived tables, reset_db deletes the table and the
+append-only rule's carve-out applies.
+
+What the guard still does NOT cover (use --force after any of these; each is a
+pre-existing gap this pair does not widen, listed so the guard is not read as
+complete): a SESSION_GAP_MINUTES retune, which re-splits every session and so
+moves every opener/closer; a person_period_lexicon rebuild, which moves the 9
+fw_*_rate columns; a VOICEPRINT_* knob change (BURST_GAP_SECONDS moves every
+burst_size, MIN_RETURN_MESSAGES moves which rows exist AND the per-scope
+feature_std population); and an AddressBook re-ingest that flips handle:N ->
+contact:M, which a rebuild self-heals but never triggers on its own.
 
 Usage: voiceprint.py [--force] [--dry-run]
 """
@@ -48,6 +67,7 @@ Usage: voiceprint.py [--force] [--dry-run]
 import argparse
 import collections
 import datetime
+import hashlib
 import json
 import statistics
 
@@ -545,13 +565,96 @@ def _corpus_max_message_id(con):
     return int(con.execute("SELECT MAX(id) FROM messages").fetchone()[0] or 0)
 
 
+def _annotations_hash(con):
+    """Fingerprint of the chunk_annotations rows _tone consumes, so an in-place
+    re-annotation forces a rebuild. Without it the message-id guard alone let
+    `annotate.py --quality hybrid` (and `--upgrade-distilled`) flip distilled
+    rows to source='llm' with no new messages, and every later run reported
+    "Voiceprints up to date" over stale tone_valence / tone_emotions_json.
+
+    Three deliberate divergences from drift._annotations_hash, the precedent:
+
+    * No `ch.is_group = 0`. drift is 1:1-only; _enumerate_tasks builds
+      scope='group' tasks and a scope='all' task with no chats join at all, so
+      group-chat annotations really do reach _tone and filtering them out here
+      would reintroduce the same miss for those scopes.
+    * source='llm' only, matching _tone's own unconditional clause. A plain
+      `--quality distilled` pass must NOT trigger a rebuild: voiceprint cannot
+      observe those rows, so a COUNT over every source would over-trigger.
+    * An exact per-row digest rather than COUNT/SUM aggregates. Not a cost
+      being paid for exactness -- measured 2026-07-30 it is the CHEAPER of the
+      two shapes on every corpus tried, because drift's plan scans the `chunks`
+      table while this one scans the much smaller `chunk_annotations`. Both
+      pairs, each named with its corpus rather than averaged into one figure:
+      on the 25,029-chunk reference corpus (chunks 27 MB, chunk_annotations
+      1.7 MB) 5-6 ms against drift's 7-8 ms, a 1.3x gap; on a 74,233-chunk one
+      (chunks 83 MB, chunk_annotations 6.1 MB) 5-7 ms against drift's 21-24 ms,
+      4x. The gap widens with the chunks table, which is drift's scan and not
+      ours -- that is the mechanism, and it is why a single ratio would have
+      been the wrong thing to record. Exactness is what buys the coverage:
+      emotions_json is a TEXT list no SUM can fingerprint, so a lossy aggregate
+      would miss an emotions-only rewrite, and SUM(valence) would miss a
+      valence swap between two chunks. Both are regression tests.
+
+    Cost, so the next reader does not mis-project it: schema.py creates NO
+    index on chunk_annotations, so this is a full scan of the table (all
+    sources) plus one rowid seek per llm row -- it grows with TOTAL annotations
+    plus per-llm-row Python work, not with the llm population alone. Measured
+    on that same 25,029-chunk reference corpus: 5-6 ms at 4,416 llm rows,
+    28-31 ms if every row were upgraded, against a 4.0 s rebuild.
+    `ORDER BY ca.chunk_id` is free (chunk_id is INTEGER PRIMARY KEY, i.e. a
+    rowid alias, so no temp b-tree) and it is what makes the digest
+    deterministic.
+
+    The JOIN is not decoration and is not there for chat_id (which is immutable
+    per chunk_id -- nothing in the tree UPDATEs chunks, and ids are
+    AUTOINCREMENT so they are never reused): it DROPS ORPHANED annotations, the
+    way _tone's own join does. A tail re-chunk deletes chunks rows while
+    chunk_annotations has no FK cascade, and ingest.py's INSERT OR REPLACE
+    omits chunk_id, so orphans can appear with MAX(messages.id) unchanged.
+
+    Rejected: a group_concat variant. Deterministic ordering needs ORDER BY
+    inside the aggregate (SQLite >= 3.44, which nothing here pins) and it
+    materializes the whole string in memory, to save 1-3 ms.
+
+    Scope note: this digest is corpus-wide while _tone is scoped per task's
+    chat_ids, and chunks.chat_id is nullable, so an annotation change in a chat
+    that yields no task can force a rebuild nothing depends on. That is the
+    safe direction and is left alone -- narrowing it would mean reproducing the
+    union of every dyad/group/all task's chats, which is easy to get wrong into
+    a MISS."""
+    h = hashlib.sha256()
+    for row in con.execute(
+            "SELECT ca.chunk_id, ca.valence, ca.emotions_json "
+            "FROM chunk_annotations ca JOIN chunks c ON c.id = ca.chunk_id "
+            "WHERE ca.source = 'llm' ORDER BY ca.chunk_id"):
+        # tuple() is LOAD-BEARING, not style: build_voiceprints takes a
+        # caller-supplied connection, and under db.connect's default rows=True
+        # a bare repr(row) is "<sqlite3.Row object at 0x...>" -- address-
+        # dependent, so the digest would differ every process and force a
+        # rebuild on every single run.
+        h.update(repr(tuple(row)).encode("utf-8"))
+    return h.hexdigest()
+
+
 def build_voiceprints(con, *, force=False, dry_run=False):
     """Full rebuild of person_voiceprint, guarded by ingest_state's
-    voiceprint_max_message_id: an unchanged corpus is skipped (unless --force),
-    otherwise every row is DELETEd and recomputed -- which self-heals a
-    handle:N -> contact:M key flip, since keys are re-derived from the current
-    contact_id each time. feature_std_json is recomputed per scope each rebuild.
-    Returns the number of rows written."""
+    voiceprint_max_message_id AND voiceprint_annotations_hash: a corpus with no
+    new messages and no change to the source='llm' annotations tone_* reads is
+    skipped (unless --force), otherwise every row is DELETEd and recomputed --
+    which self-heals a handle:N -> contact:M key flip, since keys are
+    re-derived from the current contact_id each time. feature_std_json is
+    recomputed per scope each rebuild. Returns the number of rows written.
+
+    The annotations term is what makes an annotate run visible here at all; see
+    _annotations_hash, and the module docstring for the inputs the pair still
+    does NOT cover (they need --force). Both keys are written together, only on
+    a real rebuild, so --dry-run cannot consume the trigger.
+
+    A DB that predates the annotations key rebuilds exactly once (the stored
+    value is None, which no digest equals) and is then guarded on both. That
+    one rebuild is the repair: such a DB is already stale for any upgrade pass
+    it has ever run."""
     # Self-heal a DB predating the table (voiceprint.py is reachable without a
     # fresh ingest, which is what normally applies migrations).
     if not con.execute(
@@ -560,10 +663,26 @@ def build_voiceprints(con, *, force=False, dry_run=False):
         schema.create_schema(con)
         con.commit()
 
+    # The hash query names chunk_annotations.source, which is itself a
+    # migration (schema.create_schema ALTERs it onto a pre-distillation table).
+    # Reaching it is safe for a reason the self-heal above does NOT provide --
+    # that block only runs when person_voiceprint is absent: the `source`
+    # migration predates the person_voiceprint DDL and lives in the same
+    # create_schema, so any DB old enough to lack the column is also old enough
+    # to lack the table, and the self-heal has already added both.
     current_max = _corpus_max_message_id(con)
+    current_ann = _annotations_hash(con)
     stored = get_state(con, "voiceprint_max_message_id")
-    if not force and stored is not None and int(stored) == current_max:
-        print(f"Voiceprints up to date (max message id {current_max}, 0 built)")
+    stored_ann = get_state(con, "voiceprint_annotations_hash")
+    unchanged = (stored is not None and int(stored) == current_max
+                 and stored_ann == current_ann)
+    if not force and unchanged:
+        # Name BOTH inputs, not just the message id: reporting only the one
+        # that had not moved is what made the stale-tone bug invisible -- the
+        # line read as "nothing to do" right after an annotate run that had
+        # changed exactly the thing this guard was not checking.
+        print(f"Voiceprints up to date (max message id {current_max}, "
+              f"annotations unchanged, 0 built)")
         return 0
 
     tasks = _enumerate_tasks(con)
@@ -606,6 +725,10 @@ def build_voiceprints(con, *, force=False, dry_run=False):
         for member_key_str, counterpart_key, scope, result in built
     ])
     set_state(con, "voiceprint_max_message_id", current_max)
+    # Written with the rows it vouches for, in the same implicit transaction as
+    # the DELETE + insert above: a hash committed without its rows would tell
+    # the next run the stored voiceprints already reflect these annotations.
+    set_state(con, "voiceprint_annotations_hash", current_ann)
     con.commit()
 
     n_scope = collections.Counter(scope for _m, _c, scope, _r in built)

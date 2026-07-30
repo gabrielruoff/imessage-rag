@@ -163,7 +163,17 @@ Full design history, schema rationale, and data forensics:
   you run WHILE turning the feature off, so gating it would make it unreachable
   in exactly the state it exists for), `make voiceprint`
   (`voiceprint.py [--force] [--dry-run]` → `person_voiceprint`; LLM-free, full
-  rebuild guarded by `voiceprint_max_message_id`), `make conflict`
+  rebuild guarded by `voiceprint_max_message_id` AND
+  `voiceprint_annotations_hash` — the second because an annotate pass writes
+  `source='llm'` rows with NO new messages, so on the message-id guard alone a
+  run over an OTHERWISE-UNCHANGED corpus — the resumable `--quality hybrid`
+  re-run, or a bare `make annotate && make voiceprint` — reported "up to date"
+  and kept the stale `tone_*`. A `make pipeline` whose ingest DID add a message
+  rebuilt anyway (voiceprint runs after annotate), which is why the bug reads as
+  intermittent. A SESSION_GAP_MINUTES retune, a lexicon rebuild, a
+  `VOICEPRINT_*` change and an AddressBook re-key are still NOT covered — those
+  need `--force`),
+  `make conflict`
   (`conflict_detect.py [--budget-minutes N] [--label-top N | --no-llm]
   [--max-label-turns N] [--relabel] [--limit N] [--model M] [--dry-run]` →
   `conflicts`/`conflict_signals`; Ollama only for the per-turn labels;
@@ -380,7 +390,21 @@ ingest_state(key, value)          -- last_message_rowid for --since-last, plus
                                   -- conflict_model, drift_max_message_id +
                                   -- drift_params_hash + drift_annotations_hash +
                                   -- drift_sessions_hash,
-                                  -- voiceprint_max_message_id,
+                                  -- voiceprint_max_message_id +
+                                  -- voiceprint_annotations_hash (the second
+                                  -- fingerprints the source='llm' rows tone_*
+                                  -- is built from, so an annotate pass -- which
+                                  -- adds NO messages -- still rebuilds; without
+                                  -- it a --quality hybrid run over an
+                                  -- otherwise-unchanged corpus left the stored
+                                  -- tone stale behind an "up to date" line (a
+                                  -- pipeline run that DID ingest rebuilt
+                                  -- anyway, so the bug read as intermittent).
+                                  -- Deliberately NOT drift's shape: no
+                                  -- is_group filter, since scope group/all read
+                                  -- group chats, and an exact per-row digest,
+                                  -- since emotions_json is TEXT no SUM can
+                                  -- fingerprint),
                                   -- eval_gate:<task> (F4 gate verdicts),
                                   -- nudges_reconnect_ack (durable dormant-tie
                                   -- reconnect opt-in; unset hides those rows),
@@ -499,7 +523,11 @@ person_voiceprint(member_key, counterpart_key, scope, avg_msg_len,
                                   -- (voiceprint.py); scope 'dyad'|'group'|'all';
                                   -- tone_* are LOW-TRUST (source='llm' chunks
                                   -- only); full rebuild, guarded by
-                                  -- voiceprint_max_message_id
+                                  -- voiceprint_max_message_id +
+                                  -- voiceprint_annotations_hash (an annotate
+                                  -- pass adds no messages, so the message-id
+                                  -- key alone could never see the tone_* inputs
+                                  -- change)
 conflicts(id, chat_id, first_date, last_date, start_session_id, end_session_id,
          topic, peak_signal_json, corroboration, off_text_flag, source,
          labeled_at)              -- deterministic conflict episodes

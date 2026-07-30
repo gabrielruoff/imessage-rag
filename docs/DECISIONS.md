@@ -958,8 +958,9 @@ chunks only (NULL when there are none). Keyed by `member_key` × `counterpart_ke
 × scope (`dyad`/`group`/`all`), so "my voice with Mom" and "Mom's voice with me"
 are distinct rows; a confidence flag reads `high` only when a row clears all
 three volume/engagement/breadth floors. Full rebuild, guarded by
-`voiceprint_max_message_id`; read via `get_voiceprint` (which can also recompute
-over a date window, capped). Later persona issues (draft-reply, style-match,
+`voiceprint_max_message_id` (and, from 2026-07-30, `voiceprint_annotations_hash`
+— see the entry at the end of this file); read via `get_voiceprint` (which can
+also recompute over a date window, capped). Later persona issues (draft-reply, style-match,
 simulate) will extend `query_tools/persona.py`, which stays a thin read layer.
 
 ## 2026-07-21: the analytical suite (Waves 2–4 — surfaces, read tools, generative tools)
@@ -2750,3 +2751,106 @@ routes are pinned at their call sites instead (`ANNOTATE_THINK`,
 `ANNOTATE_BATCH_SIZE`, `ANNOTATE_BUDGET_MINUTES`, `ANNOTATE_COMMIT_EVERY`),
 because "the suite is hermetic" has to be true of the whole module, not of the
 one test a review happened to name.
+
+## 2026-07-30: voiceprint's rebuild guard could not see an annotate run
+
+`--quality hybrid` exists to write `source='llm'` annotations, and
+`annotate_hybrid.py`'s module docstring sold exactly that: *"Upgraded rows are
+written source='llm', so every valence-trusting reader (conflict corroboration,
+the nudge Stage-0 exclusion, voiceprint tone) lights up."* Two of those three
+were true. `voiceprint.build_voiceprints` skipped its rebuild whenever
+`MAX(messages.id)` matched `ingest_state.voiceprint_max_message_id` — and an
+annotate pass adds **no messages**. Reproduced on a copy of the real DB (350,549
+messages): flip 500 rows `distilled → llm`, run `build_voiceprints`, get
+`Voiceprints up to date (max message id 387248, 0 built)` and the old
+`tone_valence` back.
+
+The blast radius is narrower than the first draft of this entry claimed ("broken
+on every single run"), and the correction is worth recording because it is the
+difference between a permanent corruption and a resumability bug. `make
+pipeline` runs annotate *before* voiceprint, so a run whose ingest added even
+one message moved the message-id key and rebuilt anyway — verified on the real
+corpus: the same 500-row flip left the tone stale when nothing was ingested and
+refreshed it (0.2368 → −0.0531, matching `AVG(valence)` over the llm rows) when
+one message was. What actually stayed stale is any run over an
+otherwise-unchanged corpus — precisely the resumable `--quality hybrid` re-run
+the tier is designed around, and a bare `make annotate && make voiceprint` —
+until the next run that ingested something. No historical DB needs a `--force`
+backfill on account of this; a live pipeline healed itself.
+
+This is the hole `drift.py` closed for itself on 2026-07-21
+(`drift_annotations_hash`, above). Voiceprint is now guarded on
+`voiceprint_annotations_hash` as well.
+
+**The fingerprint deliberately is NOT drift's.** Copying it would have been
+wrong three ways, and each divergence is load-bearing:
+
+- **No `ch.is_group = 0`.** drift is 1:1-only. `_enumerate_tasks` builds
+  `scope='group'` tasks and a `scope='all'` task with no `chats` join at all, so
+  group-chat annotations really do reach `_tone`; drift's filter would have
+  reproduced the same miss for those scopes.
+- **`source='llm'` only**, matching `_tone`'s own unconditional clause. A plain
+  `--quality distilled` pass must *not* trigger a rebuild — voiceprint cannot
+  observe those rows — where drift's `COUNT(*)` over every source would.
+- **An exact per-row digest, not `COUNT`/`SUM`.** Not exactness bought at a
+  price: measured, it is the **cheaper** of the two shapes on every corpus
+  tried, because drift's plan scans the `chunks` table while this one scans the
+  much smaller `chunk_annotations`. Each pair named with its corpus rather than
+  averaged into one number — an earlier draft quoted "6.6 ms vs 23.9 ms on the
+  same DB", and those two figures came from *different* DBs: on the
+  25,029-chunk reference corpus (chunks 27 MB, chunk_annotations 1.7 MB) it is
+  5–6 ms against drift's 7–8 ms, a **1.3×** gap; on a 74,233-chunk one (chunks
+  83 MB, chunk_annotations 6.1 MB) 5–7 ms against drift's 21–24 ms, **4×**. The
+  gap widens with the `chunks` table, which is drift's scan and not ours —
+  that is the mechanism, and it is why one ratio was the wrong thing to record.
+  Exactness is what buys the coverage: `emotions_json` is a TEXT list no `SUM`
+  can fingerprint, so a lossy aggregate misses an emotions-only rewrite, and
+  `SUM(valence)` misses a valence swap between two chunks. Both are regression
+  tests, and both were verified to fail when the digest is swapped for drift's
+  aggregate shape — a test that cannot fail would not have pinned either.
+
+**Cost, measured rather than asserted** (25,029-chunk reference corpus): 5–6 ms
+at 4,416 llm rows, 28–31 ms if every row were upgraded, against a **4.0 s** full
+rebuild — 0.15%, ~0.7% at full hybrid coverage. The scan is over *all*
+`chunk_annotations` rows (`schema.py` creates no index on that table), so the
+curve grows with total annotations plus per-llm-row Python work, not with the
+llm population alone — worth stating, because the fix's whole purpose is to grow
+that population. `ORDER BY ca.chunk_id` is free: `chunk_id` is `INTEGER PRIMARY
+KEY`, i.e. a rowid alias, so there is no temp b-tree — and it is what makes the
+digest deterministic.
+
+**Rejected: `group_concat`.** Deterministic ordering needs `ORDER BY` inside the
+aggregate (SQLite ≥ 3.44, which nothing in the repo pins) and it materializes
+the whole string in memory, to save 1–3 ms.
+
+Two details that read like style and are not. The `JOIN chunks` is not there for
+`chat_id` (immutable per `chunk_id` — nothing in the tree `UPDATE`s `chunks`,
+and ids are `AUTOINCREMENT` so they are never reused): it **drops orphaned
+annotations**, exactly as `_tone`'s own join does, and a tail re-chunk can
+orphan rows with `MAX(messages.id)` unchanged. And the `tuple()` in
+`repr(tuple(row))` is load-bearing: `build_voiceprints` takes a caller-supplied
+connection, and under `db.connect`'s default `rows=True` a bare `repr(row)` is
+`<sqlite3.Row object at 0x...>` — address-dependent, so the digest would differ
+every process and force a rebuild on every run.
+
+**What the pair still does not cover**, now said out loud in the module
+docstring rather than left for the next reader to discover the way this one was:
+a `SESSION_GAP_MINUTES` retune (re-splits every session, moving every
+opener/closer), a `person_period_lexicon` rebuild (moves the 9 `fw_*_rate`
+columns), a `VOICEPRINT_*` knob change (`BURST_GAP_SECONDS` moves every
+`burst_size`; `MIN_RETURN_MESSAGES` moves which rows exist *and* the per-scope
+`feature_std` population), and an AddressBook re-ingest that flips
+`handle:N → contact:M` — which a rebuild self-heals but never triggers on its
+own. All four are pre-existing and all four need `--force`. Closing one hole
+while leaving four unnamed is how this bug survived; a half-guard that reads as
+complete is worse than a documented partial one.
+
+The skip line now names both inputs (`max message id N, annotations unchanged`).
+Reporting only the input that had *not* moved is what made this invisible: the
+line read as "nothing to do" immediately after the run that had changed the one
+thing the guard was not checking.
+
+A DB predating the key rebuilds exactly once (`None` equals no digest) and is
+guarded on both thereafter — that rebuild *is* the repair, since such a DB is
+already stale for every upgrade pass it has ever run. `reset_db` clears
+`ingest_state` wholesale, so the new key needs no teardown of its own.
