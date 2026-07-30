@@ -915,7 +915,11 @@ contact; then pure-SQL detectors (N1 ships `faded_initiator` over the derived
 `sessions` table); then Python urgency scoring
 (`kind_weight * exp(-age/halflife)`, age from the corpus's latest message).
 The one LLM touch is a one-line `nudge_text` narration, guarded by
-`loose_ends_model`, which never blocks or deletes the SQL-detected rows.
+`loose_ends_model`, which never deletes the SQL-detected rows. (Amended
+2026-07-30 — see "two guards that destroyed what they existed to protect": the
+guard now REFUSES a model change while the LLM columns hold anything rather
+than clearing them, and N4's opt-in `dropped_plan` detector added a second LLM
+touch, during detection rather than narration.)
 `nudge_exclusions` is durable user intent — PRESERVED across `reset_db` — while
 `loose_threads` is derived. Dismissals set `dismissed_at` and never delete (a
 reused id could re-open a dismissed thread, hence AUTOINCREMENT). Read/act via
@@ -1991,7 +1995,7 @@ conservative: signals cannot exist without a labeling pass, but their absence
 stays ambiguous, so a pre-migration window that *was* labeled and legitimately
 produced zero rows now reads "not analyzed" rather than "analyzed and clean".
 That is the safe direction. Wherever the column exists, the invariant above is
-unchanged: the marker is the stamp, never the rows.
+unchanged: the marker is the stamp, never the rows. (Superseded 2026-07-30 for the READ side only — see "two guards that destroyed what they existed to protect": the WRITE side's marker is still the stamp, but the read tools infer on any DB from no-stamp-plus-signals.)
 
 ### Reconcile the window, don't rewrite it
 
@@ -2947,3 +2951,95 @@ Backward compatibility is total: `_sample_seed_ids` keeps its old signature and
 falls back to the historical uniform draw when either mapping is absent, which
 is what every existing caller and test exercises, and the two extra reads happen
 only when the cap can actually bite.
+
+## 2026-07-30: two guards that destroyed what they existed to protect
+
+Both surfaced by sweeping this branch for changes reaching pre-existing
+pipelines, and both were made live by the `CHAT_MODEL` default flip rather than
+by the code they sit in.
+
+### `make annotate` silently reset the conflict read state
+
+`query_tools.conflict` separated "never looked at" from "looked at" using
+`conflicts.labeled_at`, and on a database predating that column it INFERRED the
+answer from stored `conflict_signals` rows. The inference was gated on the
+COLUMN's existence — and the column can arrive without a single row changing:
+`annotate._ensure_column` self-heals by running the whole of
+`schema.create_schema`, which ALTERs `labeled_at` on. So a plain
+`make annotate` flipped every window the old pipeline had labeled from
+`labeled: true` to `labeled: false`, `n_labeled` 1 → 0, **and** removed
+`_PRE_MIGRATION_NOTE`, which was gated on the same missing column. A user who
+ran annotate before conflict got the most confident version of the wrong
+answer. Nothing in the data changed; only the test did.
+
+The fix keys the inference on the DATA — no stamp, but signal rows present —
+so it holds on every database and a migration is a no-op for this read, which
+is what it should always have been. `_predates_labeling_stamps` (a schema
+question) becomes `_has_pre_budget_rows` (a data question), and the caveat is
+reworded off "this database predates the stamp" onto "some windows here were
+labeled by a pipeline that recorded no stamp", which stays true afterwards.
+
+It is deliberately **read-side only**. The stored `labeled_at` really is NULL on
+those rows, so `conflict_detect`'s budgeted pass still re-labels them — which is
+correct, since turn selection changed underneath them. This changes what is
+reported, never what is done.
+
+**It did expose a write-side bug, now fixed.** The inference's premise is that
+signal rows imply a pass that finished. `label_top_conflicts` kept that contract
+(it rolls back a half-labeled window); `detect_chat` did not, and
+`detect_conflicts` COMMITS on `KeyboardInterrupt` rather than rolling back — so
+a Ctrl-C during the single-phase path (`--budget-minutes 0`) left committed
+signals with no stamp, which the new inference reads as fully labeled. A window
+whose labeling covered 2 of 6 turns would report as analyzed and complete, and a
+later `--no-llm` run never revisits it, so the misreport persisted. `detect_chat`
+now deletes the window's partial signals on any exception before re-raising.
+Reachable only off the default (the budgeted two-phase path already rolled
+back), one window per interrupted run, and self-healing on the next labeling
+pass — but it made the read's premise false, so it is fixed at the write side
+rather than papered over at the read.
+
+### The nudge guard cleared columns the run could not rebuild
+
+`loose_ends._guard_llm_model` deliberately did NOT refuse a model change; it
+cleared `nudge_text`/`llm_verdict`/`llm_reason` and let the run regenerate. That
+choice predates `NUDGES_MODEL` inheriting a flipped `CHAT_MODEL`, which turns it
+from an opt-in into the upgrade path every existing user takes. Three things
+were wrong with it:
+
+- **`--limit N` re-narrates N threads; the clear wiped all of them.** A limited
+  run left every other thread with no `nudge_text` at all — and a full
+  re-narration is one LLM call per open thread, a real cost to impose silently.
+- **It was silent and unpreviewable.** `--dry-run` and `--no-llm` never reach
+  `narrate_threads`, so there was no way to see the deletion coming.
+
+A third reason was drafted and is **withdrawn**, because it is false: "the run
+cannot regenerate what it clears". It could. `nudge_text` is the only one of the
+three columns with a writer anywhere in the repo — nothing writes `llm_verdict`
+or `llm_reason` (reserved for a future model-backed detector) — so the clear
+only ever destroyed narration, which `narrate_threads` rebuilt in the same run.
+The two surviving reasons carry the change on their own; recording the refuted
+one would have made the next reader believe a data-loss bug that does not
+exist.
+
+It now refuses, with the same shape and the same remedy sentence as
+`annotate._check_model_guard` and `conflict_detect._check_model_guard` — and,
+like annotate's, only when there is something to protect (a model change over a
+digest with no LLM output yet still runs). The refusal moved BEFORE detection
+for the reason conflict's did, though the precise mechanism is narrower than
+first written: `dropped_plan` spends `NUDGES_MODEL` LLM calls during DETECTION
+and stamps the model it used into `evidence_json.verified_by`, so a run that is
+going to be refused has to be refused before it pays for and records that. It
+writes no guarded COLUMN — that claim was wrong. `--model` is now threaded into
+`_build_cfg` so it scopes detection as well as narration; without that the guard
+cleared one model while the detector spent another. `--no-llm` is guarded only
+when `NUDGE_DROPPED_PLAN_ENABLED` is on: off (the default) that path makes zero
+LLM calls and cannot touch a guarded column, and this repo's rule is that a
+guard must not refuse a run it cannot affect. `--dry-run` neither guards nor
+records, `--acknowledge-reconnect` returns before it, and recording stays with
+the narration pass so a run that never reaches narration leaves the key
+untouched.
+
+The cost is a step for anyone genuinely switching models, which is the trade
+every other guard in this repo already makes; the refusal prints the exact
+`UPDATE` to run. `make pipeline` on an upgraded install now stops at nudges the
+same way it stops at annotate and conflict, and for the same reason.

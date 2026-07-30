@@ -1427,6 +1427,38 @@ class ResumeTest(_ConflictWindowsTest):
         self.assertIsNotNone(row["labeled_at"])
         self.assertEqual(row["topic"], "criticism")
 
+    def test_an_interrupted_window_leaves_no_partial_signals(self):
+        # A window is all of its turns or none of them -- the contract
+        # label_top_conflicts kept and detect_chat did not. detect_conflicts
+        # COMMITS on KeyboardInterrupt, so a partial window used to survive
+        # with signal rows and NO stamp, which the read tools then infer as
+        # fully labeled: a window whose labeling covered part of its turns
+        # reported as analyzed and complete, and a later --no-llm run never
+        # revisits it. Driven through the real detection path (detect_chat
+        # needs sessions, which the seeded-windows fixture has none of).
+        calls = {"n": 0}
+
+        def interrupt_on_second(text):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise KeyboardInterrupt
+            return _stub_criticism(text)
+
+        with mock.patch("builtins.print"):
+            _build_fixture(self.db_path, classify_fn=interrupt_on_second)
+        con = self._con()
+        self.assertGreaterEqual(calls["n"], 2, "the interrupt never fired")
+        rows = con.execute(
+            "SELECT c.id, c.labeled_at, "
+            "(SELECT COUNT(*) FROM conflict_signals s WHERE s.conflict_id = c.id) AS n "
+            "FROM conflicts c").fetchall()
+        for r in rows:
+            if r["labeled_at"] is None:
+                self.assertEqual(
+                    r["n"], 0,
+                    "a half-labeled window must not leave signal rows behind -- "
+                    "the read tools infer 'labeled' from exactly that shape")
+
     def test_stamped_even_when_no_label_survived(self):
         # A window of all-neutral turns writes zero conflict_signals rows. The
         # rows are NOT the resume marker, or every rerun would re-buy it.
@@ -2735,7 +2767,46 @@ class LabelingCoverageReadTest(_TempDBTest):
         self.assertEqual(by_id[8]["labeled_signal_turns"], 1)
         self.assertEqual(env["n_labeled"], 1)
         self.assertIn("NOT ANALYZED", env["labeling_note"])
-        self.assertIn("predates the labeling-completion stamp", env["labeling_note"])
+        self.assertIn("(Some windows here were labeled by an earlier version", env["labeling_note"])
+
+    def test_adding_the_column_alone_does_not_flip_labeled_to_false(self):
+        # THE REGRESSION. annotate._ensure_column self-heals by running the
+        # whole of schema.create_schema, so a plain `make annotate` ALTERs
+        # conflicts.labeled_at on -- without touching a single row. The read
+        # used to key "is this a pre-budget DB" off the COLUMN's existence, so
+        # that migration silently flipped every window the old pipeline had
+        # labeled from labeled=true to labeled=false AND dropped the caveat
+        # that would have explained it (it was gated on the column being
+        # missing). A user who ran annotate before conflict got the most
+        # confident version of the wrong answer.
+        self._pre_budget_db(conflict_ids=(7, 8), with_signals=(8,))
+        before = {r["conflict_id"]: r["labeled"]
+                  for r in query_tools.find_conflicts(chat_id=1)["rows"]}
+        con = sqlite3.connect(self.db_path)
+        con.execute("ALTER TABLE conflicts ADD COLUMN labeled_at TEXT")
+        con.commit()
+        con.close()
+        env = query_tools.find_conflicts(chat_id=1)
+        after = {r["conflict_id"]: r["labeled"] for r in env["rows"]}
+        self.assertEqual(before, after, "the migration changed what was reported")
+        self.assertTrue(after[8])       # signals still prove a pass ran
+        self.assertFalse(after[7])
+        self.assertEqual(env["n_labeled"], 1)
+        # ...and the caveat explaining the inference survives the migration.
+        self.assertIn("(Some windows here were labeled by an earlier version", env["labeling_note"])
+        self.assertIn("(Some windows here were labeled by an earlier version", query_tools.get_conflict(8)["note"])
+
+    def test_a_real_stamp_still_wins_over_the_inference(self):
+        # The inference must not override a recorded stamp, and a fully stamped
+        # database must not pay for the inference caveat at all. (It may still
+        # carry the labeled-but-empty note -- a different fact about a
+        # different absence, asserted elsewhere.)
+        self._seed_one_conflict(0, labeled=True)
+        env = query_tools.find_conflicts()
+        self.assertTrue(env["rows"][0]["labeled"])
+        self.assertNotIn("(Some windows here were labeled by an earlier version", env.get("labeling_note", ""))
+        self.assertNotIn("(Some windows here were labeled by an earlier version",
+                         query_tools.get_conflict(env["rows"][0]["conflict_id"])["note"])
 
     def test_a_pre_migration_episode_says_the_stamp_is_missing(self):
         self._pre_budget_db(conflict_ids=(7, 8), with_signals=(8,))
@@ -2743,7 +2814,7 @@ class LabelingCoverageReadTest(_TempDBTest):
         self.assertFalse(never["labeled"])
         self.assertEqual(never["signals_total"], 0)
         self.assertIn("NOT ANALYZED", never["note"])
-        self.assertIn("predates the labeling-completion stamp", never["note"])
+        self.assertIn("(Some windows here were labeled by an earlier version", never["note"])
         self.assertEqual(never["peak_signal"]["signal_count"], 1)  # evidence intact
         labeled = query_tools.get_conflict(8)
         self.assertTrue(labeled["labeled"])

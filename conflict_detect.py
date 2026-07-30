@@ -782,8 +782,23 @@ def detect_chat(con, chat_id, corpus_end, classify_fn, model, label=True,
             # a re-label must never stack a second set on top of a first.
             con.execute("DELETE FROM conflict_signals WHERE conflict_id = ?",
                         (conflict_id,))
-            _n_labels, survivors = _label_turns(con, conflict_id, turns, classify_fn,
-                                                four_way_cleared)
+            try:
+                _n_labels, survivors = _label_turns(con, conflict_id, turns,
+                                                    classify_fn, four_way_cleared)
+            except BaseException:
+                # A window is all of its turns or none of them -- the contract
+                # label_top_conflicts already keeps, now kept here too. Without
+                # it a Ctrl-C mid-window left committed signal rows with no
+                # stamp (detect_conflicts' handler COMMITS rather than rolling
+                # back), and the read tools infer "labeled" from exactly that
+                # shape: a window whose labeling covered 2 of 6 turns was
+                # reported as analyzed and complete, and a later --no-llm run
+                # never revisits it, so the misreport persisted. Deleting the
+                # partial rows restores the premise the inference rests on --
+                # signals imply a pass that finished.
+                con.execute("DELETE FROM conflict_signals WHERE conflict_id = ?",
+                            (conflict_id,))
+                raise
             # labeled_at is stamped even with zero survivors: the window WAS
             # processed, and the signal rows are not the marker.
             con.execute("UPDATE conflicts SET topic = ?, labeled_at = ? WHERE id = ?",

@@ -156,13 +156,39 @@ Full design history, schema rationale, and data forensics:
   `chunk_annotations` so they run after `annotate`; `make suite` = all four in
   order, and is exactly what `make pipeline` runs between annotate and topics):
   `make nudges` (`loose_ends.py [--model M] [--limit N] [--no-llm] [--dry-run]
-  [--acknowledge-reconnect]` → `loose_threads`; Ollama only for the one-line
-  `nudge_text` narration, so `--no-llm` is SQL detection only and `--limit N`
+  [--acknowledge-reconnect]` → `loose_threads`; Ollama for the one-line
+  `nudge_text` narration AND — when `NUDGE_DROPPED_PLAN_ENABLED` is on and the
+  F4 gate is cleared — for `dropped_plan`'s per-candidate verification during
+  DETECTION, which `--no-llm` does NOT skip (only `--dry-run` does), so
+  `--no-llm` is SQL-only at the defaults but not by construction. `--limit N`
   caps narrated threads, not detected ones. `--acknowledge-reconnect` is a pure
   toggle: it sets the durable `nudges_reconnect_ack` key so `get_loose_threads`
   stops hiding `dormant_tie` rows, then exits WITHOUT detecting. `--dry-run`
   prints the scope and writes nothing, skipping the LLM-backed `dropped_plan`
-  detector), `make drift` (`drift.py [--force] [--dry-run] [--purge]` →
+  detector. The `loose_ends_model` guard REFUSES a model change while
+  `nudge_text`/`llm_verdict`/`llm_reason` hold anything — like the
+  `annotate_model` and `conflict_model` guards, and unlike its own earlier
+  behavior, which CLEARED those columns and let the run regenerate. That was
+  wrong three ways and the `CHAT_MODEL` flip made all three the default upgrade
+  path: the run cannot regenerate what it clears (`narrate_threads` fills only
+  `nudge_text`; `llm_verdict`/`llm_reason` come from `dropped_plan` during
+  DETECTION, already finished), `--limit N` re-narrated N threads while the
+  clear wiped every one, and it was unpreviewable (`--dry-run`/`--no-llm` never
+  reached it). NOT a reason, though an earlier draft said so: that the run
+  could not regenerate what it cleared. It could — `nudge_text` is the only one
+  of the three columns with a writer at all, so the clear only ever destroyed
+  narration, which the same run rebuilt. The guard runs BEFORE detection because
+  `dropped_plan` spends `NUDGES_MODEL` LLM calls there and stamps the model into
+  `evidence_json.verified_by`, so a run that will be refused must be refused
+  before it pays for that; `--model` is threaded into `_build_cfg` so it scopes
+  detection too rather than only narration. It refuses on every path that
+  detects except `--dry-run`, and under `--no-llm` only when
+  `NUDGE_DROPPED_PLAN_ENABLED` is on — off (the default) that path makes zero
+  LLM calls and must not be refused for a run it cannot affect.
+  `--acknowledge-reconnect` returns before it. Recording stays with the
+  narration pass, so a run that never reaches narration leaves the key
+  untouched),
+  `make drift` (`drift.py [--force] [--dry-run] [--purge]` →
   `dyad_drift`; LLM-free, opt-in `DRIFT_ENABLED`, default off. Full rebuild,
   skip-if-unchanged, so `--force` rebuilds anyway and `--dry-run` reports how
   many dyads WOULD be scored; `make drift-purge` = `--purge`, which tears the
@@ -558,17 +584,27 @@ conflicts(id, chat_id, first_date, last_date, start_session_id, end_session_id,
                                   -- message TEXT only, so a stretch carried by
                                   -- tapbacks, by tone, or moved off-channel can
                                   -- be looked at and yield nothing, and it is
-                                  -- never narrated as "analyzed and calm". On a
-                                  -- DB whose conflicts table PREDATES the
-                                  -- column, `labeled` is INFERRED per row from
-                                  -- whether signal rows exist, so a signal-less
-                                  -- window from an old --no-llm run reads
-                                  -- labeled=false where the old flat
-                                  -- 'pre-budget' literal read true; the
-                                  -- inference is one-way-safe (signals cannot
-                                  -- exist without a pass, their absence stays
-                                  -- ambiguous) and _PRE_MIGRATION_NOTE says so,
-                                  -- with a rerun stamping properly
+                                  -- never narrated as "analyzed and calm". A
+                                  -- row with NO stamp but WITH signal rows was
+                                  -- labeled by a pipeline that recorded no
+                                  -- completion time, so `labeled` is INFERRED
+                                  -- from the signals -- on EVERY DB, not only
+                                  -- one whose table predates the column. Keyed
+                                  -- on the DATA, because the schema and the
+                                  -- data come apart: annotate's _ensure_column
+                                  -- self-heal runs create_schema, so a plain
+                                  -- `make annotate` ADDS labeled_at without
+                                  -- touching a row, and the old
+                                  -- column-existence test made that migration
+                                  -- flip every old-pipeline window from
+                                  -- labeled=true to labeled=false AND drop the
+                                  -- caveat explaining it. The inference is
+                                  -- one-way-safe (signals cannot exist without
+                                  -- a pass, their absence stays ambiguous) and
+                                  -- _PRE_MIGRATION_NOTE says so; it is READ-side
+                                  -- only, so the budgeted pass still re-labels
+                                  -- those rows (their stored stamp really is
+                                  -- NULL) and a rerun stamps them properly
 conflict_signals(id, conflict_id, message_id, actor_is_me, label_class,
          top2_labels_json, band, excerpt)
                                   -- per-turn escalation labels for a conflict;
@@ -662,8 +698,11 @@ does not touch it. Timestamps are ISO-8601 UTC strings.
   and LABELED WITH BANDS. The `labeling_note` key now appears whenever EITHER of
   the first two is in scope, not only for unlabeled rows, and neither may be
   narrated as "analyzed and calm" — the deterministic evidence (signals,
-  signal_count, corroboration, off_text_flag) is what is complete for them. On a
-  pre-migration DB a sentence saying `labeled` is INFERRED is appended. BOTH of
+  signal_count, corroboration, off_text_flag) is what is complete for them.
+  Whenever some window in the DB was labeled by a pipeline that recorded no
+  stamp — no stamp, signal rows present — a sentence saying `labeled` is
+  INFERRED for those is appended; keyed on the DATA, so a `make annotate` that
+  merely ADDS the column cannot drop it. BOTH of
   the first two also carry a code-printed `_epilogue` (never a payload-only
   note): the framing floor is code, never prompt, and "looked at, nothing
   shippable" licenses the same false "I checked and it was calm" summary the

@@ -88,22 +88,20 @@ _LABELED_EMPTY_EPILOGUE = (
 # annotation readers follow: without it `labeled_signal_turns: 0` reads as
 # evidence of absence for a window nothing ever looked at.
 #
-# One transitional state keeps both notes honest on a migrated DB: a window
-# labeled by the pre-budget pipeline carries its signal rows but a NULL
-# labeled_at (the migration deliberately does not invent a stamp -- see
-# schema.py), so labeled=false with labeled_signal_turns > 0 is possible until
-# a budgeted run re-reaches it. Those labels are real; the notes say so rather
-# than asserting an equivalence the data briefly violates.
+# A window labeled by the pre-budget pipeline carries its signal rows but a
+# NULL labeled_at (the migration deliberately does not invent a stamp -- see
+# schema.py). _labeled_at_select infers those back to labeled=true, so
+# `labeled: false` now means no stamp AND no signal rows, which forces
+# labeled_signal_turns=0 -- the two travel together and neither note has to
+# describe a mixed shape. What those rows DO need saying about them is where
+# their `labeled` came from, which is _PRE_MIGRATION_NOTE's job.
 _UNLABELED_SCOPE_NOTE = (
     "{n_unlabeled} of {total} detected windows in scope have NOT been through "
     "per-turn escalation labeling yet (it runs on a wall-clock budget, "
     "strongest windows first; rerunning the conflict pipeline extends "
     "coverage). On a row with labeled=false, labeled_signal_turns=0 means NOT "
     "ANALYZED -- not 'analyzed and nothing escalatory found' -- and topic / "
-    "reconciliation are unset for the same reason. (A labeled=false row that "
-    "still shows labeled_signal_turns > 0 was labeled by an earlier version of "
-    "the pipeline that recorded no completion stamp: those labels are real, "
-    "and a future budgeted run will refresh them.) The deterministic evidence "
+    "reconciliation are unset for the same reason. The deterministic evidence "
     "(signals, signal_count, corroboration) is complete for every row."
 )
 _LABELED_NOTE = "labels are eval-gated bands (tentative/likely), not certainties"
@@ -132,26 +130,26 @@ _LABELED_EMPTY_SCOPE_NOTE = (
     "floor or be suppressed by the eval gate. Those rows' deterministic "
     "evidence (signals, signal_count, corroboration) is what found them."
 )
-# Appended to whichever note is emitted on a DB whose `conflicts` table has no
-# labeled_at column at all (see _labeled_at_select): there `labeled` is INFERRED
-# from stored signal rows, so the two states the column exists to separate are
-# only partly separable.
+# Appended to whichever note is emitted when some window in this database was
+# labeled by a pipeline that recorded no completion stamp (see
+# _has_pre_budget_rows): for THOSE rows `labeled` is INFERRED from stored signal
+# rows, so the two states the stamp exists to separate are only partly
+# separable. Keyed on the data, not on whether the column exists -- a plain
+# `make annotate` can add the column without changing a single row.
 _PRE_MIGRATION_NOTE = (
-    "(This database predates the labeling-completion stamp, so `labeled` is "
-    "inferred from whether the window has stored signal turns: a window the old "
-    "pipeline looked at and found nothing in is indistinguishable here from one "
-    "it never reached. Rerunning the conflict pipeline stamps them properly.)"
+    "(Some windows here were labeled by an earlier version of the pipeline that "
+    "recorded no completion stamp, so for those `labeled` is inferred from "
+    "whether the window has stored signal turns: one the old pipeline looked at "
+    "and found nothing in is indistinguishable from one it never reached. "
+    "Rerunning the conflict pipeline stamps them properly.)"
 )
 _UNLABELED_NOTE = (
     "this episode has NOT been through per-turn escalation labeling yet (it "
     "runs on a wall-clock budget, strongest windows first; rerunning the "
     "conflict pipeline extends coverage), so zero signal turns here means NOT "
     "ANALYZED, not 'analyzed and nothing escalatory found' -- and topic is "
-    "unset for the same reason. If signal turns ARE present despite this, they "
-    "were written by an earlier version of the pipeline that recorded no "
-    "completion stamp: real labels, refreshed by a future budgeted run. Its "
-    "deterministic evidence (peak_signal, corroboration, off_text_flag) is "
-    "complete either way."
+    "unset for the same reason. Its deterministic evidence (peak_signal, "
+    "corroboration, off_text_flag) is complete regardless."
 )
 
 
@@ -164,37 +162,82 @@ def _has_conflict_tables(con):
     return {"conflicts", "conflict_signals"} <= names
 
 
-def _predates_labeling_stamps(con):
-    """True when `conflicts` has no labeled_at column at all -- a DB neither
-    re-ingested nor re-detected since the budgeted tier landed. Returning rows
-    beats raising `no such column`, which is the same contract
+# Sentinel `labeled_at` for a window labeled by a pipeline that recorded no
+# completion stamp. Distinguishable from a real stamp by construction -- those
+# are ISO timestamps from conflict_detect._now_iso -- so a reader can tell an
+# INFERRED "labeled" from a recorded one, which is what gates the caveat below.
+_PRE_BUDGET_STAMP = "pre-budget"
+
+
+def _has_labeled_at(con):
+    """Whether `conflicts` carries the labeled_at column at all. False on a DB
+    neither re-ingested nor re-detected since the budgeted tier landed;
+    returning rows beats raising `no such column`, the same contract
     _has_conflict_tables keeps one migration earlier."""
-    return "labeled_at" not in {r[1] for r in con.execute("PRAGMA table_info(conflicts)")}
+    return "labeled_at" in {r[1] for r in con.execute("PRAGMA table_info(conflicts)")}
+
+
+def _has_pre_budget_rows(con):
+    """Whether any window was labeled by a pipeline that recorded no stamp --
+    signal rows present, `labeled_at` absent or NULL. That, NOT the column's
+    existence, is what makes an unstamped-and-empty window ambiguous, and it is
+    the condition _PRE_MIGRATION_NOTE describes.
+
+    Keyed on the DATA rather than the SCHEMA because the two come apart, and
+    the way they come apart used to silently corrupt this read: `annotate.py`'s
+    _ensure_column self-heal runs the whole of schema.create_schema, so a plain
+    `make annotate` ADDS conflicts.labeled_at as a side effect. On the old
+    column-existence test that single migration flipped every window the old
+    pipeline had labeled from `labeled: true` to `labeled: false` -- and
+    removed the caveat that would have explained it, because the caveat was
+    gated on the column being missing. A user who ran annotate before conflict
+    got the most confident version of the wrong answer."""
+    if not _has_conflict_tables(con):
+        return False
+    stamp = "c.labeled_at IS NULL AND " if _has_labeled_at(con) else ""
+    return bool(con.execute(
+        f"SELECT 1 FROM conflicts c WHERE {stamp}EXISTS "
+        "(SELECT 1 FROM conflict_signals s WHERE s.conflict_id = c.id) LIMIT 1"
+    ).fetchone())
 
 
 def _labeled_at_select(con, alias):
-    """The SELECT fragment yielding a `labeled_at` value, degrading on a
-    `conflicts` table that predates the column.
+    """The SELECT fragment yielding a `labeled_at` value: the recorded stamp
+    where there is one, else 'pre-budget' inferred from stored signal rows,
+    else NULL.
 
-    On that path the value is derived from EVIDENCE, not asserted: 'pre-budget'
-    only where the window actually has conflict_signals rows, NULL otherwise. A
-    flat non-NULL literal was wrong in the one direction that matters -- an old
-    `--no-llm` run wrote windows nothing ever labeled, and marking them
-    `labeled` made get_conflict report "we looked and found nothing" about a
-    window nothing looked at, exactly the misreading the labeled/unlabeled split
-    exists to prevent. The inference is one-way-safe: signals cannot exist
-    without a labeling pass, while their absence stays ambiguous (a pass that
-    found nothing looks like no pass) -- which is what _PRE_MIGRATION_NOTE says
-    out loud rather than papering over.
+    The inference is applied on EVERY database, not only one whose `conflicts`
+    table predates the column. Gating it on the schema was wrong because the
+    column can arrive without the DATA changing -- `annotate.py`'s
+    _ensure_column runs create_schema, which ALTERs it on -- and at that moment
+    every window the old pipeline had labeled silently went from `labeled: true`
+    to `labeled: false`. The rows did not change; only the test did. Keyed on
+    evidence, a migration is a no-op here, which is what it should always have
+    been.
+
+    The value is derived from evidence, never asserted: 'pre-budget' only where
+    the window actually HAS conflict_signals rows. A flat non-NULL literal was
+    wrong in the one direction that matters -- an old `--no-llm` run wrote
+    windows nothing ever labeled, and marking them `labeled` made get_conflict
+    report "we looked and found nothing" about a window nothing looked at,
+    exactly the misreading the labeled/unlabeled split exists to prevent. The
+    inference is one-way-safe: signals cannot exist without a labeling pass,
+    while their absence stays ambiguous (a pass that found nothing looks like no
+    pass) -- which is what _PRE_MIGRATION_NOTE says out loud rather than
+    papering over.
+
+    Read-side only, deliberately: the stored `labeled_at` really is NULL on
+    those rows, so conflict_detect's budgeted pass still re-labels them (their
+    turn selection changed, so it should). This changes what is REPORTED, never
+    what is done.
 
     `alias` is the caller's table alias for `conflicts` and is REQUIRED: the
-    fallback correlates a subquery on `<alias>.id`, and an unqualified `id`
+    fragment correlates a subquery on `<alias>.id`, and an unqualified `id`
     there would resolve to the subquery's own conflict_signals.id. The fragment
     stays a constant -- no user input is ever interpolated."""
-    if not _predates_labeling_stamps(con):
-        return f"{alias}.labeled_at"
-    return ("CASE WHEN EXISTS (SELECT 1 FROM conflict_signals ps "
-            f"WHERE ps.conflict_id = {alias}.id) THEN 'pre-budget' END "
+    stamp = f"{alias}.labeled_at" if _has_labeled_at(con) else "NULL"
+    return (f"COALESCE({stamp}, CASE WHEN EXISTS (SELECT 1 FROM conflict_signals ps "
+            f"WHERE ps.conflict_id = {alias}.id) THEN '{_PRE_BUDGET_STAMP}' END) "
             "AS labeled_at")
 
 
@@ -213,8 +256,9 @@ def _conflict_summary(row):
     find_conflicts SELECT as a GROUP BY aggregate, so this is a pure row->dict
     shaper with no per-row query (was an N+1 COUNT).
 
-    `labeled` mirrors conflicts.labeled_at (see the notes above): it separates
-    "we never looked" (labeled false) from "the pass ran here" (labeled true).
+    `labeled` mirrors the recorded conflicts.labeled_at stamp OR, where there
+    is none, the signals-based inference (_labeled_at_select): it separates "we
+    never looked" (labeled false) from "the pass ran here" (labeled true).
     It does NOT license reading labeled true + 0 turns as "we looked and found
     nothing" -- labeling reads message text only, so a stretch carried by
     tapbacks, by tone, or moved off-channel can be looked at and yield nothing;
@@ -318,7 +362,20 @@ def find_conflicts(chat_id=None, handle_id=None, contact_id=None,
             f"{where} GROUP BY c.id", params,
         ).fetchall()
         summaries = [_conflict_summary(r) for r in rows]
-        pre_migration = _predates_labeling_stamps(con)
+        # Whether any window in the DATABASE carries inferred-labeled state,
+        # not whether the column exists: a plain `make annotate` adds the
+        # column without touching a row, and gating on the schema made that
+        # migration silently drop this caveat.
+        # `or not _has_labeled_at(con)`: a table with no stamp column cannot
+        # have a trustworthy `labeled` on ANY row, even if no signal row
+        # survives to trigger the data test -- that is the one case the schema
+        # question still dominates, so it is kept as a floor under it.
+        pre_migration = _has_pre_budget_rows(con) or not _has_labeled_at(con)
+        # ...and how many of THOSE are in this scope, so a page made entirely
+        # of inferred rows still says its `labeled` values are inferred rather
+        # than recorded. Counted off the raw rows: the sentinel is deliberately
+        # not exposed in the summary dicts.
+        n_inferred = sum(1 for r in rows if r["labeled_at"] == _PRE_BUDGET_STAMP)
 
     # Best-substantiated first: tone-corroborated episodes (llm > weak > none)
     # outrank raw signal count, so the ~5% with a corroborated valence drop
@@ -367,10 +424,13 @@ def find_conflicts(chat_id=None, handle_id=None, contact_id=None,
         # above adds nothing and the model is most likely to report "I looked
         # and it was calm" with no code-emitted correction behind it.
         env["_epilogue"] += _LABELED_EMPTY_EPILOGUE
-    if notes and pre_migration:
-        # Only alongside a note: on a pre-migration DB where every row carries
-        # signals nothing was inferred wrongly, and an unprompted caveat there
-        # would spend the model's attention on a distinction that does not bite.
+    if pre_migration and (notes or n_inferred):
+        # Alongside another note (where an unstamped-and-empty window really is
+        # ambiguous), or whenever an inferred row is on this page -- a scope
+        # made entirely of inferred-labeled windows produces no other note, and
+        # saying nothing there would present an inferred `labeled: true` as a
+        # recorded one. Still silent when neither holds, so a fully stamped DB
+        # never spends the model's attention on a distinction that cannot bite.
         notes.append(_PRE_MIGRATION_NOTE)
     if notes:
         env["labeling_note"] = " ".join(notes)
@@ -448,10 +508,14 @@ def get_conflict(conflict_id, offset=0, limit=15):
             "band, excerpt FROM conflict_signals WHERE conflict_id = ? "
             "ORDER BY id LIMIT ? OFFSET ?", (conflict_id, limit, offset),
         ).fetchall()
-        pre_migration = _predates_labeling_stamps(con)
+        pre_migration = _has_pre_budget_rows(con) or not _has_labeled_at(con)
 
     signals = [_signal_row(r) for r in sig_rows]
     labeled = row["labeled_at"] is not None
+    # This episode's `labeled` came from the signals-based inference rather than
+    # a recorded stamp -- real labels, but from a pass that recorded no
+    # completion time, so a rerun will refresh them.
+    inferred = row["labeled_at"] == _PRE_BUDGET_STAMP
     if not labeled:
         note = _UNLABELED_NOTE
     elif n_shippable:
@@ -461,7 +525,10 @@ def get_conflict(conflict_id, offset=0, limit=15):
         # one thing this must not be, so it gets its own wording rather than
         # the bands caveat (there are no bands to caveat).
         note = _LABELED_EMPTY_NOTE
-    if pre_migration and not labeled:
+    # On an unlabeled row the caveat explains the ambiguity the inference
+    # leaves; on an inferred row it explains where the `labeled: true` came
+    # from. Both are things a caller acting on this episode needs.
+    if inferred or (pre_migration and not labeled):
         note += " " + _PRE_MIGRATION_NOTE
     return {
         "conflict_id": row["id"],

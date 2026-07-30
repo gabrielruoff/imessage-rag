@@ -287,6 +287,115 @@ class ExclusionGateTest(_FixtureTest):
         self.assertEqual(statuses[100], "open")        # Alice still detected
 
 
+class LlmModelGuardTest(_FixtureTest):
+    """loose_ends_model guards the LLM-derived columns. It REFUSES a model
+    change while they hold anything -- it used to clear them instead, which the
+    CHAT_MODEL default flip turned into a silent wipe on every upgrade, since
+    NUDGES_MODEL inherits it."""
+
+    def _narrated(self, model="model-a", verdict=None):
+        loose_ends.main(["--no-llm", "--model", model])
+        con = sqlite3.connect(self.db_path)
+        con.execute("UPDATE loose_threads SET nudge_text = 'go say hi'")
+        if verdict is not None:
+            con.execute("UPDATE loose_threads SET llm_verdict = ?, llm_reason = 'r'",
+                        (verdict,))
+        con.execute("INSERT OR REPLACE INTO ingest_state(key, value) "
+                    "VALUES ('loose_ends_model', ?)", (model,))
+        con.commit()
+        con.close()
+
+    def _llm_columns(self):
+        con = sqlite3.connect(self.db_path)
+        try:
+            return con.execute(
+                "SELECT COUNT(*) FROM loose_threads WHERE nudge_text IS NOT NULL "
+                "OR llm_verdict IS NOT NULL OR llm_reason IS NOT NULL").fetchone()[0]
+        finally:
+            con.close()
+
+    def test_a_model_change_is_refused_with_the_columns_intact(self):
+        self._narrated(verdict="plan")
+        before = self._llm_columns()
+        self.assertGreater(before, 0)
+        with self.assertRaises(SystemExit):
+            loose_ends.main(["--no-llm", "--model", "model-b"])
+        self.assertEqual(self._llm_columns(), before,
+                         "the guard destroyed the columns it exists to protect")
+
+    def test_a_refused_run_does_not_record_the_new_model(self):
+        # record=False on the early call: the narration pass owns the write, so
+        # a run refused before it gets there leaves the key as it found it.
+        self._narrated(verdict="plan")
+        with self.assertRaises(SystemExit):
+            loose_ends.main(["--model", "model-b"])
+        con = sqlite3.connect(self.db_path)
+        try:
+            self.assertEqual(
+                con.execute("SELECT value FROM ingest_state "
+                            "WHERE key = 'loose_ends_model'").fetchone()[0],
+                "model-a", "a refused run must not record the new model")
+        finally:
+            con.close()
+
+    def test_no_llm_is_refused_only_when_dropped_plan_can_actually_run(self):
+        # --no-llm makes zero LLM calls with dropped_plan off (the default), so
+        # it can touch no guarded column and must not be refused -- the repo's
+        # rule that a guard never refuses a run it cannot affect. With the
+        # detector ON it DOES spend NUDGES_MODEL calls during detection and
+        # stamps evidence_json.verified_by, so it is guarded.
+        self._narrated()
+        with mock.patch.object(loose_ends, "NUDGE_DROPPED_PLAN_ENABLED", False):
+            loose_ends.main(["--no-llm", "--model", "model-b"])   # allowed
+        with mock.patch.object(loose_ends, "NUDGE_DROPPED_PLAN_ENABLED", True):
+            with self.assertRaises(SystemExit):
+                loose_ends.main(["--no-llm", "--model", "model-c"])
+
+    def test_model_scopes_detection_not_just_narration(self):
+        # dropped_plan verifies with cfg["nudges_model"] and stamps it into
+        # evidence_json.verified_by, so --model has to reach _build_cfg or the
+        # guard would clear one model while the detector spent another.
+        con = sqlite3.connect(self.db_path)
+        self.addCleanup(con.close)
+        self.assertEqual(loose_ends._build_cfg(con, "model-x")["nudges_model"],
+                         "model-x")
+        self.assertEqual(loose_ends._build_cfg(con)["nudges_model"],
+                         loose_ends.NUDGES_MODEL)
+
+    def test_the_same_model_runs_normally(self):
+        self._narrated()
+        loose_ends.main(["--no-llm", "--model", "model-a"])
+        self.assertGreater(self._llm_columns(), 0)
+
+    def test_a_model_change_is_allowed_when_nothing_is_narrated(self):
+        # Nothing to protect: the guard must not block a run over a digest that
+        # has no LLM output yet (annotate's guard has the same carve-out). The
+        # key is seeded WITHOUT writing an LLM column, so this really does
+        # reach `prev and prev != model` with n == 0 -- seeding it via a run
+        # would leave prev unset and the test would pass vacuously.
+        loose_ends.main(["--no-llm", "--model", "model-a"])
+        con = sqlite3.connect(self.db_path)
+        con.execute("INSERT OR REPLACE INTO ingest_state(key, value) "
+                    "VALUES ('loose_ends_model', 'model-a')")
+        con.commit()
+        con.close()
+        self.assertEqual(self._llm_columns(), 0)
+        loose_ends.main(["--no-llm", "--model", "model-b"])
+        self.assertEqual(self._llm_columns(), 0)
+
+    def test_dry_run_neither_guards_nor_records(self):
+        self._narrated()
+        loose_ends.main(["--no-llm", "--dry-run", "--model", "model-b"])
+        con = sqlite3.connect(self.db_path)
+        try:
+            self.assertEqual(
+                con.execute("SELECT value FROM ingest_state "
+                            "WHERE key = 'loose_ends_model'").fetchone()[0],
+                "model-a")
+        finally:
+            con.close()
+
+
 class SenderClassifierTest(unittest.TestCase):
     CFG = {"owner_contact_ids": frozenset({42}),
            "owner_handles": frozenset({"+14438480968"}),
