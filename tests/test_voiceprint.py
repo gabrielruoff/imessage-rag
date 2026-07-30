@@ -448,6 +448,200 @@ class ToneTest(_DBCase):
         self.assertNotIn("anger", card["tone"]["emotions"])
 
 
+class AnnotationGuardTest(_DBCase):
+    """voiceprint_annotations_hash: an in-place re-annotation adds NO messages,
+    so the max-message-id guard alone skipped it and served stale tone_* -- the
+    hole `annotate.py --quality hybrid` walks into on every run, since its
+    phase-3 upgrades are source='llm' rows written with no new messages.
+
+    Its own class rather than a method on CoreBuildTest: that fixture
+    deliberately has zero chunk_annotations (test_tone_omitted_when_no_llm_
+    annotations asserts it), and MinReturnFloorTest subclasses it, so both
+    would have to change to host these.
+    """
+
+    def populate(self, con):
+        con.execute("INSERT INTO contacts(id, source_uniqueid, first_name) "
+                    "VALUES (12, 'u12', 'Mom')")
+        con.execute("INSERT INTO handles(id, handle_identifier, contact_id, service) "
+                    "VALUES (70, '+1700', 12, 'iMessage')")
+        con.execute("INSERT INTO handles(id, handle_identifier, contact_id, service) "
+                    "VALUES (71, '+1701', NULL, 'iMessage')")
+        con.execute("INSERT INTO chats(id, chat_identifier, display_name, is_group, "
+                    "service) VALUES (100, 'c100', NULL, 0, 'iMessage')")
+        con.execute("INSERT INTO chats(id, chat_identifier, display_name, is_group, "
+                    "service) VALUES (200, 'c200', 'Crew', 1, 'iMessage')")
+        con.execute("INSERT INTO chat_participants VALUES (100, 70)")
+        con.execute("INSERT INTO chat_participants VALUES (200, 70)")
+        con.execute("INSERT INTO chat_participants VALUES (200, 71)")
+        import datetime
+        base = datetime.datetime(2026, 1, 1, 10, 0, 0)
+        rows = []
+        mid = 1
+        for chat_id, other in ((100, 70), (200, 71)):
+            for d in range(3):
+                day = base + datetime.timedelta(days=d * 20)
+                for i in range(4):
+                    t = day + datetime.timedelta(seconds=i * 30)
+                    from_me = 1 if i % 2 == 0 else 0
+                    rows.append(_msg(mid, chat_id, 0 if from_me else other, from_me,
+                                     "chatting away here", t.isoformat()))
+                    mid += 1
+        con.executemany(
+            "INSERT INTO messages(id, guid, chat_id, handle_id, is_from_me, text, "
+            "date, has_attachment) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
+        # chunks 1-2 in the 1:1 chat (one llm, one distilled), chunk 3 in the
+        # GROUP chat -- which scope='group'/'all' voiceprints read, and which
+        # drift's is_group=0 fingerprint would be blind to.
+        for cid, chat_id in ((1, 100), (2, 100), (3, 200)):
+            con.execute(
+                "INSERT INTO chunks(id, chat_id, first_message_id, last_message_id, "
+                "first_date, last_date, n_messages, text) "
+                "VALUES (?, ?, 1, 2, '2026-01-01', '2026-01-01', 2, 'x')",
+                (cid, chat_id))
+        con.executemany(
+            "INSERT INTO chunk_annotations(chunk_id, valence, emotions_json, depth, "
+            "events_json, source) VALUES (?, ?, ?, 3, '[]', ?)",
+            [(1, 0.8, '["joy"]', "llm"),
+             (2, -0.9, '["anger"]', "distilled"),
+             (3, 0.4, '["joy"]', "llm")])
+
+    def _write(self, sql, params=()):
+        """Mutate through a separate connection: _DBCase.build() opens its own
+        per call, so an uncommitted change on another one would be invisible."""
+        con = sqlite3.connect(self.db_path)
+        try:
+            con.execute(sql, params)
+            con.commit()
+        finally:
+            con.close()
+
+    def _state(self, key):
+        rows = self.rows("SELECT value FROM ingest_state WHERE key = ?", (key,))
+        return rows[0]["value"] if rows else None
+
+    def test_upgrade_to_llm_forces_rebuild(self):
+        # The exact shape of an `--quality hybrid` phase-3 / --upgrade-distilled
+        # write: same chunk_id (row COUNT unchanged), no new messages.
+        self.assertGreater(self.build(), 0)
+        self.assertEqual(self.build(), 0)          # unchanged -> skip
+        self._write("UPDATE chunk_annotations SET source = 'llm', valence = -0.9 "
+                    "WHERE chunk_id = 2")
+        self.assertGreater(
+            self.build(), 0,
+            "an upgraded annotation with no new messages must force a rebuild")
+        # ...and the stored tone actually moved: mean(0.8, -0.9) = -0.05.
+        tone = self.rows("SELECT tone_valence FROM person_voiceprint "
+                         "WHERE scope = 'dyad' AND member_key = 'me'")[0]
+        self.assertAlmostEqual(tone["tone_valence"], -0.05, places=4)
+
+    def test_emotions_only_rewrite_forces_rebuild(self):
+        # What a lossy COUNT/SUM aggregate (drift's shape) cannot see: valence,
+        # depth, source and the row count all hold still.
+        self.build()
+        self.assertEqual(self.build(), 0)
+        self._write("UPDATE chunk_annotations SET emotions_json = '[\"sadness\"]' "
+                    "WHERE chunk_id = 1")
+        self.assertGreater(self.build(), 0)
+        tone = self.rows("SELECT tone_emotions_json FROM person_voiceprint "
+                         "WHERE scope = 'dyad' AND member_key = 'me'")[0]
+        self.assertIn("sadness", tone["tone_emotions_json"])
+
+    def test_valence_swap_between_two_chunks_forces_rebuild(self):
+        # The other thing a lossy aggregate cannot see: chunks 1 and 3 trade
+        # valences, so COUNT, SUM(valence), SUM(depth) and the source mix are
+        # all bit-identical before and after. Only a per-row digest moves.
+        self.build()
+        self.assertEqual(self.build(), 0)
+        before = self.rows(
+            "SELECT COALESCE(SUM(valence), 0) AS s, COUNT(*) AS n "
+            "FROM chunk_annotations WHERE source = 'llm'")[0]
+        self._write("UPDATE chunk_annotations SET valence = "
+                    "CASE chunk_id WHEN 1 THEN 0.4 ELSE 0.8 END "
+                    "WHERE chunk_id IN (1, 3)")
+        after = self.rows(
+            "SELECT COALESCE(SUM(valence), 0) AS s, COUNT(*) AS n "
+            "FROM chunk_annotations WHERE source = 'llm'")[0]
+        # Precondition: the aggregate really is blind to this edit.
+        self.assertAlmostEqual(before["s"], after["s"], places=9)
+        self.assertEqual(before["n"], after["n"])
+        self.assertGreater(
+            self.build(), 0,
+            "a valence swap leaves every SUM identical -- only an exact "
+            "per-row digest can force the rebuild")
+
+    def test_group_chat_annotation_change_forces_rebuild(self):
+        # scope='group' and scope='all' rows read group-chat annotations, so
+        # the fingerprint deliberately omits drift's `ch.is_group = 0`.
+        self.build()
+        self.assertEqual(self.build(), 0)
+        self._write("UPDATE chunk_annotations SET valence = -0.7 WHERE chunk_id = 3")
+        self.assertGreater(
+            self.build(), 0,
+            "a group-chat annotation change must force a rebuild (scope "
+            "group/all read it)")
+
+    def test_distilled_only_change_does_not_force_rebuild(self):
+        # voiceprint cannot observe distilled rows (_tone is source='llm'
+        # only), so a plain `--quality distilled` pass must NOT rebuild.
+        self.build()
+        self.assertEqual(self.build(), 0)
+        self._write("UPDATE chunk_annotations SET valence = 0.123 WHERE chunk_id = 2")
+        self.assertEqual(
+            self.build(), 0,
+            "a distilled-only change is invisible to tone and must not rebuild")
+
+    def test_deleting_the_chunk_forces_rebuild(self):
+        # The JOIN's real job: a tail re-chunk deletes chunks rows, and
+        # chunk_annotations has no FK cascade, so the orphan must leave the
+        # digest the same way it leaves _tone's own join.
+        self.build()
+        self.assertEqual(self.build(), 0)
+        self._write("DELETE FROM chunks WHERE id = 1")
+        self.assertGreater(self.build(), 0)
+
+    def test_legacy_db_without_the_hash_rebuilds_once(self):
+        self.build()
+        self.assertEqual(self.build(), 0)
+        # A DB from before the key existed: the message-id guard is set, the
+        # annotations one is not.
+        self._write("DELETE FROM ingest_state WHERE key = "
+                    "'voiceprint_annotations_hash'")
+        self.assertGreater(self.build(), 0, "a missing hash must rebuild once")
+        self.assertIsNotNone(self._state("voiceprint_annotations_hash"))
+        self.assertEqual(self.build(), 0, "and then guard on both keys")
+
+    def test_dry_run_writes_no_hash(self):
+        # --dry-run promises no writes; poisoning the guard would be the worst
+        # kind, since the next real run would then skip.
+        self.build(dry_run=True)
+        self.assertIsNone(self._state("voiceprint_annotations_hash"))
+        self.assertIsNone(self._state("voiceprint_max_message_id"))
+        self.assertGreater(self.build(), 0)
+
+    def test_hash_is_deterministic_and_llm_scoped(self):
+        con = self._con()
+        first = voiceprint._annotations_hash(con)
+        self.assertEqual(first, voiceprint._annotations_hash(con))
+        self._write("UPDATE chunk_annotations SET source = 'llm' WHERE chunk_id = 2")
+        self.assertNotEqual(first, voiceprint._annotations_hash(self._con()))
+
+    def test_hash_ignores_the_connection_row_factory(self):
+        # Pins the load-bearing tuple() in repr(tuple(row)). build_voiceprints
+        # takes a caller-supplied connection, and db.connect defaults to
+        # rows=True; under sqlite3.Row a bare repr(row) is
+        # "<sqlite3.Row object at 0x...>", so the digest would be
+        # address-dependent -- different every process, rebuilding every run,
+        # and no other test would notice.
+        plain = sqlite3.connect(self.db_path)
+        self.addCleanup(plain.close)
+        as_rows = sqlite3.connect(self.db_path)
+        as_rows.row_factory = sqlite3.Row
+        self.addCleanup(as_rows.close)
+        self.assertEqual(voiceprint._annotations_hash(plain),
+                         voiceprint._annotations_hash(as_rows))
+
+
 class DateScopedSignatureAndToneTest(_DBCase):
     """openers/closers (_phrase_counts) and tone (_tone) must honor the date
     window -- they previously leaked the whole corpus into a windowed voiceprint.

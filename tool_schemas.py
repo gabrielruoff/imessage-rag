@@ -721,9 +721,19 @@ TOOL_DEFINITIONS = [
                         "expand one with get_conflict(conflict_id). A row flagged "
                         "`reconciliation` is a make-up window, not the tensest "
                         "fight. Returns {rows, total_matching, n_corroborated, "
-                        "returned, order, truncated}; total_matching counts every "
-                        "detected stretch (mostly minor lulls) -- prefer "
-                        "n_corroborated as a headline count of substantiated ones.",
+                        "n_labeled, returned, order, truncated}; total_matching "
+                        "counts every detected stretch (mostly minor lulls) -- "
+                        "prefer n_corroborated as a headline count of substantiated "
+                        "ones. Escalation labeling is time-budgeted, so n_labeled "
+                        "says how many were actually analyzed: on a row with "
+                        "`labeled` false, labeled_signal_turns 0 means NOT ANALYZED "
+                        "-- never 'nothing was found' -- so say it has not been "
+                        "analyzed rather than implying the stretch was calm. A "
+                        "`labeled` true row with labeled_signal_turns 0 is not "
+                        "'calm' either -- labeling reads message text only, so a "
+                        "stretch carried by tapbacks or moved off-channel yields "
+                        "nothing to label. A `labeling_note` appears whenever "
+                        "either case is present in scope.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -740,12 +750,19 @@ TOOL_DEFINITIONS = [
         "name": "get_conflict",
         "description": "One conflict episode (by conflict_id from find_conflicts): "
                         "its deterministic evidence (peak_signal), tone "
-                        "corroboration, off_text_flag, and up to 15 labeled "
-                        "signal turns (paginated; excerpts <= 200 chars). Labels "
+                        "corroboration, off_text_flag, and its labeled signal "
+                        "turns (paginated; excerpts <= 200 chars). Labels "
                         "are eval-gated BANDS (band 'tentative'/'likely'), never "
                         "raw scores -- describe them as tentative, and never read "
                         "a resolution or apology into an episode whose "
-                        "off_text_flag is true (the exchange moved off-channel).",
+                        "off_text_flag is true (the exchange moved off-channel). A "
+                        "`labeled` false episode has not been through per-turn "
+                        "labeling yet (that pass is time-budgeted, strongest "
+                        "windows first), so signals_total 0 means it was never "
+                        "analyzed, not that nothing was found -- report it as not "
+                        "yet analyzed. Its deterministic evidence (peak_signal, "
+                        "corroboration, off_text_flag) is complete either way, and "
+                        "the `note` field states which case applies.",
         "input_schema": {
             "type": "object",
             "properties": {

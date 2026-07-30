@@ -176,9 +176,16 @@ CREATE TABLE IF NOT EXISTS chunk_annotations (
     emotions_json TEXT,              -- JSON list of GoEmotions labels
     depth INTEGER,                   -- 1 (logistics) .. 5 (heart-to-heart)
     events_json TEXT,                -- JSON list of good-news/gratitude events
-    source TEXT DEFAULT 'llm'        -- 'llm' or 'distilled' (annotate.py provenance;
+    source TEXT DEFAULT 'llm',       -- 'llm' or 'distilled' (annotate.py provenance;
                                      -- distilled rows have empty events and can be
                                      -- re-annotated by an LLM tier)
+    knn_confidence REAL              -- 0..1 kNN agreement/proximity score written by
+                                     -- the distilled classifier (high = the neighbours
+                                     -- were close AND agreed). NULL on source='llm'
+                                     -- rows -- an LLM label needs no self-assessment --
+                                     -- and on distilled rows written before the column
+                                     -- existed. The hybrid tier ranks its LLM upgrades
+                                     -- by it, lowest confidence first.
 );
 
 CREATE TABLE IF NOT EXISTS topics (
@@ -306,6 +313,15 @@ def create_schema(con: sqlite3.Connection):
     ann_cols = {row[1] for row in con.execute("PRAGMA table_info(chunk_annotations)")}
     if ann_cols and "source" not in ann_cols:
         con.execute("ALTER TABLE chunk_annotations ADD COLUMN source TEXT DEFAULT 'llm'")
+
+    # Pre-hybrid chunk_annotations: add the kNN confidence score. Nullable with
+    # no DEFAULT (unlike `source` above) -- a distilled row written before the
+    # column genuinely has no recorded confidence, and NULL says so; any numeric
+    # default would invent a ranking signal. Same shape as the
+    # person_period_lexicon counter adds below, and idempotent for the same
+    # reason: the column is added only if absent.
+    if ann_cols and "knn_confidence" not in ann_cols:
+        con.execute("ALTER TABLE chunk_annotations ADD COLUMN knn_confidence REAL")
 
     # Pre-parking dyad_terms: add the failure counter. The DEFAULT stamps
     # existing rows 0, which is correct -- an uncurated row predating the
@@ -503,7 +519,13 @@ def _create_conflict_tables(con: sqlite3.Connection):
         peak_signal_json TEXT,           -- deterministic evidence + receipts (JSON)
         corroboration TEXT,              -- 'none' | 'weak' | 'llm' (valence, source='llm' only)
         off_text_flag INTEGER DEFAULT 0, -- large intra-window gap: forbids a resolution verdict
-        source TEXT DEFAULT 'llm'        -- pipeline provenance; guarded by conflict_model
+        source TEXT DEFAULT 'llm',       -- pipeline provenance; guarded by conflict_model
+        labeled_at TEXT                  -- resume marker: when the per-turn label pass
+                                         -- processed this window (NULL = never). Stamped
+                                         -- even when every label was neutral/suppressed --
+                                         -- the presence of conflict_signals rows is NOT
+                                         -- the marker, or a zero-survivor window would be
+                                         -- re-bought by every budgeted rerun.
     );
     CREATE INDEX IF NOT EXISTS idx_conflicts_chat ON conflicts(chat_id, first_date);
 
@@ -520,4 +542,14 @@ def _create_conflict_tables(con: sqlite3.Connection):
     CREATE INDEX IF NOT EXISTS idx_conflict_signals_conflict
         ON conflict_signals(conflict_id);
     """)
+    # Pre-budget conflicts: add the resume marker. Nullable with no DEFAULT --
+    # a window written before the column was labeled under the old unbounded
+    # path, but nothing recorded WHEN, and stamping them all with a made-up
+    # timestamp would tell the budgeted loop to skip work it never verified.
+    # NULL means "label it", which is the safe direction. Idempotent: added
+    # only when the table predates the column (on a fresh DB the CREATE above
+    # already carries it), so re-running create_schema is a no-op.
+    conf_cols = {row[1] for row in con.execute("PRAGMA table_info(conflicts)")}
+    if "labeled_at" not in conf_cols:
+        con.execute("ALTER TABLE conflicts ADD COLUMN labeled_at TEXT")
 # --- end feature: conflict ---

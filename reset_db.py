@@ -21,8 +21,9 @@ TABLES = [
     "topics",
     "chunk_annotations",
     # --- feature: persona ---
-    # Derived voiceprint table; clearing it (and ingest_state below, which
-    # holds voiceprint_max_message_id) forces a clean rebuild next pipeline.
+    # Derived voiceprint table; clearing it (and ingest_state below, which holds
+    # both voiceprint_max_message_id and voiceprint_annotations_hash) forces a
+    # clean rebuild next pipeline.
     "person_voiceprint",
     # --- end feature: persona ---
     "dyad_terms",

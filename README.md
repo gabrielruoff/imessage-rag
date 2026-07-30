@@ -52,10 +52,30 @@ Keep it that way if you contribute back.
 - **[Ollama](https://ollama.com)** with the models pulled — `make
   install-ollama` does both (Homebrew install, then pulls every model
   `config.py` names, so it follows your `.env`). By default that is
-  `nomic-embed-text` for embeddings and `gemma4:26b-a4b-it-qat` for
-  chat/annotation. The chat model is a 26B MoE; expect roughly 20 GB of free
-  RAM and seconds-to-minutes per answer. Point `CHAT_MODEL` at something
-  smaller if that's too heavy — see [`.env.example`](.env.example).
+  `nomic-embed-text` for embeddings and `qwen3.5:4b` for chat/annotation:
+  roughly 4 GB resident, and the model every timing default in this repo was
+  measured on, so the runtimes quoted below are the ones you'll actually get.
+  Point `CHAT_MODEL` at something bigger if you want more precise routing
+  across the ~32 retrieval tools — a 26B MoE like `gemma4:26b-a4b-it-qat`
+  wants roughly 20 GB of free RAM and answers in seconds-to-minutes. See
+  [`.env.example`](.env.example) for that and every other knob.
+- **A word on chat latency.** The default chat model is thinking-capable and
+  `CHAT_THINK` is unset, which omits the flag entirely and leaves the model's
+  own default — so thinking is **on** for `chat.py`. That's deliberate:
+  picking the right tool out of ~32 and chaining a couple of them is exactly
+  the work a 4B model benefits from reasoning through, so the accuracy is
+  usually worth the wait. If you'd rather have the speed, one line in `.env`
+  buys it: `CHAT_THINK=false` (measured 3.2s vs 85s per call on `qwen3:4b`).
+  It is a real quality tradeoff, which is why it's your call and not the
+  default. The batch pipelines are less exposed: term curation already ships
+  `think=false`, and the annotation `--quality` presets now resolve to `false`
+  on a model without reasoning-effort levels (see the `annotate.py` section
+  below), as does `conflict_detect.py` — an unset `CONFLICT_THINK` labels with
+  `think=false` (measured 197s vs 2.2s per turn on `qwen3.5:4b`), and an
+  explicit value still wins. `TOPIC_THINK` / `NUDGES_THINK` inherit
+  `CHAT_THINK`, so setting it once quiets those too — and `.env.example`
+  recommends `false` for each of them regardless, since their output is one
+  short label.
 
 ## Quickstart
 
@@ -117,7 +137,7 @@ already ingested.
 
 On Apple Silicon with **macOS 26+ and Apple Intelligence enabled**, you can run
 the whole thing on Apple's built-in on-device model instead of Ollama — no
-~15 GB of model downloads, no background service. Build the shim once (it
+model downloads at all, no background service. Build the shim once (it
 compiles a small Swift helper with the Command Line Tools; no Xcode):
 
 ```sh
@@ -141,11 +161,13 @@ and set only `CHAT_MODEL=apple`, say). Two things worth knowing:
 - **Switching `EMBED_MODEL` changes the embedding space**, so it needs a
   `make reset-db` + re-ingest (Apple embeddings are 512-dimensional). The DB
   guards this and refuses to silently mix spaces.
-- **The on-device window is small (4,096 tokens)**, so the chat path retrieves
-  in small staged steps under the hood, and a ~3B on-device model routes less
-  precisely across the ~30 retrieval tools than the 26B default — a great
-  zero-setup, fully-private option, at some cost in multi-hop accuracy.
-  Everything still stays on your machine, exactly as with Ollama.
+- **The on-device window is small (4,096 tokens)**, so the chat path can't do
+  native tool-calling at all — it retrieves in small staged steps under the
+  hood. That staging, not model size, is where the accuracy goes: the
+  on-device model is ~3B against a ~4B Ollama default, so this is no longer a
+  small-model-versus-big-model tradeoff, it's a small-*window* one, and
+  multi-hop questions are what suffer. A great zero-setup, fully-private
+  option; everything still stays on your machine, exactly as with Ollama.
 
 ## Analytics
 
@@ -187,10 +209,12 @@ make topics          # cluster + label topics
 Run them one at a time. They can't run in parallel — each holds a SQLite write
 lock across many LLM calls, so a concurrent run dies with `database is locked`.
 (Within one job, LLM requests do fan out: `make ollama-start` runs Ollama with
-4 parallel slots and `annotate.py` keeps `ANNOTATE_WORKERS` requests in flight,
-worth ~2x on the LLM passes.) `make pipeline` runs ingest, annotation, the
-analytical suite (nudges → drift → voiceprint → conflict), and topics back to
-back in the right order (and stays sequential even under `make -j`).
+4 parallel slots and `annotate.py` keeps `ANNOTATE_WORKERS` requests in flight
+— worth ~2x on `gpt-oss:20b`, but only ~1.24x on the default `qwen3.5:4b`,
+where generation still effectively serializes.) `make pipeline` runs ingest,
+annotation, the analytical suite (nudges → drift → voiceprint → conflict), and
+topics back to back in the right order (and stays sequential even under
+`make -j`).
 
 **`annotate.py`** has two modes, and one run only does one of them:
 
@@ -203,13 +227,63 @@ back in the right order (and stays sequential even under `make -j`).
     Valence and depth match LLM fidelity, emotions run a little rougher, and
     *events are left empty* — extracting quotes is the one thing the shortcut
     can't do.
+  - `hybrid` (`make annotate-hybrid`) buys as much of the above as a *wall
+    clock* allows: a wider stratified seed draw
+    (`ANNOTATE_HYBRID_SEED_TARGET`, default 800, capped at a quarter of the
+    budget — seeding is LLM work too) and the same corpus-wide kNN pass, then
+    real LLM calls that replace distilled rows until `ANNOTATE_BUDGET_MINUTES`
+    runs out — event candidates first (a lexicon prefilter picks the chunks
+    likely to contain good news or thanks, since events are the one label the
+    shortcut can't produce; the chunks with the most matches come first, so a
+    short budget buys the densest candidates rather than the oldest, and each
+    rerun advances through the list), then the rows the kNN vote was least
+    sure about.
+    Budgeting time rather than a chunk count is what makes it self-terminate
+    instead of overrunning: *every* phase stops at the clock, including the
+    deterministic kNN pass, and each starts from the per-request time an
+    earlier run measured so nothing is dispatched blind. It commits as it goes
+    and a rerun resumes, topping the seed pool up and buying more upgrades.
+    One LLM request is the smallest thing it can buy — a request holds 4–6
+    event-candidate chunks and banked at 46.7s on the reference machine — so a
+    budget too small for one makes the LLM *upgrade* phases decline and name
+    the knob — the seed and kNN phases still run and commit what they reach, so
+    a tiny budget buys distilled coverage rather than nothing; the 25-minute
+    default is the one to use. A *negative* `ANNOTATE_BUDGET_MINUTES` is
+    refused outright rather than silently producing an already-passed deadline.
+    `--all` /
+    `--top-dyads N` / `--limit` reach only the upgrade phase, and there
+    `--limit N` counts upgrades **written**, not requests sent — an unparseable
+    reply spends budget but doesn't consume the cap (the wall clock is the
+    spend cap; `--limit` is the deliverable cap). It is an *at most* N: an
+    unparseable reply is made up out of the other sub-phase's candidates, so
+    when those run out the run lands short and says how many candidates it left.
+    A negative `--limit` is refused (the CLI refuses one on every tier — here it
+    would have *inverted* the candidate prefix rather than shrinking it, so
+    `hybrid_chunks` refuses one itself too). `--upgrade-distilled` is an
+    error with it — upgrading distilled rows is what it already does.
   - `fast` / `balanced` / `max` are the real-LLM-call-per-chunk tiers (each
-    slower and more faithful than the last; hours to days corpus-wide), and
-    the only source of events. They cover the top `ANNOTATE_TOP_DYADS` chats
-    (default 20) bare, honor `--all` / `--top-dyads N`, and with
-    `--upgrade-distilled` also replace distilled rows in scope — so an
-    overnight `--quality fast --upgrade-distilled` is how events get filled
-    in for the chats that matter.
+    slower and more faithful than the last; hours to days corpus-wide). They
+    cover the top `ANNOTATE_TOP_DYADS` chats (default 20) bare, honor `--all`
+    / `--top-dyads N`, and with `--upgrade-distilled` also replace distilled
+    rows in scope — so an overnight `--quality fast --upgrade-distilled` is
+    how events get filled in exhaustively for the chats that matter, where
+    `hybrid` fills in as many as its budget covers. A batched tier's requests
+    are bounded by *characters* as well as rows, on every backend, so a group
+    of long chunks closes before the batch size — that keeps one slow group
+    from dominating a run, and it applies to the seed pass too.
+  - **How much a tier thinks now depends on your model, and this changed.**
+    The presets were written for a model that reads `low`/`medium`/`high` as a
+    reasoning-*effort* level (`gpt-oss`), where `low` is what makes `balanced`
+    cheaper than `max`. Every other model only toggles thinking on or off, and
+    to those the same `low` is merely truthy — it buys a *full* pass, which
+    made the fast tier the slow one. So `annotate.py` now translates: on a
+    model without effort levels (the default `qwen3.5:4b`, `gemma4`, …)
+    `distilled` / `fast` / `balanced` send `think=false`, while on `gpt-oss`
+    they still send `low`. **If you were running those tiers on `gemma4` they
+    used to do a full reasoning pass and now do none** — substantially faster,
+    at whatever that pass was worth. `max` is unaffected (it omits the flag
+    either way), and setting `ANNOTATE_THINK` yourself still overrides
+    everything.
 - `--terms` instead curates `dyad_terms` verdicts, which is what gives
   `get_word_trends` its inside-joke section. It's a mode switch, so a bare run
   never touches terms — this is the second run you need. It is *not* a
@@ -226,16 +300,38 @@ back in the right order (and stays sequential even under `make -j`).
 
 (`make annotate-all` passes `--all`, which only changes anything if you've set
 an LLM quality tier — under the default `distilled` both targets already cover
-the whole corpus.)
+the whole corpus. `make annotate-hybrid` runs the wall-clock tier and, unlike
+`make annotate`, does *not* chain the `--terms` pass: term curation is a
+separate pipeline with its own unbudgeted cost, and folding it in would break
+the one thing the budget promises.)
 
 `--dry-run` prints the pending scope and exits without calling Ollama or
-writing anything, which is worth doing before an LLM-tier `--all` to see how
-many chunks you're signing up for. It previews `--retry-failed` too: the
+writing any annotations, which is worth doing before an LLM-tier `--all` to see
+how many chunks you're signing up for. It previews `--retry-failed` too: the
 scope it prints is what the real run would curate, but the unparking itself
-is held back. `--limit N` caps a single run. `annotate.py`
+is held back. On a database old enough to predate a column the run needs, *no*
+preview applies the migration — `--terms` included: `schema.create_schema` also
+rescans and rewrites `reactions` rows, so migrating would make a preview the one
+write-free path that writes. Each dry run degrades its own read instead and says
+what it sees; for `--terms` on such a DB that means nothing is parked, so the
+scope it prints is every unverdicted term. `--limit N` caps a single run — rows
+processed on the per-chunk LLM tiers and on `--terms`, and on `hybrid` the
+number of upgrades actually **written**. It must be `>= 0` on every tier: a
+negative row cap is refused by the parser, because nowhere does it mean a
+smaller run (SQL reads `LIMIT -1` as *no* limit). `--top-dyads N` is refused on
+the same grounds — negative would widen the scope to every chat, which is what
+`--all` is for — and so is a negative `ANNOTATE_TOP_DYADS`, on the runs that
+actually use it (`--terms`, `--all` and `distilled` never bind it, so they run
+regardless). `--top-dyads 0` means zero chats. On the default
+`distilled`
+tier it is accepted and ignored, as are `--all` and `--top-dyads N`: that tier is
+corpus-wide by construction. `annotate.py`
 records its model and refuses to mix models into a non-empty
 `chunk_annotations` table (distilled rows count — they inherit the seed
 model's bias), so changing `ANNOTATE_MODEL` means emptying that table first.
+On `hybrid` that refusal comes at the *top* of the run, before the budget clock
+starts, so a switched model costs no budget (a `--dry-run` preview skips the
+check, since making it would mean writing the model down).
 
 **`topics.py`** needs no flags — one bare run clusters every embedded chunk
 into `TOPIC_K` clusters (default 50) and then labels them. It requires an
@@ -268,8 +364,36 @@ shows who made the cut before anything is generated. Override with
 `--out` (default `wrapped_<year>_<scope>.html`).
 
 Tunables (session gap, late-night hours, `LOCAL_TZ`, dyad-term thresholds,
-annotation quality/workers/seed pool, topic `k`, wrapped roster size) all
-live in `.env` — see `.env.example`.
+annotation quality/workers/seed pools — `ANNOTATE_SEED_TARGET` for `distilled`
+and `ANNOTATE_HYBRID_SEED_TARGET` for `hybrid`, which are deliberately separate
+knobs — topic `k`, wrapped roster size) all live in `.env` — see
+`.env.example`.
+
+### The analytical suite
+
+Four derived-analytics features build on top of ingest + annotate, each a
+standalone CLI and a `make` target, each reading `chunk_annotations` (so run
+them after `make annotate`). `make suite` builds all four in order; `make
+pipeline` calls it between annotate and topics.
+
+```sh
+make nudges        # loose_ends.py -> loose_threads: relationships you let drift (Ollama only for the one-line nudge text)
+make drift         # drift.py -> dyad_drift: per-counterparty relationship drift. OPT-IN: no-ops unless DRIFT_ENABLED=true
+make drift-purge   # wipe dyad_drift + its guard keys (run WHILE setting DRIFT_ENABLED=false)
+make voiceprint    # voiceprint.py -> person_voiceprint: deterministic per-person style profiles, no Ollama
+make conflict      # conflict_detect.py: detect tense 1:1 stretches everywhere, then label the strongest under a ~25-min budget
+make conflict-fast # the same detection with --no-llm: zero Ollama calls
+```
+
+Drift is off by default and silently builds nothing until you set
+`DRIFT_ENABLED=true`; `--purge` runs regardless of the flag, since it is the
+teardown you run *while* turning the feature off. Conflict's label pass is
+budgeted in **time** (`CONFLICT_BUDGET_MINUTES`, default 25) and resumes down
+its strength ranking on each rerun — `--relabel` is what makes it revisit
+windows it already stamped, and it refuses up front if `--model` names a
+different model than the labels were written with. Every flag of all four,
+plus what each surface looks like in chat and in Wrapped, is in the runbook:
+[`docs/DEMO.md`](docs/DEMO.md).
 
 ### Progress output
 
@@ -284,6 +408,9 @@ line style, `PROGRESS_STYLE=off` silences progress entirely.
 ```sh
 make                  # list every target
 make doctor           # check venv, Ollama, models, source data, ingested DB
+make suite            # rebuild just the analytical suite: nudges -> drift -> voiceprint -> conflict
+make ollama-start     # start/restart Ollama with 4 parallel slots (restart, not start: the launchctl vars are read only at process start)
+make ollama-stop      # stop the Ollama brew service
 make lint             # ruff check .
 make test             # test suite, no Ollama/chat.db needed
 make check            # everything CI enforces: lint + tests + compile check

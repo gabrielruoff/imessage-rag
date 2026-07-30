@@ -20,10 +20,15 @@ Pipeline shape, in order:
              exp(-age_days/halflife * ln 2), age measured from the corpus's
              latest message so the freshest threads score highest.
   Narration -- one short LLM line per open thread into nudge_text (skippable with
-             --no-llm). This is the ONLY place a model is used; the loose_ends_model
-             ingest_state key guards ONLY the LLM-derived columns (nudge_text,
-             llm_verdict, llm_reason) -- on a model change it clears/regenerates
-             those columns and never blocks or deletes the SQL-detected rows.
+             --no-llm). NOT the only place a model is used: the dropped_plan
+             detector (opt-in, F4-gated) verifies each candidate with the same
+             model during DETECTION, which --no-llm does not skip. The
+             loose_ends_model ingest_state key guards ONLY the LLM-derived
+             columns (nudge_text, llm_verdict, llm_reason) and REFUSES a model
+             change while they hold anything -- like the annotate_model and
+             conflict_model guards -- never blocking or deleting the
+             SQL-detected rows. Of the three, only nudge_text has a writer
+             today; the other two are reserved.
 
 Every dyad detector is confined to 1:1 chats (F3 _restrict_to_direct_chats,
 is_group=0) intersected with the shared _REAL_MESSAGE_CLAUSES. This is a
@@ -373,7 +378,12 @@ def _upsert_thread(con, cand, urgency, now):
     return cur.lastrowid
 
 
-def _build_cfg(con):
+def _build_cfg(con, model=None):
+    """`model` is the run's resolved narration model (--model > NUDGES_MODEL).
+    It reaches cfg because dropped_plan verifies with it and stamps it into
+    evidence_json.verified_by, so --model has to scope detection too or the
+    guard would clear one model while the detector spent another. None keeps
+    the config default, for the callers (tests, detectors) that do not set it."""
     return {
         "now": _corpus_now(con),
         "valence_exclude": NUDGE_VALENCE_EXCLUDE,
@@ -408,7 +418,7 @@ def _build_cfg(con):
         # ollama's tri-state (false/omitted for gemma -- a one-word verdict).
         "dropped_plan_enabled": NUDGE_DROPPED_PLAN_ENABLED,
         "plan_context_msgs": NUDGE_PLAN_CONTEXT_MSGS,
-        "nudges_model": NUDGES_MODEL,
+        "nudges_model": model or NUDGES_MODEL,
         "nudges_think": NUDGES_THINK,
         "nudges_timeout": NUDGES_TIMEOUT,
         # --- end detector: dropped_plan ---
@@ -500,22 +510,64 @@ _NARRATE_SYSTEM = (
 )
 
 
-def _guard_llm_model(con, model):
-    """Guard ONLY the LLM-derived columns. On a model change with rows present,
-    clear nudge_text/llm_verdict/llm_reason for regeneration -- never block or
-    delete the SQL-detected rows (detectors are model-free, unlike annotate's
-    refuse-outright guard)."""
+_LLM_COLUMNS_SET = ("nudge_text IS NOT NULL OR llm_verdict IS NOT NULL "
+                    "OR llm_reason IS NOT NULL")
+
+
+def _guard_llm_model(con, model, record=True):
+    """Guard ONLY the LLM-derived columns (nudge_text / llm_verdict /
+    llm_reason). The SQL-detected rows are model-free and are never touched.
+
+    REFUSES a model change while those columns hold anything, the same shape as
+    annotate._check_model_guard and conflict_detect._check_model_guard -- and,
+    like annotate's, only when there is something to protect. It used to clear
+    them and let the run regenerate, which the CHAT_MODEL default flip turned
+    from an opt-in into the upgrade path every existing user takes, since
+    NUDGES_MODEL inherits it. Two things were wrong with clearing:
+
+    * `--limit N` re-narrates N threads but the clear wiped ALL of them, so a
+      limited run left every other thread with no nudge_text at all -- and a
+      full re-narration is a real cost, one LLM call per open thread.
+    * It was silent and unpreviewable: --dry-run and --no-llm never reach
+      narrate_threads, so there was no way to see the deletion coming.
+
+    NOT a reason, though an earlier version of this docstring claimed it: that
+    the run could not regenerate what it cleared. It could. nudge_text is the
+    only one of the three columns with a writer at all -- nothing in the repo
+    writes llm_verdict or llm_reason (they are reserved for a future
+    model-backed detector), so the clear could only ever destroy narration,
+    which narrate_threads then rebuilt in the same run.
+
+    Refusing costs a user who genuinely wants to switch one explicit step, and
+    that is the trade every other model guard in this repo already makes.
+
+    `record=False` runs the REFUSAL half only, for the early call in main()
+    that fires BEFORE detection. The reason is dropped_plan: it is the one
+    model-backed detector, it spends NUDGES_MODEL LLM calls during DETECTION,
+    and it stamps the model it used into evidence_json.verified_by -- so a run
+    that is going to be refused has to be refused before it pays for and
+    records that. Recording stays with the narration pass, so a run that never
+    reaches narration (--dry-run, --no-llm, a refusal) leaves the key as it
+    found it -- the conflict_model precedent."""
     prev = get_state(con, "loose_ends_model")
     if prev and prev != model:
-        con.execute(
-            "UPDATE loose_threads SET nudge_text = NULL, llm_verdict = NULL, "
-            "llm_reason = NULL WHERE nudge_text IS NOT NULL OR llm_verdict IS NOT NULL "
-            "OR llm_reason IS NOT NULL"
-        )
-        print(f"loose_threads LLM columns were produced by {prev}, now {model}; "
-              f"cleared them for regeneration (SQL-detected rows kept).")
-    set_state(con, "loose_ends_model", model)
-    con.commit()
+        n = con.execute(
+            f"SELECT COUNT(*) FROM loose_threads WHERE {_LLM_COLUMNS_SET}"
+        ).fetchone()[0]
+        if n:
+            print(
+                f"loose_threads holds {n} rows whose LLM columns were produced "
+                f"by {prev}, but the model is now {model}. Mixing models in one "
+                f"digest makes the narration inconsistent -- rerun with "
+                f"--model {prev}, set NUDGES_MODEL={prev}, or clear the columns "
+                f"to switch:\n"
+                f"  UPDATE loose_threads SET nudge_text = NULL, "
+                f"llm_verdict = NULL, llm_reason = NULL;"
+            )
+            raise SystemExit(1)
+    if record:
+        set_state(con, "loose_ends_model", model)
+        con.commit()
 
 
 def _threads_needing_narration(con):
@@ -625,7 +677,26 @@ def main(argv=None):
                   "set); they will now appear in get_loose_threads.")
             return 0
         # --- end detector: dormant_tie ---
-        cfg = _build_cfg(con)
+        # Before detection, not just before narration: dropped_plan is the one
+        # model-backed detector, and it spends NUDGES_MODEL LLM calls and
+        # stamps evidence_json.verified_by during DETECTION -- so a run that is
+        # going to be refused has to be refused before it pays for that. Same
+        # ordering conflict_detect's guard needed, for the same reason.
+        #
+        # Refusal only; the narration pass owns the recording. Skipped under
+        # --dry-run (no writes, and its contract is to neither guard nor
+        # record), and under --no-llm UNLESS dropped_plan is actually enabled:
+        # with it off -- the default -- that path makes zero LLM calls and can
+        # touch no guarded column, and CLAUDE.md's own rule is that a guard
+        # must not refuse a run it cannot affect. (--acknowledge-reconnect
+        # returns above this: a pure toggle that never detects.)
+        if not args.dry_run and (not args.no_llm or NUDGE_DROPPED_PLAN_ENABLED):
+            _guard_llm_model(con, model, record=False)
+        # `model`, not the config default: --model scopes the WHOLE run, so the
+        # value the guard just cleared is the one dropped_plan verifies with
+        # and stamps. Passing NUDGES_MODEL here instead would guard one model
+        # and spend another.
+        cfg = _build_cfg(con, model)
         event_now = _utcnow_iso()
         summary = detect_all(con, cfg, event_now, dry_run=args.dry_run)
         print(f"Loose threads: {summary['candidates']} candidates, "

@@ -1,5 +1,5 @@
 .PHONY: help bootstrap source-data env doctor \
-        ingest annotate annotate-all topics pipeline eval eval-dry \
+        ingest annotate annotate-all annotate-hybrid topics pipeline eval eval-dry \
         chat wrapped \
         lint test check reset-db \
         install install-ollama ollama-start ollama-stop apple-shim
@@ -46,7 +46,7 @@ help:  ## Show this help
 # No stdin prompt on purpose: targets that block on input break under CI,
 # under `make -j`, and under any wrapper. The banner is the warning.
 bootstrap:  ## Fresh clone -> working setup: install, Ollama, source data, ingest
-	@echo "This will: create .venv, install Ollama and pull ~15GB of models,"
+	@echo "This will: create .venv, install Ollama and pull ~4GB of models,"
 	@echo "copy your Messages database into source_data/, and run a full ingest."
 	@echo "The ingest is the long pole -- tens of minutes on a large corpus."
 	@echo ""
@@ -262,6 +262,17 @@ annotate-all:  ## Like annotate, but over every chunk in the corpus
 	.venv/bin/python3 annotate.py --all
 	.venv/bin/python3 annotate.py --terms
 
+# The wall-clock-budgeted tier: a stratified seed draw + corpus-wide kNN, then
+# LLM upgrades of the event-candidate and least-confident chunks until
+# ANNOTATE_BUDGET_MINUTES is spent. Deliberately NOT chained with --terms the
+# way `annotate` is: --terms is a separate pipeline with its own (unbudgeted)
+# cost, and the whole point of this target is a run that finishes inside a
+# known wall-clock window. Curate terms with `make annotate` or
+# `annotate.py --terms` when you actually want to pay for them.
+annotate-hybrid:  ## Annotate on a wall-clock budget (ANNOTATE_BUDGET_MINUTES)
+	@$(REQUIRE_OLLAMA)
+	.venv/bin/python3 annotate.py --quality hybrid
+
 topics:  ## Cluster embedded chunks into topics and label them
 	@$(REQUIRE_OLLAMA)
 	.venv/bin/python3 topics.py
@@ -330,8 +341,11 @@ voiceprint:  ## Build deterministic per-person voiceprints (person_voiceprint)
 # Consumes chunk_annotations (for valence corroboration), so it slots into
 # `pipeline` AFTER annotate. Needs Ollama for the per-turn label pass; the
 # deterministic finding itself does not, and never refuses on a distilled corpus.
+# Budgeted in WALL CLOCK (CONFLICT_BUDGET_MINUTES, default 25): detection covers
+# every chat, then the strongest windows are labeled until the deadline and a
+# rerun continues down the ranking (CONFLICT_BUDGET_MINUTES=0 disables it).
 .PHONY: conflict
-conflict:  ## Detect conflict windows (deterministic) + eval-gated labels
+conflict:  ## Detect conflict windows + label the strongest under a wall-clock budget
 	@$(REQUIRE_OLLAMA)
 	.venv/bin/python3 conflict_detect.py
 
@@ -446,7 +460,8 @@ install:  ## Create .venv and install pinned deps
 # Ollama setup: the binary, the service, and every model config.py names.
 # Deliberately NOT part of `make install` -- that target is fast, offline and
 # needed for lint/tests/`ingest --no-embed`, none of which touch Ollama, while
-# this one pulls ~15GB and installs a background service.
+# this one pulls the models (~4GB at the defaults, more if CHAT_MODEL is
+# repointed at a bigger one) and installs a background service.
 #
 # brew, not `curl ollama.com/install.sh | sh`: on macOS that script installs
 # /Applications/Ollama.app, which `ollama-start`'s `brew services` cannot
