@@ -95,7 +95,14 @@ Full design history, schema rationale, and data forensics:
   `hybrid_chunks` had always read 0 as 0. EVERY
   phase is deadline-gated, including the deterministic
   kNN pass (O(rows × seeds): 14.6 s at a 450-seed index vs 82.0 s at 4,416,
-  which `ANNOTATE_KNN_INDEX_CAP` now bounds — the index, never the pool) and
+  which `ANNOTATE_KNN_INDEX_CAP` now bounds — the index, never the pool; and
+  WHICH seeds it keeps is drawn proportionally to each chat's share of the
+  CORPUS, never uniformly over the pool, because the pool is only whatever
+  earlier runs happened to label: measured, all 4,416 llm rows on the
+  reference corpus sat in ONE chat, so a uniform draw gave the other 61.8% of
+  the corpus a vote from a dyad it has nothing to do with. It cannot fix a
+  genuinely single-chat pool — widening the pool is the seed sampler's job;
+  this stops the cap re-narrowing what the sampler widened) and
   seeding (also capped at 25% of the budget — unbatched and uncapped it
   measured 10.7 min of an 8-min run). Phase 3a truncates its ranked candidate
   list to `annotate_hybrid._EVENT_FETCH_CAP` (2,000 — a module constant, not a

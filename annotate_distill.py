@@ -263,7 +263,66 @@ def _require_chunk_vectors(con):
             "or annotate with an LLM tier (--quality fast/balanced/max).")
 
 
-def _sample_seed_ids(seed_ids, cap, floor=_KNN_MIN_SEEDS):
+def _chat_sort_key(chat_id):
+    """Total order over chat ids that tolerates the NULL chunks.chat_id allows
+    (None sorts last), matching annotate_sampling's own tie-break."""
+    return (chat_id is None, chat_id or 0)
+
+
+def _corpus_quotas(pool_by_chat, corpus_sizes, n):
+    """Split `n` index slots across the chats present in `pool_by_chat`,
+    weighted by each chat's share of the CORPUS and capped by what the pool
+    actually holds for it. Largest-remainder, with the leftover from
+    pool-starved chats redistributed over the chats that still have room, so
+    the quotas always sum to exactly n. Pure and deterministic.
+
+    Weighting by corpus share rather than by pool share is the whole point:
+    a pool-proportional draw cannot fix a lopsided pool, because it reproduces
+    the lopsidedness exactly (measured: 0.58% WORSE than uniform, which is why
+    the earlier "stratifying the index sample would be chasing noise" note was
+    right about the thing it was actually about, and does not extend to this).
+    Remainders are compared as exact integers, never floats, so the tie-break
+    cannot drift."""
+    quota = dict.fromkeys(pool_by_chat, 0)
+    room = {c: len(ids) for c, ids in pool_by_chat.items() if ids}
+    remaining = min(n, sum(room.values()))
+    while remaining > 0 and room:
+        # Weight is the corpus share; a chat the corpus no longer knows about
+        # still gets a floor of 1 so it cannot become unreachable.
+        weights = {c: max(1, corpus_sizes.get(c, 0)) for c in room}
+        total = sum(weights.values())
+        parts = []
+        for chat, cap_c in room.items():
+            num = remaining * weights[chat]
+            parts.append([chat, min(num // total, cap_c), num % total])
+        extra = max(0, remaining - sum(p[1] for p in parts))
+        for part in sorted(parts, key=lambda p: (-p[2], _chat_sort_key(p[0])))[:extra]:
+            if part[1] < room[part[0]]:
+                part[1] += 1
+        progressed = False
+        for chat, add, _rem in parts:
+            if not add:
+                continue
+            quota[chat] += add
+            remaining -= add
+            room[chat] -= add
+            progressed = True
+        room = {c: k for c, k in room.items() if k > 0}
+        if not progressed:
+            # A pathological weight/room combination could round every share to
+            # zero; hand the rest out in a fixed order rather than spin.
+            for chat in sorted(room, key=_chat_sort_key):
+                if remaining <= 0:
+                    break
+                take = min(remaining, room[chat])
+                quota[chat] += take
+                remaining -= take
+            break
+    return quota
+
+
+def _sample_seed_ids(seed_ids, cap, floor=_KNN_MIN_SEEDS, chat_of=None,
+                     corpus_sizes=None):
     """Which of `seed_ids` belong in the temp kNN index: all of them when the
     cap is off (<= 0) or the pool already fits under it, otherwise a
     deterministic subset. Pure -- no DB, no writes, no global state.
@@ -276,29 +335,76 @@ def _sample_seed_ids(seed_ids, cap, floor=_KNN_MIN_SEEDS):
 
     Deterministic AND stable across calls by construction, which the two
     callers depend on -- _classify_chunks and backfill_confidence each rebuild
-    the index inside one run and must vote off the same one. Two things buy
-    that: the ids are sorted before the draw, so the caller's row order cannot
-    move it, and the draw comes from a fresh random.Random(0) rather than the
-    module-global RNG (_seed_chunks samples from that one; consuming or
-    reseeding it here would silently change the seed draw as a side effect,
-    and would make this sample depend on how much randomness the process had
-    already spent). Stratifying the sample is deliberately not attempted: the
-    pool a tier feeds this is already stratified by its own sampler, and a
-    k=10 vote off an 800-sample of it is the regime the tier ran in when its
-    pools were that size.
+    the index inside one run and must vote off the same one. Three things buy
+    that: the ids are sorted before the draw, the per-chat draws happen in a
+    fixed chat order, and the randomness comes from a fresh random.Random(0)
+    rather than the module-global RNG (_seed_chunks samples from that one;
+    consuming or reseeding it here would silently change the seed draw as a
+    side effect, and would make this sample depend on how much randomness the
+    process had already spent).
 
-    What the cap costs the labels, measured 2026-07-28 rather than assumed
-    (2,000 held-out chunks re-classified at a 4,416 pool, capped vs uncapped):
-    valence r=0.90, depth 85.1%, top-1 emotion 59.1%. The control is what makes
-    that acceptable -- a DIFFERENT 800-sample disagrees with the first by the
-    same margins (r=0.90, top-1 58.0%), so this is the kNN vote's own
-    sensitivity to which seeds are in the urn and not a cost the cap adds.
-    See config.ANNOTATE_KNN_INDEX_CAP; the earlier "~1% at k=10" claim was
-    wrong and is retracted there."""
+    `chat_of` ({chunk_id: chat_id}) and `corpus_sizes` ({chat_id: chunks in
+    that chat}) turn the draw from uniform-over-the-pool into
+    proportional-to-the-CORPUS, which is what keeps a lopsided pool from
+    becoming a lopsided index. Omit either and the historical uniform draw is
+    used unchanged -- that fallback is what every existing caller and test
+    still exercises.
+
+    Why it was needed, measured 2026-07-30 on the two real corpora: the pool is
+    every source='llm' row -- sampler seeds, phase-3 upgrades and rows
+    inherited from an earlier scoped LLM run alike -- so it is neither random
+    nor stratified, and an earlier version of this docstring claiming "the pool
+    a tier feeds this is already stratified by its own sampler" was wrong on
+    any corpus with inherited rows. On the 25,029-chunk reference corpus ALL
+    4,416 llm rows sit in ONE chat (38.2% of the corpus), so the shipped index
+    represented 1 of 532 chats and the other 61.8% of the corpus was classified
+    by a vote drawn entirely from one dyad -- a chunk in that chat sat 0.1120
+    from its nearest seed against 0.2718 for a chunk anywhere else, 2.43x
+    further. On the 74,233-chunk corpus that has actually run the hybrid tier:
+    uniform gave 58 of 535 chats at 0.1554 mean nearest-seed distance and 548.0
+    summed deviation from proportional; this draw gives 73 chats at 0.1478 and
+    165.4, against a salt-to-salt noise floor of ~0.0005.
+
+    The redistribution is deliberate and has a named cost: on that corpus the
+    dominant chat's own chunks go from 0.1216 to 0.1283 (5.5% worse) to move
+    the other 531 chats from 0.1766 to 0.1601 (9.3% better). A corpus that
+    really is one person may not want that trade; ANNOTATE_KNN_INDEX_CAP = 0
+    turns the cap -- and so this draw -- off entirely.
+
+    Scope of the claim: this is a GEOMETRY result, not a demonstrated label
+    win. Neither corpus holds held-out LLM labels outside the dominant chat, so
+    accuracy off the corpus's other 61.8% cannot be measured, and the cap's own
+    documented churn (below) means any new draw is a third sample of the same
+    urn. What the cap costs the labels, measured 2026-07-28 (2,000 held-out
+    chunks re-classified at a 4,416 pool, capped vs uncapped): valence r=0.90,
+    depth 85.1%, top-1 emotion 59.1% -- against a control where a DIFFERENT
+    800-sample disagrees by the same margins (r=0.90, top-1 58.0%), so that is
+    the vote's own sensitivity to which seeds are in the urn and not a cost the
+    cap adds. Those figures are sample-dependent: a contiguous chunk-id block
+    (chat-correlated, so a harder case) measured r=0.738 / 65.0% / 39.6%. See
+    config.ANNOTATE_KNN_INDEX_CAP; the earlier "~1% at k=10" claim was wrong
+    and is retracted there."""
     n = min(len(seed_ids), max(cap, floor))
     if cap <= 0 or n >= len(seed_ids):
         return set(seed_ids)
-    return set(random.Random(0).sample(sorted(seed_ids), n))
+    rng = random.Random(0)
+    if not chat_of or not corpus_sizes:
+        # No chat information: the historical uniform draw, unchanged.
+        return set(rng.sample(sorted(seed_ids), n))
+    pool_by_chat = {}
+    for cid in sorted(seed_ids):
+        pool_by_chat.setdefault(chat_of.get(cid), []).append(cid)
+    quota = _corpus_quotas(pool_by_chat, corpus_sizes, n)
+    keep = set()
+    # Fixed chat order so the single RNG's stream cannot depend on dict order.
+    for chat in sorted(pool_by_chat, key=_chat_sort_key):
+        want = quota.get(chat, 0)
+        ids = pool_by_chat[chat]
+        if want >= len(ids):
+            keep.update(ids)
+        elif want:
+            keep.update(rng.sample(ids, want))
+    return keep
 
 
 def _build_seed_index(con):
@@ -318,15 +424,29 @@ def _build_seed_index(con):
     corpus and machine: 14.6 s at a 450-seed index vs 82.0 s at 4,416).
     The labels are filtered WITH the index and from the same list, never
     separately -- _knn_predict looks its neighbours up in this dict, so an id
-    in one and not the other is a KeyError or a dropped vote."""
+    in one and not the other is a KeyError or a dropped vote.
+
+    WHICH rows the cap keeps is decided proportionally to each chat's share of
+    the CORPUS, not uniformly over the pool: the pool is whatever earlier runs
+    happened to label, and on both real corpora that is overwhelmingly one
+    dyad, so a uniform draw handed most of the corpus a vote from a chat it has
+    nothing to do with. See _sample_seed_ids for the measurements and for the
+    redistribution's named cost. The two extra reads that buys -- chat_id on
+    the pool rows, and one corpus-wide chunk count per chat -- are the same
+    shape annotate_sampling already runs and measured ~80 ms on the larger
+    corpus; the chunks join also drops any annotation whose chunk was removed
+    by a tail re-chunk, which could not have been voted with anyway."""
     _require_chunk_vectors(con)
     # ORDER BY: the row order of an unordered SELECT is not guaranteed stable,
     # and both the sample and the vec0 insert order have to be reproducible
     # run to run. (_sample_seed_ids sorts its input again, so it is correct
     # whatever a caller hands it; this makes the whole function reproducible.)
     seeds = con.execute("""
-        SELECT a.chunk_id, v.embedding, a.valence, a.emotions_json, a.depth
-        FROM chunk_annotations a JOIN chunk_vectors v ON v.chunk_id = a.chunk_id
+        SELECT a.chunk_id, v.embedding, a.valence, a.emotions_json, a.depth,
+               c.chat_id
+        FROM chunk_annotations a
+        JOIN chunk_vectors v ON v.chunk_id = a.chunk_id
+        JOIN chunks c ON c.id = a.chunk_id
         WHERE a.source = 'llm' ORDER BY a.chunk_id
     """).fetchall()
     # The floor is a question about the POOL -- "are there enough LLM seeds to
@@ -338,7 +458,15 @@ def _build_seed_index(con):
         raise SystemExit(
             f"only {len(seeds)} LLM seed annotations with embeddings "
             f"(need >= {_KNN_MIN_SEEDS}) -- run the seed pass first")
-    keep = _sample_seed_ids([cid for cid, *_rest in seeds], ANNOTATE_KNN_INDEX_CAP)
+    # Read only when the cap can actually bite, so an uncapped run (or a pool
+    # already under the cap) pays nothing for the corpus count.
+    chat_of = corpus_sizes = None
+    if 0 < ANNOTATE_KNN_INDEX_CAP < len(seeds):
+        chat_of = {row[0]: row[5] for row in seeds}
+        corpus_sizes = dict(con.execute(
+            "SELECT chat_id, COUNT(*) FROM chunks GROUP BY chat_id").fetchall())
+    keep = _sample_seed_ids([cid for cid, *_rest in seeds], ANNOTATE_KNN_INDEX_CAP,
+                            chat_of=chat_of, corpus_sizes=corpus_sizes)
     if len(keep) < len(seeds):
         global _last_index_report
         report = (len(keep), len(seeds))
@@ -358,7 +486,7 @@ def _build_seed_index(con):
         "INSERT INTO temp.seed_vectors(chunk_id, embedding) VALUES (?, ?)",
         [(cid, emb) for cid, emb, *_ in seeds])
     return {cid: (val, json.loads(ej), dep)
-            for cid, _emb, val, ej, dep in seeds}
+            for cid, _emb, val, ej, dep, _chat in seeds}
 
 
 # How often the kNN passes read the clock. Per row would be correct and free

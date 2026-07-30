@@ -2265,8 +2265,12 @@ The standing mitigation is unchanged and load-bearing: emotions are the label
 the distilled tier already documents as its roughest, and every high-stakes
 read (conflict corroboration, the nudge valence exclusion, voiceprint tone) is
 required to consume `source='llm'` rows only, never distilled ones. Stratifying
-the index sample is deliberately not attempted — the same control says it would
-be chasing noise.
+the index sample against the POOL's own shares is deliberately not attempted —
+the same control says it would be chasing noise, and re-measured on 2026-07-30
+it is 0.58% *worse* than uniform, because a pool-proportional draw reproduces
+the pool's lopsidedness exactly. That conclusion does **not** extend to
+stratifying against the *corpus*, which is a different composition and a real
+effect; see "the kNN index inherited one dyad" at the end of this file.
 
 ### Post-implementation validation, and two of this round's own premises
 
@@ -2854,3 +2858,92 @@ A DB predating the key rebuilds exactly once (`None` equals no digest) and is
 guarded on both thereafter — that rebuild *is* the repair, since such a DB is
 already stale for every upgrade pass it has ever run. `reset_db` clears
 `ingest_state` wholesale, so the new key needs no teardown of its own.
+
+## 2026-07-30: the kNN index inherited one dyad, and the cap made it permanent
+
+`ANNOTATE_KNN_INDEX_CAP` (above) bounds how many `source='llm'` rows the
+classify and confidence-backfill passes vote against. It said nothing about
+WHICH, and `_sample_seed_ids` drew them uniformly over the pool. That is fine if
+the pool is representative. It is not.
+
+Measured 2026-07-30 on both real corpora:
+
+- **25,029-chunk reference corpus**: all **4,416** llm rows sit in **one chat**,
+  which is 38.2% of the corpus. So the shipping index represented **1 of 532
+  chats**, and the other 61.8% of the corpus was kNN-labelled by a vote drawn
+  entirely from one dyad — a chunk in that chat sat 0.1120 cosine from its
+  nearest seed, a chunk anywhere else 0.2718, **2.43× further**.
+- **74,233-chunk corpus that has actually run the hybrid tier**: 1,640 llm rows
+  over 73 chats, 70.6% in the same dominant chat against its 38.6% of the corpus.
+
+The cap is what makes composition matter. Uncapped, kNN is local and an
+over-represented population mostly just goes unselected; capped, a uniform
+subsample lets that population crowd everything else out of the index.
+
+**The fix is a corpus-proportional draw**, not a pool-proportional one. Quotas
+are each chat's share of `chunks`, capped by what the pool holds for it,
+largest-remainder, with pool-starved chats handing their slots back — then
+today's deterministic `random.Random(0)` draw inside each chat. Measured on the
+post-hybrid corpus:
+
+| index composition | mean corpus→nearest seed | chats | summed deviation |
+|---|---|---|---|
+| uniform 800 (before) | 0.1554 | 58 / 535 | 548.0 |
+| **corpus-proportional 800 (after)** | **0.1478** | **73** | **165.4** |
+| dominant chat 71.1% → 45.4% | | | |
+
+against a salt-to-salt noise floor of ~0.0005, i.e. ~15× the spread.
+
+**Three designs were measured and two rejected.**
+
+- *Rejected: a `chunk_annotations.is_seed` column* marking the stratified
+  sampler's own draws and preferring them. It is **inert on every existing
+  corpus** — every row is NULL with no backfill path — and `hybrid_seeds=613`
+  already caps it at 187 more rows ever on the maintainer's own DB, i.e.
+  0.1554 → 0.1554 today and 0.1514 at its lifetime ceiling, against 0.1478 for
+  a draw that needs no migration at all. It also **evicts every phase-3 upgrade
+  from the index** (`seeds/upg/pre = 800/0/0`), which measurably degrades
+  exactly the event-dense regions the budget is spent producing (0.1544 vs
+  0.1479 restricted to event candidates), and no blend of the two recovers it.
+- *Rejected: skipping the seed phase once the pool exceeds the cap.* Backwards:
+  the post-hybrid pool spans 73 chats **because** 613 sampler seeds were drawn.
+  Without them it collapses toward the dominant dyad and the composition
+  freezes at the diluted state permanently.
+- *Rejected: raising or scaling the cap.* Uncapping reaches 0.1411 but at 3.3×
+  the probe wall clock (the repo's own figure is 14.6 s → 82.0 s), growing every
+  run forever — and representation does not improve: the dominant chat stays
+  70.6% and deviation *worsens* to 1103.1. Strictly dominated by a rebalanced
+  draw at the same cap.
+
+**What it does not do.** It cannot help a pool that is genuinely single-chat —
+the reference corpus is *unchanged* by it (989.3 deviation before and after),
+because a draw cannot invent diversity the pool lacks. Widening the pool is the
+seed sampler's job; this only stops the cap from re-narrowing what the sampler
+widened. The two mechanisms are complementary, which is also why the
+"stratifying the index sample would be chasing noise" note above stands: it was
+measured about stratifying against the POOL's own shares, which reproduces the
+pool's lopsidedness by construction (re-measured 0.58% *worse* than uniform).
+Against the CORPUS is a different composition and a real effect.
+
+**The redistribution has a named cost.** On the post-hybrid corpus the dominant
+chat's own chunks go from 0.1216 to 0.1283 (5.5% *worse*) to move the other 531
+chats from 0.1766 to 0.1601 (9.3% better). A corpus that really is one person
+may not want that trade; `ANNOTATE_KNN_INDEX_CAP=0` turns the cap, and so this
+draw, off entirely. A 50%-floor variant was measured and does not recover it
+(0.1486 vs 0.1478), so no floor knob was added.
+
+**Scope of the claim: this is geometry, not a demonstrated label win.** Neither
+corpus holds held-out LLM labels outside the dominant chat, so accuracy over the
+other 61.8% cannot be measured, and the cap's own documented churn means any new
+draw is a third sample of the same urn. The honest statement is that the index
+now covers the corpus it is used to classify; whether that moves label accuracy
+is untested and is not claimed. Relatedly, the capped-vs-uncapped figures above
+are **sample-dependent**: a contiguous chunk-id block (chat-correlated, a harder
+case) measures r=0.738 / depth 65.0% / top-1 emotion 39.6% against the spread
+hold-out's r=0.90 / 85.1% / 59.1%. "Churn varies with the sample" is the claim
+that survives; a single headline is not.
+
+Backward compatibility is total: `_sample_seed_ids` keeps its old signature and
+falls back to the historical uniform draw when either mapping is absent, which
+is what every existing caller and test exercises, and the two extra reads happen
+only when the cap can actually bite.

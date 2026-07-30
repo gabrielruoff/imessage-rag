@@ -331,9 +331,21 @@ ANNOTATE_KNN_K = int(os.getenv("ANNOTATE_KNN_K", "10"))
 # (ANNOTATE_HYBRID_SEED_TARGET below, and its own upgrades are 'llm' rows
 # too), so uncapped this phase gets slower forever while the budget it is
 # spent out of stays fixed.
-# Why 800: it pins the pass near its 450-seed cost (~15-20 s) permanently,
-# and a k=10 vote drawn from an 800-sample of an already-stratified pool is
-# the regime the tier ran in when its pools were that size. What capping
+# Why 800: it pins the pass near its 450-seed cost (~15-20 s) permanently, and
+# a k=10 vote drawn from 800 seeds is the regime the tier ran in when its pools
+# were that size. WHICH 800 is decided proportionally to each chat's share of
+# the CORPUS (annotate_distill._sample_seed_ids), not uniformly over the pool:
+# the pool is whatever earlier runs happened to label, and an earlier version
+# of this comment calling it "an already-stratified pool" was simply wrong --
+# measured 2026-07-30, ALL 4,416 llm rows on the 25,029-chunk reference corpus
+# sit in ONE chat (38.2% of the corpus), so a uniform draw gave the other
+# 61.8% a vote from a dyad it has nothing to do with. On the 74,233-chunk
+# corpus that has actually run the hybrid tier the proportional draw moves the
+# index from 58 to all 73 represented chats, the dominant chat from 71.1% to
+# 45.4%, and summed deviation from proportional from 548.0 to 165.4. It cannot
+# help a pool that is genuinely single-chat (the reference corpus is unchanged
+# by it) -- widening the POOL is the seed sampler's job; this only stops the
+# cap from re-narrowing what the sampler widened. What capping
 # actually costs, measured 2026-07-28 (2,000 held-out chunks re-classified at
 # a 4,416 pool, capped vs uncapped): valence r=0.90, depth agrees 85.1%,
 # top-1 emotion 59.1%. Those look alarming until the control: a DIFFERENT

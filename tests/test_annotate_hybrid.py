@@ -1085,6 +1085,98 @@ class TestSeedIndexSample(unittest.TestCase):
         self.assertEqual(annotate_distill._sample_seed_ids(short, 5), set(short))
 
 
+class TestCorpusProportionalIndex(unittest.TestCase):
+    """The cap picks WHICH rows by each chat's share of the CORPUS, not
+    uniformly over the pool. The pool is whatever earlier runs happened to
+    label -- on both real corpora overwhelmingly one dyad -- so a uniform draw
+    handed most of the corpus a vote from a chat it has nothing to do with."""
+
+    # 1,000 pool rows: 700 in the dominant chat, 30 in each of 10 others --
+    # the shape both real corpora have (one chat at 71-100% of the pool).
+    def setUp(self):
+        self.pool = list(range(1, 1001))
+        self.chat_of = {cid: (1 if cid <= 700 else 2 + (cid - 701) // 30)
+                        for cid in self.pool}
+        # ...but that dominant chat is only 30% of the CORPUS.
+        self.corpus = {1: 3000, **{c: 700 for c in range(2, 12)}}
+
+    def _by_chat(self, kept):
+        out = {}
+        for cid in kept:
+            out[self.chat_of[cid]] = out.get(self.chat_of[cid], 0) + 1
+        return out
+
+    def test_the_draw_follows_corpus_share_not_pool_share(self):
+        uniform = self._by_chat(
+            annotate_distill._sample_seed_ids(self.pool, 200))
+        kept = annotate_distill._sample_seed_ids(
+            self.pool, 200, chat_of=self.chat_of, corpus_sizes=self.corpus)
+        self.assertEqual(len(kept), 200)
+        by_chat = self._by_chat(kept)
+        # The uniform draw tracks the POOL, so the dominant chat takes ~70%.
+        self.assertGreater(uniform[1], 120)
+        # Corpus share is 3000/10000, so it takes 30% -- and every other chat
+        # gets its own 700/10000 = 14 slots rather than whatever chance left.
+        self.assertEqual(by_chat[1], 60)
+        self.assertEqual(sorted(by_chat)[1:], list(range(2, 12)))
+        self.assertTrue(all(by_chat[c] == 14 for c in range(2, 12)), by_chat)
+
+    def test_every_chat_in_the_pool_gets_a_seat(self):
+        # The uniform draw leaves small chats to chance; proportional
+        # allocation gives each one its share, which is the whole point.
+        kept = annotate_distill._sample_seed_ids(
+            self.pool, 200, chat_of=self.chat_of, corpus_sizes=self.corpus)
+        self.assertEqual(set(self._by_chat(kept)), set(range(1, 12)))
+
+    def test_a_starved_chat_hands_its_slots_back(self):
+        # Chat 1 is 99% of the corpus but the pool holds only 10 of its rows:
+        # the quota must not silently shrink the index below the cap.
+        pool = list(range(1, 111))
+        chat_of = {cid: (1 if cid <= 10 else 2) for cid in pool}
+        kept = annotate_distill._sample_seed_ids(
+            pool, 100, chat_of=chat_of, corpus_sizes={1: 99000, 2: 1000})
+        self.assertEqual(len(kept), 100)
+
+    def test_it_is_deterministic_and_order_independent(self):
+        # Both passes of one run rebuild the index and must vote off the same
+        # one -- now across two extra mappings whose order must not matter.
+        first = annotate_distill._sample_seed_ids(
+            self.pool, 200, chat_of=self.chat_of, corpus_sizes=self.corpus)
+        random.seed(31)
+        random.random()
+        second = annotate_distill._sample_seed_ids(
+            list(reversed(self.pool)),
+            200,
+            chat_of=dict(reversed(list(self.chat_of.items()))),
+            corpus_sizes=dict(reversed(list(self.corpus.items()))))
+        self.assertEqual(first, second)
+
+    def test_the_floor_still_holds_with_chat_information(self):
+        kept = annotate_distill._sample_seed_ids(
+            self.pool, 5, chat_of=self.chat_of, corpus_sizes=self.corpus)
+        self.assertEqual(len(kept), annotate_distill._KNN_MIN_SEEDS)
+
+    def test_without_chat_information_the_uniform_draw_is_unchanged(self):
+        # Every existing caller and test still exercises this path; it must be
+        # byte-identical to what shipped before.
+        for cap in (0, -1, 5, 200, 800, 5000):
+            with self.subTest(cap=cap):
+                self.assertEqual(
+                    annotate_distill._sample_seed_ids(self.pool, cap),
+                    annotate_distill._sample_seed_ids(
+                        self.pool, cap, chat_of=None, corpus_sizes=None))
+
+    def test_a_null_chat_id_does_not_break_the_ordering(self):
+        # chunks.chat_id is nullable, and None cannot be compared to an int.
+        chat_of = dict(self.chat_of)
+        for cid in range(1, 51):
+            chat_of[cid] = None
+        kept = annotate_distill._sample_seed_ids(
+            self.pool, 200, chat_of=chat_of,
+            corpus_sizes={None: 500, **self.corpus})
+        self.assertEqual(len(kept), 200)
+
+
 @_NEEDS_VEC
 class TestSeedIndexCap(HybridFixture):
     """_build_seed_index applying that cap: to the temp vec0 index AND to the
