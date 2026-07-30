@@ -2,8 +2,9 @@
 and the pieces it is built from: annotate_hybrid's budgeted phase machine,
 annotate_distill's knn_confidence + backfill, annotate_sampling's stratified
 draw, annotate_events' prefilter, and the chunk_annotations.knn_confidence
-migration. Temp SQLite only; ollama.chat_once_json is faked -- no Ollama, no
-real DB.
+migration. Temp SQLite only; BOTH Ollama seams the annotate ladder dispatches
+through are faked (chat_once_json, and chat_once for the schema-retry rung) --
+no Ollama, no real DB.
 
 The clock is faked the way the tier actually spends it: FakeClock only moves
 when a (fake) LLM request charges it, so a deadline test asserts the dispatch
@@ -11,6 +12,7 @@ rule rather than racing a real wall clock.
 """
 
 import contextlib
+import json
 import os
 import random
 import re
@@ -57,11 +59,29 @@ _NEEDS_VEC = unittest.skipUnless(_HAS_VEC, "sqlite-vec extension unavailable")
 _DIM = 8
 _MODEL = "test-annotate-model"
 
-# Enough LLM rows to clear both floors that gate the kNN passes:
-# annotate_distill._KNN_MIN_SEEDS (the vote refuses fewer) and
-# ANNOTATE_SEED_TARGET (so the distilled tier's own seed pass is a no-op and
-# a test can drive _classify_chunks straight away).
-_SEEDS = max(annotate_distill._KNN_MIN_SEEDS, config.ANNOTATE_SEED_TARGET) + 10
+# The kNN index cap the TestSeedIndexCap tests ask for. Pinned here because
+# the fixture pool has to stay comfortably ABOVE it: at or under it the cap
+# stops biting and those tests silently change meaning from "the cap bounded
+# the index" to "the pool already fit".
+_INDEX_CAP = 200
+
+# Enough LLM rows to clear every floor that gates the kNN passes:
+# annotate_distill._KNN_MIN_SEEDS (the vote refuses fewer), _INDEX_CAP above,
+# and ANNOTATE_SEED_TARGET (so the distilled tier's own seed pass is a no-op
+# and a test can drive _classify_chunks straight away).
+#
+# The env value has to stay in the max() -- distill_chunks binds
+# ANNOTATE_SEED_TARGET as a DEFAULT ARGUMENT, frozen at import, so a test that
+# reaches it through annotate.main cannot patch the target and the pool must
+# simply clear whatever a developer's .env baked in. What the other two floors
+# add is that a LOW env value can no longer drag the pool under the cap the
+# index tests use: unpinned, `ANNOTATE_SEED_TARGET=150` left a 160-seed pool,
+# which broke two of those tests outright ("160 != 200") and silently weakened a
+# third to asserting determinism over an UNCAPPED index. (A high value still
+# makes the fixture bigger, which costs setUp time and nothing else.)
+_SEEDS = max(annotate_distill._KNN_MIN_SEEDS,
+             _INDEX_CAP + 100,
+             config.ANNOTATE_SEED_TARGET) + 10
 # chat 1 keeps the pending chunks the LLM phases work on; chat 2 exists so the
 # top-dyad scope has something to exclude.
 _PENDING_MAIN = 30
@@ -127,24 +147,60 @@ class LLMError(RuntimeError):
     KeyboardInterrupt nor a SystemExit and so hits no handler on the way out."""
 
 
-class FakeLLM:
-    """Stand-in for ollama.chat_once_json. Records the chunk ids of every
-    request, optionally charges a clock, and can fail chosen chunks (which is
-    how a dispatched-but-unwritten chunk gets tested for re-dispatch).
+class ReachedTheNetwork(BaseException):
+    """Deliberately NOT an Exception. It stands in for the ollama.chat_once
+    seam in every fixture here, and that seam's own caller
+    (annotate._annotate_schema_retry) catches `Exception` on purpose -- its
+    contract is "degrade to the per-chunk rung, never propagate". An ordinary
+    error would therefore be swallowed, the test would pass, and a real run
+    would have opened an HTTP connection to localhost. This one propagates."""
 
-    `raise_after` is the other failure mode: `fail_ids` is a reply the caller
-    cannot parse (handled, counted, skipped), while raise_after makes the
-    REQUEST itself blow up mid-pass."""
+
+def _would_have_called_ollama(*_args, **_kwargs):
+    raise ReachedTheNetwork(
+        "a test reached ollama.chat_once -- the annotate ladder's schema-retry "
+        "rung dispatches there, so pass a FakeLLM (its .schema_retry stands in) "
+        "or patch the seam; this suite makes no network calls")
+
+
+class FakeLLM:
+    """Stand-in for ollama.chat_once_json AND -- via `schema_retry` -- for
+    ollama.chat_once, the seam annotate._annotate_schema_retry uses for the
+    middle rung of the batch ladder (chat_once_json hardcodes format='json' and
+    cannot carry a dict schema). Stubbing only the first left that rung aimed at
+    a live localhost Ollama, reachable from any batch_size > 1 request that came
+    back missing an id.
+
+    Records the chunk ids of every request, optionally charges a clock, and can
+    fail chosen chunks (which is how a dispatched-but-unwritten chunk gets
+    tested for re-dispatch).
+
+    The three failure modes are distinct, because the ladder treats them
+    differently:
+      fail_ids    -- this model never answers these ids, on ANY rung: the batch
+                     omits them, the schema retry omits them, the single-chunk
+                     request returns None. Handled, counted, skipped.
+      batch_drops -- ids only the free-JSON batch omits (the real, measured
+                     failure: coverage is bimodal on long event-dense chunks).
+                     The schema retry, whose coverage is guaranteed by the
+                     grammar, answers them.
+      raise_after -- the REQUEST itself blows up mid-pass, and `retry_raises`
+                     is the same for the schema rung, which must cost the group
+                     its retry rather than the run."""
 
     def __init__(self, clock=None, seconds=0.0, fail_ids=(), interrupt_after=None,
-                 raise_after=None):
+                 raise_after=None, batch_drops=(), retry_raises=False):
         self.clock = clock
         self.seconds = seconds
         self.fail_ids = set(fail_ids)
         self.interrupt_after = interrupt_after
         self.raise_after = raise_after
+        self.batch_drops = set(batch_drops)
+        self.retry_raises = retry_raises
         self.requests = []          # ids per request
         self.order = []             # ids in dispatch order, flattened
+        self.retry_requests = []    # ids per SCHEMA-RETRY request
+        self.retry_schemas = []     # the `format` each retry was given
 
     def __call__(self, messages, model=None, think=None, timeout=None, **kwargs):
         if self.interrupt_after is not None and len(self.requests) >= self.interrupt_after:
@@ -157,11 +213,27 @@ class FakeLLM:
         if self.clock is not None and self.seconds:
             self.clock.advance(self.seconds)
         if len(ids) > 1:
-            return {str(cid): dict(_ANNOTATION)
-                    for cid in ids if cid not in self.fail_ids}
+            return {str(cid): dict(_ANNOTATION) for cid in ids
+                    if cid not in self.fail_ids and cid not in self.batch_drops}
         if not ids or ids[0] in self.fail_ids:
             return None
         return dict(_ANNOTATION)
+
+    def schema_retry(self, messages, model=None, format=None, timeout=None,
+                     think=None, **kwargs):
+        """ollama.chat_once as _annotate_schema_retry calls it: returns the
+        response's `message` dict, whose content is JSON. Kept out of
+        `requests`/`order` -- those are the ids DISPATCHED, and a retry re-asks
+        ids the batch already recorded."""
+        ids = _ids_in(messages[-1]["content"])
+        self.retry_requests.append(ids)
+        self.retry_schemas.append(format)
+        if self.clock is not None and self.seconds:
+            self.clock.advance(self.seconds)
+        if self.retry_raises:
+            raise LLMError("this build will not take a dict format")
+        return {"content": json.dumps({str(cid): dict(_ANNOTATION) for cid in ids
+                                       if cid not in self.fail_ids})}
 
 
 class DBFixture(unittest.TestCase):
@@ -179,6 +251,35 @@ class DBFixture(unittest.TestCase):
         patcher = mock.patch.object(annotate, "DB_PATH", self.db_path)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # The seam no FakeLLM installed itself over: a test that reaches it has
+        # found a path to a real Ollama, and says so loudly instead of quietly
+        # making the request. Individual tests override this (see
+        # HybridFixture.hybrid).
+        patcher = mock.patch.object(ollama, "chat_once", _would_have_called_ollama)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # "Hermetic" has to include the developer's .env. config reads these at
+        # import and the tier modules bind their own copies, and each was
+        # measured to flip a test in THIS module: ANNOTATE_THINK=true or
+        # ANNOTATE_BATCH_SIZE=32 breaks the preset test, ANNOTATE_BUDGET_MINUTES
+        # =2 breaks the apple packing test, ANNOTATE_COMMIT_EVERY=1 breaks the
+        # seed-pass rollback test. ANNOTATE_TOP_DYADS is the exception and is
+        # pinned for the other reason: no LEGAL value flips anything, but a
+        # negative one now aborts main() before it dispatches, so an invalid
+        # .env would fail these tests for a reason that is not theirs.
+        # Pinned to the documented UNSET values so a test asserts
+        # the code's behavior and not the machine's; a test wanting another
+        # value patches over this (mock.patch stacks).
+        for module, knob, value in ((annotate, "ANNOTATE_THINK", ""),
+                                    (annotate, "ANNOTATE_BATCH_SIZE", 0),
+                                    (annotate, "ANNOTATE_TOP_DYADS", 20),
+                                    (annotate, "ANNOTATE_COMMIT_EVERY", 50),
+                                    (annotate_distill, "ANNOTATE_COMMIT_EVERY", 50),
+                                    (config, "ANNOTATE_COMMIT_EVERY", 50),
+                                    (config, "ANNOTATE_BUDGET_MINUTES", 0)):
+            patcher = mock.patch.object(module, knob, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def build_vec_table(self, dim=_DIM):
         self.con.execute(f"""
@@ -303,8 +404,10 @@ class HybridFixture(DBFixture):
         kwargs.setdefault("workers", 1)
         kwargs.setdefault("seed_target", _SEEDS)
         kwargs.setdefault("top_dyads", 1)
+        retry = getattr(llm, "schema_retry", _would_have_called_ollama)
         with mock.patch.object(ollama, "chat_once_json", llm):
-            return annotate_hybrid.hybrid_chunks(self.con, model, **kwargs)
+            with mock.patch.object(ollama, "chat_once", retry):
+                return annotate_hybrid.hybrid_chunks(self.con, model, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -524,6 +627,53 @@ class TestPhaseThree(HybridFixture):
         self.assertEqual(llm.order.count(_EVENT_IDS[0]), 1)
         self.assertEqual(len(llm.order), len(set(llm.order)))
         self.assertEqual(self.sources()[_EVENT_IDS[0]], "distilled")
+
+    def test_a_batch_that_drops_an_id_buys_one_schema_retry_not_singles(self):
+        # The middle rung of the ladder, and the ONE annotate request that
+        # reaches ollama.chat_once rather than chat_once_json. Free-JSON
+        # coverage is bimodal on long event-dense chunks, and every miss used to
+        # cost its own single-chunk request; the schema retry caps that at one
+        # extra request whose coverage the grammar guarantees. The rung's own
+        # contract is pinned at the unit level in tests/test_annotate.py
+        # (TestAnnotateGroupLadder); what is new here is reaching it THROUGH the
+        # tier, which is what noticed that this module's fixture left the seam
+        # unstubbed and pointed at a live Ollama.
+        self.seed_and_classify()
+        llm = FakeLLM(batch_drops=[_EVENT_IDS[1]])
+        self.hybrid(llm, batch_size=8, limit=3)
+        # One batched request for the whole group, then one retry naming
+        # exactly the id it missed -- and NO single-chunk request after it.
+        self.assertEqual(llm.requests, [_EVENT_IDS])
+        self.assertEqual(llm.retry_requests, [[_EVENT_IDS[1]]])
+        self.assertEqual(set(llm.retry_schemas[0]["properties"]),
+                         {str(_EVENT_IDS[1])})
+        for chunk_id in _EVENT_IDS:
+            self.assertEqual(self.sources()[chunk_id], "llm")
+
+    def test_a_schema_retry_that_fails_costs_the_group_its_retry_not_the_run(self):
+        # An Ollama build that will not take a dict `format`, or a grammar that
+        # runs past the timeout: _annotate_schema_retry swallows all of it and
+        # the per-chunk rung underneath still completes the group.
+        self.seed_and_classify()
+        llm = FakeLLM(batch_drops=[_EVENT_IDS[1]], retry_raises=True)
+        self.hybrid(llm, batch_size=8, limit=3)
+        self.assertEqual(len(llm.retry_requests), 1)
+        self.assertEqual(llm.requests, [_EVENT_IDS, [_EVENT_IDS[1]]])
+        for chunk_id in _EVENT_IDS:
+            self.assertEqual(self.sources()[chunk_id], "llm")
+
+    def test_an_id_no_rung_can_answer_is_skipped_not_written(self):
+        # batch_size > 1 with a chunk the model never answers: the batch omits
+        # it, the schema retry omits it, the single-chunk request comes back
+        # unparseable. It stays distilled and costs no write -- the case that
+        # would have made a live request from a suite that promises none.
+        self.seed_and_classify()
+        llm = FakeLLM(fail_ids=[_EVENT_IDS[1]])
+        self.hybrid(llm, batch_size=8, limit=3)
+        self.assertEqual(llm.retry_requests, [[_EVENT_IDS[1]]])
+        self.assertEqual(llm.requests[:2], [_EVENT_IDS, [_EVENT_IDS[1]]])
+        self.assertEqual(self.sources()[_EVENT_IDS[1]], "distilled")
+        self.assertEqual(self.sources()[_EVENT_IDS[0]], "llm")
 
     def test_limit_caps_the_total_across_both_sub_phases(self):
         self.seed_and_classify()
@@ -959,16 +1109,20 @@ class TestSeedIndexCap(HybridFixture):
         return labels, indexed, said
 
     def test_the_cap_bounds_the_index_and_says_so(self):
-        labels, indexed, said = self.build(200)
-        self.assertEqual(len(indexed), 200)
-        self.assertEqual(said, f"using 200 of {_SEEDS:,} seeds for the kNN index")
+        # _SEEDS is pinned above _INDEX_CAP, so this asserts the cap biting --
+        # never a pool that happened to fit under it.
+        self.assertGreater(_SEEDS, _INDEX_CAP)
+        labels, indexed, said = self.build(_INDEX_CAP)
+        self.assertEqual(len(indexed), _INDEX_CAP)
+        self.assertEqual(said, f"using {_INDEX_CAP} of {_SEEDS:,} seeds "
+                               f"for the kNN index")
         # ...the POOL is untouched: every seed is still a stored annotation.
         self.assertEqual(self.n_source("llm"), _SEEDS)
         self.assertEqual(set(labels), indexed)
 
     def test_both_passes_of_a_run_vote_off_the_same_index(self):
-        first_labels, first_indexed, _ = self.build(200)
-        second_labels, second_indexed, _ = self.build(200)
+        first_labels, first_indexed, _ = self.build(_INDEX_CAP)
+        second_labels, second_indexed, _ = self.build(_INDEX_CAP)
         self.assertEqual(first_indexed, second_indexed)
         self.assertEqual(first_labels, second_labels)
 
@@ -976,21 +1130,31 @@ class TestSeedIndexCap(HybridFixture):
         # _classify_chunks and backfill_confidence each rebuild the index inside
         # one hybrid run, so the unguarded print put the same sentence on screen
         # twice, wedged between two different progress bars. It is news once.
-        with mock.patch.object(annotate_distill, "ANNOTATE_KNN_INDEX_CAP", 200):
+        with mock.patch.object(annotate_distill, "ANNOTATE_KNN_INDEX_CAP", _INDEX_CAP):
             with mock.patch.object(annotate_distill, "_last_index_report", None):
                 with mock.patch("builtins.print") as printed:
                     annotate_distill._build_seed_index(self.con)
                     annotate_distill._build_seed_index(self.con)
         said = [str(a) for call in printed.call_args_list for a in call.args]
         self.assertEqual([line for line in said if "kNN index" in line],
-                         [f"using 200 of {_SEEDS:,} seeds for the kNN index"])
+                         [f"using {_INDEX_CAP} of {_SEEDS:,} seeds "
+                          f"for the kNN index"])
 
-    def test_a_cap_of_zero_reproduces_the_uncapped_index(self):
-        labels, indexed, said = self.build(0)
-        self.assertEqual(len(indexed), _SEEDS)
-        self.assertEqual(set(labels), indexed)
-        self.assertEqual(self.build(_SEEDS + 100)[1], indexed)
-        self.assertNotIn("kNN index", said)
+    def test_a_cap_of_zero_or_less_reproduces_the_uncapped_index(self):
+        # A negative env value is uncapped too, and deliberately not refused the
+        # way a negative --limit or ANNOTATE_BUDGET_MINUTES is: a sign error
+        # THERE changes what the run does (an unbounded --limit run; a deadline
+        # already in the past that declines every LLM phase), while here it only
+        # makes the kNN passes slower and gives the labels the tier gave before
+        # the cap existed. So the sign has to land on that documented pre-cap
+        # behavior, end to end and not just inside _sample_seed_ids.
+        for cap in (0, -1):
+            with self.subTest(cap=cap):
+                labels, indexed, said = self.build(cap)
+                self.assertEqual(len(indexed), _SEEDS)
+                self.assertEqual(set(labels), indexed)
+                self.assertEqual(self.build(_SEEDS + 100)[1], indexed)
+                self.assertNotIn("kNN index", said)
 
     def test_a_pool_under_the_cap_says_nothing(self):
         # The line is news only when the cap actually bit.
@@ -1317,6 +1481,39 @@ class TestEnsureColumnSelfHeal(HybridFixture):
                                  _columns(self.con, "chunk_annotations"))
 
 
+class TestTermsEnsureColumnSelfHeal(DBFixture):
+    """The same _ensure_column contract for its third caller, --terms.
+
+    Deliberately NOT under HybridFixture: that fixture is @_NEEDS_VEC, and this
+    path reads no vectors at all. Inheriting the skip would have left the only
+    pin on a doc claim that ALREADY drifted once silently green on exactly the
+    interpreters CLAUDE.md's install note calls out (python.org builds, no
+    sqlite-vec)."""
+
+    def test_a_terms_dry_run_does_not_migrate_its_column_either(self):
+        # --terms migrated under --dry-run in the first cut; the flag reached it
+        # later and nothing pinned the change, so the README went on promising a
+        # migration the code had stopped making until the PR #42 round-3 pass.
+        self.con.execute("ALTER TABLE dyad_terms DROP COLUMN curate_failures")
+        self.con.executemany(
+            "INSERT INTO dyad_terms(chat_id, term, lift, n_uses, "
+            "first_message_id, coined_by_handle_id, coined_is_me, llm_verdict) "
+            "VALUES (1, ?, 10.0, 5, NULL, NULL, 1, NULL)",
+            [("blorbo",), ("zonk",)])
+        self.con.commit()
+        with mock.patch.object(ollama, "chat_once") as llm:
+            with mock.patch("builtins.print") as printed:
+                annotate.main(["--terms", "--dry-run"])
+        llm.assert_not_called()
+        self.assertNotIn("curate_failures", _columns(self.con, "dyad_terms"))
+        # And the degraded read is the honest one rather than a crash: a DB
+        # without the column has recorded no failures, so nothing is parked and
+        # every unverdicted term is in scope.
+        said = "\n".join(str(a) for call in printed.call_args_list for a in call.args)
+        self.assertIn("2 dyad terms pending", said)
+        self.assertNotIn("parked", said)
+
+
 # ---------------------------------------------------------------------------
 # CLI surface
 # ---------------------------------------------------------------------------
@@ -1333,6 +1530,114 @@ class TestHybridCli(DBFixture):
             with self.assertRaises(SystemExit):
                 annotate.main(["--quality", "hybrid", "--upgrade-distilled"])
         llm.assert_not_called()
+
+    def test_a_negative_row_cap_is_refused_before_a_tier_is_chosen(self):
+        # hybrid_chunks refuses a negative --limit itself (there it is a list
+        # slice: event_ids[:-1] keeps everything but the LEAST dense candidate),
+        # but that check cannot see the other tiers. On the per-chunk tiers and
+        # on --terms the same value reaches a SQL `LIMIT ?`, where -1 means NO
+        # limit -- the flag that exists to bound a run buying an unbounded one.
+        # --top-dyads has the same shape against the scope subquery.
+        for argv in (["--quality", "fast", "--limit", "-1"],
+                     ["--quality", "hybrid", "--limit", "-5"],
+                     ["--terms", "--limit", "-1"],
+                     ["--quality", "fast", "--top-dyads", "-1"]):
+            with self.subTest(argv=argv):
+                with mock.patch.object(ollama, "chat_once_json") as llm:
+                    with self.assertRaises(SystemExit):
+                        annotate.main(argv)
+                llm.assert_not_called()
+
+    def test_a_row_cap_of_zero_is_still_a_legitimate_run(self):
+        # 0 is the empty cap, which someone can legitimately ask for; only the
+        # sign is refused.
+        with mock.patch.object(ollama, "chat_once_json") as llm:
+            annotate.main(["--quality", "fast", "--limit", "0"])
+        llm.assert_not_called()
+
+    def _one_pending_chunk_per_chat(self):
+        """Two chats with one un-annotated chunk each, so a scope assertion can
+        be about the CHUNKS a run would touch and not about the label it
+        printed."""
+        self.con.executemany(
+            "INSERT INTO chats(id, chat_identifier, display_name, is_group, "
+            "service) VALUES (?, ?, NULL, 0, 'iMessage')", [(1, "c1"), (2, "c2")])
+        self.con.executemany(
+            "INSERT INTO chunks(id, chat_id, first_message_id, last_message_id, "
+            "first_date, last_date, n_messages, text) VALUES "
+            "(?, ?, NULL, NULL, '2026-01-01T00:00:00', '2026-01-01T00:05:00', "
+            "1, 'text')", [(1, 1), (2, 2)])
+        self.con.executemany(
+            "INSERT INTO messages(id, guid, chat_id, handle_id, is_from_me, "
+            "text, date, chunk_id) VALUES (?, ?, ?, 1, 0, 'hi', "
+            "'2026-01-01T00:00:00', ?)",
+            [(1, "g1", 1, 1), (2, "g2", 2, 2)])
+        self.con.commit()
+
+    def _dry_run_scope(self, argv):
+        """The chunk ids a --dry-run of `argv` says it would annotate. Parsed
+        from the preview line's own comma-separated list -- NOT with _ids_in,
+        which reads '### chunk N' prompt headers and would quietly return []
+        for every scope, making the assertions below unfalsifiable."""
+        with mock.patch.object(ollama, "chat_once_json") as llm:
+            with mock.patch("builtins.print") as printed:
+                annotate.main(argv + ["--dry-run"])
+        llm.assert_not_called()
+        said = "\n".join(str(a) for call in printed.call_args_list for a in call.args)
+        listed = re.search(r"--dry-run: first chunk ids: (.*)", said).group(1)
+        return said, [] if listed == "(none)" else [int(c) for c in listed.split(", ")]
+
+    def test_top_dyads_zero_means_zero_chats_not_the_default(self):
+        # main resolved this with `args.top_dyads or ANNOTATE_TOP_DYADS`, so an
+        # explicit 0 fell through to the 20-chat default -- while hybrid_chunks
+        # has always read its own 0 as 0. `--quality max --top-dyads 0` asked
+        # for nothing and would have bought a full default-scope LLM run.
+        #
+        # Asserted on the chunks the run would TOUCH: the printed "top 0 chats"
+        # label only proves what main resolved, and would go on passing if the
+        # scope subquery then treated 0 as "every chat".
+        self._one_pending_chunk_per_chat()
+        said, scoped = self._dry_run_scope(["--quality", "fast", "--top-dyads", "0"])
+        self.assertIn("top 0 chats", said)
+        self.assertEqual(scoped, [])
+        self.assertEqual(self._dry_run_scope(["--quality", "fast"])[1], [1, 2])
+        self.assertEqual(
+            self._dry_run_scope(["--quality", "fast", "--top-dyads", "1"])[1], [1])
+
+    def test_a_negative_scope_is_refused_from_the_env_too(self):
+        # The flag is refused at the parser; the env twin reaches the SAME scope
+        # subquery LIMIT, where SQLite reads -1 as no limit and a scoped run
+        # silently becomes an --all one. A knob is validated where it is
+        # RESOLVED, not only where a flag supplies it.
+        with mock.patch.object(annotate, "ANNOTATE_TOP_DYADS", -1):
+            with mock.patch.object(ollama, "chat_once_json") as llm:
+                with self.assertRaises(SystemExit) as cm:
+                    annotate.main(["--quality", "fast"])
+        self.assertIn("ANNOTATE_TOP_DYADS", str(cm.exception))
+        llm.assert_not_called()
+
+    def test_the_env_refusal_spares_the_runs_that_never_read_the_knob(self):
+        # The other half of the same precedent: a bad knob must not refuse a run
+        # it could not have affected. `--terms` has no scope, `--all` omits the
+        # scope clause, and distilled hardcodes top_dyads=0 -- so refusing them
+        # would take out bare `make annotate` over a value those runs never
+        # bind, and would leave the message naming a remedy (--all) it had just
+        # refused.
+        with mock.patch.object(annotate, "ANNOTATE_TOP_DYADS", -1):
+            with mock.patch.object(ollama, "chat_once_json") as llm:
+                for argv in (["--terms"],
+                             ["--quality", "fast", "--all"],
+                             ["--quality", "distilled", "--dry-run"]):
+                    with self.subTest(argv=argv):
+                        try:
+                            annotate.main(argv)
+                        except SystemExit as exc:
+                            # These paths can still exit for their OWN reasons
+                            # on an empty fixture DB (distilled wants
+                            # chunk_vectors). What matters is that it is never
+                            # the scope knob refusing a run it cannot affect.
+                            self.assertNotIn("ANNOTATE_TOP_DYADS", str(exc))
+            llm.assert_not_called()
 
     def test_upgrade_distilled_still_allowed_on_the_llm_tiers(self):
         # The rejection must be about the two kNN tiers, not the flag itself.

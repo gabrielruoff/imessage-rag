@@ -1715,12 +1715,23 @@ schema, never data. The second half is false: `create_schema` also rescans
 (`schema.py`), so a preview became the one write-free path that wrote —
 reproduced on a copy of the real DB, where `--quality hybrid --dry-run`
 committed the new column while printing "no LLM calls, no writes". It now takes
-a `dry_run` flag and *returns False* instead of migrating, and the two dry-run
+a `dry_run` flag and *returns False* instead of migrating, and the dry-run
 readers degrade: the backfill counts every distilled row as pending (it is),
 and the phase-3b preview orders by `chunk_id` instead of the column that does
-not exist yet. `--terms` is deliberately left alone — its own dry run still
-migrates `curate_failures`, which is pre-existing behavior and outside this
-change; README says so.
+not exist yet.
+
+`--terms` takes the same flag — the reasoning is not tier-specific, and leaving
+one caller migrating would have kept exactly one preview that writes. Its
+degraded reads say what a pre-column DB actually knows: nothing is parked,
+nothing can be unparked, and every unverdicted term is pending, so the scope the
+preview prints is the whole uncurated set. Only `--dry-run` ever sees
+`has_failures=False`; the real path migrates first, so every read past the
+dry-run return can still rely on the column. (This entry and the README's
+`--terms` asterisk both said the opposite for a while — that a `--terms` dry run
+still migrated. That was true when it was written; the flag reached this caller
+a commit later and the prose did not follow. Corrected in the PR #42 round-3
+pass, which is why the claim is recorded here rather than quietly deleted: a
+doc that once described the code is the kind that gets trusted after it stops.)
 
 ### Two smaller review fixes worth recording
 
@@ -2195,11 +2206,23 @@ same corpus and machine: **14.6 s at a 450-seed index vs 82.0 s at 4,416**, a
 the hybrid tier writes `source='llm'` rows on every run, so the pool widens
 forever while the budget it is spent from stays fixed.
 
-`ANNOTATE_KNN_INDEX_CAP` (default 800, `0` = uncapped) bounds the **index**,
+`ANNOTATE_KNN_INDEX_CAP` (default 800; `0` — or any value below it — =
+uncapped) bounds the **index**,
 never the pool. Every LLM annotation is still written, still counted toward the
 seed targets, still read by every other consumer; a capped run simply votes off
 a deterministic sample of them. 800 pins the pass near its 450-seed cost
 permanently.
+
+Why any `<= 0` is uncapped here while `ANNOTATE_BUDGET_MINUTES` and `--limit`
+*refuse* a negative: there, a sign error changes what the run **does** — an
+unbounded `--limit` run, or a deadline already in the past that declines every
+LLM phase. Here it changes only how long the deterministic, LLM-free kNN passes
+take — both of them, since classify and the confidence backfill each rebuild the
+index; the labels are the ones the tier gave before the cap existed. So the sign lands
+on documented behavior and `_sample_seed_ids` stays a pure function with no
+refusal path. `<= 0` and not `== 0` because the cap is raised to
+`_KNN_MIN_SEEDS` before it is applied: under a `== 0` guard, `-1` would have
+meant "an index of exactly 100", which is neither uncapped nor asked for.
 
 **The determinism contract is the load-bearing part**, because both kNN passes
 rebuild the index inside one run and must vote off the same one.
@@ -2592,8 +2615,8 @@ further from the peak can lose its slot to a terse neighbour.
   `event_ids[:-1]` drops the LEAST dense candidate instead of taking a
   densest-first prefix, and `max(0, limit - done)` then switched phase 3b off, so
   a stray minus bought a run nobody asked for. (The LLM tiers' `--limit` reaches
-  SQLite as `LIMIT -1` = no limit; that lives in `annotate.py`'s parser and is
-  left as found.)
+  SQLite as `LIMIT -1` = no limit; that was left as found here and **refused at
+  the parser in round 3** — see below.)
 - **The closing summary stops claiming it finished.** "finished every candidate
   in scope with budget to spare" printed even when `--limit` or a fetch cap had
   left thousands of candidates untouched with minutes unspent — which is exactly
@@ -2623,3 +2646,107 @@ idempotent, and the test passed against a deliberate double application as
 readily as against the fix. It counts `_record_seeds` invocations now. Worth
 generalizing: for an idempotent write, only the call count can prove
 "exactly once".
+
+## 2026-07-30: PR #42 review fixes, round 3
+
+Four findings the previous round's fixes did not cover. Two are code, two are
+recorded where the thing they describe already lives: the
+`ANNOTATE_KNN_INDEX_CAP` section above now says any value `<= 0` is uncapped
+(and why that knob does *not* refuse a negative the way the budgets do), and the
+`_ensure_column` section corrects the claim that a `--terms` dry run still
+migrates — it stopped when the flag reached that caller, and the prose did not
+follow.
+
+### A negative row cap is refused once, at the parser
+
+`--limit` reached three different consumers with three different meanings for a
+negative: a SQL `LIMIT ?` on the per-chunk tiers and on `--terms`, where `-1`
+means **no limit**, and a list prefix in hybrid's phase 3a, where
+`event_ids[:-5]` is not a prefix of the density ranking at all — it drops the
+five *least* dense candidates and dispatches everything else. `hybrid_chunks`
+already refused its own; the other two silently bought an unbounded run out of
+the one flag whose job is to bound one.
+
+The check belongs at `annotate.main`'s parser, where every tier passes through,
+rather than at each consumer. `hybrid_chunks` keeps its own `SystemExit` for
+callers reaching it directly — the same defense-in-depth argument as the model
+guard, which is now called both at the top of the run and at phase 3a.
+
+`--top-dyads` is refused for the same reason (negative reaches the scope
+subquery's `LIMIT` and widens the run to every chat, which is what `--all` is
+for), and that pulled in two things the flag check alone would have left
+half-done:
+
+- **`ANNOTATE_TOP_DYADS` is validated too**, where it is *resolved* — the rule
+  `CONFLICT_MAX_LABEL_TURNS` already follows. Refusing the flag while the env
+  twin still reached the same `LIMIT` would have left the unbounded run
+  available through the quieter of the two doors. All three resolution sites do
+  it: `annotate.main`, `hybrid_chunks` (which resolves `config.ANNOTATE_TOP_DYADS`
+  itself for direct callers, exactly as it keeps its own `--limit` refusal) and
+  `annotate_chunks` (whose default argument freezes the value at import).
+- **…but only where the run BINDS it**, which is the other half of that same
+  precedent — `conflict_detect` deliberately does not resolve
+  `CONFLICT_BUDGET_MINUTES` under `--no-llm` so a bad value cannot refuse a run
+  it could not have affected. `--terms` has no scope, `--all` omits the scope
+  clause, and `distilled` hardcodes `top_dyads=0` because it is corpus-wide by
+  construction. The first cut refused all three, which took out bare
+  `make annotate` over a knob those runs never read — and left the message
+  prescribing `--all` as the remedy while refusing `--all` with the same message.
+- **`--top-dyads 0` now means zero chats**, not the 20-chat default.
+  `main` resolved it with `args.top_dyads or ANNOTATE_TOP_DYADS`, so an explicit
+  `0` fell through — while `hybrid_chunks` has always read its own `0` as `0`
+  (`if top_dyads is None`). The two halves of one flag disagreed, and `main` was
+  the one that had to move: `--quality max --top-dyads 0` asked for nothing and
+  would have bought a full default-scope LLM run.
+
+`--limit 0` stays legal and unchanged — it is the empty *cap*. The refusal
+message says only that, deliberately: what a tier does with an empty cap is the
+tier's business (`distilled` ignores `--limit` outright, and hybrid's phase 1
+can still spend LLM calls on seeds), so promising "nothing this run" would have
+been a fourth doc claim that isn't true.
+
+### The suite had a second Ollama seam, and nothing stood on it
+
+`FakeLLM` stubbed `ollama.chat_once_json`, but the batch ladder's middle rung
+(`_annotate_schema_retry`, added in round 2) dispatches through
+`ollama.chat_once` — `chat_once_json` hardcodes `format='json'` and cannot carry
+a dict schema. Any test with `batch_size > 1` and a dropped id would therefore
+have made a **live HTTP request to localhost** from a suite whose header
+promises it makes none. Nothing in *this* module had reached that rung, so
+nothing had noticed the gap. (`tests/test_annotate.py` does cover the rung, at
+the unit level: `_LadderLLM` stubs both seams and `TestAnnotateGroupLadder`
+drives `_annotate_group` directly. That is where the ladder's own contract is
+pinned; it could not have caught this, because it never runs through
+`HybridFixture`.)
+
+`FakeLLM.schema_retry` now stands in for it, `DBFixture` patches the seam by
+default, and the default raises `ReachedTheNetwork` — deliberately **not** an
+`Exception`, because `_annotate_schema_retry` catches `Exception` by design (its
+contract is "degrade to the per-chunk rung, never propagate"), so an ordinary
+error would have been swallowed and the test would have passed anyway. Three
+tests now cover the rung *as the tier reaches it*, which is what the unit-level
+ladder tests cannot say: a dropped id costs one schema retry naming exactly that
+id and no single-chunk request, and all three chunks land `source='llm'`; a
+retry that raises costs the group its retry and not the run; and an id no rung
+can answer stays `distilled` rather than being written.
+
+### A fixture pinned to a knob a developer's `.env` can move
+
+`_SEEDS` was `max(_KNN_MIN_SEEDS, config.ANNOTATE_SEED_TARGET) + 10`, and the
+kNN index-cap tests build at a cap of 200. `ANNOTATE_SEED_TARGET=150` in a
+developer's `.env` left a 160-seed pool, *under* that cap: measured against
+HEAD's file, two of those tests then failed outright (`160 != 200`, and the
+"using 200 of 160 seeds" line the cap never printed) and a third —
+`test_both_passes_of_a_run_vote_off_the_same_index` — silently weakened to
+asserting determinism over an *uncapped* index. Failing on a colleague's `.env`
+and quietly testing less on it are both defects; the cap is a named constant now
+and the pool clears it by construction.
+
+The env value stays in the `max()` on purpose: `distill_chunks` binds
+`ANNOTATE_SEED_TARGET` as a **default argument**, frozen at import, so a test
+reaching it through `annotate.main` cannot patch the target and the fixture must
+simply clear whatever was baked in. The knobs that reach the module by other
+routes are pinned at their call sites instead (`ANNOTATE_THINK`,
+`ANNOTATE_BATCH_SIZE`, `ANNOTATE_BUDGET_MINUTES`, `ANNOTATE_COMMIT_EVERY`),
+because "the suite is hermetic" has to be true of the whole module, not of the
+one test a review happened to name.

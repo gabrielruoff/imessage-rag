@@ -257,7 +257,9 @@ topics back to back in the right order (and stays sequential even under
     spend cap; `--limit` is the deliverable cap). It is an *at most* N: an
     unparseable reply is made up out of the other sub-phase's candidates, so
     when those run out the run lands short and says how many candidates it left.
-    A negative `--limit` is refused. `--upgrade-distilled` is an
+    A negative `--limit` is refused (the CLI refuses one on every tier — here it
+    would have *inverted* the candidate prefix rather than shrinking it, so
+    `hybrid_chunks` refuses one itself too). `--upgrade-distilled` is an
     error with it — upgrading distilled rows is what it already does.
   - `fast` / `balanced` / `max` are the real-LLM-call-per-chunk tiers (each
     slower and more faithful than the last; hours to days corpus-wide). They
@@ -307,12 +309,22 @@ the one thing the budget promises.)
 writing any annotations, which is worth doing before an LLM-tier `--all` to see
 how many chunks you're signing up for. It previews `--retry-failed` too: the
 scope it prints is what the real run would curate, but the unparking itself
-is held back. (One asterisk: on a database old enough to predate a column
-`--terms` needs, a dry run still applies that one schema migration before it
-can read — the chunk tiers no longer do.) `--limit N` caps a single run — rows
+is held back. On a database old enough to predate a column the run needs, *no*
+preview applies the migration — `--terms` included: `schema.create_schema` also
+rescans and rewrites `reactions` rows, so migrating would make a preview the one
+write-free path that writes. Each dry run degrades its own read instead and says
+what it sees; for `--terms` on such a DB that means nothing is parked, so the
+scope it prints is every unverdicted term. `--limit N` caps a single run — rows
 processed on the per-chunk LLM tiers and on `--terms`, and on `hybrid` the
-number of upgrades actually **written**. On the default `distilled` tier it is
-accepted and ignored, as are `--all` and `--top-dyads N`: that tier is
+number of upgrades actually **written**. It must be `>= 0` on every tier: a
+negative row cap is refused by the parser, because nowhere does it mean a
+smaller run (SQL reads `LIMIT -1` as *no* limit). `--top-dyads N` is refused on
+the same grounds — negative would widen the scope to every chat, which is what
+`--all` is for — and so is a negative `ANNOTATE_TOP_DYADS`, on the runs that
+actually use it (`--terms`, `--all` and `distilled` never bind it, so they run
+regardless). `--top-dyads 0` means zero chats. On the default
+`distilled`
+tier it is accepted and ignored, as are `--all` and `--top-dyads N`: that tier is
 corpus-wide by construction. `annotate.py`
 records its model and refuses to mix models into a non-empty
 `chunk_annotations` table (distilled rows count — they inherit the seed

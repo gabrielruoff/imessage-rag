@@ -982,6 +982,16 @@ def _annotation_groups(pending, model, batch_size):
 def annotate_chunks(con, model, all_chats=False, top_dyads=ANNOTATE_TOP_DYADS,
                     limit=None, dry_run=False, think=None, batch_size=1,
                     workers=1, upgrade_distilled=False):
+    # `top_dyads` defaults to ANNOTATE_TOP_DYADS, bound at import, so a direct
+    # caller can reach _pending_chunks' scope `LIMIT ?` with a negative env
+    # value that main's own check never saw. Same rule and same gate as there:
+    # refused where it is resolved, and only where the run binds it (`all_chats`
+    # omits the scope clause entirely).
+    if top_dyads is not None and top_dyads < 0 and not all_chats:
+        raise SystemExit(
+            f"ANNOTATE_TOP_DYADS cannot be negative (got {top_dyads}); SQLite "
+            f"reads it as no limit at all, so a scoped run silently becomes an "
+            f"--all one. Pass all_chats=True if that is what you want.")
     pending = _pending_chunks(con, all_chats, top_dyads, limit,
                               upgrade_distilled=upgrade_distilled)
     scope = "all chats" if all_chats else f"top {top_dyads} chats by message count"
@@ -1383,6 +1393,50 @@ def main(argv=None):
 
     model = args.model or ANNOTATE_MODEL
     quality = args.quality or ANNOTATE_QUALITY
+    # A negative row cap is never a smaller run, whichever tier reads it. On the
+    # per-chunk tiers and on --terms it reaches a SQL `LIMIT ?`, where -1 means
+    # NO limit; in hybrid's phase 3a it reaches a list slice, where
+    # `event_ids[:-5]` is not a prefix of the density ranking at all -- it drops
+    # the five LEAST dense candidates and dispatches everything else. Both
+    # directions turn a flag whose whole job is to bound a run into an unbounded
+    # one, so the check belongs here, at the one place every tier passes
+    # through, rather than once per consumer (hybrid_chunks keeps its own for
+    # callers that reach it directly). 0 is legal: it is the empty cap. What
+    # each tier then does with an empty cap is the tier's own business and is
+    # documented there -- distilled ignores --limit outright, and hybrid's
+    # phase 1 can still spend LLM calls on seeds -- so this message promises
+    # nothing about the run, only about the cap.
+    if args.limit is not None and args.limit < 0:
+        parser.error(f"--limit cannot be negative (got {args.limit}); use 0 for "
+                     f"an empty cap, or omit it for no cap")
+    # --top-dyads is the same shape against the scope subquery's own LIMIT,
+    # where a negative widens the run to every chat -- which is what --all is
+    # for. Resolved with `is not None` rather than `or` so an explicit 0 means
+    # "no chats in scope" instead of silently falling through to the 20-chat
+    # default; hybrid_chunks has always read its own 0 that way, and main was
+    # the half that disagreed.
+    if args.top_dyads is not None and args.top_dyads < 0:
+        parser.error(f"--top-dyads cannot be negative (got {args.top_dyads}); "
+                     f"use --all to annotate every chat")
+    top_dyads = args.top_dyads if args.top_dyads is not None else ANNOTATE_TOP_DYADS
+    # The env half of the same check, for the reason conflict_detect gives for
+    # CONFLICT_MAX_LABEL_TURNS: a knob is validated where it is RESOLVED, not
+    # only where a flag supplies it, or the unbounded run stays reachable
+    # through the quieter of the two doors.
+    #
+    # Gated on the run actually BINDING it, which is the other half of that
+    # same precedent (`--no-llm` does not resolve CONFLICT_BUDGET_MINUTES at
+    # all, so a bad value cannot refuse a run it could not have affected).
+    # `--terms` has no scope at all, `--all` omits the scope clause, and
+    # distilled hardcodes `top_dyads=0` because it is corpus-wide by
+    # construction -- none of the three can reach that LIMIT. Refusing them
+    # would take out bare `make annotate` over a knob those runs never read,
+    # and would make the message below name a remedy it had itself refused.
+    if top_dyads < 0 and not args.terms and not args.all and quality != "distilled":
+        raise SystemExit(
+            f"ANNOTATE_TOP_DYADS cannot be negative (got {top_dyads}); SQLite "
+            f"reads it as no limit at all, so a scoped run silently becomes an "
+            f"--all one. Pass --all (or --top-dyads N) if that is what you want.")
     # --quality is a chunk-annotation tier and never described term curation;
     # accepting it silently here is what let its `think` cost ~11x per term.
     # Checked before --upgrade-distilled so `--terms --quality max
@@ -1425,7 +1479,7 @@ def main(argv=None):
                 think=think,
                 workers=ANNOTATE_WORKERS,
                 all_chats=args.all,
-                top_dyads=args.top_dyads or ANNOTATE_TOP_DYADS,
+                top_dyads=top_dyads,
                 limit=args.limit,
                 dry_run=args.dry_run,
                 batch_size=batch_size,
@@ -1434,7 +1488,7 @@ def main(argv=None):
             annotate_chunks(
                 con, model,
                 all_chats=args.all,
-                top_dyads=args.top_dyads or ANNOTATE_TOP_DYADS,
+                top_dyads=top_dyads,
                 limit=args.limit,
                 dry_run=args.dry_run,
                 think=think,

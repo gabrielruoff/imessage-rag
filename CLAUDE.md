@@ -58,7 +58,8 @@ Full design history, schema rationale, and data forensics:
   ~`ANNOTATE_SEED_TARGET` seed then kNN-classifies the whole corpus from
   `chunk_vectors` (fast; events left empty); it is corpus-wide by construction,
   so `--all`/`--top-dyads N`/`--limit N` are accepted and SILENTLY IGNORED there
-  (not an error). `hybrid` = a stratified
+  (not an error — though a NEGATIVE N is still refused by the parser, which runs
+  before any tier does). `hybrid` = a stratified
   `ANNOTATE_HYBRID_SEED_TARGET` seed draw + that same kNN pass (both corpus-wide),
   then LLM upgrades — event-candidate chunks first (ranked by pattern-hit count
   DESC, chunk id ASC, so the prefix a budget affords is the DENSEST candidates,
@@ -77,9 +78,21 @@ Full design history, schema rationale, and data forensics:
   3a's ranked list exhausted) the run lands short of N. Making it up regardless
   means dispatching past N, which is spend the flag did not authorize; the
   closing summary says how many candidates were left rather than claiming it
-  "finished every candidate in scope". A NEGATIVE `--limit` is a `SystemExit`
-  (it inverted both prefixes: `[:-1]` drops the LEAST dense candidate and
-  `max(0, limit - done)` then switched 3b off). EVERY
+  "finished every candidate in scope". A NEGATIVE `--limit` (or `--top-dyads`)
+  is refused by `annotate.py`'s PARSER, for every tier and `--terms` alike:
+  negative never means a smaller run anywhere — on the per-chunk tiers and
+  `--terms` it reaches a SQL `LIMIT ?` where `-1` means NO limit, and in hybrid
+  it inverted both prefixes (`[:-1]` drops the LEAST dense candidate and
+  `max(0, limit - done)` then switched 3b off). `hybrid_chunks` keeps its own
+  `SystemExit` for callers reaching it directly, and `ANNOTATE_TOP_DYADS` gets
+  the same check at all three places it is RESOLVED (`main`, `hybrid_chunks`,
+  `annotate_chunks`) — a knob is validated where it is resolved, not only where
+  a flag supplies it — but ONLY on runs that bind it: `--terms`, `--all` and
+  `distilled` never reach that `LIMIT`, and refusing them would break bare `make
+  annotate` over a value they don't read (the `CONFLICT_MAX_LABEL_TURNS` /
+  `--no-llm` rule, both halves). `--top-dyads 0` means ZERO chats, not the
+  default: `main` resolved it with `or` and so read an explicit 0 as "20", where
+  `hybrid_chunks` had always read 0 as 0. EVERY
   phase is deadline-gated, including the deterministic
   kNN pass (O(rows × seeds): 14.6 s at a 450-seed index vs 82.0 s at 4,416,
   which `ANNOTATE_KNN_INDEX_CAP` now bounds — the index, never the pool) and

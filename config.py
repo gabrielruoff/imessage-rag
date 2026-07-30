@@ -251,7 +251,13 @@ ANNOTATE_MODEL = os.getenv("ANNOTATE_MODEL", "") or CHAT_MODEL
 # Chats the LLM tiers scope to (top N by message count); --top-dyads N
 # overrides, --all removes the scope. hybrid applies it to the UPGRADE phase
 # only -- its seed and kNN phases are corpus-wide -- and the distilled tier
-# ignores it entirely (corpus-wide by construction).
+# ignores it entirely (corpus-wide by construction). A NEGATIVE value is refused
+# wherever it is resolved (annotate.main, hybrid_chunks, annotate_chunks), the
+# same check the flag gets and for the same reason: it reaches the scope
+# subquery's `LIMIT ?`, where SQLite reads -1 as no limit, so it would silently
+# widen a scoped run to --all. Only on the runs that BIND it, though -- --terms,
+# --all and the distilled tier never do, and a bad knob must not refuse a run it
+# cannot affect. 0 = no chats.
 ANNOTATE_TOP_DYADS = int(os.getenv("ANNOTATE_TOP_DYADS", "20"))
 # Annotated chunks between commits: the resumability granularity on Ctrl-C.
 ANNOTATE_COMMIT_EVERY = int(os.getenv("ANNOTATE_COMMIT_EVERY", "50"))
@@ -300,7 +306,19 @@ ANNOTATE_WORKERS = int(os.getenv("ANNOTATE_WORKERS", "4"))
 ANNOTATE_SEED_TARGET = int(os.getenv("ANNOTATE_SEED_TARGET", "450"))
 ANNOTATE_KNN_K = int(os.getenv("ANNOTATE_KNN_K", "10"))
 # Ceiling on how many LLM seeds are loaded into the temporary kNN index that
-# the classify and confidence-backfill passes vote against; 0 = uncapped.
+# the classify and confidence-backfill passes vote against; 0 -- or any value
+# below it -- = uncapped. Deliberately NOT refused the way a negative --limit or
+# ANNOTATE_BUDGET_MINUTES is: those are refused because a sign error there
+# changes what a run DOES (an unbounded --limit run; a budget deadline already
+# in the past, which declines every LLM phase). The only thing an uncapped index
+# changes is how long the deterministic, LLM-free kNN passes take -- both of
+# them, since classify and the confidence backfill each rebuild it -- with no
+# extra LLM spend and the labels the tier gave before the cap existed. `<= 0`
+# rather
+# than `== 0` so a stray sign lands on that documented pre-cap behavior:
+# _sample_seed_ids raises the cap to _KNN_MIN_SEEDS before applying it, so a
+# `== 0` guard would have made -1 mean "an index of exactly 100", which is the
+# one reading nobody would be asking for.
 # It caps the INDEX, never the stored seed pool: every source='llm' row is
 # still written, still counted toward the seed targets, still read by every
 # other consumer -- a capped run simply votes off a deterministic sample of

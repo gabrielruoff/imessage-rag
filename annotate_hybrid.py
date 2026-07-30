@@ -439,6 +439,17 @@ def hybrid_chunks(con, model, think=False, workers=1, all_chats=False,
                          f"'upgrade nothing', omit it for no cap")
     if top_dyads is None:
         top_dyads = config.ANNOTATE_TOP_DYADS
+    if top_dyads < 0 and not all_chats:
+        # This is the second place ANNOTATE_TOP_DYADS is resolved (annotate.main
+        # is the first), and a knob is checked where it is resolved -- otherwise
+        # a caller reaching this function directly gets the corpus-wide phase-3
+        # scope that `LIMIT -1` means, which is the run --all exists to ask for
+        # explicitly. Gated on `not all_chats` because that branch never binds
+        # the value: a bad knob must not refuse a run it cannot affect.
+        raise SystemExit(
+            f"ANNOTATE_TOP_DYADS cannot be negative (got {top_dyads}); SQLite "
+            f"reads it as no limit at all, so phase 3 would silently cover every "
+            f"chat. Pass all_chats=True if that is what you want.")
     if not seed_target:
         seed_target = config.ANNOTATE_HYBRID_SEED_TARGET
     if batch_size is None:
