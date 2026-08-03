@@ -7,31 +7,38 @@ turn persistence, /api/health, and conversation CRUD.
 Run from the repo root:  python3 -m unittest tests.test_api
 """
 
+import importlib.util
 import os
 import tempfile
 import unittest
 
+import chat
+
 # The web layer is OPTIONAL: fastapi/sse-starlette live in requirements-api.txt,
 # which `make install` deliberately does not install (only `make api-install`
-# does). Import them defensively and skip -- an unguarded module-level import
-# turns a missing optional dep into a discovery ERROR for the whole suite, which
-# is what CI hit before requirements-api.txt was added to its test job. Same
-# shape as test_annotate_hybrid.py's sqlite-vec gate.
-# api.main imports fastapi itself, so the app imports have to sit inside the
-# guard too -- guarding only the test client would still raise on `from
-# api.main import app`.
-try:
+# does). Skip when they are absent -- an unguarded module-level import turns a
+# missing optional dep into a discovery ERROR for the whole suite, which is what
+# CI hit before requirements-api.txt was added to its test job. Same shape as
+# test_annotate_hybrid.py's sqlite-vec gate.
+#
+# The gate is find_spec over the THIRD-PARTY deps only, deliberately NOT a
+# try/except ImportError wrapped around the api imports. api.main imports
+# fastapi itself, so it has to sit behind the gate -- but an ImportError raised
+# FROM INSIDE api/ (a renamed module, a bad import in api/models.py) is a real
+# regression, and catching it here turned these four tests into four silent
+# skips and left CI green over a broken web layer.
+_HAS_API_DEPS = all(
+    importlib.util.find_spec(name) for name in ("fastapi", "sse_starlette"))
+
+if _HAS_API_DEPS:
     from fastapi.testclient import TestClient
     from sse_starlette.sse import AppStatus
 
     from api import store
     from api.main import app
-except ImportError:                                       # pragma: no cover
+else:                                                     # pragma: no cover
     TestClient = AppStatus = store = app = None
 
-import chat
-
-_HAS_API_DEPS = TestClient is not None
 _NEEDS_API_DEPS = unittest.skipUnless(
     _HAS_API_DEPS, "web-API deps not installed (run `make api-install`)")
 

@@ -299,22 +299,63 @@ class StripUngroundedTermsTest(unittest.TestCase):
             "INSERT INTO dyad_terms(chat_id, term) VALUES (?, ?)",
             # chat 100 is THIS dyad (grounded); chat 999 is another dyad, whose
             # terms form the suspect universe. "s/o" tokenizes to the 1-char
-            # fragments 's' and 'o'.
-            [(100, "wombat"), (999, "floopy"), (999, "s/o")])
+            # fragments 's' and 'o'. "don" is the 3-char fragment that used to
+            # be stripped OUT OF the contraction "don’t".
+            [(100, "wombat"), (999, "floopy"), (999, "s/o"), (999, "don")])
         self.con.commit()
 
-    def test_short_tokens_are_never_stripped(self):
-        # A curly apostrophe splits "It’s" into the tokens "it" and "s", so
-        # without the len >= 3 rule the ungrounded fragment 's' would be removed
-        # and strand the apostrophe ("It’s okay" -> "It’ okay").
-        draft = "It’s okay wombat floopy"
+    def _strip(self, draft):
+        """Run the post-check and assert it never reached the model -- it is
+        pure code, and that assertion IS the safety test."""
         with mock.patch.object(ollama, "chat_once") as chat_once:
-            clean, stripped = persona_draft._strip_ungrounded_terms(
+            result = persona_draft._strip_ungrounded_terms(
                 self.con, draft, [100], [], "sure thing")
-        chat_once.assert_not_called()  # the post-check is pure code, never a call
+        chat_once.assert_not_called()
+        return result
+
+    def test_short_tokens_are_never_stripped(self):
+        # "s/o" (another dyad's term) tokenizes to the 1-char fragments 's' and
+        # 'o'. Without the len >= 3 rule those would be removed wherever they
+        # appear as standalone words, which is noise, not an inside joke.
+        clean, stripped = self._strip("It’s okay wombat floopy s o")
         self.assertEqual(stripped, ["floopy"])   # only the len >= 3 ungrounded one
-        self.assertEqual(clean, "It’s okay wombat")
+        self.assertEqual(clean, "It’s okay wombat s o")
         self.assertIn("It’s", clean)             # apostrophe intact, word whole
+
+    def test_a_curly_apostrophe_contraction_is_not_split(self):
+        # THE regression this fixture's "don" row exists for. function_words.
+        # TOKEN_RE accepts both apostrophes, so "don’t" is ONE token and the
+        # ungrounded 3-char fragment "don" is never matched inside it. With the
+        # straight-only pattern this produced "I ’t know wombat" and reported
+        # "don" as stripped -- a mangled draft handed to the user.
+        curly = self._strip("I don’t know wombat floopy")
+        self.assertEqual(curly, ("I don’t know wombat", ["floopy"]))
+        # The two spellings must agree: the corpus carries both (iOS types the
+        # curly one), and a post-check that depends on which is a coin flip.
+        straight = self._strip("I don't know wombat floopy")
+        self.assertEqual(straight, ("I don't know wombat", ["floopy"]))
+
+    def test_a_term_stored_with_an_apostrophe_is_stripped_whole(self):
+        # The other direction: when the ungrounded TERM itself contains an
+        # apostrophe it is stripped entirely, from either spelling, because
+        # both sides normalize curly -> straight (the set via tokenize(), the
+        # draft via _repl).
+        self.con.execute("INSERT INTO dyad_terms(chat_id, term) VALUES (999, 'y’all')")
+        self.con.commit()
+        self.assertEqual(self._strip("y’all coming wombat"),
+                         ("coming wombat", ["y'all"]))
+        self.assertEqual(self._strip("y'all coming wombat"),
+                         ("coming wombat", ["y'all"]))
+
+    def test_a_possessive_form_of_an_ungrounded_term_survives(self):
+        # DELIBERATE consequence of matching whole tokens: "floopy’s" is not
+        # the token "floopy", so it is left alone where the bare word is
+        # stripped. Accepted rather than fixed -- the post-check is a
+        # belt-and-braces net that already missed every other inflection, and
+        # leaving one possessive standing is strictly safer than the stranding
+        # that chasing it produced.
+        self.assertEqual(self._strip("hey floopy, ok"), ("hey, ok", ["floopy"]))
+        self.assertEqual(self._strip("floopy’s here"), ("floopy’s here", []))
 
 
 class TapbackBaseRateTest(_DBCase):

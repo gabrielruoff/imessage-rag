@@ -46,6 +46,35 @@ from unittest import mock
 import config
 import dotenv
 
+# Every knob parsed with the STRICT form -- int/float(os.getenv("X", "default"))
+# -- as of this commit: 42 of the 103 numeric knobs (the other 61 use the
+# tolerant `os.getenv("X") or "default"`). The strict form dies at import on a
+# set-but-EMPTY value, so this is a landmine inventory, not a style record; see
+# EnvParsingTest.test_no_new_strict_form_knob_is_added for what it is asserted
+# against and why the assertion is one-directional. Regenerate with:
+#
+#   python -c 'import re,pathlib;print(sorted(set(re.findall(
+#     r"(?:int|float)\(os\.getenv\(\s*\"([A-Z][A-Z0-9_]*)\"\s*,",
+#     pathlib.Path("config.py").read_text()))))'
+_KNOWN_STRICT_KNOBS = frozenset({
+    "ADJACENCY_MINUTES", "ANNOTATE_COMMIT_EVERY",
+    "ANNOTATE_HYBRID_SEED_TARGET", "ANNOTATE_KNN_K", "ANNOTATE_SEED_TARGET",
+    "ANNOTATE_TOP_DYADS", "ANNOTATE_WORKERS", "API_PORT",
+    "APPLE_ANSWER_MAX_TOKENS", "APPLE_DIGEST_MAX_TOKENS",
+    "APPLE_FILL_MAX_TOKENS", "APPLE_MAX_TOOL_ITERATIONS",
+    "APPLE_NO_PROGRESS_LIMIT", "APPLE_ROUTE_MAX_TOKENS",
+    "APPLE_TOOL_RESULT_MAX_CHARS", "CHAT_TIMEOUT", "CHUNK_GAP_MINUTES",
+    "CHUNK_MAX_CHARS", "CHUNK_MIN_CHARS", "CHUNK_OVERLAP_MESSAGES",
+    "DOUBLE_TEXT_MIN_MINUTES", "DYAD_TERM_MIN_LIFT", "DYAD_TERM_MIN_USES",
+    "DYAD_TERM_TOP_K", "EMBED_BATCH_SIZE", "EMBED_COMMIT_EVERY",
+    "EMBED_MAX_WORKERS", "INITIATION_GAP_HOURS", "LATE_NIGHT_END_HOUR",
+    "LATE_NIGHT_START_HOUR", "MAX_TOOL_ITERATIONS", "OLLAMA_PORT",
+    "OLLAMA_TIMEOUT", "PROGRESS_LOG_EVERY", "SESSION_GAP_MINUTES",
+    "TOOL_RESULT_MAX_CHARS", "TOPIC_K", "TOPIC_KMEANS_ITERS",
+    "TOPIC_LABEL_SAMPLES", "WRAPPED_SILENT_MIN_MESSAGES",
+    "WRAPPED_SILENT_MONTHS", "WRAPPED_TOP_CONTACTS",
+})
+
 
 def _env_without(*names):
     """A `patch.dict` target holding the real environment MINUS `names`, so an
@@ -147,23 +176,48 @@ class EnvParsingTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"EMBED_DIM": ""}, clear=False):
             self.assertEqual(int(os.getenv("EMBED_DIM") or "0"), 0)
 
-    def test_the_strict_int_form_raises_on_an_empty_value(self):
+    def test_a_set_but_empty_strict_knob_kills_the_import(self):
         # int(os.getenv("X", "default")): a var that is SET BUT EMPTY returns ""
         # (the fallback never fires), int("") raises ValueError AT IMPORT, and
-        # every CLI in the repo dies on `import config`. Demonstrated with the
-        # actual parsing expressions rather than by breaking the real import.
-        with mock.patch.dict(os.environ, {"OLLAMA_PORT": ""}, clear=False):
-            with self.assertRaises(ValueError):
-                int(os.getenv("OLLAMA_PORT", "11434"))
-            # The tolerant form over the SAME env survives -- the two forms
-            # genuinely differ, and which one a knob got is not cosmetic.
-            self.assertEqual(int(os.getenv("OLLAMA_PORT") or "11434"), 11434)
-        # Both forms are live in config.py (measured: 42 strict, 61 tolerant).
+        # every CLI in the repo dies on `import config` -- a one-line .env typo
+        # that takes the whole tool down with a traceback naming neither the
+        # variable nor the file.
+        #
+        # Asserted by reloading the REAL module. An earlier version asserted
+        # int(os.getenv("OLLAMA_PORT", "11434")) raises, which is a fact about
+        # Python's int(), not about config.py, and could not fail for the
+        # reason described above.
+        for knob in ("OLLAMA_PORT", "CHUNK_MAX_CHARS", "TOPIC_K"):
+            with self.subTest(knob=knob):
+                with self.assertRaises(ValueError):
+                    with _reloaded_config(**{knob: ""}):
+                        pass
+        # ...and the module survives it: _reloaded_config restores in a finally,
+        # so a raising reload cannot leave siblings with a half-built config.
+        self.assertEqual(config.OLLAMA_PORT, 11434)
+        # The tolerant form over the same shape imports fine -- the two forms
+        # genuinely differ, and which one a knob got is not cosmetic.
+        with _reloaded_config(ANNOTATE_KNN_INDEX_CAP="") as cfg:
+            self.assertIsInstance(cfg.ANNOTATE_KNN_INDEX_CAP, int)
+
+    def test_no_new_strict_form_knob_is_added(self):
+        # A SUBSET assertion, not equality, and the direction is the point:
+        # migrating a knob strict -> tolerant is the fix for the defect above
+        # and must not require editing this list, but ADDING a strict site
+        # plants a new import-time landmine and should be a conscious edit.
         src = pathlib.Path(config.__file__).resolve().read_text()
-        strict = re.findall(r'(?:int|float)\(os\.getenv\(\s*"[A-Z][A-Z0-9_]*"\s*,', src)
-        tolerant = re.findall(r'(?:int|float)\(os\.getenv\(\s*"[A-Z][A-Z0-9_]*"\s*\)\s*or\s*"', src)
-        self.assertGreater(len(strict), 0)
-        self.assertGreater(len(tolerant), 0)
+        strict = set(re.findall(
+            r'(?:int|float)\(os\.getenv\(\s*"([A-Z][A-Z0-9_]*)"\s*,', src))
+        self.assertLessEqual(
+            strict, _KNOWN_STRICT_KNOBS,
+            "new strict-form knob(s): a set-but-empty value now kills the "
+            "import. Prefer int(os.getenv(\"X\") or \"default\"), or add the "
+            "name to _KNOWN_STRICT_KNOBS deliberately")
+        # Both forms are genuinely live, so neither branch above is dead.
+        tolerant = set(re.findall(
+            r'(?:int|float)\(os\.getenv\(\s*"([A-Z][A-Z0-9_]*)"\s*\)\s*or\s*"', src))
+        self.assertTrue(tolerant)
+        self.assertEqual(strict & tolerant, set(), "a knob parsed both ways")
 
     def test_parse_json_dict_env_raises_naming_the_variable(self):
         # config.py:496-509 fails LOUDLY at import on a malformed drift knob,

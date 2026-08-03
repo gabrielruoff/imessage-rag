@@ -10,7 +10,7 @@ import contextlib
 import re
 
 import config
-from function_words import FUNCTION_WORDS, tokenize
+from function_words import FUNCTION_WORDS, TOKEN_RE, tokenize
 
 from ._shared import HYBRID_POOL, RRF_K, TEXT_PREVIEW_CHARS, _connect
 from .persona import (
@@ -190,16 +190,20 @@ def _strip_ungrounded_terms(con, draft, chat_ids, pairs, incoming):
         return draft, []
 
     stripped = []
-    token_re = re.compile(r"[^\W\d_]+(?:'[^\W\d_]+)?")
 
     def _repl(match):
+        # Normalize the curly apostrophe the same way tokenize() does, because
+        # `strip` was built from tokenize() output: without it a draft's
+        # "don’t" would never match the "don't" in the set. TOKEN_RE accepts
+        # both apostrophes so the whole contraction is one match -- matching
+        # only "don" and deleting it stranded the "’t".
         low = match.group(0).lower().replace("’", "'")
         if low in strip:
             stripped.append(low)
             return ""
         return match.group(0)
 
-    clean = token_re.sub(_repl, draft)
+    clean = TOKEN_RE.sub(_repl, draft)
     clean = re.sub(r"\s+([,.!?;:])", r"\1", clean)   # tidy space before punctuation
     clean = re.sub(r"[ \t]{2,}", " ", clean).strip()  # collapse the gaps left behind
     return clean, sorted(set(stripped))
