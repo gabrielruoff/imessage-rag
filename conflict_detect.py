@@ -818,8 +818,22 @@ def main(argv=None):
         con.close()
 
 
+# Runs BEFORE the bottom imports, and re-enters through the real module name
+# rather than calling the local `main`. As `__main__` this file is a SECOND
+# module object, distinct from the `conflict_detect` that conflict_signals and
+# conflict_labeling import; executing the bottom imports from here starts the
+# cycle at the one module that cannot complete it, and `from conflict_signals
+# import ...` raises ImportError on a still-empty module. Importing ourselves
+# first lets the cycle resolve against a single fully-initialized copy, which
+# `main` is then read off. annotate.py needs no such shim only because its
+# top-level `import annotate_distill` already forces that full load.
+#
+# The module body is definitions and config reads only, so the double execution
+# this costs is free.
 if __name__ == "__main__":
-    run_cli(main)
+    import conflict_detect
+
+    run_cli(conflict_detect.main)
 
 
 # The deterministic signal computation and the LLM labeling pass live in their
