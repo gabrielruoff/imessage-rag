@@ -315,11 +315,18 @@ class LlmModelGuardTest(_FixtureTest):
             con.close()
 
     def test_a_model_change_is_refused_with_the_columns_intact(self):
+        # A plain run (no --no-llm): the guard fires at the top of main(), before
+        # detection and before any Ollama call, so this stays hermetic. It must
+        # NOT pass --no-llm -- with NUDGE_DROPPED_PLAN_ENABLED off (the default)
+        # that path makes zero LLM calls and is deliberately not guarded, which
+        # is what test_no_llm_is_refused_only_when_dropped_plan_can_actually_run
+        # below pins. This method owns the columns-survive half; the sibling
+        # above owns the key-not-recorded half.
         self._narrated(verdict="plan")
         before = self._llm_columns()
         self.assertGreater(before, 0)
         with self.assertRaises(SystemExit):
-            loose_ends.main(["--no-llm", "--model", "model-b"])
+            loose_ends.main(["--model", "model-b"])
         self.assertEqual(self._llm_columns(), before,
                          "the guard destroyed the columns it exists to protect")
 

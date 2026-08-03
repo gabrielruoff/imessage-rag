@@ -75,9 +75,13 @@ FUNCTION_WORDS = {
 STOPWORDS = frozenset().union(*FUNCTION_WORDS.values())
 
 # Word tokens: letter runs with an optional internal apostrophe ("don't"),
-# no digits/underscores. Curly apostrophes (what iOS types) are normalized
-# in tokenize() so contractions stay whole.
-TOKEN_RE = re.compile(r"[^\W\d_]+(?:'[^\W\d_]+)?")
+# no digits/underscores. BOTH apostrophes are accepted, straight and curly
+# (what iOS types). For tokenize() that is a no-op -- it normalizes curly to
+# straight before matching -- but it is load-bearing for the one caller that
+# runs this regex over RAW text, persona_draft._strip_ungrounded_terms: with
+# the straight-only form "don't" split into "don" + "t", and an ungrounded
+# "don" was stripped out of a draft leaving the apostrophe stranded ("'t").
+TOKEN_RE = re.compile(r"[^\W\d_]+(?:['’][^\W\d_]+)?")
 
 
 def tokenize(text):
