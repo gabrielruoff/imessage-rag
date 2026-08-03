@@ -11,12 +11,29 @@ import os
 import tempfile
 import unittest
 
-from fastapi.testclient import TestClient
-from sse_starlette.sse import AppStatus
+# The web layer is OPTIONAL: fastapi/sse-starlette live in requirements-api.txt,
+# which `make install` deliberately does not install (only `make api-install`
+# does). Import them defensively and skip -- an unguarded module-level import
+# turns a missing optional dep into a discovery ERROR for the whole suite, which
+# is what CI hit before requirements-api.txt was added to its test job. Same
+# shape as test_annotate_hybrid.py's sqlite-vec gate.
+# api.main imports fastapi itself, so the app imports have to sit inside the
+# guard too -- guarding only the test client would still raise on `from
+# api.main import app`.
+try:
+    from fastapi.testclient import TestClient
+    from sse_starlette.sse import AppStatus
+
+    from api import store
+    from api.main import app
+except ImportError:                                       # pragma: no cover
+    TestClient = AppStatus = store = app = None
 
 import chat
-from api import store
-from api.main import app
+
+_HAS_API_DEPS = TestClient is not None
+_NEEDS_API_DEPS = unittest.skipUnless(
+    _HAS_API_DEPS, "web-API deps not installed (run `make api-install`)")
 
 
 def _fake_run_turn_events(messages, model=None):
@@ -30,6 +47,7 @@ def _fake_run_turn_events(messages, model=None):
     yield {"type": "done", "reply": "Hello world"}
 
 
+@_NEEDS_API_DEPS
 class ApiTestBase(unittest.TestCase):
     def setUp(self):
         # Point app.db at a throwaway temp file and (re)create the schema.
