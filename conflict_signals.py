@@ -17,8 +17,6 @@ import statistics
 
 import stats
 
-import conflict_detect
-
 
 # ---------------------------------------------------------------------------
 # Deterministic signal computation
@@ -228,3 +226,11 @@ def _corroboration(chat_mean, llm_rows, first_date, last_date):
     if drop >= conflict_detect.CONFLICT_MIN_VALENCE_DROP:
         return "llm", True, round(drop, 3)
     return "weak", False, round(drop, 3)
+
+# Bottom import: this module is one half of a cycle -- `conflict_detect` re-exports the
+# names below, so importing it from the TOP here makes conflict_signals unimportable
+# on its own (the parent would run its own re-export against a still-empty
+# conflict_signals). Down here every name above is already bound, so the cycle
+# resolves whichever module a caller reaches first. Only used inside functions,
+# so the late binding costs nothing.
+import conflict_detect  # noqa: E402

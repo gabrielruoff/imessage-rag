@@ -10,11 +10,8 @@ wrapped_html.
 
 import config
 import db
-import wrapped
 import wrapped_html
-import wrapped_sections
 
-from wrapped_sections import _person_chat_ids, _session_duration
 
 
 # --- feature: drift ---
@@ -651,3 +648,16 @@ def _sec_open_loops(exclude_chat_ids=(), excluded_names=frozenset()):
                  "one or two; never scold, and don't list them all."),
     }
 # --- end feature: nudges ---
+
+# Bottom import: this module is one half of a cycle -- wrapped_sections re-exports the
+# names below, so importing it from the TOP here makes wrapped_sections_suite unimportable on
+# its own (the parent would run its own re-export against a still-empty
+# wrapped_sections_suite). Down here every name above is already bound, so the cycle resolves
+# whichever module a caller reaches first. Only used inside functions, so the
+# late binding costs nothing.
+import wrapped  # noqa: E402
+import wrapped_sections  # noqa: E402
+from wrapped_sections import (  # noqa: E402
+    _person_chat_ids,
+    _session_duration,
+)

@@ -9,7 +9,16 @@ name: CI
 # No `paths:` filter on purpose: with one, a docs-only or Makefile-only PR
 # runs zero jobs, and a required status check that never runs blocks the PR
 # instead of passing it. The whole suite is hermetic and takes ~1 minute.
-on: [push, pull_request]
+#
+# `push` is scoped to main rather than left bare. A bare `on: [push,
+# pull_request]` fires BOTH events for any push to a branch with an open PR, so
+# every job ran twice per PR (PR #45 and #47 each showed 10 checks for 5 jobs).
+# Scoped this way a PR branch is covered once by `pull_request`, and main is
+# still covered directly on merge.
+on:
+  push:
+    branches: [main]
+  pull_request:
 
 jobs:
   compile-check:

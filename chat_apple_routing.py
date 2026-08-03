@@ -16,8 +16,6 @@ value, the way the other split modules in this repo do it.
 
 import re
 
-import chat_apple
-
 # --- Deterministic name->id pre-resolution (before the staged loop) ----------
 # Question words / imperative verbs that a capitalized-token scan picks up but
 # that must never be looked up as a contact.
@@ -370,3 +368,11 @@ def _suggest_first_action(question):
         if tool in chat_apple._TOOL_SPECS and pattern.search(question):
             return tool
     return None
+
+# Bottom import: this module is one half of a cycle -- `chat_apple` re-exports the
+# names below, so importing it from the TOP here makes chat_apple_routing unimportable
+# on its own (the parent would run its own re-export against a still-empty
+# chat_apple_routing). Down here every name above is already bound, so the cycle
+# resolves whichever module a caller reaches first. Only used inside functions,
+# so the late binding costs nothing.
+import chat_apple  # noqa: E402

@@ -246,6 +246,41 @@ class RunCliReentryTest(unittest.TestCase):
         self.assertIn("NameError", result.stderr)
 
 
+class StandaloneImportTest(unittest.TestCase):
+    """Every module must be importable on its own, in any order.
+
+    The same split that produced the entrypoint bugs left seven modules
+    importable only via their parent: each child did `import <parent>` (or
+    `from <parent> import ...`) from the TOP, so reaching the child first ran
+    the parent's bottom re-export against a still-empty child and raised
+    ImportError. Every child now takes that import at the BOTTOM instead, where
+    its own names are already bound, so the cycle resolves from either side.
+
+    Asserted with no allowlist on purpose: an exemption list is where this kind
+    of debt hides. A new cycle fails here immediately.
+    """
+
+    def test_every_module_imports_standalone(self):
+        mods = [n[:-3] for n in sorted(os.listdir(ROOT))
+                if n.endswith(".py") and not n.startswith("_")]
+        # One subprocess per module, each with a virgin sys.modules -- the whole
+        # point is the FIRST import, which an in-process import cannot retest.
+        broken = {}
+        for mod in mods:
+            result = subprocess.run(
+                [sys.executable, "-c", f"import {mod}"],
+                cwd=ROOT, capture_output=True, text=True,
+                stdin=subprocess.DEVNULL, timeout=120,
+            )
+            if result.returncode != 0:
+                broken[mod] = (result.stderr.strip().splitlines() or ["?"])[-1]
+        self.assertEqual(
+            broken, {},
+            "these modules cannot be imported first -- move the cyclic import "
+            "to the BOTTOM of the module that fails:\n"
+            + "\n".join(f"  {m}: {err}" for m, err in sorted(broken.items())))
+
+
 class EntrypointStartupTest(unittest.TestCase):
     """CLASS 2: every entry CLI must survive module initialization."""
 

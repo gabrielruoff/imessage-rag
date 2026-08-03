@@ -9,14 +9,6 @@ primitives from wrapped_html.
 
 import re
 
-from wrapped_html import (
-    _columns,
-    _rows_table,
-    display_scalar,
-    esc,
-    format_scalar,
-)
-
 
 # --- feature: drift ---
 def render_window_chips(rows, label_key="contact", days_key="days_until_dormant",
@@ -236,3 +228,17 @@ def render_wellbeing(markers, window, support_text):
     chart = render_trajectory(markers, window) or ""
     return _WELLBEING_STYLE + chart + render_support_block(support_text)
 # --- end feature: wellbeing ---
+
+# Bottom import: this module is one half of a cycle -- wrapped_html re-exports the
+# names below, so importing it from the TOP here makes wrapped_visuals unimportable on
+# its own (the parent would run its own re-export against a still-empty
+# wrapped_visuals). Down here every name above is already bound, so the cycle resolves
+# whichever module a caller reaches first. Only used inside functions, so the
+# late binding costs nothing.
+from wrapped_html import (  # noqa: E402
+    _columns,
+    _rows_table,
+    display_scalar,
+    esc,
+    format_scalar,
+)
