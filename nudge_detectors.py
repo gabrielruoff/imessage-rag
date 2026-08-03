@@ -18,6 +18,7 @@ from collections import defaultdict
 from typing import Iterable
 
 import ollama
+import stats
 from eval.evalkit.gates import eval_gate_passed
 from query_tools._shared import TEXT_PREVIEW_CHARS, _restrict_to_direct_chats
 from query_tools.analytics_language import lsm_score
@@ -287,7 +288,14 @@ def _final_sentence(text):
     """The message's final sentence, lowercased and stripped, keeping its
     trailing terminator (so 'right?' matches the stoplist form). Splits on a
     sentence terminator followed by whitespace, so 'Hey. How are you?' -> 'how
-    are you?'."""
+    are you?'.
+
+    Shares a name with eval.evalkit.checks._final_sentence and is NOT the same
+    function: that one strips the terminator, does not lowercase, and splits on
+    newlines too, because it reads an LLM reply's closing line. This one's
+    output is matched against _RHETORICAL_STOPLIST, whose entries carry their
+    '?'. Kept separate deliberately -- one implementation would silently change
+    one of the two matchers."""
     parts = re.split(r"(?<=[.!?])\s+", text.strip())
     return parts[-1].strip().lower() if parts else ""
 
@@ -435,19 +443,16 @@ _OCCASION_PHRASES = (
 
 def _next_occurrence(now, month_day):
     """The next calendar date on or after `now` that falls on month_day
-    ('MM-DD'), as an ISO 'YYYY-MM-DD' string. Rolls to next year once this
-    year's date has already passed; a Feb 29 occasion in a non-leap target year
-    falls back to Feb 28 so the reminder never silently vanishes."""
-    month, day = int(month_day[:2]), int(month_day[3:5])
-    today = now.date()
-    for year in (today.year, today.year + 1):
-        try:
-            candidate = datetime.date(year, month, day)
-        except ValueError:  # Feb 29 in a non-leap year
-            candidate = datetime.date(year, month, 28)
-        if candidate >= today:
-            return candidate.isoformat()
-    return None
+    ('MM-DD'), as an ISO 'YYYY-MM-DD' string, or None. Parses the 'MM-DD' form
+    here and defers the roll-forward (and the Feb 29 -> Feb 28 rule) to
+    stats.next_occurrence, which is the single home for both. 2000 is the
+    anchor year purely because it is a leap year, so a Feb 29 occasion parses."""
+    try:
+        anchor = datetime.date(2000, int(month_day[:2]), int(month_day[3:5]))
+    except ValueError:
+        return None
+    candidate = stats.next_occurrence(anchor, now.date())
+    return candidate.isoformat() if candidate else None
 
 
 def detect_inferred_occasion(con, cfg) -> Iterable[CandidateRow]:

@@ -29,6 +29,7 @@ for no speed gain, and running the patterns as separate per-pattern scans cost
 several times one OR'd predicate.
 """
 
+from db import like_escape
 from function_words import EVENT_CANDIDATE_PATTERNS
 
 # Flattened once: the frozen contract returns a single kind-agnostic list, and
@@ -42,18 +43,6 @@ from function_words import EVENT_CANDIDATE_PATTERNS
 _ALL_PATTERNS = tuple(p for pats in EVENT_CANDIDATE_PATTERNS.values() for p in pats)
 
 
-def _like_escape(value):
-    r"""Escape LIKE wildcards for use with ESCAPE '\'. A deliberate 3-line
-    duplicate of annotate._like_escape rather than an import: that is another
-    module's private helper, and importing annotate here would create an
-    import cycle for no gain. EVENT_CANDIDATE_PATTERNS is wildcard-free today
-    (documented there), so this is purely insurance against a later pattern
-    containing a literal % or _."""
-    return (value.replace("\\", "\\\\")
-                 .replace("%", "\\%")
-                 .replace("_", "\\_"))
-
-
 def _candidate_ids(con, patterns, all_chats, top_dyads):
     """Chunk ids in scope with at least one message matching `patterns`, ranked
     by how many of the chunk's messages matched (descending), chunk id
@@ -64,7 +53,7 @@ def _candidate_ids(con, patterns, all_chats, top_dyads):
     # per-row function call for zero behavior change. Messages with NULL text
     # drop out on their own (NULL LIKE x is NULL, never true).
     like = " OR ".join(["m.text LIKE ? ESCAPE '\\'"] * len(patterns))
-    params = [f"%{_like_escape(p)}%" for p in patterns]
+    params = [f"%{like_escape(p)}%" for p in patterns]
     # LEFT JOIN, not NOT EXISTS: a chunk is a candidate when it has no
     # annotation at all or only a distilled one. Rows already source='llm'
     # have their events and must never be paid for twice.

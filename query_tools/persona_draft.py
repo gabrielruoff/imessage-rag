@@ -7,18 +7,20 @@ See docs/DECISIONS.md (RES-62) for the grounding rationale.
 """
 
 import contextlib
+import re
 
 import config
-from function_words import FUNCTION_WORDS
+from function_words import FUNCTION_WORDS, tokenize
 
-from ._shared import _connect
+from ._shared import HYBRID_POOL, RRF_K, TEXT_PREVIEW_CHARS, _connect
 from .persona import (
     _FW_COLUMNS,
     _STYLE_FEATURES,
     _clip,
     _lookup,
     _resolve_person,
-    reply_pairs_in_chunk,
+    collect_pairs as _collect_pairs,
+    resolve_voice_scope as _resolve_voice_scope,
 )
 
 
@@ -64,7 +66,6 @@ def _similar_chunk_ids(con, incoming, chat_ids, pool):
     (skipped when chunk_vectors isn't built or embedding is unavailable),
     best-first. Reuses the chunk-retrieval primitives so scope/date handling
     stays identical to search_messages_hybrid."""
-    from ._shared import RRF_K
     from .chunks import _chunk_knn, _embed_query, _fts_chunk_ranks
 
     fts_ranks = _fts_chunk_ranks(con, incoming, chat_ids, None, None)
@@ -96,22 +97,6 @@ def _recent_chunk_ids(con, chat_ids, pool):
         list(chat_ids) + [pool],
     ).fetchall()
     return [r[0] for r in rows]
-
-
-def _collect_pairs(con, chunk_ids, cap):
-    """Reply-in-context pairs across `chunk_ids` in order, deduped by
-    (incoming_id, reply_id), capped at `cap`."""
-    pairs, seen = [], set()
-    for cid in chunk_ids:
-        for pair in reply_pairs_in_chunk(con, cid):
-            key = (pair["incoming_id"], pair["reply_id"])
-            if key in seen:
-                continue
-            seen.add(key)
-            pairs.append(pair)
-            if len(pairs) >= cap:
-                return pairs
-    return pairs
 
 
 def _public_exemplars(pairs):
@@ -182,10 +167,6 @@ def _strip_ungrounded_terms(con, draft, chat_ids, pairs, incoming):
     universe (dyad_terms across all chats) that is NOT grounded -- neither in
     THIS dyad's own dyad_terms nor in the exemplars/incoming the model was shown
     -- is stripped from the draft. Returns (clean_draft, [stripped_tokens])."""
-    import re
-
-    from function_words import tokenize
-
     allowed = set(tokenize(incoming or ""))
     for pair in pairs:
         allowed |= set(tokenize(pair["incoming"]))
@@ -224,7 +205,7 @@ def _strip_ungrounded_terms(con, draft, chat_ids, pairs, incoming):
     return clean, sorted(set(stripped))
 
 
-def draft_reply(incoming, contact_id=None, handle_id=None, name=None):
+def draft_reply(incoming, contact_id=None, handle_id=None, name=None) -> dict:
     """Draft a reply to an INCOMING message in the USER's own voice with a named
     person, grounded ONLY in real reply-in-context exemplars from that 1:1 chat.
 
@@ -256,8 +237,6 @@ def draft_reply(incoming, contact_id=None, handle_id=None, name=None):
         if not chat_ids:
             return {"error": f"no 1:1 chat history with {label} to draft a reply from",
                     "counterpart_key": person_key, "counterpart": label}
-
-        from ._shared import HYBRID_POOL, TEXT_PREVIEW_CHARS
 
         card = _lookup(con, "me", person_key, "dyad")
         floor = config.VOICEPRINT_MIN_CONTEXT_PAIRS
@@ -392,7 +371,6 @@ def _draft_features(draft):
     rates as category-hit / total-word counts (function_words), and burst_size
     as the message count (all draft lines are one same-sender burst)."""
     import voiceprint  # lazy: avoids a query_tools <-> voiceprint import cycle
-    from function_words import tokenize
 
     msgs = _draft_messages(draft)
     n = len(msgs)
@@ -481,7 +459,7 @@ def _style_distance(card_features, draft_features, feature_std, voice_label):
 
 
 def check_style_match(draft, contact_id=None, handle_id=None, name=None,
-                      subject="me", scope=None, chat_id=None):
+                      subject="me", scope=None, chat_id=None) -> dict:
     """Deterministically score how closely a user-written DRAFT matches a
     target voiceprint -- 'does this sound like me (or them)?'.
 
@@ -507,42 +485,14 @@ def check_style_match(draft, contact_id=None, handle_id=None, name=None,
         if err:
             return err
 
-        if scope is None:
-            scope = "dyad" if person_key is not None else "all"
-        scope = str(scope).lower()
-        if scope not in ("dyad", "group", "all"):
-            return {"error": f"scope must be dyad, group, or all (got {scope!r})"}
-
-        if scope == "dyad":
-            if person_key is None:
-                return {"error": "scope='dyad' needs a person "
-                                 "(contact_id/handle_id/name)"}
-            member_key_str, counterpart_key = (
-                ("me", person_key) if subject == "me" else (person_key, "me"))
-        elif scope == "all":
-            counterpart_key = "*"
-            if subject == "me":
-                member_key_str = "me"
-            elif person_key is None:
-                return {"error": "scope='all' with subject='them' needs a person"}
-            else:
-                member_key_str = person_key
-        else:  # group
-            if chat_id is None:
-                return {"error": "scope='group' needs a group chat_id"}
-            counterpart_key = f"chat:{chat_id}"
-            if subject == "me":
-                member_key_str = "me"
-            elif person_key is None:
-                return {"error": "scope='group' with subject='them' needs a person"}
-            else:
-                member_key_str = person_key
+        member_key_str, counterpart_key, scope, err = _resolve_voice_scope(
+            scope, subject, person_key, chat_id)
+        if err:
+            return err
 
         card = _lookup(con, member_key_str, counterpart_key, scope)
         if not isinstance(card, dict) or "features" not in card:
             return card  # the not-found / not-built note, returned verbatim
-
-        from ._shared import TEXT_PREVIEW_CHARS
 
         feature_std = card.get("feature_std") or {}
         draft_features = _draft_features(draft)

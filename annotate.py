@@ -57,9 +57,6 @@ Usage (terms):  annotate.py --terms [--limit N] [--model NAME]
 
 import argparse
 import json
-import threading
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import annotate_distill
 import annotate_hybrid
@@ -73,7 +70,6 @@ from config import (
     ANNOTATE_MODEL,
     ANNOTATE_QUALITY,
     ANNOTATE_TERMS_BATCH_SIZE,
-    ANNOTATE_TERMS_MAX_FAILURES,
     ANNOTATE_TERMS_THINK,
     ANNOTATE_THINK,
     ANNOTATE_TIMEOUT,
@@ -81,8 +77,26 @@ from config import (
     ANNOTATE_WORKERS,
     TARGET_DB,
 )
-from db import connect_default, get_state, run_cli, set_state
+from db import (
+    check_model_guard,
+    connect_default,
+    run_cli,
+)
 from function_words import EMOTION_LABELS
+
+# The dispatch/budget machinery lives in annotate_rate; re-exported so
+# annotate._pooled / ._GroupRate / ._DispatchDeadline (annotate_distill,
+# annotate_hybrid, the tests) keep resolving.
+from annotate_rate import (  # noqa: F401
+    _COLD_GROUP_SECONDS_PER_CHUNK,
+    _DispatchDeadline,
+    _GroupRate,
+    _group_rate_key,
+    _load_group_rate,
+    _mean_group_rows,
+    _pooled,
+    _save_group_rate,
+)
 
 # Module attribute so tests can patch it; _connect() reads it at call time.
 DB_PATH = TARGET_DB
@@ -119,36 +133,23 @@ QUALITY_PRESETS = {
 # over it raises rather than answering -- so the batched-annotation prompt has
 # to be packed under a char budget rather than the Ollama batch_size.
 #
-# 2,000, down from 8,000 (itself down from 12,000). Measured 2026-07-27 on the
-# real applefm corpus, running the production path (_annotate_group: batch,
-# then a single-chunk retry for every id the batch missed) over spread samples:
+# 2,000 = one CHUNK_MAX_CHARS: never two full-size chunks in one request, while
+# genuinely short chunks still pair up. Smaller is strictly CHEAPER here, which
+# is the counter-intuitive part: the dominant batched-call failure on this
+# backend is malformed JSON, not overflow, so a batched apple request usually
+# fails whatever its size and each failure costs its wall time PLUS the
+# single-chunk retries. (docs/DECISIONS.md has the budget-vs-failure table and
+# why the earlier 12,000 and 8,000 values did not fix what they were chosen for.)
 #
-#   budget  batched-call failure  context_overflow  dropped  s/chunk
-#    8,000        9/9 = 100%         4 / 48 chunks   1 (2%)   4.3-5.2
-#    4,000        6/7 =  86%         1 / 24 chunks   1 (4%)   5.5
-#    2,000     10/14 =  71%          3 / 144 chunks  5 (3%)   1.6-4.1
+# Residual, not fixable here: _char_budget_groups always emits at least one row,
+# so a chunk bigger than the budget is still sent alone and can still overflow
+# (~3% of chunks, mostly emoji/non-Latin text that tokenizes far worse than the
+# 4-chars-per-token rule of thumb). Such a row is lost for the run and retried
+# the next.
 #
-# Two things that measurement says and the older comment did not. First, the
-# 8,000 budget did NOT stop the overflow it was chosen to stop (7+ overflows and
-# 6 of 66 chunks lost in the full runs). Second, the dominant batched-call
-# failure on this backend is not overflow at all: dumping the raw replies shows
-# malformed JSON ('{"a": {...}, {"b": ...}', ```json fences, "chunk_<id>" keys),
-# so a batched apple request usually fails whatever its size -- and every
-# failure costs its own wall time PLUS the single-chunk retries. That makes a
-# smaller budget strictly cheaper, which is why per-chunk time falls as the
-# budget does. 2,000 is one CHUNK_MAX_CHARS: never two full-size chunks in one
-# request, while genuinely short chunks still pair up.
-#
-# Residual, and not fixable here: _char_budget_groups always emits at least one
-# row, so a chunk bigger than the budget is still sent alone and can still
-# overflow. Measured, 1 chunk in a 32-chunk sample (3%) does so reproducibly --
-# ~2 kB of emoji/non-Latin text tokenizes far worse than the ~4 chars/token
-# English rule of thumb. That one row is lost for the run and retried the next.
-#
-# Shared by every tier (annotate._annotation_groups), so the reduction is
-# global: fast/balanced/max on apple all pack smaller and measured 1.7-3.5x
-# faster per chunk. A module constant, not a config knob: it is a property of
-# the FM window, not something a user tunes.
+# Shared by every tier (_annotation_groups), so the reduction is global. A
+# module constant, not a config knob: a property of the FM window, not a user
+# tunable.
 _APPLE_ANNOTATE_CHAR_BUDGET = 2000
 
 # Ollama backend: the same packing idea for a different reason. Nothing here
@@ -251,328 +252,6 @@ def _connect():
     return connect_default(DB_PATH, rows=False)
 
 
-def _like_escape(value):
-    r"""Escape LIKE wildcards for use with ESCAPE '\'."""
-    return (value.replace("\\", "\\\\")
-                 .replace("%", "\\%")
-                 .replace("_", "\\_"))
-
-
-def _pooled(items, request_fn, workers):
-    """Yield (item, request_fn(item)) with up to `workers` requests in
-    flight, in completion order. Only request_fn runs on worker threads --
-    callers keep validation, SQLite writes and progress on the main thread
-    (mirrors chunking.embed_chunks). By contract `items` is consumed on the
-    caller's thread (the driving loop below iterates it), so a generator that
-    runs SQL per item -- _term_groups does -- keeps its sqlite affinity.
-    workers<=1 is a plain sequential loop.
-    On interrupt, not-yet-started requests are cancelled; in-flight ones
-    finish server-side but their results are dropped."""
-    if workers <= 1:
-        for item in items:
-            yield item, request_fn(item)
-        return
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {}
-        try:
-            for item in items:
-                futures[pool.submit(request_fn, item)] = item
-                if len(futures) >= workers * 2:
-                    done = next(as_completed(futures))
-                    yield futures.pop(done), done.result()
-            while futures:
-                done = next(as_completed(futures))
-                yield futures.pop(done), done.result()
-        finally:
-            for f in futures:
-                f.cancel()
-
-
-class _GroupRate:
-    """Thread-safe running mean of per-group wall-clock. Deliberately OUTSIDE
-    _DispatchDeadline so the estimator outlives the gate that uses it:
-    _load_group_rate primes one PER PHASE with what an earlier run banked and
-    _save_group_rate writes back what this run measured, so only a phase with
-    nothing banked has to start from the cold constant. Phases do not share an
-    estimator -- their per-group costs differ; see _load_group_rate.
-
-    `prior` is what to estimate with BEFORE anything has completed: a value
-    _load_group_rate read back from an earlier run (or the cold constant). A
-    measured mean always wins over it; `mean()` stays measurement-only, so a
-    caller can still tell the two apart."""
-
-    def __init__(self, prior=None, cold_per_chunk=None, workers=1):
-        self._lock = threading.Lock()
-        self._n = 0
-        self._total = 0.0
-        self._worst = 0.0
-        self.prior = prior
-        # Set ONLY when `prior` is the cold constant's arithmetic rather than a
-        # banked measurement, so denominate() can redo that arithmetic against
-        # the packing the caller actually built and can never touch a number an
-        # earlier run really measured.
-        self._cold_per_chunk = cold_per_chunk
-        self._workers = max(1, workers)
-
-    def denominate(self, rows_per_group):
-        """Re-scale a COLD prior to the rows a group actually holds. A no-op on
-        a prior an earlier run banked and on a rate with no prior at all -- and
-        moot once anything has completed, since estimate() takes the measured
-        mean over the prior regardless.
-
-        _load_group_rate has only `batch_size` when it builds the prior, and
-        batch_size is a MAXIMUM: _annotation_groups packs by char budget too, so
-        the real group is ~5 rows on the ~1,900-char event candidates and 1-2 on
-        Apple FM. The dispatch loops know the true number for free -- they built
-        the groups -- and this is where they hand it back. See
-        _COLD_GROUP_SECONDS_PER_CHUNK for what the mis-denomination cost."""
-        if not self._cold_per_chunk or not rows_per_group:
-            return
-        with self._lock:
-            self.prior = (self._cold_per_chunk * max(1.0, rows_per_group)
-                          * self._workers)
-
-    def record(self, seconds):
-        with self._lock:                    # worker threads; a paired update
-            self._n += 1
-            self._total += seconds
-            self._worst = max(self._worst, seconds)
-
-    def mean(self):
-        """Mean seconds per group, or None when nothing has completed yet."""
-        with self._lock:
-            return self._total / self._n if self._n else None
-
-    def worst(self):
-        """Slowest group seen, or None when nothing has completed yet. This is
-        what gets carried to the NEXT run: group latency is noisy (a batched
-        reply that covers only some ids costs an extra request -- the schema
-        retry, or a single-chunk request per miss when that fails too -- so the
-        same phase measured a 106.4 s mean one run and 148 s the next), and the
-        failure this whole gate exists to prevent is one-sided -- under-buying
-        costs coverage a rerun recovers, overrunning breaks the only promise
-        the tier makes."""
-        with self._lock:
-            return self._worst or None
-
-    def estimate(self):
-        """What to plan with: this run's measurement if there is one, else the
-        prior, else None (nothing to go on)."""
-        return self.mean() or self.prior
-
-
-# Seconds of group LATENCY per chunk to assume when nothing has been measured
-# and nothing was stored -- i.e. the first budgeted run against a given DB.
-# reserve() divides latency by `workers`, so the group estimate is
-# rate x rows-per-group x workers. Measured 2026-07-28 on the 25,029-chunk
-# corpus (qwen3.5:4b, batch 8, ANNOTATE_WORKERS=4), slowest group per phase:
-# 160.3 s seeding, 152.9-198.1 s on the event upgrades, 77.7-107.3 s on the
-# confidence upgrades. 5.3 x 8 x 4 = 169.6 s covers the slowest two.
-#
-# Sized to the worst phase on purpose. It is a prior, not a prediction: it
-# governs only until the first group of a phase completes, _save_group_rate
-# replaces it per phase with this machine's own number after one run, and an
-# over-estimate makes a run buy LESS rather than overrun -- the safe direction
-# for something whose whole contract is a wall clock.
-#
-# ROWS-PER-GROUP, not batch_size, is the denominator -- and getting that wrong
-# was expensive. _load_group_rate has only the batch size to work with, but
-# batch_size is a MAXIMUM: _annotation_groups packs by char budget too, closing
-# an Ollama group at ~5 rows on the ~1,900-char event candidates and an Apple FM
-# group at 1-2. Charging the prior for 8 rows a group does not hold measured a
-# ~3.6x over-estimate on the event phase after _OLLAMA_ANNOTATE_CHAR_BUDGET and
-# the schema retry landed (the banked worst group came out at 46.7 s against
-# this prior's 169.6 s), and because reserve() plans off the prior until a
-# phase's FIRST group completes, phase 3a stopped dispatching with 3.4 of its
-# 4.6 minutes unused on a cold DB -- which phase 3b then spent instead. So the
-# dispatch loops call _GroupRate.denominate with the mean rows-per-group of the
-# packing they just built: free (they hold the groups already), no new constant,
-# and it fixes the same over-estimate on both backends at once.
-#
-# The margin stays one-sided, which is the point: at ~5 rows the prior is
-# ~106 s against that measured 46.7 s worst group, still ~2.3x conservative,
-# and it governs only until the first group completes. 5.3 itself is
-# deliberately unchanged -- lowering the constant trades a self-healing
-# first-run under-buy for a risk of overrunning the wall clock, and would want
-# its own measurement across phases and backends rather than a division done
-# here. See the round-2 entry in docs/DECISIONS.md.
-_COLD_GROUP_SECONDS_PER_CHUNK = 5.3
-
-
-def _mean_group_rows(groups):
-    """Mean rows per group of a packing that has already been built -- the
-    denominator _GroupRate.denominate wants, since _annotation_groups' char
-    budget can close a group well before batch_size. 0.0 for an empty packing,
-    which denominate() treats as "nothing to say".
-
-    The MEAN is deliberately the less conservative choice: a packing's
-    remainder group dilutes it below the typical dispatched group, where
-    _COLD_GROUP_SECONDS_PER_CHUNK was calibrated against WORST groups.
-    Affordable because the rescaled prior still measured ~2.3x over the banked
-    worst group; if a budgeted first run ever overruns its wall clock, making
-    this max(len(group)) is the first knob to reach for."""
-    if not groups:
-        return 0.0
-    return sum(len(group) for group in groups) / len(groups)
-
-
-def _group_rate_key(phase, model, batch_size, workers):
-    return f"annotate_group_seconds:{phase}:{model}:b{batch_size}:w{workers}"
-
-
-def _load_group_rate(con, phase, model, batch_size, workers):
-    """A _GroupRate primed with what an earlier run measured for this exact
-    (phase, model, batch, workers) shape.
-
-    Without a prior, reserve() returns 0.0 until the first group completes and
-    _pooled has by then committed 2x workers groups the gate cannot take back:
-    measured 2026-07-28, a 2-min budget landed at 4.4 min and phase 3b was
-    starved to zero. The gate cannot shrink that wave without changing
-    _pooled's backlog rule for every tier -- but it can stop dispatching into
-    it, which is exactly what having an estimate at group #1 buys.
-
-    The key carries batch and workers because the reserve is denominated in
-    group LATENCY, and both change it (4 concurrent requests against a
-    serializing Ollama each measure ~4x a lone one). It carries `phase` because
-    a run's phases have measurably different per-group costs -- their chunks are
-    different populations, the event candidates averaging ~1,900 chars against
-    the confidence upgrades' ~360 median, so the same batch_size buys a ~5-row
-    group in one phase and a full 8 in the other -- and one shared estimator
-    would let whichever phase ran first anchor the others wrong in both
-    directions.
-
-    `batch_size` in the key is a MAXIMUM, not the size of any particular group:
-    _annotation_groups also packs to _OLLAMA_ANNOTATE_CHAR_BUDGET, so a
-    long-chunk phase runs 4-6-row groups under a b8 key. That is fine and is
-    what the key is for -- it identifies the PACKING CONFIG, and every group a
-    run makes under one config is drawn from the same distribution, which is
-    all a per-group estimate needs. Rates banked under an older packing
-    self-heal rather than needing a migration: _save_group_rate stores the
-    worst group of each run unconditionally, so the first run under new packing
-    overwrites whatever the old one left.
-
-    The COLD fallback cannot be so relaxed about it, because it is arithmetic
-    rather than a measurement: batch_size is the only size it has here, so the
-    returned rate carries the constant along and a caller that has built its
-    groups calls _GroupRate.denominate with their real mean row count."""
-    raw = get_state(con, _group_rate_key(phase, model, batch_size, workers))
-    try:
-        prior = float(raw) if raw else None
-    except (TypeError, ValueError):
-        prior = None
-    if prior and prior > 0:
-        return _GroupRate(prior=prior)
-    return _GroupRate(
-        prior=_COLD_GROUP_SECONDS_PER_CHUNK * max(1, batch_size) * max(1, workers),
-        cold_per_chunk=_COLD_GROUP_SECONDS_PER_CHUNK, workers=workers)
-
-
-def _save_group_rate(con, rate, phase, model, batch_size, workers):
-    """Persist what this run actually measured, so the next one is not blind.
-    Only a MEASURED value is stored -- writing the prior back would freeze a
-    cold guess into the DB where nothing would ever correct it -- and the
-    slowest group rather than the mean, for the reason _GroupRate.worst gives.
-    Within a run the live mean still wins, so the conservative number only
-    governs the dispatches made before this run has measured anything."""
-    worst = rate.worst()
-    if not worst:
-        return
-    set_state(con, _group_rate_key(phase, model, batch_size, workers), repr(worst))
-    con.commit()
-
-
-class _DispatchDeadline:
-    """Deadline gate for a _pooled dispatch loop, sized so the groups still in
-    flight when it stops dispatching DRAIN inside the deadline.
-
-    Testing `now >= deadline` before each dispatch is not enough. _pooled holds
-    up to 2x workers groups (one when sequential) and every one of them still
-    finishes, is written and is committed after the generator stops yielding.
-    Measured 2026-07-27 at ANNOTATE_WORKERS=4, batch 8, qwen3.5:4b: +1.5 min
-    past a 5-min budget, +2.0 min past 2 min, +3.7 min past a 1-min apple
-    budget -- minutes, not the "one group, tens of seconds" the first cut
-    assumed. So the gate reserves that drain: the pool retires its backlog
-    `workers` at a time, i.e. (in_flight / workers) waves of the mean per-group
-    wall-clock of the groups that have ALREADY completed.
-
-    _pooled submits 2x workers groups before it yields the first result, and
-    those submissions all happen in the same instant, so a phase with nothing
-    to estimate from commits to that much work whatever the clock says. That
-    is what _GroupRate's `prior` is for: _load_group_rate hands the gate the
-    seconds-per-group an earlier run measured for the same model/batch/workers
-    (falling back to _COLD_GROUP_SECONDS_PER_CHUNK, which the dispatch loop then
-    denominates in its packing's real rows-per-group), so reserve() is honest at
-    group #1 and the wave is never committed blind. Each phase brings its OWN
-    `rate` under its own key -- 3a's event groups and 3b's confidence groups
-    are different populations, and one shared estimator would let whichever
-    phase ran first anchor the other wrong (see _load_group_rate).
-
-    `monotonic` is injected because the deadline and the gate must read the
-    SAME clock -- the tier tests patch their module's `time` with a fake one
-    that only advances when a fake LLM charges it.
-    """
-
-    def __init__(self, deadline, workers, monotonic=time.monotonic, rate=None):
-        self.deadline = deadline
-        self.workers = max(1, workers)
-        self.stopped = False
-        self.rate = rate if rate is not None else _GroupRate()
-        self._monotonic = monotonic
-        self._lock = threading.Lock()
-        self._dispatched = 0
-        self._finished = 0
-
-    def timed(self, request_fn):
-        """Wrap the per-group request so completions feed both the shared rate
-        and THIS gate's outstanding count."""
-        def run(group):
-            started = self._monotonic()
-            try:
-                return request_fn(group)
-            finally:
-                self.rate.record(self._monotonic() - started)
-                with self._lock:
-                    self._finished += 1
-        return run
-
-    def reserve(self):
-        """Seconds to drain what this gate still has in flight plus the group
-        about to join it -- 0 only when the rate has neither a measurement nor
-        a prior to plan with.
-
-        Counting the ACTUAL backlog rather than _pooled's 2x workers ceiling
-        matters at both ends: a phase starting with an empty pool would
-        otherwise reserve two full waves before its very first group and buy
-        nothing, while a phase in steady state is holding roughly that ceiling
-        anyway. The estimate is over group LATENCY as observed under the run's
-        own concurrency, which is what makes this self-correcting on a
-        serializing Ollama: 4 concurrent requests each measure ~4x a lone one,
-        and dividing by `workers` puts the throughput back."""
-        mean = self.rate.estimate()
-        if not mean:
-            return 0.0
-        with self._lock:
-            outstanding = max(0, self._dispatched - self._finished) + 1
-        # At least one wave: a lone group takes a full latency however many
-        # workers are idle.
-        return max(1.0, outstanding / self.workers) * mean
-
-    def dispatchable(self, groups):
-        """Yield from `groups` until the reserved drain would cross the
-        deadline. _pooled consumes its items on the CALLER's thread (its
-        documented contract), so a generator that simply stops yielding is
-        exactly the semantics wanted: the clock is read immediately before a
-        group is handed to the pool, and everything already dispatched still
-        completes and commits."""
-        for group in groups:
-            if self._monotonic() + self.reserve() >= self.deadline:
-                self.stopped = True
-                return
-            with self._lock:
-                self._dispatched += 1
-            yield group
-
-
 # ---------------------------------------------------------------------------
 # Chunk annotation
 # ---------------------------------------------------------------------------
@@ -602,24 +281,20 @@ def _pending_chunks(con, all_chats, top_dyads, limit, upgrade_distilled=False):
 
 
 def _check_model_guard(con, model, table="chunk_annotations", predicate="1"):
-    """Refuse to mix annotation models within one artifact (same shape as
-    chunking.build_vec_table's embedding guard). `predicate` narrows the count
-    to the rows this model actually produced (dyad_terms holds uncurated rows
-    too). Records the chosen model when proceeding."""
-    prev = get_state(con, "annotate_model")
-    if prev and prev != model:
-        n = con.execute(
-            f"SELECT COUNT(*) FROM {table} WHERE {predicate}").fetchone()[0]
-        if n:
-            print(
-                f"{table} holds {n} rows annotated by {prev}, but the "
-                f"model is now {model}. Mixing annotation models skews every "
-                f"downstream aggregate -- clear {table} (or reset_db.py) "
-                f"to switch, or rerun with --model {prev}."
-            )
-            raise SystemExit(1)
-    set_state(con, "annotate_model", model)
-    con.commit()
+    """Refuse to mix annotation models within one artifact -- db.check_model_guard
+    (the shared shape, also chunking.build_vec_table's embedding guard) with this
+    pipeline's key, table and remedy sentence. `predicate` narrows the count to
+    the rows this model actually produced (dyad_terms holds uncurated rows too).
+    Records the chosen model when proceeding."""
+    check_model_guard(
+        con, key="annotate_model", model=model, table=table, predicate=predicate,
+        message=(
+            "{table} holds {n} rows annotated by {prev}, but the "
+            "model is now {model}. Mixing annotation models skews every "
+            "downstream aggregate -- clear {table} (or reset_db.py) "
+            "to switch, or rerun with --model {prev}."
+        ),
+    )
 
 
 def _ensure_column(con, table, column, dry_run=False):
@@ -1044,255 +719,6 @@ def annotate_chunks(con, model, all_chats=False, top_dyads=ANNOTATE_TOP_DYADS,
 
 
 # ---------------------------------------------------------------------------
-# Dyad-term curation (--terms)
-# ---------------------------------------------------------------------------
-
-def _term_prompt(con, chat_id, term):
-    """Build the curation prompt for one term. Main-thread SQL because sqlite
-    connections aren't shared across threads; that costs nothing -- the LIKE
-    rides idx_messages_chat_date and measures ~2ms at 350k messages, against
-    seconds for the LLM call it feeds. ESCAPE: a term is tokenizer output so
-    '%'/'_' are vanishingly unlikely, but an unescaped one would silently
-    match everything."""
-    examples = [r[0] for r in con.execute(
-        "SELECT text FROM messages "
-        "WHERE chat_id = ? AND text LIKE '%' || ? || '%' ESCAPE '\\' LIMIT 3",
-        (chat_id, _like_escape(term)),
-    )]
-    return f'Term: "{term}"\n\nExample messages from this chat:\n' + (
-        "\n".join(f"- {t[:200]}" for t in examples) or "(none found)"
-    )
-
-
-def _curate_one(prompt, model, think):
-    """One single-term request -> (verdict, reason). reason is None on success
-    and otherwise says why there is no verdict: an unparseable reply and a
-    well-formed reply naming a bogus verdict are different failures (a bad
-    prompt vs a bad model) and used to be reported identically as `None`."""
-    data = ollama.chat_once_json(
-        [{"role": "system", "content": _TERMS_SYSTEM},
-         {"role": "user", "content": prompt}],
-        model=model, think=think, timeout=ANNOTATE_TIMEOUT,
-        retry_nudge=_TERMS_NUDGE,
-    )
-    if not isinstance(data, dict):
-        return None, "no JSON object in reply (and the retry nudge also failed)"
-    verdict = data.get("verdict")
-    if verdict not in TERM_VERDICTS:
-        return None, f"reply had no valid verdict (got {verdict!r})"
-    return verdict, None
-
-
-def _curate_batch(group, model, think):
-    """One JSON-mode request classifying several terms at once; returns
-    {index: verdict} for the entries the reply actually covered -- the caller
-    retries the rest individually. Keyed by position, not by the term text:
-    positions can't collide or need escaping."""
-    user = "\n\n".join(f"### term {i}\n{prompt}"
-                       for i, (_chat_id, _term, prompt) in enumerate(group))
-    data = ollama.chat_once_json(
-        [{"role": "system", "content": _TERMS_BATCH_SYSTEM},
-         {"role": "user", "content": user}],
-        model=model, think=think, timeout=ANNOTATE_TIMEOUT,
-        retry_nudge=_TERMS_BATCH_NUDGE,
-    )
-    if not isinstance(data, dict):
-        return {}
-    return {i: data.get(str(i)) for i in range(len(group))
-            if data.get(str(i)) in TERM_VERDICTS}
-
-
-def _curate_group(group, model, think):
-    """All LLM work for one group of (chat_id, term, prompt) items: a batched
-    request for a multi-term group -- falling back to a single-term request
-    for any entry it missed or mangled -- or just the single request for a
-    singleton. Once _GROUP_GIVEUP fallbacks in a row have failed, the rest of
-    the group is abandoned unattempted (reason `_ABANDONED`) rather than
-    fanned out into more doomed requests. Runs on worker threads; returns
-    {index: (verdict, reason)}."""
-    batched = _curate_batch(group, model, think) if len(group) > 1 else {}
-    out = {}
-    misses = 0
-    for i, (_chat_id, _term, prompt) in enumerate(group):
-        if i in batched:
-            out[i] = (batched[i], None)
-            misses = 0
-        elif misses >= _GROUP_GIVEUP:
-            out[i] = (None, _ABANDONED)
-        else:
-            verdict, reason = _curate_one(prompt, model, think)
-            out[i] = (verdict, reason)
-            misses = 0 if verdict is not None else misses + 1
-    return out
-
-
-def _term_groups(con, rows, batch_size):
-    """Lazily yield batches of (chat_id, term, prompt), never spanning chats:
-    a batch shares one system prompt that says 'in one text-message chat', and
-    mixing chats would make the examples contradict it. Lazy so the per-term
-    prompt SQL stays interleaved with the LLM calls (rows arrive ordered by
-    chat_id, so a plain run-length walk groups them)."""
-    group = []
-    for chat_id, term in rows:
-        if group and group[0][0] != chat_id:
-            yield group
-            group = []
-        group.append((chat_id, term, _term_prompt(con, chat_id, term)))
-        if len(group) >= batch_size:
-            yield group
-            group = []
-    if group:
-        yield group
-
-
-def _report_parked(parked, max_failures):
-    """Name the terms this run parked. The header printed the pre-existing
-    parked count, but a long run scrolls it away -- and a term going quiet
-    forever should not be something you have to query SQL to discover."""
-    if not parked:
-        return
-    shown = ", ".join(parked[:10]) + (" ..." if len(parked) > 10 else "")
-    print(f"  parked {len(parked)} terms at {max_failures} failures "
-          f"({shown}); --retry-failed to retry them")
-
-
-def curate_terms(con, model, limit=None, dry_run=False, think=False, workers=1,
-                 batch_size=1, max_failures=ANNOTATE_TERMS_MAX_FAILURES,
-                 retry_failed=False):
-    # dry_run is forwarded so a preview keeps the no-writes promise on a DB
-    # from before the column (the migration is a write, and create_schema also
-    # rescans reactions -- same contract as the distilled/hybrid callers).
-    # has_failures is False only under --dry-run: the real path migrates, so
-    # every read past the dry-run return below can rely on the column. A
-    # pre-column DB has no recorded failures, which is what each degraded read
-    # says: nothing parked, nothing to unpark, every unverdicted term pending.
-    has_failures = _ensure_column(con, "dyad_terms", "curate_failures",
-                                  dry_run=dry_run)
-    if retry_failed and dry_run:
-        # --dry-run promises no writes, and unparking during a *preview* is
-        # worse than a stray write: the preview spends the parking state, so
-        # the next bare --terms run re-attempts those terms at full price --
-        # the loop this pipeline exists to close.
-        (n_would,) = con.execute(
-            "SELECT COUNT(*) FROM dyad_terms "
-            "WHERE llm_verdict IS NULL AND curate_failures > 0"
-        ).fetchone() if has_failures else (0,)
-        print(f"--retry-failed: would unpark {n_would} terms (--dry-run: not written)")
-    elif retry_failed:
-        n_reset = con.execute(
-            "UPDATE dyad_terms SET curate_failures = 0 "
-            "WHERE llm_verdict IS NULL AND curate_failures > 0").rowcount
-        con.commit()
-        print(f"--retry-failed: unparked {n_reset} terms")
-    # Parked terms (curate_failures at the cap) are deliberately NOT pending:
-    # a term that has already failed max_failures times -- each failure costing
-    # two requests, since chat_once_json retries once -- would otherwise be
-    # re-attempted at full price by every run forever.
-    n_parked = con.execute(
-        "SELECT COUNT(*) FROM dyad_terms "
-        "WHERE llm_verdict IS NULL AND curate_failures >= ?", (max_failures,)
-    ).fetchone()[0] if has_failures else 0
-    # --retry-failed lifts the ceiling: after the unpark above every term sits
-    # at 0 anyway, and under --dry-run (which skipped the unpark) the preview
-    # must still show the scope the real run would take.
-    ceiling = float("inf") if retry_failed else max_failures
-    parked_filter = "AND curate_failures < ? " if has_failures else ""
-    sql = ("SELECT chat_id, term FROM dyad_terms "
-           f"WHERE llm_verdict IS NULL {parked_filter}"
-           "ORDER BY chat_id, term")
-    params = [ceiling] if has_failures else []
-    if limit is not None:
-        sql += " LIMIT ?"
-        params.append(limit)
-    rows = con.execute(sql, params).fetchall()
-    settings = f"model {model}, think {think!r}"
-    if batch_size > 1:
-        settings += f", batch {batch_size}"
-    if workers > 1:
-        settings += f", workers {workers}"
-    print(f"{len(rows)} dyad terms pending curation ({settings})")
-    if n_parked and not retry_failed:
-        print(f"  ({n_parked} parked after {max_failures} failed attempts; "
-              f"--retry-failed to retry them)")
-    if dry_run:
-        preview = ", ".join(f"{chat_id}:{term}" for chat_id, term in rows[:10])
-        print(f"--dry-run: first terms: {preview or '(none)'}")
-        return 0
-    if not rows:
-        return 0
-    # Verdicts are model-derived and survive dyad_terms rebuilds, exactly like
-    # chunk_annotations rows -- so they get the same anti-mixing guard.
-    _check_model_guard(con, model, "dyad_terms", "llm_verdict IS NOT NULL")
-
-    n_done = n_skipped = 0
-    parked = []
-    try:
-        with progress.track("Curating terms", total=len(rows), header=False) as p:
-            for group, results in _pooled(
-                    _term_groups(con, rows, batch_size),
-                    lambda g: _curate_group(g, model, think), workers):
-                for i, (chat_id, term, _prompt) in enumerate(group):
-                    verdict, reason = results[i]
-                    if verdict is None:
-                        n_skipped += 1
-                        # An abandoned term never got its own request, so it
-                        # is still pending, not failing -- don't charge it.
-                        # Every other miss did get a dedicated request (the
-                        # batch fallback), so the counter only ever records
-                        # failures a single term actually earned.
-                        if reason is not _ABANDONED:
-                            con.execute(
-                                "UPDATE dyad_terms SET curate_failures = "
-                                "curate_failures + 1 WHERE chat_id = ? AND term = ?",
-                                (chat_id, term),
-                            )
-                            (n_fail,) = con.execute(
-                                "SELECT curate_failures FROM dyad_terms "
-                                "WHERE chat_id = ? AND term = ?",
-                                (chat_id, term)).fetchone()
-                            if n_fail >= max_failures:
-                                parked.append(f"{chat_id}:{term}")
-                        print(f"  term {chat_id}:{term}: {reason}, skipped")
-                        if n_done == 0 and n_skipped >= _TERMS_ABORT_AFTER:
-                            # Nothing committed yet (the cadence below waits
-                            # for a first success), so this really does undo
-                            # every counter this run wrote.
-                            con.rollback()
-                            raise SystemExit(
-                                f"Aborting: the first {n_skipped} terms all failed "
-                                f"and none succeeded -- that is a configuration "
-                                f"problem, not {n_skipped} bad terms, so no failure "
-                                f"counters were recorded. Check that model {model!r} "
-                                f"is pulled and answers JSON; if it is gpt-oss, "
-                                f"think={think!r} yields empty replies -- set "
-                                f"ANNOTATE_TERMS_THINK=low."
-                            )
-                    else:
-                        con.execute(
-                            "UPDATE dyad_terms SET llm_verdict = ? "
-                            "WHERE chat_id = ? AND term = ?",
-                            (verdict, chat_id, term),
-                        )
-                        n_done += 1
-                    p.advance()
-                    # Both branches write, so the cadence counts both -- but
-                    # not before a first success, so the abort above can roll
-                    # back cleanly whatever ANNOTATE_COMMIT_EVERY is set to.
-                    if n_done and (n_done + n_skipped) % ANNOTATE_COMMIT_EVERY == 0:
-                        con.commit()
-    except KeyboardInterrupt:
-        con.commit()
-        print(f"\nInterrupted -- committed {n_done} verdicts "
-              f"({n_skipped} skipped); rerun to resume.")
-        _report_parked(parked, max_failures)
-        return n_done
-    con.commit()
-    print(f"Curated {n_done} terms ({n_skipped} skipped)")
-    _report_parked(parked, max_failures)
-    return n_done
-
-
-# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1353,7 +779,9 @@ def _resolve_terms_think():
     return _parse_think(ANNOTATE_TERMS_THINK) if ANNOTATE_TERMS_THINK else False
 
 
-def main(argv=None):
+def _build_parser():
+    """The CLI's flag surface, extracted from main() so it is greppable and
+    testable on its own."""
     parser = argparse.ArgumentParser(
         description="Batch LLM annotation of conversation chunks (or dyad-term "
                     "curation with --terms). Resumable; Ctrl-C commits progress.")
@@ -1389,6 +817,11 @@ def main(argv=None):
                              "terms so this run retries them")
     parser.add_argument("--dry-run", action="store_true",
                         help="print the pending scope and exit without LLM calls or writes")
+    return parser
+
+
+def main(argv=None):
+    parser = _build_parser()
     args = parser.parse_args(argv)
 
     model = args.model or ANNOTATE_MODEL
@@ -1502,3 +935,9 @@ def main(argv=None):
 
 if __name__ == "__main__":
     run_cli(main)
+
+
+# --terms is its own pipeline and lives in annotate_terms; re-exported so
+# annotate.curate_terms keeps resolving. Bottom import: annotate_terms
+# late-binds the prompts and helpers defined above.
+from annotate_terms import curate_terms  # noqa: E402,F401

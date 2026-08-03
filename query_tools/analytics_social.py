@@ -21,6 +21,7 @@ import contextlib
 import datetime
 import statistics
 
+import stats
 from db import CONTACT_LABEL_SQL, TAPBACK_NAMES, tapback_name
 
 from ._shared import (
@@ -315,7 +316,7 @@ def _hall_of_fame(con, chat_ids, date_from, date_to, type_code, limit,
 
 def get_reaction_stats(chat_id=None, handle_id=None, contact_id=None,
                        date_from=None, date_to=None, include=None,
-                       reaction_type=None, limit=10, exclude_chat_id=None):
+                       reaction_type=None, limit=10, exclude_chat_id=None) -> dict:
     """Tapback statistics in one call: `given` (reactions I sent: total,
     per-type, rate per 100 messages received), `received` (reactions on my
     messages: total, per-type, rate per 100 messages sent), `reciprocity`
@@ -403,21 +404,9 @@ def _fetch_message(con, where, params, direction="ASC", offset=0):
     return _receipt(row)
 
 
-def _next_occurrence(first_date, ref):
-    """Next calendar occurrence of first_date's month-day on/after ref.
-    A Feb 29 first contact celebrates on Feb 28 in common years."""
-    for year in (ref.year, ref.year + 1):
-        try:
-            candidate = first_date.replace(year=year)
-        except ValueError:
-            candidate = datetime.date(year, 2, 28)
-        if candidate >= ref:
-            return candidate
-
-
 def _anniversary_fields(first_iso, ref):
     first_date = datetime.date.fromisoformat(first_iso[:10])
-    candidate = _next_occurrence(first_date, ref)
+    candidate = stats.next_occurrence(first_date, ref)
     return {
         "next_anniversary": candidate.isoformat(),
         "years": candidate.year - first_date.year,
@@ -428,7 +417,7 @@ def _anniversary_fields(first_iso, ref):
 def _upcoming_anniversaries(con, ref, limit):
     """Unscoped anniversaries: contacts whose first-ever message month-day
     falls within _ANNIVERSARY_WINDOW_DAYS after ref (year wrap handled by
-    _next_occurrence), min _ANNIVERSARY_MIN_MESSAGES lifetime messages
+    stats.next_occurrence), min _ANNIVERSARY_MIN_MESSAGES lifetime messages
     *from them* -- from-me rows carry no handle, so my side can't be
     attributed to a person without a per-chat expansion."""
     people = {}
@@ -516,7 +505,7 @@ def _earliest_phrase(con, where, params, phrase):
 
 
 def get_milestones(chat_id=None, handle_id=None, contact_id=None, phrase=None,
-                   n=None, reference_date=None, limit=10):
+                   n=None, reference_date=None, limit=10) -> dict:
     """Relationship milestones in one call: `firsts` (first/last message in
     scope plus each side's first, with text), `nth` (the nth message when n
     is given, else landmark messages at 1000/5000/10000/25000/50000),

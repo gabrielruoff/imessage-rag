@@ -28,6 +28,7 @@ import random
 import time
 
 import annotate
+import annotate_quota
 import progress
 from config import (
     ANNOTATE_COMMIT_EVERY,
@@ -281,44 +282,14 @@ def _corpus_quotas(pool_by_chat, corpus_sizes, n):
     the lopsidedness exactly (measured: 0.58% WORSE than uniform, which is why
     the earlier "stratifying the index sample would be chasing noise" note was
     right about the thing it was actually about, and does not extend to this).
-    Remainders are compared as exact integers, never floats, so the tie-break
-    cannot drift."""
-    quota = dict.fromkeys(pool_by_chat, 0)
-    room = {c: len(ids) for c, ids in pool_by_chat.items() if ids}
-    remaining = min(n, sum(room.values()))
-    while remaining > 0 and room:
-        # Weight is the corpus share; a chat the corpus no longer knows about
-        # still gets a floor of 1 so it cannot become unreachable.
-        weights = {c: max(1, corpus_sizes.get(c, 0)) for c in room}
-        total = sum(weights.values())
-        parts = []
-        for chat, cap_c in room.items():
-            num = remaining * weights[chat]
-            parts.append([chat, min(num // total, cap_c), num % total])
-        extra = max(0, remaining - sum(p[1] for p in parts))
-        for part in sorted(parts, key=lambda p: (-p[2], _chat_sort_key(p[0])))[:extra]:
-            if part[1] < room[part[0]]:
-                part[1] += 1
-        progressed = False
-        for chat, add, _rem in parts:
-            if not add:
-                continue
-            quota[chat] += add
-            remaining -= add
-            room[chat] -= add
-            progressed = True
-        room = {c: k for c, k in room.items() if k > 0}
-        if not progressed:
-            # A pathological weight/room combination could round every share to
-            # zero; hand the rest out in a fixed order rather than spin.
-            for chat in sorted(room, key=_chat_sort_key):
-                if remaining <= 0:
-                    break
-                take = min(remaining, room[chat])
-                quota[chat] += take
-                remaining -= take
-            break
-    return quota
+    The rounding itself lives in annotate_quota.apportion, shared with the seed
+    sampler's own allocation -- including the exact-integer remainders that keep
+    the tie-break from drifting."""
+    # Weight is the corpus share; annotate_quota floors each weight at 1, so a
+    # chat the corpus no longer knows about cannot become unreachable.
+    return annotate_quota.apportion(
+        {c: len(ids) for c, ids in pool_by_chat.items()},
+        corpus_sizes, n, _chat_sort_key)
 
 
 def _sample_seed_ids(seed_ids, cap, floor=_KNN_MIN_SEEDS, chat_of=None,
@@ -350,40 +321,20 @@ def _sample_seed_ids(seed_ids, cap, floor=_KNN_MIN_SEEDS, chat_of=None,
     used unchanged -- that fallback is what every existing caller and test
     still exercises.
 
-    Why it was needed, measured 2026-07-30 on the two real corpora: the pool is
-    every source='llm' row -- sampler seeds, phase-3 upgrades and rows
-    inherited from an earlier scoped LLM run alike -- so it is neither random
-    nor stratified, and an earlier version of this docstring claiming "the pool
-    a tier feeds this is already stratified by its own sampler" was wrong on
-    any corpus with inherited rows. On the 25,029-chunk reference corpus ALL
-    4,416 llm rows sit in ONE chat (38.2% of the corpus), so the shipped index
-    represented 1 of 532 chats and the other 61.8% of the corpus was classified
-    by a vote drawn entirely from one dyad -- a chunk in that chat sat 0.1120
-    from its nearest seed against 0.2718 for a chunk anywhere else, 2.43x
-    further. On the 74,233-chunk corpus that has actually run the hybrid tier:
-    uniform gave 58 of 535 chats at 0.1554 mean nearest-seed distance and 548.0
-    summed deviation from proportional; this draw gives 73 chats at 0.1478 and
-    165.4, against a salt-to-salt noise floor of ~0.0005.
+    Why it is needed: the pool is every source='llm' row -- sampler seeds,
+    phase-3 upgrades and rows inherited from an earlier scoped LLM run alike --
+    so it is neither random nor stratified. Measured 2026-07-30, ALL 4,416 llm
+    rows on the 25,029-chunk reference corpus sit in ONE chat, so a uniform draw
+    gave the other 61.8% of the corpus a vote from a dyad it has nothing to do
+    with. The redistribution has a named cost -- the dominant chat's own chunks
+    get slightly worse coverage so every other chat's gets better -- and
+    ANNOTATE_KNN_INDEX_CAP = 0 turns the cap, and so this draw, off entirely.
 
-    The redistribution is deliberate and has a named cost: on that corpus the
-    dominant chat's own chunks go from 0.1216 to 0.1283 (5.5% worse) to move
-    the other 531 chats from 0.1766 to 0.1601 (9.3% better). A corpus that
-    really is one person may not want that trade; ANNOTATE_KNN_INDEX_CAP = 0
-    turns the cap -- and so this draw -- off entirely.
-
-    Scope of the claim: this is a GEOMETRY result, not a demonstrated label
-    win. Neither corpus holds held-out LLM labels outside the dominant chat, so
-    accuracy off the corpus's other 61.8% cannot be measured, and the cap's own
-    documented churn (below) means any new draw is a third sample of the same
-    urn. What the cap costs the labels, measured 2026-07-28 (2,000 held-out
-    chunks re-classified at a 4,416 pool, capped vs uncapped): valence r=0.90,
-    depth 85.1%, top-1 emotion 59.1% -- against a control where a DIFFERENT
-    800-sample disagrees by the same margins (r=0.90, top-1 58.0%), so that is
-    the vote's own sensitivity to which seeds are in the urn and not a cost the
-    cap adds. Those figures are sample-dependent: a contiguous chunk-id block
-    (chat-correlated, so a harder case) measured r=0.738 / 65.0% / 39.6%. See
-    config.ANNOTATE_KNN_INDEX_CAP; the earlier "~1% at k=10" claim was wrong
-    and is retracted there."""
+    Scope of the claim: a GEOMETRY result, not a demonstrated label win, and it
+    cannot fix a pool that is genuinely single-chat (widening the POOL is the
+    seed sampler's job). Numbers, and what capping costs the labels against the
+    control of simply resampling the pool: docs/DECISIONS.md, "the kNN index
+    inherited one dyad, and the cap made it permanent"."""
     n = min(len(seed_ids), max(cap, floor))
     if cap <= 0 or n >= len(seed_ids):
         return set(seed_ids)

@@ -42,6 +42,7 @@ import db
 import ollama
 import progress
 import query_tools
+import stats
 import wellbeing  # --- feature: wellbeing --- (RES-68 / W4): narrative scrub
 import wrapped_html
 import wrapped_sections
@@ -103,11 +104,6 @@ def _tool(name, /, **kwargs):
         if result.get("available") is False:
             return None, f"{name}: data not available"
     return result, None
-
-
-def _month_index(ym):
-    """'YYYY-MM...' -> monotonic month number (year*12 + month)."""
-    return int(ym[:4]) * 12 + int(ym[5:7])
 
 
 def parse_exclude_spec(spec):
@@ -195,7 +191,7 @@ def silent_exclusions(con, roster, min_messages=None, silent_months=None):
     corpus_end = con.execute("SELECT MAX(date) FROM messages").fetchone()[0]
     if not corpus_end:
         return list(roster), []
-    end_idx = _month_index(corpus_end)
+    end_idx = stats.month_index(corpus_end)
     kept, excluded = [], []
     for entry in roster:
         if entry["contact_id"] is not None:
@@ -216,7 +212,7 @@ def silent_exclusions(con, roster, min_messages=None, silent_months=None):
         if last_date is None or lifetime < min_messages:
             kept.append(entry)
             continue
-        last_idx = _month_index(last_date)
+        last_idx = stats.month_index(last_date)
         if end_idx - last_idx < silent_months:
             kept.append(entry)
             continue
@@ -230,7 +226,7 @@ def silent_exclusions(con, roster, min_messages=None, silent_months=None):
             """,
             params,
         ).fetchall()
-        active = sum(1 for (ym,) in months if last_idx - 5 <= _month_index(ym) <= last_idx)
+        active = sum(1 for (ym,) in months if last_idx - 5 <= stats.month_index(ym) <= last_idx)
         if active >= 3:
             excluded.append({**entry, "last_month": last_date[:7]})
         else:
@@ -482,7 +478,9 @@ def _excluded_name_set(con, contact_ids, entries, name_specs):
     return names
 
 
-def main(argv=None):
+def _build_parser():
+    """The CLI's flag surface, extracted from main() so it is greppable and
+    testable on its own."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--year", type=int, help="scope the report to one calendar year")
     parser.add_argument("--contact", help="single-relationship deep-dive for this contact name")
@@ -499,6 +497,11 @@ def main(argv=None):
     parser.add_argument("--wellbeing", action="store_true",
                         help="include the opt-in wellbeing trajectory section")
     # --- end feature: wellbeing ---
+    return parser
+
+
+def main(argv=None):
+    parser = _build_parser()
     args = parser.parse_args(argv)
 
     # --- feature: wellbeing ---

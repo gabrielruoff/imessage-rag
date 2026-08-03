@@ -114,7 +114,7 @@ def _chunk_knn(con, query_vec, k, chat_ids, from_day, to_day, exclude_chunk_id=N
 
 
 def search_conversations(query: str, k=10, chat_id=None, handle_id=None, contact_id=None,
-                         date_from=None, date_to=None):
+                         date_from=None, date_to=None) -> list:
     """Semantic search over conversation chunks: embed the query and find the
     nearest chunk vectors. chat_id/handle_id/contact_id (single id or list
     each) scope to chats / a person's chats; date_from/date_to accept the
@@ -134,7 +134,7 @@ def search_conversations(query: str, k=10, chat_id=None, handle_id=None, contact
 
 
 def find_similar_conversations(chunk_id: int, k=10, chat_id=None, handle_id=None,
-                               contact_id=None, date_from=None, date_to=None):
+                               contact_id=None, date_from=None, date_to=None) -> list:
     """More-like-this: find conversation chunks semantically similar to an
     existing one, using its stored vector (no embedding request needed). The
     source chunk itself is excluded. Same scope/date filters as
@@ -156,7 +156,7 @@ def find_similar_conversations(chunk_id: int, k=10, chat_id=None, handle_id=None
     return _truncate_text_field(rows, CHUNK_PREVIEW_CHARS)
 
 
-def get_conversation(chunk_id: int):
+def get_conversation(chunk_id: int) -> dict | None:
     """Expand a chunk into its full messages: every message in the chunk's
     chat within the chunk's time window (so overlap-carried messages and
     system events that didn't render into the chunk text appear too).
@@ -223,7 +223,7 @@ def _fts_chunk_ranks(con, query, chat_ids, date_from, date_to):
 
 
 def search_messages_hybrid(query: str, k=10, chat_id=None, handle_id=None, contact_id=None,
-                           date_from=None, date_to=None):
+                           date_from=None, date_to=None) -> list:
     """Keyword (FTS5 over messages) and semantic (chunk vectors) search run
     together and fused with reciprocal-rank fusion; FTS hits vote for the
     chunk containing them. Returns ranked conversation chunks, each tagged

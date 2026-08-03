@@ -33,7 +33,6 @@ import contextlib
 import datetime
 import json
 import statistics
-import zoneinfo
 
 import config
 import wellbeing
@@ -46,7 +45,11 @@ from ._shared import (
     _connect,
     _normalize_date_bound,
     _validate_include,
+    contact_label as _contact_display_name,
+    is_late_night as _is_late_night,
+    local_tz as _local_tz,
     member_key,
+    month_bounds as _month_bounds,
 )
 
 # Envelope sections a caller may select via `include` (default: all). The other
@@ -87,24 +90,6 @@ _REPLY_LATENCY_NOTE = (
 
 
 # --------------------------------------------------------------------------
-# local-tz late-night bucketing (mirrors analytics_time; never SQL date funcs)
-# --------------------------------------------------------------------------
-
-def _local_tz():
-    name = config.LOCAL_TZ
-    return zoneinfo.ZoneInfo(name) if name else None
-
-
-def _is_late_night(hour):
-    """Local hour inside [LATE_NIGHT_START_HOUR, LATE_NIGHT_END_HOUR); a
-    start > end window wraps midnight."""
-    start, end = config.LATE_NIGHT_START_HOUR, config.LATE_NIGHT_END_HOUR
-    if start <= end:
-        return start <= hour < end
-    return hour >= start or hour < end
-
-
-# --------------------------------------------------------------------------
 # scope resolution
 # --------------------------------------------------------------------------
 
@@ -120,35 +105,9 @@ def _contact_chat_ids(con, handle_ids):
         f"WHERE handle_id IN ({placeholders})", handle_ids).fetchall()]
 
 
-def _contact_display_name(con, contact_id):
-    row = con.execute(
-        "SELECT COALESCE("
-        "NULLIF(nickname, ''), "
-        "NULLIF(TRIM(COALESCE(first_name, '') || ' ' || COALESCE(last_name, '')), '')"
-        ") FROM contacts WHERE id = ?", (contact_id,)).fetchone()
-    if row and row[0]:
-        return row[0]
-    handle = con.execute(
-        "SELECT handle_identifier FROM handles WHERE contact_id = ? "
-        "ORDER BY id LIMIT 1", (contact_id,)).fetchone()
-    return handle[0] if handle else f"contact {contact_id}"
-
-
 # --------------------------------------------------------------------------
 # date-range helpers
 # --------------------------------------------------------------------------
-
-def _month_bounds(date_from, date_to):
-    """Inclusive 'YYYY-MM' bounds for the lexicon month filter (mirrors
-    analytics_language._month_bounds)."""
-    lo = hi = None
-    if date_from is not None:
-        lo = _normalize_date_bound(date_from)[:7]
-    if date_to is not None:
-        upper = datetime.datetime.fromisoformat(_normalize_date_bound(date_to, upper=True))
-        hi = (upper - datetime.timedelta(microseconds=1)).strftime("%Y-%m")
-    return lo, hi
-
 
 def _date_bounds(date_from, date_to):
     lo = _normalize_date_bound(date_from) if date_from is not None else None
@@ -436,7 +395,7 @@ def _sanitize_text(text):
 
 
 def get_language_trajectory(contact=None, date_from=None, date_to=None,
-                            include=None, min_words=None):
+                            include=None, min_words=None) -> dict:
     """Detect a sustained, cross-family shift in someone's texting language --
     self by default, or a consent-gated contact.
 

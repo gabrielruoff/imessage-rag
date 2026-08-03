@@ -69,7 +69,9 @@ TABLES = [
 DROP_TABLES = ["chunk_vectors", "message_vectors"]
 
 
-def main() -> None:
+def _build_parser():
+    """The CLI's flag surface, extracted from main() so it is greppable and
+    testable on its own."""
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "-f",
@@ -77,6 +79,11 @@ def main() -> None:
         action="store_true",
         help="Skip the confirmation prompt.",
     )
+    return parser
+
+
+def main() -> None:
+    parser = _build_parser()
     args = parser.parse_args()
 
     if not DB_PATH.exists():

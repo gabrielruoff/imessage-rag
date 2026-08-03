@@ -22,7 +22,7 @@ from ._shared import (
 
 
 def search_messages_sql(chat_id=None, handle_id=None, contact_id=None, is_from_me=None,
-                         date_from=None, date_to=None, limit=50):
+                         date_from=None, date_to=None, limit=50) -> dict:
     """Structured filter search -- no text matching, just facets. chat_id and
     handle_id each accept a single id or a list of ids. contact_id (single or
     list) scopes to a person across every handle they own -- the way to search
@@ -67,7 +67,8 @@ def search_messages_sql(chat_id=None, handle_id=None, contact_id=None, is_from_m
     return _envelope(_truncate_text_field([dict(r) for r in rows]), total, "newest-first")
 
 
-def search_messages_fts(query: str, chat_id=None, handle_id=None, contact_id=None, limit=50):
+def search_messages_fts(query: str, chat_id=None, handle_id=None, contact_id=None,
+                        limit=50) -> dict:
     """Keyword/phrase search via FTS5 (supports FTS5 query syntax:
     'foo AND bar', '"exact phrase"', 'foo NOT bar', etc.). chat_id/handle_id
     accept a single id or a list; contact_id (single or list) scopes to a
@@ -106,7 +107,7 @@ def search_messages_fts(query: str, chat_id=None, handle_id=None, contact_id=Non
     )
 
 
-def get_message_context(message_id: int, before=10, after=10):
+def get_message_context(message_id: int, before=10, after=10) -> list:
     """The messages surrounding one message in its chat, in time order --
     turns any single search hit (FTS, SQL, or a message inside a chunk) into
     a readable stretch of conversation. The target row is flagged
@@ -144,7 +145,7 @@ def get_message_context(message_id: int, before=10, after=10):
     return _truncate_text_field(rows)
 
 
-def get_message_reactions(target_message_guid):
+def get_message_reactions(target_message_guid) -> list:
     """List the reactions/tapbacks on one or more messages (by guid), with who
     reacted. Accepts a single guid or a list of guids -- each returned row
     carries its `target_message_guid` so a batch result stays attributable.
@@ -174,7 +175,7 @@ def get_message_reactions(target_message_guid):
     return results
 
 
-def get_full_messages(ids):
+def get_full_messages(ids) -> list:
     """Return the full, untruncated text for one or more message ids.
     Use after a search result's `text` was truncated and the full content
     is needed."""

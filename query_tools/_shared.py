@@ -3,7 +3,9 @@ result-size ceilings, id-list/scope normalization, date-bound parsing, and
 the message SELECT fragments every message-returning tool shares."""
 
 import datetime
+import zoneinfo
 
+import config
 from config import TARGET_DB
 from db import CONTACT_LABEL_SQL, connect
 
@@ -93,6 +95,87 @@ def member_key(is_from_me, contact_id, handle_id, *, unknown="unknown"):
     if handle_id:
         return f"handle:{handle_id}"
     return unknown
+
+
+def contact_label(con, contact_id):
+    """Display name for a contacts row: nickname, else "First Last", else the
+    contact's lowest-id handle identifier, else a "contact <id>" placeholder.
+    The other direction of member_key -- key to label is `label_for_key`."""
+    row = con.execute(
+        "SELECT COALESCE("
+        "NULLIF(nickname, ''), "
+        "NULLIF(TRIM(COALESCE(first_name, '') || ' ' || COALESCE(last_name, '')), '')"
+        ") FROM contacts WHERE id = ?", (contact_id,)
+    ).fetchone()
+    if row and row[0]:
+        return row[0]
+    handle = con.execute(
+        "SELECT handle_identifier FROM handles WHERE contact_id = ? "
+        "ORDER BY id LIMIT 1", (contact_id,)
+    ).fetchone()
+    return handle[0] if handle else f"contact {contact_id}"
+
+
+def label_for_key(con, key, stored=None):
+    """Human-readable label for a member_key / counterpart_key string -- the
+    inverse of `member_key`, and its single home for the same reason.
+
+    `stored` is a label a derived table already resolved for this key
+    (`dyad_drift.label` is CONTACT_LABEL_SQL, the resolution every live
+    aggregate uses). It wins when non-empty, so a read tool always agrees with
+    the row it read the key from; pass None for a fresh lookup."""
+    if stored:
+        return stored
+    if key == "me":
+        return "Me"
+    if key == "*":
+        return "everyone"
+    kind, _, raw = key.partition(":")
+    if kind == "contact" and raw.isdigit():
+        return contact_label(con, int(raw))
+    if kind == "handle" and raw.isdigit():
+        row = con.execute(
+            "SELECT handle_identifier FROM handles WHERE id = ?", (int(raw),)
+        ).fetchone()
+        return row[0] if row and row[0] else key
+    if kind == "chat" and raw.isdigit():
+        row = con.execute(
+            "SELECT COALESCE(NULLIF(display_name, ''), chat_identifier) "
+            "FROM chats WHERE id = ?", (int(raw),)
+        ).fetchone()
+        return row[0] if row and row[0] else f"group chat {raw}"
+    return key
+
+
+def local_tz():
+    """Effective bucketing timezone: config.LOCAL_TZ (an IANA name) resolved
+    through zoneinfo, or None -- which astimezone() treats as the system local
+    zone. Read from config at call time (and kept as a function) so tests can
+    pin a zone deterministically."""
+    name = config.LOCAL_TZ
+    return zoneinfo.ZoneInfo(name) if name else None
+
+
+def is_late_night(hour):
+    """Local hour inside [LATE_NIGHT_START_HOUR, LATE_NIGHT_END_HOUR); a
+    start > end window wraps midnight (e.g. 22..5)."""
+    start, end = config.LATE_NIGHT_START_HOUR, config.LATE_NIGHT_END_HOUR
+    if start <= end:
+        return start <= hour < end
+    return hour >= start or hour < end
+
+
+def month_bounds(date_from, date_to):
+    """Inclusive 'YYYY-MM' bounds for filtering person_period_lexicon.month.
+    The upper bound backs off one microsecond from the half-open datetime bound
+    so date_to='2026-04-30' includes April but not May."""
+    lo = hi = None
+    if date_from is not None:
+        lo = _normalize_date_bound(date_from)[:7]
+    if date_to is not None:
+        upper = datetime.datetime.fromisoformat(_normalize_date_bound(date_to, upper=True))
+        hi = (upper - datetime.timedelta(microseconds=1)).strftime("%Y-%m")
+    return lo, hi
 
 
 def _truncate_text_field(rows, limit=TEXT_PREVIEW_CHARS):

@@ -35,7 +35,7 @@ import json
 
 import config
 
-from ._shared import _as_id_list, _connect, member_key
+from ._shared import _as_id_list, _connect, label_for_key as _label_for_key, member_key
 
 # The seven drift signals, in the pipeline's order. Duplicated locally on
 # purpose: the read layer must not import the root drift.py twin.
@@ -70,30 +70,6 @@ def _has_drift_table(con):
     return con.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='dyad_drift'"
     ).fetchone() is not None
-
-
-def _label_for_key(con, key, stored):
-    """Human-readable label for a member_key. Prefer the label D1 stored (it is
-    CONTACT_LABEL_SQL, the same resolution every live aggregate uses); fall back
-    to a fresh lookup, then to the key string itself."""
-    if stored:
-        return stored
-    kind, _, raw = key.partition(":")
-    if kind == "contact" and raw.isdigit():
-        row = con.execute(
-            "SELECT COALESCE("
-            "NULLIF(nickname, ''), "
-            "NULLIF(TRIM(COALESCE(first_name, '') || ' ' || COALESCE(last_name, '')), '')"
-            ") FROM contacts WHERE id = ?", (int(raw),)).fetchone()
-        if row and row[0]:
-            return row[0]
-    if kind == "handle" and raw.isdigit():
-        row = con.execute(
-            "SELECT handle_identifier FROM handles WHERE id = ?", (int(raw),)
-        ).fetchone()
-        if row and row[0]:
-            return row[0]
-    return key
 
 
 def _resolve_contact_key(con, contact_id, handle_id, chat_id):
@@ -234,7 +210,7 @@ def _narration(tier):
             "template": _TIER_TEMPLATE.get(tier, _TIER_TEMPLATE["low"])}
 
 
-def get_relationship_drift(contact_id=None, handle_id=None, chat_id=None):
+def get_relationship_drift(contact_id=None, handle_id=None, chat_id=None) -> dict:
     """How one 1:1 relationship is trending over time, read from the drift
     pipeline (dyad_drift) -- no re-scoring. Identify the relationship with
     exactly ONE of contact_id / handle_id / chat_id (each a scalar or list; a
@@ -340,7 +316,7 @@ def _normalize_phases(phase_filter):
     return normalized or None
 
 
-def get_fadeout_watchlist(limit=10, min_messages=0, phase_filter=None):
+def get_fadeout_watchlist(limit=10, min_messages=0, phase_filter=None) -> dict:
     """A leaderboard of relationships fading out, read from dyad_drift and
     PARTITIONED BY COVERAGE -- it never ranks across coverage. `watchlist` holds
     the rankable tier (mandatory signals all present), ordered by drift_score;
@@ -493,7 +469,7 @@ def _reconnection_memory_candidates(con, chat_ids):
     return out
 
 
-def get_reconnection_candidates(contact_id=None, handle_id=None, chat_id=None):
+def get_reconnection_candidates(contact_id=None, handle_id=None, chat_id=None) -> dict:
     """Surface CANDIDATE curated references for reconnecting with ONE 1:1
     relationship -- the grounding step before drafting a reconnection opener.
     This is prompt-only and human-in-the-loop: it NEVER writes an opener, never

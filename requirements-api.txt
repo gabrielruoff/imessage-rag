@@ -4,3 +4,6 @@
 fastapi==0.120.4
 uvicorn[standard]==0.38.0
 sse-starlette==2.4.1
+# Imported directly by api/models.py, so it is declared here rather than relied
+# on as a FastAPI transitive that a FastAPI bump could move.
+pydantic==2.13.4

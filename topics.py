@@ -280,7 +280,9 @@ def label_clusters(con, relabel=False, samples=TOPIC_LABEL_SAMPLES, model=None):
 # CLI
 # ---------------------------------------------------------------------------
 
-def main(argv=None):
+def _build_parser():
+    """The CLI's flag surface, extracted from main() so it is greppable and
+    testable on its own."""
     parser = argparse.ArgumentParser(
         description="K-means topic clustering over chunk embeddings, plus an "
                     "LLM label pass naming each cluster.")
@@ -291,6 +293,11 @@ def main(argv=None):
     parser.add_argument("--model", default=None,
                         help=f"Ollama model for the label pass "
                              f"(default {config.TOPIC_MODEL})")
+    return parser
+
+
+def main(argv=None):
+    parser = _build_parser()
     args = parser.parse_args(argv)
 
     con = _connect()

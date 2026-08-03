@@ -10,12 +10,26 @@ helpers from .persona_draft.
 """
 
 import contextlib
+import datetime
 
 import config
 import consent
+from db import tapback_name
 
-from ._shared import _connect, _normalize_date_bound
-from .persona import _STYLE_FEATURES, _clip, _lookup, _resolve_person
+from ._shared import (
+    HYBRID_POOL,
+    TEXT_PREVIEW_CHARS,
+    _REAL_MESSAGE_CLAUSES,
+    _connect,
+    _normalize_date_bound,
+)
+from .persona import (
+    _STYLE_FEATURES,
+    _clip,
+    _lookup,
+    _resolve_person,
+    collect_pairs as _collect_sim_pairs,
+)
 from .persona_draft import (
     _dyad_chats,
     _public_exemplars,
@@ -60,64 +74,12 @@ _SIM_BLOCK_MESSAGE = (
 )
 
 
-def _directed_reply_pairs(con, chunk_id, reply_from_me):
-    """reply_pairs_in_chunk generalized to EITHER direction: each real message
-    immediately followed (in (date, id) order over REAL rows -- emote/system rows
-    can neither anchor nor serve) by a real message from the requested speaker
-    becomes an (incoming -> reply) pair. reply_from_me selects WHOSE replies to
-    collect: 1 = the user's (past-self grounding), 0 = the counterpart's
-    (simulating a contact). Textless (attachment-only) rows on either side are
-    skipped. This is the same load-bearing adjacency rule as V2's
-    reply_pairs_in_chunk, just parameterized by direction."""
-    from ._shared import TEXT_PREVIEW_CHARS, _REAL_MESSAGE_CLAUSES
-
-    real = " AND ".join(_REAL_MESSAGE_CLAUSES)
-    rows = con.execute(
-        f"SELECT m.id, m.is_from_me, m.text, m.date FROM messages m "
-        f"WHERE m.chunk_id = ? AND {real} ORDER BY m.date, m.id",
-        (chunk_id,),
-    ).fetchall()
-    want = 1 if reply_from_me else 0
-    pairs = []
-    for i in range(len(rows) - 1):
-        cur_id, cur_me, cur_text = rows[i][0], rows[i][1], rows[i][2]
-        nxt_id, nxt_me, nxt_text = rows[i + 1][0], rows[i + 1][1], rows[i + 1][2]
-        if cur_me == (1 - want) and nxt_me == want and cur_text and nxt_text:
-            pairs.append({
-                "incoming": _clip(cur_text, TEXT_PREVIEW_CHARS),
-                "reply": _clip(nxt_text, TEXT_PREVIEW_CHARS),
-                "date": rows[i + 1][3],
-                "incoming_id": cur_id,
-                "reply_id": nxt_id,
-            })
-    return pairs
-
-
-def _collect_sim_pairs(con, chunk_ids, cap, reply_from_me):
-    """Directed reply pairs across chunk_ids in order, deduped by
-    (incoming_id, reply_id), capped at `cap`. The simulate-a-contact analogue of
-    _collect_pairs, but for the counterpart's replies (reply_from_me=0)."""
-    pairs, seen = [], set()
-    for cid in chunk_ids:
-        for pair in _directed_reply_pairs(con, cid, reply_from_me):
-            key = (pair["incoming_id"], pair["reply_id"])
-            if key in seen:
-                continue
-            seen.add(key)
-            pairs.append(pair)
-            if len(pairs) >= cap:
-                return pairs
-    return pairs
-
-
 def _window_reply_pairs(con, chat_ids, date_from, date_to, reply_from_me, cap):
     """Directed reply pairs from a raw (date, id)-ordered scan of chat_ids within
     [date_from, date_to), independent of chunks/vectors -- the past-self path's
     bounded raw rescan, so it works even before embedding. Same adjacency rule as
-    _directed_reply_pairs. Returns the MOST RECENT `cap` pairs (closest to the
+    persona.directed_reply_pairs. Returns the MOST RECENT `cap` pairs (closest to the
     window's end), public-shaped (no private ids)."""
-    from ._shared import TEXT_PREVIEW_CHARS, _REAL_MESSAGE_CLAUSES
-
     real = " AND ".join(_REAL_MESSAGE_CLAUSES)
     want = 1 if reply_from_me else 0
     collected = []
@@ -202,10 +164,6 @@ def _predict_tapback(con, chat_ids, handle_ids):
     reaction (that denominator conditions on a reaction and overstates every
     rate). Returns the modal tapback + per-type base rates, clearly an estimate,
     or None when there is nothing to normalize."""
-    from db import tapback_name
-
-    from ._shared import _REAL_MESSAGE_CLAUSES
-
     if not chat_ids or not handle_ids:
         return None
     real = " AND ".join(_REAL_MESSAGE_CLAUSES)
@@ -249,10 +207,6 @@ def _dormant_signal(con, chat_ids, handle_ids):
     Returns an evidence dict when it fires, else None. Uses the corpus's latest
     message as 'now' (the data has no real clock) and plain-string date compares
     only (never a SQL date function -- the load-bearing date rule)."""
-    import datetime
-
-    from ._shared import _REAL_MESSAGE_CLAUSES
-
     if not chat_ids or not handle_ids:
         return None
     real = " AND ".join(_REAL_MESSAGE_CLAUSES)
@@ -331,8 +285,6 @@ def _simulate_them(con, message, contact_id, handle_id, name, acknowledged):
         if dormant:
             out["deceased_warning"] = dormant
         return out
-
-    from ._shared import HYBRID_POOL, TEXT_PREVIEW_CHARS
 
     base = {"member_key": person_key, "counterpart_key": "me", "person": label,
             "subject": "them", "message": _clip(message, TEXT_PREVIEW_CHARS),
@@ -433,8 +385,6 @@ def _simulate_past_self(con, message, contact_id, handle_id, name, as_of_date):
                 "subject": "me", "as_of_date": as_of_date, "scope": scope_label,
                 "n_messages": n, "generated": False}
 
-    from ._shared import TEXT_PREVIEW_CHARS
-
     # Grounding: how YOU actually replied in the window (reply_from_me=1).
     pairs = _window_reply_pairs(con, chats, None, dt, reply_from_me=1,
                                cap=_SIM_EXEMPLAR_CAP)
@@ -481,7 +431,7 @@ def _simulate_past_self(con, message, contact_id, handle_id, name, as_of_date):
 
 
 def simulate_contact(message, contact_id=None, handle_id=None, name=None,
-                     subject="them", as_of_date=None, acknowledged=False):
+                     subject="them", as_of_date=None, acknowledged=False) -> dict:
     """ESTIMATE how a contact might reply in their voice, or talk to your PAST
     SELF as of a date. In-tool generation: the returned `simulation` is ALREADY
     wrapped in code (every line labeled an estimate, post-generation), so the

@@ -721,7 +721,9 @@ def _run_turn_events_apple(messages, model):
     yield {"type": "done", "reply": reply}
 
 
-def main(argv=None):
+def _build_parser():
+    """The CLI's flag surface, extracted from main() so it is greppable and
+    testable on its own."""
     parser = argparse.ArgumentParser(
         description="Chat with your iMessage history via a local Ollama model."
     )
@@ -746,6 +748,11 @@ def main(argv=None):
         "hit). Overrides CONFLICT_DV_SCREEN transiently.",
     )
     # --- end feature: conflict ---
+    return parser
+
+
+def main(argv=None):
+    parser = _build_parser()
     args = parser.parse_args(argv)
 
     # --- feature: conflict ---

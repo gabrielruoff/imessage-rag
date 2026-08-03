@@ -23,9 +23,7 @@ import collections
 import contextlib
 import datetime
 import statistics
-import zoneinfo
 
-import config
 from config import (
     DOUBLE_TEXT_MIN_MINUTES,
     INITIATION_GAP_HOURS,
@@ -49,21 +47,14 @@ from ._shared import (
     _restrict_to_direct_chats,
     _scope_requested,
     _validate_include,
+    is_late_night as _is_late_night,
+    local_tz as _local_tz,
 )
 
 _WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
                   "Saturday", "Sunday"]  # datetime.weekday() order
 _GRANULARITIES = ("day", "month", "year")
 _ACTIVITY_SECTIONS = ("heatmap", "volume_series", "late_night", "busiest_days", "streaks")
-
-
-def _local_tz():
-    """Effective bucketing timezone: config.LOCAL_TZ (an IANA name) resolved
-    through zoneinfo, or None -- which astimezone() treats as the system
-    local zone. Read from config at call time (and kept as a function) so
-    tests can pin a zone deterministically."""
-    name = config.LOCAL_TZ
-    return zoneinfo.ZoneInfo(name) if name else None
 
 
 def _tz_label(tz):
@@ -74,15 +65,6 @@ def _tz_label(tz):
 
 def _side(is_from_me):
     return "me" if is_from_me else "them"
-
-
-def _is_late_night(hour):
-    """Local hour inside [LATE_NIGHT_START_HOUR, LATE_NIGHT_END_HOUR); a
-    start > end window wraps midnight (e.g. 22..5)."""
-    start, end = LATE_NIGHT_START_HOUR, LATE_NIGHT_END_HOUR
-    if start <= end:
-        return start <= hour < end
-    return hour >= start or hour < end
 
 
 def _volume_section(series, granularity):
@@ -264,7 +246,7 @@ def _streaks_section(day_counts, drought):
 
 def get_activity_patterns(chat_id=None, handle_id=None, contact_id=None,
                           date_from=None, date_to=None, granularity="month",
-                          include=None, exclude_chat_id=None):
+                          include=None, exclude_chat_id=None) -> dict:
     """When-do-we-talk analytics, bucketed in the local timezone: `heatmap`
     (7x24 weekday-by-hour message counts), `volume_series` (per-period
     sent/received at granularity 'day'|'month'|'year'; a day series past
@@ -523,7 +505,7 @@ def _initiations_by_member(sess, group_ids, labels):
 
 
 def get_response_dynamics(chat_id=None, handle_id=None, contact_id=None,
-                          date_from=None, date_to=None):
+                          date_from=None, date_to=None) -> dict:
     """How the conversation moves, for one scope (required -- chat_id, or
     handle_id/contact_id covering that person's 1:1 chats): `reply_latency`
     (median/p90 seconds per side; only gaps shorter than INITIATION_GAP_HOURS

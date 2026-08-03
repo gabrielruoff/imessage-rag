@@ -414,7 +414,11 @@ def probe_block(case, transcript, calls, gt_entry):
 
 def _final_sentence(text):
     """Last sentence with content (a boundary is a run of .!? or newlines).
-    Empty for empty text."""
+    Empty for empty text.
+
+    Shares a name with nudge_detectors._final_sentence and is NOT the same
+    function: that one lowercases and KEEPS the terminator, because it matches a
+    stoplist whose entries carry their '?'. Kept separate deliberately."""
     segments = [s for s in re.split(r"[.!?]+\s*|\n+", text or "") if s.strip()]
     return segments[-1] if segments else ""
 

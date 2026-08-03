@@ -19,7 +19,7 @@ from ._shared import (
 )
 
 
-def search_contact_by_handle(handle_id=None, handle_identifier=None):
+def search_contact_by_handle(handle_id=None, handle_identifier=None) -> dict | None:
     """Look up contact info for a handle, plus every other handle the same contact owns."""
     if handle_id is None and handle_identifier is None:
         raise ValueError("must provide handle_id or handle_identifier")
@@ -63,7 +63,7 @@ def search_contact_by_handle(handle_id=None, handle_identifier=None):
     }
 
 
-def search_contacts_by_name(name: str, limit=20):
+def search_contacts_by_name(name: str, limit=20) -> list:
     """Find contacts by name or organization -- the bridge from a human name to
     the handle_id / chat_id values the other tools need. Returns each matched
     contact plus all handles (phone numbers/emails) it owns."""
@@ -95,7 +95,7 @@ def search_contacts_by_name(name: str, limit=20):
     return results
 
 
-def list_chats(query=None, chat_id=None, handle_id=None, contact_id=None, limit=50):
+def list_chats(query=None, chat_id=None, handle_id=None, contact_id=None, limit=50) -> list:
     """List chats (conversations) with resolved participant names -- the bridge
     from a person/chat name to a chat_id, and the way to label a chat_id. Pass
     chat_id (single id or list) to label specific chats you already have ids
@@ -184,7 +184,7 @@ def _stats_filters(prefix, chat_ids, handle_ids, is_from_me, date_from, date_to)
 
 def get_chat_summary_stats(chat_id=None, handle_id=None, contact_id=None,
                             is_from_me=None, date_from=None, date_to=None,
-                            group_by_chat=False, limit=25):
+                            group_by_chat=False, limit=25) -> dict | list:
     """Cheap aggregate stats -- no LLM call needed. chat_id (single id or
     list) aggregates across one or more chats. handle_id/contact_id (single
     or list) scopes to a person instead -- e.g. total messages exchanged with

@@ -62,7 +62,14 @@ from config import (
     TARGET_DB,
 )
 from consent import parse_consent_ids
-from db import CONTACT_LABEL_SQL, connect_default, get_state, run_cli, set_state
+from db import (
+    CONTACT_LABEL_SQL,
+    check_model_guard,
+    connect_default,
+    get_state,
+    run_cli,
+    set_state,
+)
 from nudge_shared import (  # noqa: F401 -- re-exported for tests / nudge_detectors
     DETECTORS,
     CandidateRow,
@@ -518,56 +525,32 @@ def _guard_llm_model(con, model, record=True):
     """Guard ONLY the LLM-derived columns (nudge_text / llm_verdict /
     llm_reason). The SQL-detected rows are model-free and are never touched.
 
-    REFUSES a model change while those columns hold anything, the same shape as
-    annotate._check_model_guard and conflict_detect._check_model_guard -- and,
-    like annotate's, only when there is something to protect. It used to clear
-    them and let the run regenerate, which the CHAT_MODEL default flip turned
-    from an opt-in into the upgrade path every existing user takes, since
-    NUDGES_MODEL inherits it. Two things were wrong with clearing:
+    REFUSES a model change while those columns hold anything -- the shared
+    db.check_model_guard shape, and like annotate's only when there is something
+    to protect. It used to CLEAR them and let the run regenerate; that was wrong
+    because `--limit N` re-narrates N threads while the clear wiped all of them,
+    and because it was unpreviewable (neither --dry-run nor --no-llm reaches
+    narration). See docs/DECISIONS.md, "two guards that destroyed what they
+    existed to protect".
 
-    * `--limit N` re-narrates N threads but the clear wiped ALL of them, so a
-      limited run left every other thread with no nudge_text at all -- and a
-      full re-narration is a real cost, one LLM call per open thread.
-    * It was silent and unpreviewable: --dry-run and --no-llm never reach
-      narrate_threads, so there was no way to see the deletion coming.
-
-    NOT a reason, though an earlier version of this docstring claimed it: that
-    the run could not regenerate what it cleared. It could. nudge_text is the
-    only one of the three columns with a writer at all -- nothing in the repo
-    writes llm_verdict or llm_reason (they are reserved for a future
-    model-backed detector), so the clear could only ever destroy narration,
-    which narrate_threads then rebuilt in the same run.
-
-    Refusing costs a user who genuinely wants to switch one explicit step, and
-    that is the trade every other model guard in this repo already makes.
-
-    `record=False` runs the REFUSAL half only, for the early call in main()
-    that fires BEFORE detection. The reason is dropped_plan: it is the one
-    model-backed detector, it spends NUDGES_MODEL LLM calls during DETECTION,
-    and it stamps the model it used into evidence_json.verified_by -- so a run
-    that is going to be refused has to be refused before it pays for and
-    records that. Recording stays with the narration pass, so a run that never
-    reaches narration (--dry-run, --no-llm, a refusal) leaves the key as it
-    found it -- the conflict_model precedent."""
-    prev = get_state(con, "loose_ends_model")
-    if prev and prev != model:
-        n = con.execute(
-            f"SELECT COUNT(*) FROM loose_threads WHERE {_LLM_COLUMNS_SET}"
-        ).fetchone()[0]
-        if n:
-            print(
-                f"loose_threads holds {n} rows whose LLM columns were produced "
-                f"by {prev}, but the model is now {model}. Mixing models in one "
-                f"digest makes the narration inconsistent -- rerun with "
-                f"--model {prev}, set NUDGES_MODEL={prev}, or clear the columns "
-                f"to switch:\n"
-                f"  UPDATE loose_threads SET nudge_text = NULL, "
-                f"llm_verdict = NULL, llm_reason = NULL;"
-            )
-            raise SystemExit(1)
-    if record:
-        set_state(con, "loose_ends_model", model)
-        con.commit()
+    `record=False` runs the REFUSAL half only, for main()'s early call BEFORE
+    detection: dropped_plan spends NUDGES_MODEL calls during DETECTION and
+    stamps the model into evidence_json.verified_by, so a run that will be
+    refused must be refused before it pays for that. Recording stays with the
+    narration pass, so a run that never narrates leaves the key untouched."""
+    check_model_guard(
+        con, key="loose_ends_model", model=model, table="loose_threads",
+        predicate=_LLM_COLUMNS_SET, record=record,
+        message=(
+            "loose_threads holds {n} rows whose LLM columns were produced "
+            "by {prev}, but the model is now {model}. Mixing models in one "
+            "digest makes the narration inconsistent -- rerun with "
+            "--model {prev}, set NUDGES_MODEL={prev}, or clear the columns "
+            "to switch:\n"
+            "  UPDATE loose_threads SET nudge_text = NULL, "
+            "llm_verdict = NULL, llm_reason = NULL;"
+        ),
+    )
 
 
 def _threads_needing_narration(con):
@@ -637,7 +620,9 @@ def narrate_threads(con, model, think, timeout, limit=None):
 # CLI
 # ---------------------------------------------------------------------------
 
-def main(argv=None):
+def _build_parser():
+    """The CLI's flag surface, extracted from main() so it is greppable and
+    testable on its own."""
     parser = argparse.ArgumentParser(
         description="Detect loose threads (nudges): SQL detectors behind an "
                     "exclusion gate, urgency-scored, with an optional one-line "
@@ -659,6 +644,11 @@ def main(argv=None):
                              "key so get_loose_threads stops hiding them, then "
                              "exits without running detection")
     # --- end detector: dormant_tie ---
+    return parser
+
+
+def main(argv=None):
+    parser = _build_parser()
     args = parser.parse_args(argv)
 
     model = args.model or NUDGES_MODEL

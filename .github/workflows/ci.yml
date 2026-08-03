@@ -1,5 +1,11 @@
 name: CI
 
+# History: this file shipped as `ci.yml.disabled` from 1e3a5f9 ("disable ci for
+# now", 2026-07-22) until the lean pass re-enabled it. No specific breakage was
+# recorded when it was turned off. It is back on deliberately: the suite is
+# hermetic (no Ollama, no real chat.db) and CLAUDE.md steers agents away from
+# running it locally, so CI is the only automated gate the repo has.
+#
 # No `paths:` filter on purpose: with one, a docs-only or Makefile-only PR
 # runs zero jobs, and a required status check that never runs blocks the PR
 # instead of passing it. The whole suite is hermetic and takes ~1 minute.

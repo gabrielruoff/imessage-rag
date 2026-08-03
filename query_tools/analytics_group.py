@@ -235,7 +235,7 @@ def _group_lsm_section(con, chat_ids, labels, date_from, date_to):
     return {"members": scores[:_MAX_MEMBER_ROWS]}
 
 
-def get_group_dynamics(chat_id, date_from=None, date_to=None, include=None):
+def get_group_dynamics(chat_id, date_from=None, date_to=None, include=None) -> dict:
     """Structural analytics for one GROUP chat. Sections (include=[...]
     selects): members (per-member message share and word counts, 'Me'
     included), gini (participation inequality, 0=equal, plus per-year

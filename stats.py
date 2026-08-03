@@ -20,6 +20,7 @@ replies as right-censored observations and use the survival estimators here
 (`kaplan_meier_median`, `frac_over_threshold`) instead of truncating the tail.
 """
 
+import datetime
 import math
 import random
 import statistics
@@ -259,3 +260,30 @@ def cusum_changepoints(series, *, k, h):
             s_hi = 0.0
             s_lo = 0.0
     return changepoints
+
+
+# --- calendar primitives (stdlib-only, shared by the pipelines and the read
+# tools so a month axis and an anniversary roll mean the same thing everywhere)
+
+
+def month_index(ym):
+    """'YYYY-MM' (or any longer ISO prefix like 'YYYY-MM-DD') -> a monotonic
+    month number, year*12 + month. Month distance is then plain subtraction, so
+    a trend x-axis reflects real elapsed time and a skipped month leaves a real
+    gap. Slices rather than splits, so a full date works unchanged."""
+    return int(ym[:4]) * 12 + int(ym[5:7])
+
+
+def next_occurrence(anchor, ref):
+    """The next calendar date on or after `ref` (a date) falling on `anchor`'s
+    month-day. A Feb 29 anchor lands on Feb 28 in a common year, so a recurring
+    occasion never silently vanishes for three years at a time. Returns a date,
+    or None if `ref` is somehow past both candidate years."""
+    for year in (ref.year, ref.year + 1):
+        try:
+            candidate = anchor.replace(year=year)
+        except ValueError:  # Feb 29 in a common year
+            candidate = datetime.date(year, 2, 28)
+        if candidate >= ref:
+            return candidate
+    return None
