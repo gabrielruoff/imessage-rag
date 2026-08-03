@@ -125,13 +125,6 @@ def _month(dt: datetime.datetime) -> str:
     return f"{dt.year:04d}-{dt.month:02d}"
 
 
-def _month_index(month: str) -> int:
-    """'YYYY-MM' -> integer month count, so the trend x-axis reflects real time
-    distance (a skipped month leaves a real gap)."""
-    year, mon = month.split("-")
-    return int(year) * 12 + (int(mon) - 1)
-
-
 def _cap_series(monthly: dict) -> dict:
     """Keep only the most recent _MAX_SERIES_MONTHS months of a {month: value}
     series (the slope input and the stored evidence both cap here)."""
@@ -218,7 +211,7 @@ def _signal_trend(monthly, orient, *, min_months, alpha, n_boot=_N_BOOT):
             "n_months": n, "slope": None, "ci_low": None, "ci_high": None}
     if n < min_months:
         return base
-    xs = [_month_index(m) for m in months]
+    xs = [stats.month_index(m) for m in months]
     oriented = [orient(monthly[m]) for m in months]
     lo, hi = min(oriented), max(oriented)
     norm = [(v - lo) / (hi - lo) for v in oriented] if hi > lo else [0.0] * n
@@ -363,7 +356,13 @@ def _observation_end(con):
 
 def _load_messages(con, chat_to_key):
     """{contact_key: {chat_id: [(is_from_me, datetime), ...]}}, each chat's
-    stream in (date, id) order. Only 1:1 chats that resolved to a key."""
+    stream in (date, id) order. Only 1:1 chats that resolved to a key.
+
+    Shares a name with conflict_detect._load_messages (and _load_sessions with
+    its twin) and is NOT the same query: those take a single chat_id and return
+    that chat's raw rows including message TEXT. These are corpus-wide, keyed by
+    counterparty, and deliberately select no text -- drift is a shape-of-contact
+    signal, never a content one."""
     per_key = defaultdict(lambda: defaultdict(list))
     for chat_id, is_from_me, date in con.execute(
         f"SELECT m.chat_id, m.is_from_me, m.date FROM messages m "
@@ -819,7 +818,9 @@ def purge_drift(con):
 # CLI
 # ---------------------------------------------------------------------------
 
-def main(argv=None):
+def _build_parser():
+    """The CLI's flag surface, extracted from main() so it is greppable and
+    testable on its own."""
     parser = argparse.ArgumentParser(
         description="Score relationship drift into the dyad_drift table "
                     "(deterministic; no Ollama). Full rebuild, skip-if-unchanged.")
@@ -831,6 +832,11 @@ def main(argv=None):
                         help="delete dyad_drift + its ingest_state guard keys, "
                              "then print the DRIFT_ENABLED=false reminder "
                              "(runs regardless of DRIFT_ENABLED)")
+    return parser
+
+
+def main(argv=None):
+    parser = _build_parser()
     args = parser.parse_args(argv)
 
     # --purge runs regardless of DRIFT_ENABLED: it is the teardown you run WHILE

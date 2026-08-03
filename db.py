@@ -113,6 +113,99 @@ def set_state(con, key, value):
     )
 
 
+def get_float_state(con, key):
+    """A positive float previously banked under `key`, else None. Anything
+    unparseable or non-positive reads as None: these keys hold measured rates
+    that prime a budget's arithmetic, and a garbage value must degrade to "no
+    measurement" rather than poison a deadline."""
+    raw = get_state(con, key)
+    try:
+        value = float(raw) if raw else None
+    except (TypeError, ValueError):
+        return None
+    return value if value and value > 0 else None
+
+
+def set_float_state(con, key, value):
+    """Bank a MEASURED float under `key` and commit. A falsy value writes
+    nothing -- every caller here measures a rate, and storing a zero (or the
+    cold prior a run started from) would freeze a non-measurement into the DB
+    where nothing would ever correct it."""
+    if not value:
+        return
+    set_state(con, key, repr(value))
+    con.commit()
+
+
+def check_model_guard(con, *, key, model, table, message, predicate="1", record=True):
+    """The repo's one model guard: refuse to mix generation models within one
+    derived artifact (the same shape as chunking.build_vec_table's embedding
+    guard), and record the model that produced it.
+
+    `key` is the ingest_state key, `table`/`predicate` count only the rows this
+    model actually produced (dyad_terms holds uncurated rows too), and `message`
+    is the refusal text, rendered with {n} (rows found), {prev}, {model} and
+    {table}. Each pipeline passes its own wording -- the guards' shape is
+    shared, the remedy sentence is not.
+
+    `record=False` runs the REFUSAL half only. Callers use it for an early call
+    that fires before anything destructive (conflict_detect's --relabel clear
+    and detection sweep, loose_ends' dropped_plan detection), so a run that will
+    be refused is refused before it destroys or pays for anything -- while the
+    key still means "the model that wrote these rows", set by the pass that
+    actually writes them."""
+    prev = get_state(con, key)
+    if prev and prev != model:
+        n = con.execute(f"SELECT COUNT(*) FROM {table} WHERE {predicate}").fetchone()[0]
+        if n:
+            print(message.format(n=n, prev=prev, model=model, table=table))
+            raise SystemExit(1)
+    if record:
+        set_state(con, key, model)
+        con.commit()
+
+
+def resolve_budget_minutes(flag, env_value, default, *, zero_means, flag_name,
+                           env_name, default_name, flag_error, env_error):
+    """(minutes, provenance) for a wall-clock budget. Precedence: flag > env >
+    default -- the one order both budgeted pipelines use.
+
+    `zero_means` is the only thing that genuinely differs between them:
+      * "unset"      -- 0 falls through to the next source (annotate's hybrid
+                        tier: the budget IS the tier, so there is no such thing
+                        as a zero-minute run and 0 must mean the default).
+      * "unbudgeted" -- 0 is a real value meaning "no deadline" (conflict
+                        labeling: the budget is additive, so switching it off
+                        has to restore the unbounded path, not a default).
+
+    A NEGATIVE value is refused from either source, never clamped. Passed
+    through it is a deadline already in the past, which every phase declines
+    while reporting a clean exit; clamped to 0 it silently buys either the
+    default or the unbounded run the CLI refuses a negative flag for. The
+    caller supplies `flag_error`/`env_error` (rendered with {value}) so the
+    refusal names the knob it came from in that pipeline's own words."""
+    if flag is not None:
+        if flag < 0:
+            raise SystemExit(flag_error.format(value=flag))
+        if flag or zero_means == "unbudgeted":
+            return flag, flag_name
+    if env_value < 0:
+        raise SystemExit(env_error.format(value=env_value))
+    if env_value or zero_means == "unbudgeted":
+        return env_value, env_name
+    return default, default_name
+
+
+def like_escape(value):
+    r"""Escape LIKE wildcards for use with ESCAPE '\'. Lives here rather than in
+    either caller because both `annotate` and `annotate_events` need it and
+    importing one from the other is an import cycle -- `db` is the module
+    everything may import."""
+    return (value.replace("\\", "\\\\")
+                 .replace("%", "\\%")
+                 .replace("_", "\\_"))
+
+
 def iso_to_day(iso_date: str) -> int:
     """Calendar day number (proleptic Gregorian ordinal) of an ISO date or
     datetime string. Written into chunk_vectors' first_day/last_day INTEGER

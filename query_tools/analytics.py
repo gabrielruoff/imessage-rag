@@ -36,7 +36,7 @@ from ._shared import (
 )
 
 
-def get_chat_participant_stats(chat_id, date_from=None, date_to=None):
+def get_chat_participant_stats(chat_id, date_from=None, date_to=None) -> list:
     """Per-participant stats for a chat (group-chat 'awards show' numbers):
     one row per member -- including 'Me' and zero-message members -- with
     messages_sent, first/last message date, reactions_given, and
@@ -164,7 +164,7 @@ def _tokenize(text):
 
 def get_word_frequency(chat_id=None, handle_id=None, contact_id=None, is_from_me=None,
                        date_from=None, date_to=None, ngram=1, top=25, min_count=2,
-                       include_stopwords=False, exclude_chat_id=None):
+                       include_stopwords=False, exclude_chat_id=None) -> dict:
     """Most frequent words (ngram=1) or phrases (ngram=2..3) in message text,
     with counts. Unlike the other analytics tools this scopes by SENDER:
     handle_id/contact_id means messages that person sent, is_from_me=true

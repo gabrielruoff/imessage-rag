@@ -14,7 +14,6 @@ compares only, never SQL date functions in WHERE (see CLAUDE.md gotchas)."""
 import contextlib
 import json
 
-import config
 
 from ._shared import (
     _connect,
@@ -23,14 +22,11 @@ from ._shared import (
     _resolve_chat_scope,
     _restrict_to_direct_chats,
 )
-# LSM primitives are imported, never reimplemented (F1/analytics_language is the
-# single home): _weighted_rates -> word-count-weighted category rates over
-# lexicon rows, _lsm_score -> the me-vs-them style-matching score.
-from .analytics_language import _lsm_score, _weighted_rates
-from .conflict_dv import _dv_screen, _window_message_texts
-# set_dv_screen_bypass re-exported so query_tools.conflict.set_dv_screen_bypass
-# (chat.py --no-dv-screen, tests) keeps resolving after the DV split.
-from .conflict_dv import set_dv_screen_bypass  # noqa: F401
+# The DV floor lives in conflict_dv (its single home) and is applied by
+# conflict_diagnose / conflict_apology. Re-exported here so
+# query_tools.conflict._dv_screen and .set_dv_screen_bypass (chat.py
+# --no-dv-screen, tests) keep resolving after the module splits.
+from .conflict_dv import _dv_screen, set_dv_screen_bypass  # noqa: F401
 
 # Result caps (contract-fixed; this tool's own, like analytics_social's
 # eligibility gates). Kept well under TOOL_RESULT_MAX_CHARS: <=15 signal rows,
@@ -305,7 +301,7 @@ def _empty_conflicts_envelope(order):
 
 
 def find_conflicts(chat_id=None, handle_id=None, contact_id=None,
-                   date_from=None, date_to=None, limit=10):
+                   date_from=None, date_to=None, limit=10) -> dict:
     """Detected conflict episodes in scope, ranked so the best-substantiated
     surface first: tone-corroborated episodes (corroboration llm > weak > none),
     then deterministic signal strength, then recency. Each is a tense stretch
@@ -453,7 +449,7 @@ def _signal_row(row):
     }
 
 
-def get_conflict(conflict_id, offset=0, limit=15):
+def get_conflict(conflict_id, offset=0, limit=15) -> dict:
     """One conflict episode: its deterministic evidence (peak_signal), tone
     corroboration, off_text_flag, and up to 15 labeled signal turns (paginated;
     excerpts capped at 200 chars). Labels are eval-gated BANDS (band
@@ -568,388 +564,9 @@ def get_conflict(conflict_id, offset=0, limit=15):
     }
 
 
-# ===========================================================================
-# C2 (RES-51): diagnose_conflict scorecard + softened DV-suppression floor.
-#
-# The scorecard composes DETERMINISTIC pieces ONLY -- lexicon I-vs-you /
-# we-talk ratios, LSM, session initiator/ender roles, reply-latency + volume
-# collapse read off C1's stored peak_signal survival stats -- and carries NO
-# aggressor / who-won verdict. The one interpretive-ish section (which side
-# withdrew vs pursued, a NON-BLAME demand-withdraw read) is the "role
-# assignment" the DV floor withholds.
-# ===========================================================================
-
-
-# --- Deterministic scorecard sections ---------------------------------------
-
-def _side_ratios(rows):
-    """I-vs-you & we-talk ratios for one side (F1 contract: SUM raw counts then
-    form the rate against summed n_words; COALESCE the nullable pronoun-split
-    columns). Returns None when the side has no words."""
-    n_msgs = sum(r["n_messages"] for r in rows)
-    n_words = sum(r["n_words"] for r in rows)
-    if not n_words or not n_msgs:
-        return None
-    i_c = sum((r["i_count"] or 0) for r in rows)
-    you_c = sum((r["you_count"] or 0) for r in rows)
-    we_c = sum(r["we_count"] for r in rows)
-    return {
-        "n_messages": n_msgs,
-        "n_words": n_words,
-        "i_rate": round(i_c / n_words, 4),
-        "you_rate": round(you_c / n_words, 4),
-        "i_to_you_ratio": round(i_c / you_c, 3) if you_c else None,
-        "we_per_100_msgs": round(100 * we_c / n_msgs, 2),
-    }
-
-
-def _lexicon_section(con, chat_id, first_date, last_date):
-    """Per-side I-vs-you & we-talk ratios + the LSM style-matching score over
-    the window's months (person_period_lexicon, chat-scoped). Deterministic;
-    'available' False when the lexicon has not been built for this window."""
-    lo, hi = first_date[:7], last_date[:7]
-    rows = con.execute(
-        "SELECT * FROM person_period_lexicon WHERE chat_id = ? "
-        "AND month >= ? AND month <= ?", (chat_id, lo, hi)).fetchall()
-    me_rows = [r for r in rows if r["handle_id"] is None]
-    them_rows = [r for r in rows if r["handle_id"] is not None]
-    me, them = _side_ratios(me_rows), _side_ratios(them_rows)
-    section = {"me": me, "them": them}
-    if me is None or them is None:
-        section["available"] = False
-        section["note"] = ("lexicon not built for this window "
-                           "(person_period_lexicon is built by ingest)")
-    else:
-        section["available"] = True
-    # LSM reuses the F1 primitives (never reimplemented).
-    rates_me = _weighted_rates(me_rows) if me_rows else None
-    rates_them = _weighted_rates(them_rows) if them_rows else None
-    if rates_me is not None and rates_them is not None:
-        section["lsm"] = round(_lsm_score(rates_me, rates_them)[0], 4)
-    else:
-        section["lsm"] = None
-    return section
-
-
-def _session_roles(con, start_session_id, end_session_id):
-    """Deterministic session roles: who opened the episode's first session
-    (initiator) and who had the last word in its final session (ender). Raw
-    is-me facts; NOT a verdict. Always returned, even under a DV hit."""
-    out = {"opener": None, "last_word": None}
-    if start_session_id is not None:
-        s = con.execute("SELECT initiator_is_me FROM sessions WHERE id = ?",
-                        (start_session_id,)).fetchone()
-        if s is not None:
-            out["opener"] = "me" if s["initiator_is_me"] else "them"
-    if end_session_id is not None:
-        e = con.execute("SELECT ender_is_me FROM sessions WHERE id = ?",
-                        (end_session_id,)).fetchone()
-        if e is not None:
-            out["last_word"] = "me" if e["ender_is_me"] else "them"
-    return out
-
-
-def _interaction_pattern(con, peak, session_roles):
-    """The demand-withdraw READ -- who withdrew vs who kept reaching out --
-    derived DETERMINISTICALLY from C1's peak reply-gap (the actor of the
-    message left hanging pursued; the other withdrew), falling back to who had
-    the last word. A NON-BLAME interactional description with NO aggressor /
-    who-won verdict -- and the one section the DV floor withholds (A10)."""
-    pursuer = None
-    peak_mid = peak.get("peak_gap_message_id")
-    if peak_mid is not None:
-        m = con.execute("SELECT is_from_me FROM messages WHERE id = ?",
-                        (peak_mid,)).fetchone()
-        if m is not None:
-            pursuer = "me" if m["is_from_me"] else "them"
-    if pursuer is None:
-        pursuer = session_roles.get("last_word")
-    withdrawer = {"me": "them", "them": "me"}.get(pursuer)
-    return {
-        "pursuer": pursuer,
-        "withdrawer": withdrawer,
-        "basis": ("deterministic demand-withdraw read from the peak reply gap; "
-                  "a mechanical pattern, NOT a judgment of fault"),
-    }
-
-
-def diagnose_conflict(conflict_id):
-    """A deterministic scorecard for one conflict episode (by conflict_id from
-    find_conflicts): lexicon I-vs-you & we-talk ratios and LSM style-matching
-    per side, the session opener/last-word roles, reply-latency and
-    volume-collapse read off the stored deterministic evidence, and a NON-BLAME
-    demand-withdraw read (who withdrew vs pursued). It carries NO aggressor or
-    who-won verdict. A code-enforced DV safety screen (Master Spec A10) scans
-    the window's full text: on a high-risk marker it withholds ONLY the
-    demand-withdraw read and appends a fixed hotline resource footer, while the
-    mechanical scorecard still returns; CONFLICT_DV_SCREEN=off (or chat.py
-    --no-dv-screen) restores the read but still appends the footer on a hit.
-    The screen result is never persisted."""
-    conflict_id = int(conflict_id)
-    with contextlib.closing(_connect()) as con:
-        if not _has_conflict_tables(con):
-            return {"error": "no conflict tables (run conflict_detect.py first)"}
-        row = con.execute(
-            "SELECT id, chat_id, first_date, last_date, start_session_id, "
-            "end_session_id, topic, peak_signal_json, corroboration, "
-            "off_text_flag FROM conflicts WHERE id = ?", (conflict_id,),
-        ).fetchone()
-        if row is None:
-            return {"error": f"no conflict with id {conflict_id}"}
-        peak = _signals_json(row["peak_signal_json"])
-        signals = peak.get("signals", [])
-        result = {
-            "conflict_id": row["id"],
-            "chat_id": row["chat_id"],
-            "first_date": row["first_date"],
-            "last_date": row["last_date"],
-            "topic": row["topic"],
-            "signals": signals,
-            "corroboration": row["corroboration"],
-            "off_text_flag": bool(row["off_text_flag"]),
-            "lexicon": _lexicon_section(
-                con, row["chat_id"], row["first_date"], row["last_date"]),
-            "session_roles": _session_roles(
-                con, row["start_session_id"], row["end_session_id"]),
-            # Latency + volume come from C1's stored survival stats
-            # (stats.frac_over_threshold); get_response_dynamics is NOT called.
-            "latency": {
-                "peak_gap_hours": peak.get("peak_gap_hours"),
-                "withdrawal_fired": "latency_withdrawal" in signals,
-                "source": "peak_signal survival stats (frac_over_threshold), C1",
-            },
-            "volume": {
-                "volume_ratio": peak.get("volume_ratio"),
-                "collapse_fired": "volume_collapse" in signals,
-            },
-            "note": ("deterministic scorecard -- no aggressor/who-won verdict; "
-                     "labels elsewhere are eval-gated bands, not certainties"),
-        }
-        pattern = _interaction_pattern(con, peak, result["session_roles"])
-        screen = _dv_screen(con, conflict_id)
-
-    result["dv_screen"] = screen["status"]
-    if screen["suppress_role"]:
-        result["interaction_pattern"] = {
-            "withheld": True,
-            "reason": ("high-risk safety markers present -- role/aggressor read "
-                       "withheld (DV floor); the mechanical scorecard still "
-                       "applies"),
-        }
-    else:
-        result["interaction_pattern"] = pattern
-    if screen["footer"]:
-        result["resource_footer"] = screen["footer"]
-    # Code-printed humility disclaimer (out-of-band via chat.run_turn); distinct
-    # from the in-payload resource_footer, which the model narrates.
-    result["_epilogue"] = _ANALYSIS_DISCLAIMER
-    return result
-
-
-# --- feature: conflict ---
-# ===========================================================================
-# C3 (RES-52): gated cross-chat conflict trace.
-#
-# trace_conflict_across_chats(conflict_id, k, consent) answers "did this one
-# argument spill into my OTHER conversations?" -- chunks in a DIFFERENT chat,
-# within a few days of the episode, that are BOTH semantically close to it AND
-# literally name chat A's partner (their handle, first name, or one of the
-# chat's distinctive dyad_terms). Two STRUCTURAL gates keep it safe:
-#   1. Registration gate (the real boundary): the schema is registered in
-#      chat.py's tool list ONLY when config.CONFLICT_TRACE_ENABLED. Off by
-#      default -- withholding the schema is the repo's one reliable way to stop
-#      the model calling a tool (see the CLAUDE.md gotcha), so a disabled
-#      deployment never needs prompt-level "don't trace" text.
-#   2. Per-episode consent (UX ONLY, NOT the boundary): without consent=True the
-#      tool returns a fixed ask-the-user payload and reads no data.
-# The name-reference gate filters topically-similar-but-unnamed chunks (a
-# "weekend with my boss" chunk near a "weekend with Jordan" episode is dropped
-# unless it actually names Jordan). Computed on demand and written to NO table
-# (there is deliberately no conflict_links table): nothing here is persisted.
-# ===========================================================================
-import re  # noqa: E402 (local to the additive C3 block)
-
-from db import iso_to_day  # noqa: E402
-
-from ._shared import CHUNK_PREVIEW_CHARS, MAX_VEC_K  # noqa: E402
-
-# Shortest token that counts as a literal partner reference -- a 1-2 char name
-# or dyad_term ("i", "ok") would match half the corpus, defeating the gate.
-_TRACE_MIN_REF_LEN = 3
-# Query-text budget fed to the embedder (the episode's own window text).
-_TRACE_QUERY_CHARS = 4000
-# Over-fetch factor: the sim floor + name gate prune hard, so pull a wider KNN
-# pool than k before filtering (still capped at MAX_VEC_K).
-_TRACE_POOL_FACTOR = 5
-
-
-def _trace_ask_payload(conflict_id):
-    """The fixed no-data response returned when consent was NOT given: it
-    carries zero retrieved content -- only the instruction to ask first. This
-    is the UX layer, not the security boundary (registration is)."""
-    return {
-        "conflict_id": conflict_id,
-        "status": "consent_required",
-        "links": [],
-        "ask": ("Tracing whether this argument spilled into your OTHER "
-                "conversations reads across chats. Want me to check? I'll look "
-                "only at messages that both match this episode AND name the "
-                "person involved, and I won't save anything."),
-        "note": ("no data was read -- call again with consent=true only after "
-                 "the user agrees; nothing is ever persisted"),
-    }
-
-
-def _chat_partner_references(con, chat_id):
-    """The literal strings a related chunk must contain to count as naming chat
-    A's partner: each participant handle_identifier, the counterparty contact
-    first_name(s), and chat A's distinctive dyad_terms. Returns an ordered,
-    de-duplicated list of (kind, lowercased_value); blank/too-short values are
-    dropped so the gate stays meaningful."""
-    refs = []
-    for hid, first_name in con.execute(
-        "SELECT h.handle_identifier, c.first_name "
-        "FROM chat_participants cp "
-        "JOIN handles h ON h.id = cp.handle_id "
-        "LEFT JOIN contacts c ON c.id = h.contact_id "
-        "WHERE cp.chat_id = ?", (chat_id,),
-    ):
-        if hid and len(hid) >= _TRACE_MIN_REF_LEN:
-            refs.append(("handle", hid.lower()))
-        if first_name and len(first_name) >= _TRACE_MIN_REF_LEN:
-            refs.append(("name", first_name.lower()))
-    for (term,) in con.execute(
-        "SELECT term FROM dyad_terms WHERE chat_id = ?", (chat_id,),
-    ):
-        if term and len(term) >= _TRACE_MIN_REF_LEN:
-            refs.append(("dyad_term", term.lower()))
-    seen, out = set(), []
-    for kind, value in refs:
-        if value not in seen:
-            seen.add(value)
-            out.append((kind, value))
-    return out
-
-
-def _mentions_reference(text, references):
-    """The first partner reference `text` literally mentions ({kind, value}) or
-    None. Handle identifiers (phones/emails) match as substrings; names and
-    dyad_terms match on WORD BOUNDARIES, so 'Jordan' fires on 'weekend with
-    Jordan' but not on 'Jordania', and a topically-similar chunk that names no
-    one is filtered out."""
-    if not text:
-        return None
-    lowered = text.lower()
-    for kind, value in references:
-        if kind == "handle":
-            if value in lowered:
-                return {"kind": kind, "value": value}
-        elif re.search(rf"\b{re.escape(value)}\b", lowered):
-            return {"kind": kind, "value": value}
-    return None
-
-
-def trace_conflict_across_chats(conflict_id, k=10, consent=False):
-    """Trace whether ONE conflict episode (a conflict_id from find_conflicts)
-    spilled into your OTHER conversations: conversation chunks in a DIFFERENT
-    chat, within CONFLICT_TRACE_BUFFER_DAYS of the episode, that are BOTH
-    semantically close to it AND literally name chat A's partner (their handle,
-    first name, or one of the chat's distinctive terms). A link needs cosine
-    similarity > CONFLICT_TRACE_SIM_THRESHOLD AND a name hit -- topically
-    similar but unnamed chunks are dropped.
-
-    Cross-chat by nature, so it is off by default and consent-gated. The real
-    off-switch is REGISTRATION: the whole tool is withheld from the model unless
-    config.CONFLICT_TRACE_ENABLED. The `consent` param is a UX prompt only, NOT
-    the security boundary -- without consent=True this returns a fixed
-    ask-the-user payload and reads no data. Computed on demand; NOTHING is
-    persisted (there is deliberately no conflict_links table)."""
-    conflict_id = int(conflict_id)
-    if not consent:
-        return _trace_ask_payload(conflict_id)
-
-    # Local import keeps this additive block self-contained and cycle-safe (the
-    # package is fully initialized by the time a tool is called).
-    from .chunks import _chunk_knn, _embed_query
-
-    k = max(1, min(int(k), MAX_VEC_K))
-    buffer = max(0, int(config.CONFLICT_TRACE_BUFFER_DAYS))
-    threshold = float(config.CONFLICT_TRACE_SIM_THRESHOLD)
-
-    with contextlib.closing(_connect()) as con:
-        if not _has_conflict_tables(con):
-            return {"conflict_id": conflict_id, "links": [],
-                    "error": "no conflict tables (run conflict_detect.py first)"}
-        row = con.execute(
-            "SELECT chat_id, first_date, last_date, topic FROM conflicts "
-            "WHERE id = ?", (conflict_id,)).fetchone()
-        if row is None:
-            return {"conflict_id": conflict_id, "links": [],
-                    "error": f"no conflict with id {conflict_id}"}
-        origin_chat = row["chat_id"]
-        first_date, last_date = row["first_date"], row["last_date"]
-        # Convert the episode's UTC-ISO message dates to vec0 day numbers with
-        # db.iso_to_day -- the SAME converter the metadata writer uses; mixing
-        # formats silently empties the scan (see the CLAUDE.md gotcha).
-        from_day = iso_to_day(first_date) - buffer
-        to_day = iso_to_day(last_date) + buffer
-
-        references = _chat_partner_references(con, origin_chat)
-        # Query text = the episode's own full window text (same source the DV
-        # screen reads), falling back to its topic when the window has no text.
-        window_texts = _window_message_texts(
-            con, conflict_id, origin_chat, first_date, last_date)
-        query_text = " ".join(t for t in window_texts if t)[:_TRACE_QUERY_CHARS]
-        if not query_text.strip():
-            query_text = (row["topic"] or "")
-        if not query_text.strip():
-            return {"conflict_id": conflict_id, "origin_chat_id": origin_chat,
-                    "links": [], "returned": 0,
-                    "note": "no episode text to trace; nothing persisted"}
-
-        query_vec = _embed_query(query_text)
-        pool = max(1, min(k * _TRACE_POOL_FACTOR, MAX_VEC_K))
-        candidates = _chunk_knn(
-            con, query_vec, pool, chat_ids=None, from_day=from_day, to_day=to_day,
-            exclude_chat_ids=[origin_chat])
-
-    links = []
-    for r in candidates:
-        distance = r.get("distance")
-        if distance is None:
-            continue
-        similarity = 1.0 - float(distance)
-        if similarity <= threshold:
-            continue
-        matched = _mentions_reference(r.get("text") or "", references)
-        if matched is None:
-            continue
-        links.append({
-            "chunk_id": r["chunk_id"],
-            "chat_id": r["chat_id"],
-            "participants": r.get("participants"),
-            "first_date": r["first_date"],
-            "last_date": r["last_date"],
-            "similarity": round(similarity, 4),
-            "matched_reference": matched,
-            "text": (r.get("text") or "")[:CHUNK_PREVIEW_CHARS],
-        })
-        if len(links) >= k:
-            break
-
-    return {
-        "conflict_id": conflict_id,
-        "origin_chat_id": origin_chat,
-        "window": {"first_date": first_date, "last_date": last_date,
-                   "buffer_days": buffer},
-        "sim_threshold": threshold,
-        "n_references": len(references),
-        "links": links,
-        "returned": len(links),
-        "note": ("cross-chat spillover -- each link BOTH exceeds the similarity "
-                 "threshold AND literally names the partner; computed on demand "
-                 "and NOT persisted (no conflict_links table exists)"),
-    }
-# --- end feature: conflict ---
-
-
+# diagnose_conflict (C2) and trace_conflict_across_chats (C3) live in their own
+# modules now; re-export them so query_tools.conflict.diagnose_conflict and
+# .trace_conflict_across_chats keep resolving for callers and tests. Bottom
+# imports: both modules read the notes/helpers defined above.
+from .conflict_diagnose import diagnose_conflict  # noqa: E402,F401
+from .conflict_trace import trace_conflict_across_chats  # noqa: E402,F401

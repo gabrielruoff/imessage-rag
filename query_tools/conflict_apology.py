@@ -121,7 +121,7 @@ def _ignored_repair_attempts(con, conflict_id):
     } for r in rows]
 
 
-def draft_apology(conflict_id):
+def draft_apology(conflict_id) -> dict:
     """SCAFFOLD (never ghostwrite) a repair message for one conflict episode (a
     conflict_id from find_conflicts). Returns the ranked Lewicki-6 apology
     checklist (Lewicki, Polin & Lount 2016 -- components ordered by measured

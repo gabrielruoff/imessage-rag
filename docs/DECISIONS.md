@@ -840,6 +840,60 @@ Two smaller things the profile exposed:
   `NUM_PARALLEL` back, so there is nothing to assert afterwards; making the
   restart unconditional is the only fix.
 
+## 2026-07-17: evalkit — why the analytics eval is a framework, not a script
+
+`eval/fast_eval.sh` pipes `id|prompt` lines through `chat.py -p` and eyeballs the
+replies. That answers "did it crash"; it cannot answer "did it call the right
+tool with the right scope, and is the number in the sentence the number the DB
+holds". `eval/evalkit/` exists for the second question. Five design choices are
+load-bearing and none of them are visible from the code alone.
+
+**The transcript is `chat.run_turn`'s own `messages` list, never stdout.**
+`run_turn` mutates the list in place, so after it returns the caller is holding
+the complete structured record: the system prompt, every assistant message with
+its `tool_calls`, every `{"role": "tool"}` result, the final reply. Scraping the
+`rich` console would have thrown away exactly the structure the checks need, and
+multi-turn cases (S8) come free — append the next user message and call again on
+the same list. Silencing the console is `chat.console = Console(quiet=True)`;
+timing and per-round tool capture is a wrapper around `chat.ollama_chat_stream`.
+Both are module globals resolved at call time, so the framework patches them
+in-process and never edits an app module on disk.
+
+**App imports are function-local everywhere.** `config.py` reads env at import
+and `load_dotenv()` does not override an already-set variable, so `TARGET_DB` /
+`MAX_TOOL_ITERATIONS` / `TOOL_RESULT_MAX_CHARS` have to be in `os.environ`
+*before* `config`, `chat` or `query_tools` is first imported. A module-level
+`import chat` anywhere in `eval/evalkit/` would silently pin the wrong DB for
+the whole process. That constraint, not import hygiene, is why the package looks
+the way it does.
+
+**One Ollama lane, enforced by a lockfile.** Ollama serializes requests and the
+pipelines hold a SQLite write lock across LLM calls, so only `run`, `p3 wrapped`
+and `p3 … --judge` may touch the model, and they take
+`eval/results/.ollama.lock` (`O_CREAT|O_EXCL`, with a dead-pid recovery) to
+prove it. Everything else — `manifest`, `check`, `report`, and the per-suite
+grading agents — is pure file I/O and therefore fans out in parallel. This split
+is what makes agent orchestration of the eval possible at all.
+
+**Ground truth is computed, not asserted.** Every expected value comes from
+calling `query_tools.<fn>(...)` directly against the same DB in the same run —
+no golden files to rot. The manifest carries a corpus fingerprint (`COUNT(*)`,
+`MAX(date)` over `messages`); a mismatch invalidates grading rather than quietly
+comparing a new corpus against old numbers.
+
+**Only routing auto-fails.** Prose number-matching is fuzzy — a reply may round,
+spell out, or restate a figure — so the numeric and faithfulness blocks are
+written as *advisory evidence* for a grading agent and are tagged
+`"advisory": true` in the output. Tool routing (was the right tool called, with
+a scope intersecting the roster entry) is the one fully deterministic verdict.
+The tolerance vocabulary exists for the same reason: `exact` for counts, dates,
+names and hours; `round` for floats; `pct1` for shares and rates, checked both
+as a 0–1 share and ×100, because replies say "38%" where the tool returns 0.38.
+
+The roster is placeholder-based (`<TOP1>`, `<GROUP>`, `<PHRASE_HI>`, …) with
+definitions committed and resolutions gitignored: the cases are shareable, the
+real names never leave the machine.
+
 ## 2026-07-20: the analytical suite (Wave 0 + Wave 1)
 
 A wave of self-insight features from the Linear project *Close Read —
@@ -1780,6 +1834,53 @@ of existence-tested — so ranking by it introduces no new number to justify, an
 the id tiebreak keeps a rerun's progress exactly as obvious as ascending order
 made it. See "2026-07-28: annotation throughput, round 2" below.
 
+## 2026-07-27: the web layer is transport, and stops there
+
+`api/` + `frontend/` put a browser on the existing engine without becoming a
+second engine. Four constraints decided the shape, and all four are properties
+of what is already here rather than preferences about web stacks.
+
+**Generation is serialized, so the API must not be designed for concurrency.**
+Ollama serializes requests and every pipeline holds a SQLite write lock across
+its LLM calls (`make pipeline` is deliberately serial even under `make -j`).
+A fan-out design would buy `database is locked`, not throughput. One in-flight
+turn, queue the rest — which single-user local use never notices.
+
+**The floor is not inherited by a new entry path.** The wellbeing floor
+(whole-reply `sanitize_condition_names`, the verbatim `_epilogue` channel,
+stripping `_epilogue`/`support_block` from what the model sees) lived inside
+`chat.run_turn`, and `chat_apple.py` had already re-implemented it because it
+bypasses `run_turn`. Adding a third entry point — the SSE generator — would have
+made three copies of a safety mechanism, which is how one of them ends up a
+version behind. So the floor moved out into `chat_floor.TurnFloor` first, and
+all three turn-runners construct the same object. This is the reason
+`chat_floor.py` exists as a module rather than as a helper inside `chat.py`.
+Every code-enforced gate — the DV screen, the consent lists, the sanitize — stays
+server-side; the browser is never trusted with a floor.
+
+**Streaming was already there; only `run_turn` swallowed it.**
+`ollama.chat_stream` yields deltas. The web work was refactoring what `run_turn`
+*does* with them (structured `token` / `tool_call` / `epilogue` / `done` events
+instead of console prints), not new transport. SSE over a POST is the whole
+seam — WebSockets buy bidirectionality nothing here needs, and the tools' typed
+envelopes (`rows`/`total_matching`/`returned`/`order`/`truncated`) are already
+the API contract, so no response schema had to be invented.
+
+**App state lives in its own database.** `app.db` (conversations/turns) is
+deliberately not a table in `imessage_analysis.db`: that file is derived and
+`reset_db.py` is expected to be able to empty it without destroying the UI's
+chat history. Plain sqlite3, no sqlite-vec, its own connection helper — and
+`PRAGMA foreign_keys = ON` per connection, since sqlite3 defaults it off and the
+`turns → conversations` cascade is the only thing keeping orphans out.
+
+Rejected, and why: Postgres/Redis/a queue (single-user local; SQLite is the
+privacy story), a hand-rolled chat component, and any re-implementation of
+retrieval behind an HTTP route. The whole layer assumes **local-first,
+single-user on macOS**. Hosting for multiple users is not a bigger version of
+this — it changes the database, requires real auth and per-user isolation, and
+retires the "the corpus never leaves the machine" guarantee that the rest of the
+repo is built around.
+
 ## 2026-07-28: default `CHAT_MODEL` → `qwen3.5:4b`, and effort levels get translated
 
 Two changes that only make sense together: the default chat model dropped from
@@ -2003,9 +2104,10 @@ unchanged: the marker is the stamp, never the rows. (Superseded 2026-07-30 for t
 budget that is fatal, and not subtly: **every** budgeted run re-detects all 787
 chats before it labels anything, so a delete-then-rewrite would discard exactly
 the labels the previous run's 25 minutes bought, and no rerun could ever extend
-coverage past one budget's worth. (The plan document said the rewrite would
-"naturally clear" `labeled_at` and treated that as a feature — see the status
-header on `docs/PLAN_CONFLICT_HYBRID.md`.)
+coverage past one budget's worth. (The design plan this feature was built from
+said the rewrite would "naturally clear" `labeled_at` and treated that as a
+feature. It was the plan's single most load-bearing error, and the shipped test
+asserts the opposite: re-detection PRESERVES an unchanged window's stamp.)
 
 `detect_chat` now reconciles, keyed on `chat_id` + `first_date` + `last_date`: a
 window whose boundaries are unchanged keeps its row id, its `conflict_signals`,

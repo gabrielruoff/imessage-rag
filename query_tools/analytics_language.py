@@ -13,7 +13,6 @@ _resolve_chat_scope, so both sides of the conversation are counted."""
 
 import collections
 import contextlib
-import datetime
 import json
 
 from db import CONTACT_LABEL_SQL
@@ -29,10 +28,10 @@ from ._shared import (
     _date_clauses,
     _exclude_id_filters,
     _id_filter_clause,
-    _normalize_date_bound,
     _resolve_chat_scope,
     _truncate_text_field,
     _validate_include,
+    month_bounds as _month_bounds,
 )
 
 _FW_CATEGORIES = tuple(FUNCTION_WORDS)
@@ -48,19 +47,6 @@ _TREND_SECTIONS = ("phrase_trend", "emoji", "rates", "distinctive_terms", "lsm",
 _TEXT_MESSAGE_CLAUSES = (
     "m.date IS NOT NULL", "m.text IS NOT NULL", "m.text != ''", *_REAL_MESSAGE_CLAUSES,
 )
-
-
-def _month_bounds(date_from, date_to):
-    """Inclusive 'YYYY-MM' bounds for filtering person_period_lexicon.month.
-    The upper bound backs off one microsecond from the half-open datetime
-    bound so date_to='2026-04-30' includes April but not May."""
-    lo = hi = None
-    if date_from is not None:
-        lo = _normalize_date_bound(date_from)[:7]
-    if date_to is not None:
-        upper = datetime.datetime.fromisoformat(_normalize_date_bound(date_to, upper=True))
-        hi = (upper - datetime.timedelta(microseconds=1)).strftime("%Y-%m")
-    return lo, hi
 
 
 def _period_len(granularity):
@@ -361,7 +347,7 @@ def _valence_section(ann, granularity):
 
 def get_word_trends(phrase=None, chat_id=None, handle_id=None, contact_id=None,
                     date_from=None, date_to=None, granularity="year", include=None,
-                    exclude_chat_id=None):
+                    exclude_chat_id=None) -> dict:
     """Language-over-time analytics in one call. Sections (include=[...]
     selects; default is every applicable one): phrase_trend (how often
     `phrase` appears per period, split me/them -- only when phrase is given),

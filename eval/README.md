@@ -6,7 +6,8 @@ S4 words/language, S5 milestones, S6 group dynamics, S7 routing/negative
 controls, S8 multi-turn robustness, S9 retrieval/directory plumbing) through
 `chat.py`'s tool-calling loop, compares replies against SQL-computed ground
 truth, and aggregates grades into a scorecard. Mechanizes [`docs/ANALYTICS_TEST_PLAN.md`](../docs/ANALYTICS_TEST_PLAN.md)
-(design: [`docs/EVALKIT_IMPLEMENTATION_PLAN.md`](../docs/EVALKIT_IMPLEMENTATION_PLAN.md)).
+(design rationale: [`docs/DECISIONS.md`](../docs/DECISIONS.md), the 2026-07-17
+evalkit entry).
 Everything below is copy-pasteable. `fast_eval.sh` / `prompts-smoke.txt` are a
 separate, older path — leave them alone.
 

@@ -130,7 +130,7 @@ def _thread_summary(kind, contact, evidence):
     return None
 
 
-def get_loose_threads(status="open", kind=None, limit=5):
+def get_loose_threads(status="open", kind=None, limit=5) -> list:
     """The current loose-thread digest: nudges the detector found, ranked by
     urgency (highest first). status defaults to 'open' (pass 'dismissed' to
     review resolved ones); kind optionally narrows to one detector
@@ -229,7 +229,7 @@ def get_loose_threads(status="open", kind=None, limit=5):
     return out
 
 
-def resolve_loose_thread(thread_id):
+def resolve_loose_thread(thread_id) -> dict:
     """Dismiss one loose thread by its id: sets status='dismissed' and stamps
     dismissed_at. The row is never deleted -- a dismissed thread stays as a
     record and is what stops the detector from re-opening the same nudge."""
@@ -252,7 +252,7 @@ def resolve_loose_thread(thread_id):
             "changed": changed > 0, "dismissed_at": now}
 
 
-def mute_contact_from_nudges(contact_id=None, handle_id=None, reason="muted"):
+def mute_contact_from_nudges(contact_id=None, handle_id=None, reason="muted") -> dict:
     """Permanently exclude a contact (or a bare handle) from future nudges AND
     dismiss any of their currently-open loose threads. Writes a durable
     nudge_exclusions row (deduped -- muting twice never stacks rows) so no

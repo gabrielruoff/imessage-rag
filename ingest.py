@@ -504,7 +504,9 @@ def _split_csv(value):
     return [s.strip() for s in value.split(",") if s.strip()]
 
 
-def main():
+def _build_parser():
+    """The CLI's flag surface, extracted from main() so it is greppable and
+    testable on its own."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-embed", action="store_true", help="skip the embedding step")
     ap.add_argument("--since-last", action="store_true",
@@ -520,6 +522,11 @@ def main():
                           "(units d=days/w=weeks/mo=months/y=years); an extra lower "
                           "bound on message.date, combines with --since-last/--senders/"
                           "--exclude")
+    return ap
+
+
+def main():
+    ap = _build_parser()
     args = ap.parse_args()
 
     senders = _split_csv(args.senders)

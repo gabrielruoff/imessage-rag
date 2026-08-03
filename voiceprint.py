@@ -572,57 +572,28 @@ def _annotations_hash(con):
     rows to source='llm' with no new messages, and every later run reported
     "Voiceprints up to date" over stale tone_valence / tone_emotions_json.
 
-    Three deliberate divergences from drift._annotations_hash, the precedent:
+    Deliberately NOT drift._annotations_hash's shape, on three counts:
 
-    * No `ch.is_group = 0`. drift is 1:1-only; _enumerate_tasks builds
-      scope='group' tasks and a scope='all' task with no chats join at all, so
-      group-chat annotations really do reach _tone and filtering them out here
-      would reintroduce the same miss for those scopes.
-    * source='llm' only, matching _tone's own unconditional clause. A plain
-      `--quality distilled` pass must NOT trigger a rebuild: voiceprint cannot
-      observe those rows, so a COUNT over every source would over-trigger.
-    * An exact per-row digest rather than COUNT/SUM aggregates. Not a cost
-      being paid for exactness -- measured 2026-07-30 it is the CHEAPER of the
-      two shapes on every corpus tried, because drift's plan scans the `chunks`
-      table while this one scans the much smaller `chunk_annotations`. Both
-      pairs, each named with its corpus rather than averaged into one figure:
-      on the 25,029-chunk reference corpus (chunks 27 MB, chunk_annotations
-      1.7 MB) 5-6 ms against drift's 7-8 ms, a 1.3x gap; on a 74,233-chunk one
-      (chunks 83 MB, chunk_annotations 6.1 MB) 5-7 ms against drift's 21-24 ms,
-      4x. The gap widens with the chunks table, which is drift's scan and not
-      ours -- that is the mechanism, and it is why a single ratio would have
-      been the wrong thing to record. Exactness is what buys the coverage:
-      emotions_json is a TEXT list no SUM can fingerprint, so a lossy aggregate
-      would miss an emotions-only rewrite, and SUM(valence) would miss a
-      valence swap between two chunks. Both are regression tests.
+    * No `ch.is_group = 0` -- drift is 1:1-only, but _enumerate_tasks builds
+      scope='group' and scope='all' tasks, so group annotations really do reach
+      _tone and filtering them here would reintroduce the same miss.
+    * source='llm' only, matching _tone's own clause, so a plain distilled pass
+      (which voiceprint cannot observe) does not over-trigger a rebuild.
+    * An exact per-row digest rather than COUNT/SUM aggregates: emotions_json is
+      TEXT that no SUM can fingerprint, and SUM(valence) would miss a valence
+      swap between two chunks. Both are regression tests. Exactness is also the
+      CHEAPER shape here -- it scans chunk_annotations where drift's scans the
+      much larger `chunks` (docs/DECISIONS.md, 2026-07-30).
 
-    Cost, so the next reader does not mis-project it: schema.py creates NO
-    index on chunk_annotations, so this is a full scan of the table (all
-    sources) plus one rowid seek per llm row -- it grows with TOTAL annotations
-    plus per-llm-row Python work, not with the llm population alone. Measured
-    on that same 25,029-chunk reference corpus: 5-6 ms at 4,416 llm rows,
-    28-31 ms if every row were upgraded, against a 4.0 s rebuild.
-    `ORDER BY ca.chunk_id` is free (chunk_id is INTEGER PRIMARY KEY, i.e. a
-    rowid alias, so no temp b-tree) and it is what makes the digest
-    deterministic.
+    The JOIN drops ORPHANED annotations, the way _tone's own join does: a tail
+    re-chunk deletes chunks rows, chunk_annotations has no FK cascade, and
+    ingest's INSERT OR REPLACE omits chunk_id, so orphans can appear with
+    MAX(messages.id) unchanged. `ORDER BY ca.chunk_id` is free (rowid alias) and
+    is what makes the digest deterministic.
 
-    The JOIN is not decoration and is not there for chat_id (which is immutable
-    per chunk_id -- nothing in the tree UPDATEs chunks, and ids are
-    AUTOINCREMENT so they are never reused): it DROPS ORPHANED annotations, the
-    way _tone's own join does. A tail re-chunk deletes chunks rows while
-    chunk_annotations has no FK cascade, and ingest.py's INSERT OR REPLACE
-    omits chunk_id, so orphans can appear with MAX(messages.id) unchanged.
-
-    Rejected: a group_concat variant. Deterministic ordering needs ORDER BY
-    inside the aggregate (SQLite >= 3.44, which nothing here pins) and it
-    materializes the whole string in memory, to save 1-3 ms.
-
-    Scope note: this digest is corpus-wide while _tone is scoped per task's
-    chat_ids, and chunks.chat_id is nullable, so an annotation change in a chat
-    that yields no task can force a rebuild nothing depends on. That is the
-    safe direction and is left alone -- narrowing it would mean reproducing the
-    union of every dyad/group/all task's chats, which is easy to get wrong into
-    a MISS."""
+    The digest is corpus-wide while _tone is scoped per task, so an annotation
+    change in a chat that yields no task can force a rebuild nothing depends on.
+    That is the safe direction; narrowing it risks turning it into a MISS."""
     h = hashlib.sha256()
     for row in con.execute(
             "SELECT ca.chunk_id, ca.valence, ca.emotions_json "
@@ -738,7 +709,9 @@ def build_voiceprints(con, *, force=False, dry_run=False):
     return len(built)
 
 
-def main(argv=None):
+def _build_parser():
+    """The CLI's flag surface, extracted from main() so it is greppable and
+    testable on its own."""
     parser = argparse.ArgumentParser(
         description="Build deterministic per-person voiceprints "
                     "(person_voiceprint). Pure SQL/Python, no Ollama.")
@@ -746,6 +719,11 @@ def main(argv=None):
                         help="rebuild even if the corpus is unchanged")
     parser.add_argument("--dry-run", action="store_true",
                         help="print how many rows would be built and exit")
+    return parser
+
+
+def main(argv=None):
+    parser = _build_parser()
     args = parser.parse_args(argv)
     con = _connect()
     try:

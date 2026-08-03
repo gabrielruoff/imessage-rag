@@ -343,7 +343,8 @@ def _flatten(messages):
     rendered as its own role-labeled block ("User: ...", "Assistant: ...")
     joined by blank lines, so a single-turn shim session still sees the whole
     exchange. A second system message (rare) folds in as a labeled turn --
-    gemma4's renderer also honors only the first system message (see CLAUDE.md),
+    gemma4's renderer also honors only the first system message
+    (docs/DECISIONS.md, "Known environment quirks"),
     so nothing that runs on Ollama relies on more than one."""
     system = ""
     have_system = False

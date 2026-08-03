@@ -1,4 +1,5 @@
-"""evalkit -- the analytics-eval framework (docs/EVALKIT_IMPLEMENTATION_PLAN.md).
+"""evalkit -- the analytics-eval framework (rationale: docs/DECISIONS.md, the
+2026-07-17 evalkit entry).
 
 Loads test prompts with expected-output success criteria (eval/cases/),
 runs them through chat.run_turn, captures full structured transcripts

@@ -14,76 +14,41 @@ whole corpus. This module replaces that draw with two levels:
 Everything here is read-only SQL and deterministic: two calls with the same
 (pending, need, DB) return the identical list, in the same order.
 
-What it actually buys (measured, and smaller than you might assume)
-------------------------------------------------------------------
-Measured 2026-07-27 against the 25,029-chunk / 532-chat reference corpus
-(nomic-embed-text, dim 768), need=800, probing with EVERY corpus chunk:
+What it buys, and what it does not
+---------------------------------
+Measured 2026-07-27 on the 25,029-chunk / 532-chat reference corpus (details in
+docs/DECISIONS.md, "The stratified seed sampler: what it actually buys"):
 
-* Corpus *coverage* is a wash. Mean cosine distance from a chunk to its
-  nearest seed: 0.1496 stratified vs 0.1503 for random.sample (-0.4%); p90
-  0.2223 vs 0.2282 (-2.6%); worst-covered chunk 0.3547 vs 0.3675 (-3.5%);
-  mean distance to the 10 nearest seeds (k = ANNOTATE_KNN_K) 0.1857 vs 0.1830,
-  i.e. 1.4% *worse*; mean pairwise distance among the seeds 0.3522 vs 0.3482
-  (+1.1%). At 768 dimensions, 800 seeds over 25k chunks are already spread
-  near-uniformly by chance, and no selection rule moves the average much. An
-  earlier 3,000-probe measurement showed a "-11% covering radius" win that
-  did not survive probing the full corpus -- it was sampling noise. Do not
-  claim a coverage win for this module; it does not have one.
-* Redundant seeds drop ~4x, and that is the real win. Seeds whose nearest
-  *other* seed is closer than 0.02 cosine (a near-duplicate: the LLM call
-  teaches the kNN vote nothing new): 22/800 for random.sample, 5/800 here.
-  Under 0.05: 32 vs 15. Under 0.10: 116 vs 81. In a tier whose whole premise
-  is a wall-clock budget, ~2-4% of the seed LLM calls recovered from
-  duplicated work is worth 4s of preamble.
-* Chat representation stops being a lottery. Over 25 random.sample draws the
-  number of chats represented ranged 92-117 and the summed deviation from
-  proportional was 208.9 +- 12.0 rows, with a worst single-chat miss of 31.6
-  rows on the dominant dyad. The allocation here is deterministic, hits 108
-  chats, and its summed deviation is 77.5 rows -- the irreducible
-  largest-remainder floor, with every chat within 1 row of proportional.
+* NOT corpus coverage -- that measured a wash against random.sample (1.4%
+  *worse* at k=10). Do not claim a coverage win for this module.
+* ~4x fewer near-duplicate seeds (5/800 within 0.02 cosine against 22/800), so
+  a budgeted tier stops paying for LLM calls that teach the kNN vote nothing.
+* Deterministic proportional chat representation instead of a lottery: summed
+  deviation from proportional 77.5 rows against random.sample's 208.9 +- 12.0,
+  with every chat within 1 row.
 
-Performance, and why there is no numpy
---------------------------------------
-numpy is NOT a dependency of this project (see requirements.txt / pyproject)
-and this sampler is a preamble to a wall-clock-budgeted annotate run, so it has
-to be fast in pure CPython. Selection at full embedding width is not: 768-dim
-vectors over a 25k-chunk corpus cost `need_c * n_c * 768` multiply-adds per
-chat, ~8e8 float ops corpus-wide -- minutes, not seconds.
+Why there is no numpy
+---------------------
+numpy is NOT a dependency, and this sampler is preamble to a wall-clock-budgeted
+run, so it has to be fast in pure CPython. Selection at full embedding width is
+not: 768-dim vectors over 25k chunks are ~8e8 multiply-adds corpus-wide.
 
-Two things make it cheap instead. First, every embedding is projected ONCE
-through a deterministic sparse Johnson-Lindenstrauss / Achlioptas matrix down
-to _PROJ_DIMS coordinates, each row supported on only _PROJ_NNZ of the input
-coordinates with random +/-1 signs, so a projection costs
-`_PROJ_DIMS * _PROJ_NNZ` gathers done at C speed via operator.itemgetter
-rather than `_PROJ_DIMS * dim`. Second, selection runs in that low-dimensional
-space against a documented op budget (_SPREAD_DOT_BUDGET); a chat whose
-candidate pool would blow its share of the budget is first subsampled with the
-seeded RNG, which degrades that chat toward random-within-chat -- i.e. toward
-exactly the status quo -- never toward a blown time budget.
-
-Measured on the same corpus/machine (CPython 3.14.6), need=800:
-
-| step                                             | wall     |
-|---|---|
-| decode 25,029 float32 blobs (array.array)        | 0.01s    |
-| project 25,029 vectors (p=32, nnz=32)            | 0.40s    |
-| selection dot products                           | ~2.0e6/s |
-| stratified_sample(con, pending, 800), end to end | 4.2-4.6s |
-
-random.sample is ~0.01s for the same draw, and ~4.5s against a 25-minute
-annotate budget is 0.3% of the run. The op budget makes the cost flat rather
-than growing in `need`: need=1200 also lands at 4.5s, need=5000 at 4.0s (the
-per-chat pool shrinks as need grows), need == len(pending) at 0.01s (every chat
-takes its whole pool, so no vector is read at all). Widening the projection
-buys distance fidelity (Pearson r against full-dim cosine: 0.68 at p=32, 0.77
-at p=64, 0.83 at p=96/nnz=128) but moved none of the selection metrics above,
-while wall clock went 4.5s -> 6.3s -> 9.8s: p=32 it is.
+Two things make it cheap. Every embedding is projected ONCE through a
+deterministic sparse Johnson-Lindenstrauss / Achlioptas matrix down to
+_PROJ_DIMS coordinates, each row supported on only _PROJ_NNZ inputs with random
++/-1 signs, so a projection is `_PROJ_DIMS * _PROJ_NNZ` gathers at C speed via
+operator.itemgetter. And selection runs in that space against an op budget
+(_SPREAD_DOT_BUDGET): a chat whose pool would blow its share is subsampled with
+the seeded RNG first, degrading that chat toward random-within-chat -- the
+status quo -- never toward a blown time budget. End to end that is 4.2-4.6 s for
+need=800, flat in `need`, against a 25-minute annotate budget. A wider
+projection buys distance fidelity but moved none of the selection metrics.
 
 Degradation is always graceful: a missing chunk_vectors table, an unloadable
-sqlite-vec extension, a missing/zero embed_dim, a chunk with no vector row, or
-a wrong-length blob each fall back to a seeded random draw *within the chat*.
-The level-1 allocation survives every one of those paths, so the worst case is
-still exactly stratified -- only level 2 is lost.
+sqlite-vec extension, a missing/zero embed_dim, a chunk with no vector row, or a
+wrong-length blob each fall back to a seeded random draw *within the chat*. The
+level-1 allocation survives all of them, so the worst case is still exactly
+stratified -- only level 2 is lost.
 """
 
 import array
@@ -93,6 +58,7 @@ from bisect import bisect_right
 from itertools import accumulate
 from operator import itemgetter, mul
 
+import annotate_quota
 from db import get_state, load_vec_extension
 
 # Width and per-row support of the sparse JL projection. The selection rule
@@ -198,42 +164,22 @@ def _allocate(chats, sizes, rank, need):
     chat's pending count, capped at that count. Returns {chat: quota} summing
     to min(need, total pending).
 
-    Remainders are compared as exact integers (need*n_c divided by the total),
-    never floats, so the tie-break can never drift. Weighting by *remaining*
-    capacity makes the cap self-enforcing -- floor(R*cap/T) can only reach cap
-    when R == T, and then every remainder is 0 so nothing is rounded up -- so
-    the redistribution loop below provably settles in one pass. It is kept as a
-    loop anyway because the invariant is worth enforcing rather than trusting.
+    Weighting by *remaining* capacity (annotate_quota's `weights=None` mode)
+    makes the cap self-enforcing -- floor(R*cap/T) can only reach cap when
+    R == T, and then every remainder is 0 so nothing is rounded up -- so the
+    shared redistribution loop provably settles in one pass for this caller. It
+    stays a loop because annotate_quota's other caller weights by corpus share,
+    where that argument does not hold.
+
+    This was its own copy of that loop until 2026-08-03, and the copy differed
+    in its degenerate tail: it treated "no progress" as unreachable and simply
+    broke, leaving the remainder UNALLOCATED. The shared version hands it out in
+    a fixed order, so a short allocation is no longer reachable from here
+    either. On every non-degenerate input -- which, per the argument above, is
+    every input this caller produces -- the result is unchanged.
     """
-    quota = dict.fromkeys(chats, 0)
-    room = {c: sizes[c] for c in chats if sizes[c] > 0}
-    remaining = min(need, sum(room.values()))
-    while remaining > 0 and room:
-        total = sum(room.values())
-        parts = []
-        for chat, cap in room.items():
-            num = remaining * cap
-            parts.append([chat, min(num // total, cap), num % total])
-        # max(0, ...) only so a negative slice can never silently hand the
-        # remainder to the *smallest* fractions; the sum cannot exceed remaining.
-        extra = max(0, remaining - sum(p[1] for p in parts))
-        # Hand the rounding remainder to the biggest fractional parts first.
-        for part in sorted(parts, key=lambda p: (-p[2], rank[p[0]]))[:extra]:
-            if part[1] < room[part[0]]:
-                part[1] += 1
-        progressed = False
-        for chat, add, _rem in parts:
-            if not add:
-                continue
-            quota[chat] += add
-            remaining -= add
-            room[chat] -= add
-            progressed = True
-        room = {c: n for c, n in room.items() if n > 0}
-        if not progressed:
-            # Unreachable given the argument above; bail rather than spin.
-            break
-    return quota
+    return annotate_quota.apportion(
+        {c: sizes[c] for c in chats}, None, need, rank.__getitem__)
 
 
 # ---------------------------------------------------------------------------

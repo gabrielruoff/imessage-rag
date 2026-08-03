@@ -20,8 +20,12 @@ import config
 from function_words import FUNCTION_WORDS
 
 from ._shared import (
+    TEXT_PREVIEW_CHARS,
+    _REAL_MESSAGE_CLAUSES,
     _connect,
     _normalize_date_bound,
+    contact_label as _contact_label,
+    label_for_key as _label_for_key,
     member_key,
 )
 
@@ -46,45 +50,6 @@ def _confidence(n_messages, n_reply_pairs, n_months):
             and n_months >= config.VOICEPRINT_MIN_MONTHS):
         return "high"
     return "low"
-
-
-def _contact_label(con, contact_id):
-    row = con.execute(
-        "SELECT COALESCE("
-        "NULLIF(nickname, ''), "
-        "NULLIF(TRIM(COALESCE(first_name, '') || ' ' || COALESCE(last_name, '')), '')"
-        ") FROM contacts WHERE id = ?", (contact_id,)
-    ).fetchone()
-    if row and row[0]:
-        return row[0]
-    handle = con.execute(
-        "SELECT handle_identifier FROM handles WHERE contact_id = ? "
-        "ORDER BY id LIMIT 1", (contact_id,)
-    ).fetchone()
-    return handle[0] if handle else f"contact {contact_id}"
-
-
-def _label_for_key(con, key):
-    """Human-readable label for a member_key / counterpart_key string."""
-    if key == "me":
-        return "Me"
-    if key == "*":
-        return "everyone"
-    kind, _, raw = key.partition(":")
-    if kind == "contact":
-        return _contact_label(con, int(raw))
-    if kind == "handle":
-        row = con.execute(
-            "SELECT handle_identifier FROM handles WHERE id = ?", (int(raw),)
-        ).fetchone()
-        return row[0] if row else key
-    if kind == "chat":
-        row = con.execute(
-            "SELECT COALESCE(NULLIF(display_name, ''), chat_identifier) "
-            "FROM chats WHERE id = ?", (int(raw),)
-        ).fetchone()
-        return (row[0] if row and row[0] else f"group chat {raw}")
-    return key
 
 
 def _resolve_person(con, contact_id, handle_id, name):
@@ -283,8 +248,56 @@ def _recompute(con, member_key_str, counterpart_key, scope, chat_id, person_key,
     return card
 
 
+def resolve_voice_scope(scope, subject, person_key, chat_id):
+    """Turn (scope, subject, resolved person, chat_id) into the
+    (member_key, counterpart_key, scope) triple person_voiceprint is keyed by.
+
+    Returns (member_key, counterpart_key, scope, error): `error` is a ready-to-
+    return tool payload and the other three are None when it is set. Named
+    `resolve_voice_scope`, not `_resolve_scope`, because _shared._resolve_scope
+    already means "chat/handle id scope" -- a different question.
+
+    Shared by get_voiceprint and check_style_match so the five refusal messages
+    have one home; scope defaults to 'dyad' when a person was named, else 'all'.
+    """
+    if scope is None:
+        scope = "dyad" if person_key is not None else "all"
+    scope = str(scope).lower()
+    if scope not in ("dyad", "group", "all"):
+        return None, None, None, {
+            "error": f"scope must be dyad, group, or all (got {scope!r})"}
+
+    if scope == "dyad":
+        if person_key is None:
+            return None, None, None, {"error": "scope='dyad' needs a person "
+                                               "(contact_id/handle_id/name)"}
+        member_key_str, counterpart_key = (
+            ("me", person_key) if subject == "me" else (person_key, "me"))
+    elif scope == "all":
+        counterpart_key = "*"
+        if subject == "me":
+            member_key_str = "me"
+        elif person_key is None:
+            return None, None, None, {
+                "error": "scope='all' with subject='them' needs a person"}
+        else:
+            member_key_str = person_key
+    else:  # group
+        if chat_id is None:
+            return None, None, None, {"error": "scope='group' needs a group chat_id"}
+        counterpart_key = f"chat:{chat_id}"
+        if subject == "me":
+            member_key_str = "me"
+        elif person_key is None:
+            return None, None, None, {
+                "error": "scope='group' with subject='them' needs a person"}
+        else:
+            member_key_str = person_key
+    return member_key_str, counterpart_key, scope, None
+
+
 def get_voiceprint(contact_id=None, handle_id=None, name=None, subject="me",
-                   scope=None, chat_id=None, date_from=None, date_to=None):
+                   scope=None, chat_id=None, date_from=None, date_to=None) -> dict:
     """A person's deterministic voiceprint -- how they text.
 
     Defaults to YOUR voice (subject='me'): name a person
@@ -308,36 +321,10 @@ def get_voiceprint(contact_id=None, handle_id=None, name=None, subject="me",
         if err:
             return err
 
-        if scope is None:
-            scope = "dyad" if person_key is not None else "all"
-        scope = str(scope).lower()
-        if scope not in ("dyad", "group", "all"):
-            return {"error": f"scope must be dyad, group, or all (got {scope!r})"}
-
-        if scope == "dyad":
-            if person_key is None:
-                return {"error": "scope='dyad' needs a person "
-                                 "(contact_id/handle_id/name)"}
-            member_key_str, counterpart_key = (
-                ("me", person_key) if subject == "me" else (person_key, "me"))
-        elif scope == "all":
-            counterpart_key = "*"
-            if subject == "me":
-                member_key_str = "me"
-            elif person_key is None:
-                return {"error": "scope='all' with subject='them' needs a person"}
-            else:
-                member_key_str = person_key
-        else:  # group
-            if chat_id is None:
-                return {"error": "scope='group' needs a group chat_id"}
-            counterpart_key = f"chat:{chat_id}"
-            if subject == "me":
-                member_key_str = "me"
-            elif person_key is None:
-                return {"error": "scope='group' with subject='them' needs a person"}
-            else:
-                member_key_str = person_key
+        member_key_str, counterpart_key, scope, err = resolve_voice_scope(
+            scope, subject, person_key, chat_id)
+        if err:
+            return err
 
         if date_from is not None or date_to is not None:
             return _recompute(con, member_key_str, counterpart_key, scope,
@@ -352,35 +339,41 @@ def get_voiceprint(contact_id=None, handle_id=None, name=None, subject="me",
 
 def _clip(text, limit):
     """Truncate a message body to `limit` chars for prompt/payload size, with a
-    trailing ellipsis (the same marker the shared message truncator uses)."""
+    trailing ellipsis (the same marker the shared message truncator uses).
+
+    Deliberately NOT chat_apple._clip, which shares the name: that one is a hard
+    total-length cap for a char-budgeted scratchpad (result <= n) and maps None
+    to ''; this one keeps `limit` chars of BODY and passes None through, so a
+    preview is comparable to TEXT_PREVIEW_CHARS everywhere else."""
     return text if text is None or len(text) <= limit else text[:limit] + "…"
 
 
-def reply_pairs_in_chunk(con, chunk_id):
-    """The ACTUAL reply-in-context pairs inside one chunk: each inbound
-    (is_from_me=0) message paired with the is_from_me=1 message that IMMEDIATELY
-    follows it, ordering by (date, id) over REAL messages only
-    (_REAL_MESSAGE_CLAUSES -- emote/system rows can neither anchor nor serve as
-    the reply). This is the load-bearing correctness point: adjacency in the
-    time-ordered stream, NOT every inbound x self co-occurrence in the chunk.
+def directed_reply_pairs(con, chunk_id, reply_from_me=1):
+    """The ACTUAL reply-in-context pairs inside one chunk: each real message
+    paired with the message from the requested speaker that IMMEDIATELY follows
+    it, ordering by (date, id) over REAL messages only (_REAL_MESSAGE_CLAUSES --
+    emote/system rows can neither anchor nor serve as the reply). Adjacency in
+    the time-ordered stream is the load-bearing correctness point, NOT every
+    inbound x self co-occurrence in the chunk.
 
-    Rows are read positionally so the helper is row_factory-agnostic. Pairs
-    whose either side has no text (an attachment-only message can't be a text
-    exemplar) are skipped."""
-    from ._shared import TEXT_PREVIEW_CHARS, _REAL_MESSAGE_CLAUSES
-
+    `reply_from_me` selects WHOSE replies to collect: 1 = the user's (V2
+    drafting, past-self grounding), 0 = the counterpart's (simulating a
+    contact). Rows are read positionally so the helper is row_factory-agnostic.
+    Pairs whose either side has no text (an attachment-only message can't be a
+    text exemplar) are skipped."""
     real = " AND ".join(_REAL_MESSAGE_CLAUSES)
     rows = con.execute(
         f"SELECT m.id, m.is_from_me, m.text, m.date FROM messages m "
         f"WHERE m.chunk_id = ? AND {real} ORDER BY m.date, m.id",
         (chunk_id,),
     ).fetchall()
+    want = 1 if reply_from_me else 0
     pairs = []
     for i in range(len(rows) - 1):
-        cur_id, cur_me, cur_text, _cur_date = rows[i][0], rows[i][1], rows[i][2], rows[i][3]
+        cur_id, cur_me, cur_text = rows[i][0], rows[i][1], rows[i][2]
         nxt_id, nxt_me, nxt_text, nxt_date = rows[i + 1][0], rows[i + 1][1], \
             rows[i + 1][2], rows[i + 1][3]
-        if cur_me == 0 and nxt_me == 1 and cur_text and nxt_text:
+        if cur_me == (1 - want) and nxt_me == want and cur_text and nxt_text:
             pairs.append({
                 "incoming": _clip(cur_text, TEXT_PREVIEW_CHARS),
                 "reply": _clip(nxt_text, TEXT_PREVIEW_CHARS),
@@ -388,4 +381,26 @@ def reply_pairs_in_chunk(con, chunk_id):
                 "incoming_id": cur_id,
                 "reply_id": nxt_id,
             })
+    return pairs
+
+
+def reply_pairs_in_chunk(con, chunk_id):
+    """V2's direction of `directed_reply_pairs`: inbound message -> the reply of
+    MINE that immediately follows it."""
+    return directed_reply_pairs(con, chunk_id, reply_from_me=1)
+
+
+def collect_pairs(con, chunk_ids, cap, reply_from_me=1):
+    """Directed reply pairs across `chunk_ids` in order, deduped by
+    (incoming_id, reply_id), capped at `cap`."""
+    pairs, seen = [], set()
+    for cid in chunk_ids:
+        for pair in directed_reply_pairs(con, cid, reply_from_me):
+            key = (pair["incoming_id"], pair["reply_id"])
+            if key in seen:
+                continue
+            seen.add(key)
+            pairs.append(pair)
+            if len(pairs) >= cap:
+                return pairs
     return pairs

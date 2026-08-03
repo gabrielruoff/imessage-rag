@@ -1,5 +1,11 @@
 name: CI
 
+# History: this file shipped as `ci.yml.disabled` from 1e3a5f9 ("disable ci for
+# now", 2026-07-22) until the lean pass re-enabled it. No specific breakage was
+# recorded when it was turned off. It is back on deliberately: the suite is
+# hermetic (no Ollama, no real chat.db) and CLAUDE.md steers agents away from
+# running it locally, so CI is the only automated gate the repo has.
+#
 # No `paths:` filter on purpose: with one, a docs-only or Makefile-only PR
 # runs zero jobs, and a required status check that never runs blocks the PR
 # instead of passing it. The whole suite is hermetic and takes ~1 minute.
@@ -47,5 +53,11 @@ jobs:
       # Dev deps too: the suite is stdlib-only today, but installing just
       # requirements.txt means a test that imports a dev-only tool would fail
       # here for a reason that looks nothing like the cause.
-      - run: pip install -r requirements.txt -r requirements-dev.txt
+      #
+      # And requirements-api.txt: tests/test_api.py covers the optional web
+      # layer, and without fastapi/sse-starlette `unittest discover` turned the
+      # missing import into a collection ERROR for the whole run. That module
+      # now skips cleanly when they are absent -- but skipping would mean CI
+      # never exercises api/ at all, so install them rather than rely on it.
+      - run: pip install -r requirements.txt -r requirements-dev.txt -r requirements-api.txt
       - run: python -m unittest discover tests
