@@ -154,7 +154,9 @@ def _seed_chunks(con, model, think, workers, target, dry_run=False, sampler=None
             with progress.track("Seeding annotations", total=total,
                                 header=False) as p:
                 for group, results in annotate._pooled(
-                        items, request if gate is None else gate.timed(request),
+                        items,
+                        request if gate is None else gate.timed(
+                            request, produced=annotate._group_produced),
                         workers):
                     for chunk_id, _text in group:
                         data = results.get(chunk_id)

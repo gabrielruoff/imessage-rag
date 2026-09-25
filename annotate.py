@@ -468,13 +468,29 @@ def _resolve_event_message_ids(con, chunk_id, events):
 def _annotate_batch(group, model, think):
     """One JSON-mode request annotating several chunks at once; returns
     {chunk_id: annotation dict} for the ids the reply actually covered --
-    the caller retries any missing/mangled id with a single-chunk request."""
+    the caller retries any missing/mangled id with a single-chunk request.
+
+    Covers nothing rather than raising, for the same reason the schema retry
+    below does: this runs on a worker thread, and _pooled hands a worker
+    exception to the future, where it surfaces on the CALLER's thread at
+    done.result() and aborts the whole PHASE. chat_once_json turns a MALFORMED
+    reply into a value (None) on its own, so for a long time the only failures
+    here were values -- but a transport failure is not one. ANNOTATE_TIMEOUT
+    expiring on one batched request killed a whole seed pass this way
+    (2026-08-03). The rungs behind this one -- the schema retry, then
+    per-chunk singles, each a fraction of a batch's work -- are the retry, so
+    a batch that times out has to cost this group its cheapest rung and
+    nothing more. KeyboardInterrupt is not an Exception and still propagates,
+    which keeps the ladder Ctrl-C safe."""
     user = "\n\n".join(f"### chunk {cid}\n{text}" for cid, text in group)
-    data = ollama.chat_once_json(
-        [{"role": "system", "content": _ANNOTATE_SYSTEM + _BATCH_SYSTEM_SUFFIX},
-         {"role": "user", "content": user}],
-        model=model, think=think, timeout=ANNOTATE_TIMEOUT,
-    )
+    try:
+        data = ollama.chat_once_json(
+            [{"role": "system", "content": _ANNOTATE_SYSTEM + _BATCH_SYSTEM_SUFFIX},
+             {"role": "user", "content": user}],
+            model=model, think=think, timeout=ANNOTATE_TIMEOUT,
+        )
+    except Exception:
+        return {}
     if not isinstance(data, dict):
         return {}
     return {cid: data[str(cid)] for cid, _ in group
@@ -519,11 +535,10 @@ def _annotate_schema_retry(rows, model, think):
     PHASE (the group included) and _run_upgrades' finally can only commit what
     already landed. An Ollama build that will not take a dict `format` -- or a
     grammar that runs past ANNOTATE_TIMEOUT -- must cost this group its retry,
-    never the run. The rung above (_annotate_batch) is deliberately unguarded by
-    contrast: chat_once_json already returns None rather than raising on a
-    malformed reply, so its failures are values, not exceptions.
-    KeyboardInterrupt still propagates (it is not an Exception), which is what
-    keeps the tier Ctrl-C safe."""
+    never the run. The rung above (_annotate_batch) degrades identically and
+    for the identical reason -- read its docstring for why a value-returning
+    seam still needs the guard. KeyboardInterrupt still propagates (it is not
+    an Exception), which is what keeps the tier Ctrl-C safe."""
     ids = [cid for cid, _text in rows]
     user = "\n\n".join(f"### chunk {cid}\n{text}" for cid, text in rows)
     try:
@@ -592,6 +607,19 @@ def _annotate_group(group, model, think):
             )
         out[chunk_id] = data if isinstance(data, dict) else None
     return out
+
+
+def _group_produced(results):
+    """Did an _annotate_group call come back with anything usable? The
+    predicate every budgeted dispatch loop hands _DispatchDeadline.timed, so a
+    group whose whole ladder failed cannot bank its latency as this phase's
+    worst group (see _GroupRate.worst).
+
+    ANY annotation counts, not all of them: a partial group did real work at a
+    real price. False means every rung -- batch, schema retry, and a
+    single-chunk request per row -- came back unusable, which at these
+    latencies means they timed out."""
+    return any(data is not None for data in results.values())
 
 
 def _write_annotation(con, chunk_id, data, source="llm"):

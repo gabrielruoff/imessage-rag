@@ -89,11 +89,19 @@ class _GroupRate:
             self.prior = (self._cold_per_chunk * max(1.0, rows_per_group)
                           * self._workers)
 
-    def record(self, seconds):
+    def record(self, seconds, ok=True):
+        """Feed one completed group's wall-clock in.
+
+        `ok=False` marks a group that produced NOTHING -- every request in its
+        ladder failed, which in practice means they timed out. Such a group
+        still counts toward the mean (the budget really did lose that time, and
+        the in-run gate has to plan around it) but never toward worst(), which
+        is the number banked for the next run. See worst()."""
         with self._lock:                    # worker threads; a paired update
             self._n += 1
             self._total += seconds
-            self._worst = max(self._worst, seconds)
+            if ok:
+                self._worst = max(self._worst, seconds)
 
     def mean(self):
         """Mean seconds per group, or None when nothing has completed yet."""
@@ -101,14 +109,27 @@ class _GroupRate:
             return self._total / self._n if self._n else None
 
     def worst(self):
-        """Slowest group seen, or None when nothing has completed yet. This is
-        what gets carried to the NEXT run: group latency is noisy (a batched
+        """Slowest SUCCESSFUL group seen, or None when none has completed. This
+        is what gets carried to the NEXT run: group latency is noisy (a batched
         reply that covers only some ids costs an extra request -- the schema
         retry, or a single-chunk request per miss when that fails too -- so the
         same phase measured a 106.4 s mean one run and 148 s the next), and the
         failure this whole gate exists to prevent is one-sided -- under-buying
         costs coverage a rerun recovers, overrunning breaks the only promise
-        the tier makes."""
+        the tier makes.
+
+        Successful only, for the reason conflict_labeling._timed gives about the
+        same trade: a group whose whole ladder failed measured TIMEOUTS, not
+        throughput -- batch + schema retry + a single per chunk, so up to
+        (batch + 2) x ANNOTATE_TIMEOUT -- and banking that latches the gate
+        shut. Measured 2026-08-04: 5,825 s banked under
+        annotate_group_seconds:seed:<model>:b8:w4 exceeded the seed phase's
+        whole share of a 60-minute budget, so dispatchable() yielded zero
+        groups, so nothing was measured, so nothing overwrote the value that
+        stopped it -- the tier no-opped on every rerun, forever. A PARTIAL
+        group still counts: it returned annotations, so its latency is evidence
+        about what working work costs, and the retry rungs it paid for are
+        exactly the noise this method exists to be conservative about."""
         with self._lock:
             return self._worst or None
 
@@ -212,7 +233,11 @@ def _save_group_rate(con, rate, phase, model, batch_size, workers):
     """Persist what this run actually measured, so the next one is not blind.
     Only a MEASURED value is stored -- writing the prior back would freeze a
     cold guess into the DB where nothing would ever correct it -- and the
-    slowest group rather than the mean, for the reason _GroupRate.worst gives.
+    slowest SUCCESSFUL group rather than the mean, for the reason
+    _GroupRate.worst gives. A run whose every group failed measured nothing
+    bankable, so worst() is None and set_float_state's falsy guard leaves the
+    stored value alone: the next run starts from the last honest number rather
+    than from a wall of timeouts.
     Within a run the live mean still wins, so the conservative number only
     governs the dispatches made before this run has measured anything."""
     set_float_state(con, _group_rate_key(phase, model, batch_size, workers),
@@ -260,15 +285,27 @@ class _DispatchDeadline:
         self._dispatched = 0
         self._finished = 0
 
-    def timed(self, request_fn):
+    def timed(self, request_fn, produced=None):
         """Wrap the per-group request so completions feed both the shared rate
-        and THIS gate's outstanding count."""
+        and THIS gate's outstanding count.
+
+        `produced` is Callable[result, bool]: did this group actually come back
+        with work? It decides `ok` on the record() call, i.e. whether the
+        group's wall-clock is allowed to become the number banked for the next
+        run -- see _GroupRate.worst for why an all-failed group must not be. It
+        is the TIER's question, not this module's (annotate._group_produced
+        answers it for the annotation ladder), so the default keeps every group
+        eligible, and the outstanding count is updated on every path regardless.
+        A request that RAISES is never eligible: `ok` is still False."""
         def run(group):
             started = self._monotonic()
+            ok = False
             try:
-                return request_fn(group)
+                result = request_fn(group)
+                ok = produced is None or bool(produced(result))
+                return result
             finally:
-                self.rate.record(self._monotonic() - started)
+                self.rate.record(self._monotonic() - started, ok=ok)
                 with self._lock:
                     self._finished += 1
         return run

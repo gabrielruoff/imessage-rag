@@ -322,7 +322,8 @@ def _run_upgrades(con, rows, model, think, workers, batch_size, deadline,
                             header=False) as p:
             for group, results in annotate._pooled(
                     gate.dispatchable(groups),
-                    gate.timed(lambda g: annotate._annotate_group(g, model, think)),
+                    gate.timed(lambda g: annotate._annotate_group(g, model, think),
+                               produced=annotate._group_produced),
                     workers):
                 for chunk_id, _text in group:
                     # Dispatched, so never a candidate again this run -- even if
