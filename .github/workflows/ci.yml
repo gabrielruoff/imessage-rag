@@ -68,5 +68,8 @@ jobs:
       # missing import into a collection ERROR for the whole run. That module
       # now skips cleanly when they are absent -- but skipping would mean CI
       # never exercises api/ at all, so install them rather than rely on it.
-      - run: pip install -r requirements.txt -r requirements-dev.txt -r requirements-api.txt
+      #
+      # And requirements-mcp.txt, for the same reason: the MCP server tests
+      # would otherwise skip and CI would never exercise mcp_server/.
+      - run: pip install -r requirements.txt -r requirements-dev.txt -r requirements-api.txt -r requirements-mcp.txt
       - run: python -m unittest discover tests
