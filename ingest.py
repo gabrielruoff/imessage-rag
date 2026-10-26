@@ -7,9 +7,11 @@ Pipeline:
   3. Join message/handle/chat/attachment tables into a normalized schema,
      enriching handles with contact names from ./address_book.abcddb if present
   4. Build an FTS5 index over message text
-  5. Group messages into conversation chunks and embed them via local Ollama
-     (nomic-embed-text) into a sqlite-vec table -- both stages live in
-     chunking.py; this module runs them (and re-exports them for callers)
+  5. Group messages into conversation chunks and embed them into a sqlite-vec
+     table -- via local Ollama (nomic-embed-text), or for EMBED_MODEL=voyage/<id>
+     via the Voyage Batch API (submit, save the batch ids in ingest_state, poll,
+     collect; an interrupted run's batches are finished first next time). Both
+     stages live in chunking.py; this module runs them (and re-exports them)
 
 Usage:
     python3 ingest.py                  # full pipeline
@@ -24,6 +26,9 @@ Usage:
     python3 ingest.py --lookback=3mo    # only ingest messages from the last 3 months
                                         # (units d/w/mo/y); an extra lower bound on
                                         # message.date, combines with the flags above
+    python3 ingest.py --budget 2 --max-parallel 4
+                                        # voyage/ EMBED_MODEL only: USD spend cap
+                                        # (else HOSTED_BUDGET_USD) and requests in flight
 """
 
 import argparse
@@ -37,8 +42,23 @@ import sys
 from pathlib import Path
 
 import progress
-from chunking import build_chunks, build_vec_table, embed_chunks
-from config import ADDRESS_BOOK_PATH, SNAPSHOT_DB, SOURCE_DB, TARGET_DB
+from chunking import (
+    build_chunks,
+    build_vec_table,
+    embed_chunks,
+    embed_chunks_voyage,
+    unembedded_chunks,
+)
+from config import (
+    ADDRESS_BOOK_PATH,
+    EMBED_MODEL,
+    HOSTED_MAX_PARALLEL,
+    SNAPSHOT_DB,
+    SOURCE_DB,
+    TARGET_DB,
+    hosted_model_id,
+    is_voyage_model,
+)
 from db import get_state, load_vec_extension, set_state, strip_reaction_guid_prefix
 from lexicon_build import build_dyad_terms, build_person_period_lexicon
 from sessions import build_sessions
@@ -522,18 +542,51 @@ def _build_parser():
                           "(units d=days/w=weeks/mo=months/y=years); an extra lower "
                           "bound on message.date, combines with --since-last/--senders/"
                           "--exclude")
+    ap.add_argument("--budget", type=float, default=None, metavar="USD",
+                     help="voyage/ EMBED_MODEL only: spend cap for this run "
+                          "(else HOSTED_BUDGET_USD; one of the two is required)")
+    ap.add_argument("--max-parallel", type=int, default=None, metavar="N",
+                     help="voyage/ EMBED_MODEL only: max Voyage requests in flight "
+                          f"(default HOSTED_MAX_PARALLEL={HOSTED_MAX_PARALLEL})")
     return ap
+
+
+def _embed_voyage(tgt, budget, max_parallel):
+    """The voyage/ embedding step. A HostedStop becomes an exit naming the
+    cause and how many chunks are still pending."""
+    import hosted
+
+    hosted.upload_notice(f"Voyage AI ({hosted_model_id(EMBED_MODEL)})", "chunk text")
+    build_vec_table(tgt, detect_embed_dim())
+    tgt.commit()
+    try:
+        embed_chunks_voyage(tgt, budget, max_parallel)
+    except hosted.HostedStop as e:
+        pending = len(unembedded_chunks(tgt))
+        raise SystemExit(f"error: Voyage run stopped: {e.cause}\n"
+                         f"  {pending} chunks still have no vector; re-run ingest to "
+                         f"resume.") from None
 
 
 def main():
     ap = _build_parser()
     args = ap.parse_args()
+    use_voyage = is_voyage_model(EMBED_MODEL)
+    if not use_voyage and (args.budget is not None or args.max_parallel is not None):
+        ap.error("--budget / --max-parallel only apply to hosted models "
+                 f"(EMBED_MODEL={EMBED_MODEL})")
 
     senders = _split_csv(args.senders)
     excluded = _split_csv(args.exclude)
     # Parse-and-validate before the (potentially multi-GB) snapshot copy so a
     # typo fails instantly rather than minutes in.
     lookback = _parse_lookback(args.lookback)
+    if use_voyage and not args.no_embed:
+        import hosted
+
+        budget = hosted.Budget(hosted.resolve_budget_usd(args.budget))
+        max_parallel = hosted.check_max_parallel(
+            HOSTED_MAX_PARALLEL if args.max_parallel is None else args.max_parallel)
 
     snapshot_source(SOURCE_DB, SNAPSHOT_DB)
 
@@ -609,7 +662,9 @@ def main():
             build_person_period_lexicon(tgt)
             build_dyad_terms(tgt)
 
-            if not args.no_embed:
+            if not args.no_embed and use_voyage:
+                _embed_voyage(tgt, budget, max_parallel)
+            elif not args.no_embed:
                 try:
                     dim = detect_embed_dim()
                 except (http.client.HTTPException, OSError, RuntimeError) as e:
