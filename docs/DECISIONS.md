@@ -3423,3 +3423,213 @@ model sends it to its provider. No per-contact deny-list or consent list gates
 any of the 21 tools; `WELLBEING_DENY_IDS` gates only the excluded
 `get_language_trajectory`. The docs say both plainly rather than imply a
 protection that doesn't exist.
+
+## 2026-10-26: hosted embeddings (Voyage) and hosted annotation (OpenRouter)
+
+Two pipelines gained an opt-in, paid, uploading backend: chunk embeddings on
+Voyage AI (`EMBED_MODEL=voyage/voyage-4-large`) and the per-chunk annotation tiers
+on OpenRouter (`ANNOTATE_MODEL=openrouter/anthropic/claude-haiku-5.5`). The local
+defaults are unchanged; with no hosted name set, nothing behaves differently.
+Modules: `hosted.py` (shared budget, retry classification, `Limiter`, upload
+notice), `voyage.py` + `chunking`/`ingest`, `openrouter.py` +
+`annotate_hosted.py`. Runbook: `docs/DEMO.md`, "Hosted models".
+
+### Evidence
+
+Measured in this repo with `eval/evalkit/recall.py` and `eval/evalkit/pilot.py`
+(raw results under `eval/results/`, gitignored).
+
+**Retrieval** (`eval.evalkit recall`): 200 synthetic gold queries ranked against
+a 5,200-chunk pool (200 gold + 5,000 random distractors).
+
+| | recall@1 | recall@10 | MRR@10 |
+|---|---|---|---|
+| nomic-embed-text | 0.560 | 0.820 | 0.651 |
+| voyage-4-large | **0.755** | **0.960** | **0.831** |
+
+Paired at @10, 30 queries were found only by Voyage and 2 only by nomic (sign test
+p≈2e-7); at @1 the split was 46 vs 7. The pool inflates both models' numbers
+(full-corpus nomic recall@10 is 0.605), so the gap is the signal.
+
+**Distilled kNN labels** (`eval.evalkit distill-ab`, 5-fold CV over 3,774
+`source='llm'` labels): Voyage vectors cut valence MAE 0.386 → 0.355 (Δ −0.031,
+CI −0.037…−0.026), lift emotion Jaccard 0.165 → 0.180, and leave depth ±1 flat.
+The gain is real but small (~8–9% relative), and it only matters on the local
+distilled path, which hosted annotation never takes.
+
+**Annotation pilot** (`eval.evalkit annotate-pilot`): 300 seeded chunks, the
+production prompt, validator and schema, strict `json_schema`, one chunk per
+request.
+
+| Agreement | Haiku 5.5 vs Sonnet 5.5 | Haiku vs local qwen3.5:4b | Sonnet vs local |
+|---|---|---|---|
+| valence MAE | **0.125** | 0.322 | 0.308 |
+| valence sign | **82%** | 63% | 62% |
+| depth ±1 / exact | **100% / 78%** | 67% / 31% | 68% / 32% |
+| emotion Jaccard | **0.47** | 0.27 | 0.27 |
+| has-event / event-kind Jaccard | **89% / 0.79** | 60% / 0.52 | 59% / 0.52 |
+
+Haiku agrees with Sonnet at about one LLM's own run-to-run noise (valence MAE
+0.12, 2026-07-17 entry), at 1/20th the price ($0.000199 vs $0.00395 per chunk in
+the pilot shape), so Haiku was chosen. Both hosted models disagree with the local
+4B labels equally. The local labels are the noisy side, so local and hosted
+`source='llm'` rows must not mix, and the `annotate_model` guard already refuses
+that. Strict structured output gave 0 unparseable replies in 582.
+
+**Token efficiency** (52 calls, Haiku, same chunks):
+
+- The strict schema is billed as **+710 prompt tokens on every call**. OpenRouter
+  injects no text of its own.
+- `response_format: json_object` is a silent no-op on this route: no tokens, and
+  the replies are still fenced. It is not a cheaper substitute.
+- **Prompt caching works, and the schema is what makes it work.** With
+  `cache_control` on the system block, 1,109 tokens are written once, then read
+  on every later call. The system prompt alone (~395 tokens) is under Haiku's
+  512-token cacheable minimum. Warm, a chunk costs $0.000120 against $0.000220
+  uncached.
+- **Packing is rejected.** The repo's repeated-id schema fails at 8 ids
+  ("compiled grammar is too large"). The `$ref` and array forms work, but they
+  found fewer events (5 vs 11 over the same 8 chunks) and flipped one chunk's
+  valence sign, for only ~10% more saving once caching is on.
+
+**Projected full-corpus cost** (77,696 chunks): Voyage batch embeddings, 16.23M
+tokens × $0.0804/M = **$1.31**. Haiku with the cached prefix, sync, ≈ **$6.3–7.7**
+(≈ $14.6–17 without caching).
+
+### Decisions
+
+- **D1: hosted annotation tiers.** Only `max`/`balanced`/`fast` accept an
+  `openrouter/` model, always one chunk per request in the cached shape. `fast`'s
+  batch size is ignored with a note, because packing is a measured quality risk.
+  `--quality distilled|hybrid` as a flag is a `parser.error`, and so is
+  `ANNOTATE_QUALITY=hybrid`. Both exist to save local LLM time with kNN-copied,
+  low-trust labels (events always empty). At about $7 for the whole corpus, a
+  hosted per-chunk run makes that trade unnecessary. A `distilled` that comes only from the
+  env/default runs `balanced` with a note, so `make annotate-all` works without
+  editing `.env`.
+- **D2: `openrouter/` is annotate-only, enforced at the ollama seam.**
+  `chat_once`, `chat_once_json` and `chat_stream` refuse an `openrouter/` model.
+  Every other pipeline, including its `--model` flag, passes through that seam,
+  so a hosted name can't reach the cloud by accident. There is deliberately no
+  OpenRouter dispatch there.
+- **D3: choosing the model is the consent.** Each hosted run prints one line
+  naming what is uploaded and where. There is no extra flag. The chat-time query
+  path prints nothing, because under the MCP server stdout is the wire.
+- **D4: a spend cap is required, with no default.** It covers both clients:
+  `--budget` or `HOSTED_BUDGET_USD`, or the run refuses to start. Each request
+  reserves its worst case before it is sent: UTF-8 bytes × input price (byte-level
+  BPE never yields more tokens than bytes), plus `max_tokens` × output price for
+  OpenRouter. The request then settles at the reported cost. Voyage reports usage
+  per output line, and a batch settles at their sum. A 4xx or 429 settles at 0;
+  a 5xx or timeout without usage settles at the worst case. Chat-time query
+  embeddings (~20 tokens) are not budgeted. The cost of worst-case reservation:
+  the full corpus is 55.0M bytes, which reserves $4.42 for a $1.31 batch, so a
+  first full run needs `--budget` ≥ ~4.5.
+- **D5: Voyage ingest polls until done.** Ingest submits, saves the batch ids in
+  `ingest_state` *before* polling, then polls, collects and resubmits errored
+  lines until nothing errors. An interrupted run's saved batches are finished
+  before anything new is submitted, so nothing is paid for twice. Polling with a
+  progress line was chosen over a `--no-wait` submit-now, collect-later mode, so
+  one ingest ends with every vector in place and never blocks silently.
+- **D6:** the eval harnesses (`pilot.py`, `recall.py`) are committed as they
+  were measured.
+- **D7: live, paid calls are limited to one smoke test** with a throwaway
+  `TARGET_DB` and a $0.10 budget. Every test is hermetic (`httpx.MockTransport`).
+  The full-corpus hosted run is the user's to run.
+- **D8: OpenRouter `:batch` was validated and rejected.** See below.
+- **D9: `--terms` under a hosted `ANNOTATE_MODEL` curates locally** on
+  `CHAT_MODEL`, with a note, and an `openrouter/` `--model` with `--terms` is an
+  error. Terms have their own guard key, `terms_model`, so hosted chunk labels
+  and local term verdicts don't trip each other's guard and `make annotate` /
+  `make pipeline` keep working. A one-time migration copies `annotate_model` to
+  `terms_model` when curated terms exist. It runs before any guard, because a
+  later hosted chunk run overwrites `annotate_model`.
+
+Shape decisions:
+
+- **Backend selection by a model-name prefix** (`voyage/`, `openrouter/`), like
+  the `apple` sentinel, rather than a new `EMBED_BACKEND` knob.
+  `ingest_state.embed_model` records the full prefixed value, so the existing
+  vector-table guard tells a hosted model from a local one. A bare `voyage-` name
+  match was rejected, because open-weight voyage models can be pulled into Ollama.
+- **`EMBED_DIM` doubles as Voyage's `output_dimension`.** Unset means 1024, and
+  only 256/512/1024/2048 are accepted. No paid probe is made to detect it.
+- **Voyage documents are batch-only.** `embed_texts(kind="document")` raises on a
+  voyage model, and only queries use the sync endpoint (`input_type: "query"`;
+  instruction tokens are not billed). The nomic task prefixes are skipped.
+  Batch is 33% cheaper than sync, and OpenRouter's Voyage route has no batch
+  variant.
+- **The sync query path is bounded**: 3 attempts, then an error. A chat turn must
+  not hang. The plan expected the semantic tools to fall back to FTS on that
+  error; they don't. The tool returns an error to the model, just as when Ollama
+  is down. The "never skip" rule applies to runs, not to one query.
+- **Stale-vector protection.** A Voyage `custom_id` carries a hash of the chunk's
+  text, and on collect a line whose text has changed since submit is discarded
+  and resubmitted. Tail chunks are rebuilt between ingests. Input JSONL is built
+  in memory and never written to disk, and output is streamed (a full run is
+  ~0.8 GB of JSON). After results are committed, a batch's remote files are
+  deleted, best-effort; Voyage would otherwise keep them for about 30 days. Ingest
+  ends by recounting missing vectors from the DB and exits non-zero unless the
+  count is 0.
+- **Completeness over convenience.** Transient errors (429, 5xx, timeouts) are
+  retried without limit. A moderation 403 is retried with that upstream added to
+  `provider.ignore`. Unparseable replies get 3 retries, and anything still
+  unparseable or refused is listed in a non-zero exit, never written and never
+  skipped. The pilot's 4-retries-then-drop behaviour lost 18 of 300 Sonnet chunks,
+  which is exactly what this rules out.
+- **The cache is verified, not assumed.** One `session_id` per run keeps
+  OpenRouter's sticky routing on the warm provider, `provider.order` is never set,
+  and the system text and schema are built once per run so they stay
+  byte-identical. A warning prints if `cached_tokens` stays 0 after the first few
+  calls.
+- **Reasoning follows the tri-state `think`.** `False` → `{enabled: false}`,
+  `True` → `{enabled: true}`, an effort string → `{effort}`, and `None` omits the
+  key. A hosted run reads `ANNOTATE_THINK` like a local one. The balanced preset
+  resolves to `False` for Haiku, which is the measured setting (0 reasoning
+  tokens). An explicit `ANNOTATE_THINK=true` wins and buys unmeasured reasoning
+  tokens, so the runbook prefixes hosted commands with `ANNOTATE_THINK=false`.
+
+### OpenRouter echoes a dated model id; the guard records ours
+
+OpenRouter answered a request for `anthropic/claude-haiku-5.5` with
+`anthropic/claude-haiku-5.5-20261007`. The `annotate_model` guard records the
+**configured** value (`openrouter/anthropic/claude-haiku-5.5`), never an id taken
+from a response. An echoed id changes whenever the alias is repointed, and
+recording it would make the guard refuse the next run against an unchanged
+config. The served id is printed once per run (`OpenRouter served <id>`) for the
+log, and that's all.
+
+Accepted consequence: the guard can't tell when OpenRouter repoints the alias to a
+newer snapshot partway through a corpus, so one table can hold labels from two
+snapshots of the same alias. The alias is what the user chose. The printed id is
+the only record.
+
+### D8: OpenRouter `:batch` — validated, fails on caching
+
+`:batch` lists Haiku at half the sync price, so it was tested before anything was
+built. Batch `batch-1793053043-y3iRnFVOtkpoi3SMNowC` was 20 chunks with the
+recommended body:
+
+| Check | Result |
+|---|---|
+| Ran | `completed` in 666 s, routed to Anthropic, 0 failed |
+| Replies parse | 20/20, none fenced |
+| Schema honoured | mean prompt 1,340 tokens (~640 if the schema were dropped) |
+| Reasoning | 0 reasoning tokens |
+| **Prompt caching** | **0/20 cache reads; every request paid `cache_write_tokens: 1109`** |
+| Cost | $0.00187 (base $0.00159 + 20 × 1,109 × the cache-write premium) |
+
+A batch's requests run concurrently, so each one writes the prefix and none reads
+it. Per chunk on these chunks, the sync cached path costs ≈ $0.000059, `:batch`
+measured $0.000093, and `:batch` without `cache_control` ≈ $0.000080. Batch is
+~1.35–1.6× more expensive and hours slower, so the sync cached path is the only
+hosted annotation path. Not tested: a batch of thousands, or a 1-hour cache TTL,
+which would need a cache-hit rate above ~40% to break even.
+
+Two facts from the validation, kept for any future `:batch` work. `GET` can
+return 404 just after the 202, so a 404 on a just-saved id must be retried, not
+treated as gone. And `DELETE /api/v1/batches/{id}` **cascades to the upstream
+provider's copy**: the response reported both OpenRouter's copy and Anthropic's as
+deleted. A future implementation should delete each batch once its results are
+written, rather than leave message-derived output on third-party servers for the
+30-day retention.
