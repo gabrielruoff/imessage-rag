@@ -391,6 +391,25 @@ web-dev:  ## Run the Vite frontend dev server
 web-build:  ## Build the frontend for production
 	npm --prefix frontend run build
 
+# --- MCP server (optional) ---------------------------------------------------
+# When an agent client launches `make mcp`, stdout IS the JSON-RPC wire, so:
+#  - every `mcp` recipe line is @-prefixed (make echoes unprefixed commands to
+#    stdout);
+#  - clients launch it as `make -s --no-print-directory -C /ABS/PATH mcp` --
+#    `-C` turns on `-w` in GNU make 4.x (and in 3.81 under MAKEFLAGS=w), whose
+#    "Entering directory" line lands on stdout; --no-print-directory stops it,
+#    and -s covers any future recipe line that lacks @;
+#  - no $(REQUIRE_OLLAMA): only two tools need Ollama, and that macro's output
+#    is not guaranteed to stay off stdout.
+.PHONY: mcp-install mcp
+
+mcp-install:  ## Install the MCP server deps (requirements-mcp.txt) into .venv
+	.venv/bin/python -m pip install -r requirements-mcp.txt
+
+mcp:  ## Run the MCP server on stdio for agent clients (see docs/MCP.md)
+	@.venv/bin/python3 -c 'import mcp' 2>/dev/null || { echo "MCP deps missing -- run: make mcp-install" >&2; exit 1; }
+	@exec .venv/bin/python3 -m mcp_server
+
 # --- Analytics eval (evalkit) ------------------------------------------------
 # EVAL_RUN_ID names the results dir under eval/results/; override to re-check or
 # re-report an existing run: `make eval EVAL_RUN_ID=20260717T120000-baseline`.
