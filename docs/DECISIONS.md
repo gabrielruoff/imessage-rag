@@ -3153,24 +3153,26 @@ from the `annotate` that `annotate_terms` and `annotate_distill` import by name.
 `conflict_detect` and its `conflict_signals` / `conflict_labeling` children have
 the same shape: each child imports the parent at the top to read its knobs late,
 and the parent re-exports child names from a from-import at its BOTTOM. That
-shape has two script-only failures, and both shipped. CLASS 1: the `__main__`
-guard sat above the bottom import and called the local `main`, which read a
-name not yet bound in `__main__` — `annotate.py --terms` (and so
-`make pipeline`) died on `NameError: curate_terms`. CLASS 2: moving the guard
-below the bottom import makes `__main__` execute that import itself, which
-re-enters a half-initialized child — `conflict_detect.py` died on ImportError.
+shape has two script-only failures. CLASS 1, which shipped in both CLIs: the
+`__main__` guard sat above the bottom import and called the local `main`, which
+read a name not yet bound in `__main__` — `annotate.py --terms` (and so
+`make pipeline`) died on `NameError: curate_terms`, and `conflict_detect.py` on
+a NameError the same way. CLASS 2, hit by the obvious alternative fix: moving
+the guard below the bottom import makes `__main__` execute that import itself,
+which re-enters a half-initialized child — `conflict_detect.py` then dies on
+ImportError, `--help` included.
 
 Nothing saw CLASS 1. Every test imports `annotate`, which runs the whole module
 before anything calls `main`, so the name is bound. ruff sees a module-level
 binding. `--help` exits inside argparse before `main()` reaches the late name.
-`annotate.py` itself had only worked earlier by accident: its top-level
-`import annotate_distill` forced the full load, so a plain guard below the
-bottom import resolved — until an edit moving that import into `main()`, which
-is lint-clean and suite-green, would have restored the break.
+`annotate.py` would have survived moving its guard to the bottom, but only by
+accident: its top-level `import annotate_distill` forces the full load, and
+moving that import into `main()` — lint-clean and suite-green — would bring the
+break back.
 
 The first fix was a per-file self-import shim (`import annotate;
-run_cli(annotate.main)`). It worked, but every future split parent — topics,
-wrapped and loose_ends already have siblings — would have had to rediscover it,
+run_cli(annotate.main)`). It worked, but every future split parent (wrapped
+already has a child, `wrapped_sections`, that imports it) would have had to rediscover it,
 and the two copies' comments had already drifted into contradicting each other.
 `db.run_cli` now does the re-entry once: when `main.__module__ == "__main__"` it
 imports the real module (by `__spec__.name` under `-m`, by file name otherwise)
@@ -3192,5 +3194,5 @@ runtime test that runs a planted parent/child cycle both ways, with a bare
 leg for CLASS 2. Discovery reads `git ls-files`, so an untracked scratch script
 is never executed.
 
-PR #48 later lets children import the parent at the bottom; that is compatible
-with this fix and does not change the guard shape.
+PR #48 (open at the time of writing) moves each child's parent import to the
+bottom; that is compatible with this fix and does not change the guard shape.

@@ -11,8 +11,8 @@ a bottom from-import therefore has two script-only failures:
 Shape rule: every module-level `if __name__ == "__main__":` guard is the last
 module-level statement, or its body is exactly `run_cli(<name>)` /
 `db.run_cli(<name>)`, which re-reads `main` off the fully-initialized real
-module. EntrypointShapeTest guards CLASS 1 (statically, plus a runtime proof of
-that re-entry); EntrypointStartupTest (`--help`) guards CLASS 2.
+module. EntrypointShapeTest guards CLASS 1 statically and RunCliReentryTest
+proves that re-entry at runtime; EntrypointStartupTest (`--help`) guards CLASS 2.
 
 Limits: a CLI that is not a git-tracked root-level file or listed in
 PACKAGE_ENTRYPOINTS is not covered, and `--help` exits inside argparse, so it
