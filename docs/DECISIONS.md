@@ -3332,3 +3332,94 @@ is never executed.
 
 PR #48 (open at the time of writing) moves each child's parent import to the
 bottom; that is compatible with this fix and does not change the guard shape.
+
+## 2026-10-26: an MCP server over the read-only retrieval tools
+
+`mcp_server/` serves 21 tools from `query_tools/` to agent clients (Claude Code,
+Claude Desktop, any MCP client) over stdio. It is transport only, like `api/`:
+it serves `tool_schemas.TOOL_DEFINITIONS` verbatim and dispatches into
+`query_tools`, as `chat.py` does for Ollama. User reference: `docs/MCP.md`.
+
+**Scope.** The tools come from three sections of the tool inventory: search and
+retrieval, contacts and chats, and analytics. That is 22 tools, minus one.
+`get_language_trajectory` is excluded because its wellbeing floor
+(`chat_floor.TurnFloor`: a whole-reply condition-name scrub plus a verbatim
+support epilogue) works only inside this app's own turn-runners. An MCP server
+never sees the agent's reply, so the floor can't run, and removing the
+capability is the control. Every Voice, Conflict, Nudge and Drift tool is out of
+scope too. Several of them write (`resolve_loose_thread`,
+`mute_contact_from_nudges`), and others depend on the DV screen or on
+code-printed epilogues. None of the 21 is flag-gated, writes, or emits
+`_epilogue`. `EXPOSED_TOOLS` is an explicit allow-list: a new `query_tools`
+function is never exposed automatically, and one that writes or relies on a
+turn-level floor is never added.
+
+**stdio only.** stdio confines access to the one client process that launched
+the server. Streamable HTTP would need authorization plus Origin validation to be
+safe for a corpus this private, and nobody asked for it.
+
+**Low-level `Server`, not decorators.** `MCPServer`'s decorators re-derive each
+schema from type hints, which would give the tools a second schema source free
+to drift from `tool_schemas`. The low-level `Server` takes the dicts as-is. The
+existing JSON Schema 2020-12 constructs (`"type": ["integer", "array"]` for the
+scalar-or-list ids) are valid MCP `inputSchema`s. In SDK v2 the low-level
+`Server` does not validate arguments, and an uncaught handler exception reaches
+the client as an opaque `-32603`. So the server validates with `jsonschema` and
+returns `isError: true` on failure, and it catches tool exceptions into an
+`{"error": ...}` result, the same posture as `chat._run_turn_core`. The model
+sees the error and can correct itself.
+
+**Text results only.** No `outputSchema` or `structuredContent`. The 21 results
+are heterogeneous, the size cap can return a `partial_json` fragment that would
+violate any declared output schema, and text content is universally supported.
+
+**A separate cap knob.** `MCP_RESULT_MAX_CHARS` (40000) sits under Claude Code's
+default 25k-token MCP output limit even at ~2 chars/token for `\u`-escaped emoji.
+`TOOL_RESULT_MAX_CHARS` is sized to Ollama's whole-message window drop, and
+tuning it for a small local model must not shrink MCP results. The capping logic
+moved from `chat._cap_tool_result` into `query_tools._shared.cap_tool_result_json`
+with the cap as a parameter. `chat._cap_tool_result` stays as a thin wrapper so
+the tests that patch `chat.TOOL_RESULT_MAX_CHARS` keep working unmodified.
+
+**`chat` is not imported.** It pulls in `rich`, `applefm` and `readline`, which
+can write terminal escapes on import onto the stdio wire, and it would couple a
+tool transport to the chat CLI. The server imports `query_tools`, `tool_schemas`
+and `config` only.
+
+**A package, not a root module.** `tests/test_entrypoints.py` imports every root
+`.py` with no allowlist. A root `mcp_server.py` importing the optional `mcp`
+dependency would fail `make test` for anyone who skipped `make mcp-install`.
+Nothing may be named `mcp.py` or `mcp/`, which would shadow the SDK.
+
+**stdout is the wire, and the SDK's fd diversion is not enough.**
+`stdio_server()` moves fd 1 to stderr while it serves, but a stray `print()`
+still corrupted the stream in the prototype: Python's block-buffered
+`sys.stdout` flushed onto the restored fd at exit, and the client logged
+`Invalid JSON: 'stray print…'`. The fix is `sys.stdout = sys.stderr` inside the
+`stdio_server()` block, once the SDK holds the wire on its private fd.
+Reassigning it before entering the block is wrong, because the SDK then serves
+the wire from the reassigned stream. The same rule reaches make: every `mcp`
+recipe line is `@`-prefixed, and every client launch is
+`make -s --no-print-directory -C … mcp`. `-C` implies `-w` in GNU make 4.x, which
+prints `make: Entering directory …` to stdout, and macOS make 3.81 does the same
+under `MAKEFLAGS=w`. `-s` alone does not suppress an explicit `MAKEFLAGS=w`;
+`--no-print-directory` does. `make mcp` deliberately skips `$(REQUIRE_OLLAMA)`:
+only two of the tools need Ollama, and that macro's output isn't guaranteed to
+stay off stdout.
+
+**`sse-starlette` 2.4.1 → 3.6.0.** `mcp==2.3.0` requires
+`sse-starlette>=3.0.0`, and pip reported `ResolutionImpossible` for any env
+holding `requirements-api.txt` too, which includes CI's test job. With 3.6.0 all
+four requirement files resolve together (starlette 0.49.3 satisfies both
+fastapi 0.120.4's `<0.50` and mcp's `>=0.48`), on macOS py3.14 and on CI's Linux
+py3.13 leg (checked with `pip install --dry-run --only-binary=:all:`).
+`pip check` is clean, `tests.test_api` and `tests.test_run_turn_events` pass, and
+the import path `sse_starlette.sse.{EventSourceResponse, ServerSentEvent}` is
+unchanged.
+
+**Privacy.** The README's "everything stays local" claim stopped being absolute:
+the server hands retrieved message text to the connected agent, and a hosted
+model sends it to its provider. No per-contact deny-list or consent list gates
+any of the 21 tools; `WELLBEING_DENY_IDS` gates only the excluded
+`get_language_trajectory`. The docs say both plainly rather than imply a
+protection that doesn't exist.
