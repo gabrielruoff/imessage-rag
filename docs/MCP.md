@@ -6,8 +6,8 @@ client) search and analyze your ingested iMessage history. It is transport only:
 it serves 21 of the read-only retrieval tools from `query_tools/`, with the same
 schemas `chat.py` gives the local model (`tool_schemas.TOOL_DEFINITIONS`,
 verbatim). The code is the `mcp_server/` package. Design history is in
-[`DECISIONS.md`](DECISIONS.md) (entry "an MCP server over the read-only retrieval
-tools").
+[`DECISIONS.md`](DECISIONS.md), in the entry "MCP server over the read-only
+retrieval tools" (the "MCP server entry" the code points at).
 
 Read [Privacy & security model](#privacy--security-model) before you connect an
 agent. It changes where your messages go.
@@ -186,6 +186,8 @@ npx @modelcontextprotocol/inspector make -s --no-print-directory -C /ABS/PATH/im
 ## Configuration
 
 All of these live in `config.py` and can be set in `.env` or the client's `env`.
+`.env.example` lists `MCP_RESULT_MAX_CHARS` commented out under `# --- MCP server ---`,
+like every line in that file; uncomment it in your `.env` to change it.
 
 | Variable | Effect |
 |---|---|

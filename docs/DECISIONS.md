@@ -3333,7 +3333,7 @@ is never executed.
 PR #48 (open at the time of writing) moves each child's parent import to the
 bottom; that is compatible with this fix and does not change the guard shape.
 
-## 2026-10-26: an MCP server over the read-only retrieval tools
+## 2026-10-26: MCP server over the read-only retrieval tools
 
 `mcp_server/` serves 21 tools from `query_tools/` to agent clients (Claude Code,
 Claude Desktop, any MCP client) over stdio. It is transport only, like `api/`:
