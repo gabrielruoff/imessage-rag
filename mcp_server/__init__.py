@@ -17,10 +17,17 @@ import sys
 import tomllib
 from pathlib import Path
 
-import jsonschema
-from mcp import MCPError, types
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
+# Checked here, not by a probe in `make mcp`, which cost every client launch a
+# second interpreter and a second `mcp` import; `-m` runs this before __main__.
+try:
+    import jsonschema
+    from mcp import MCPError, types
+    from mcp.server import Server
+    from mcp.server.stdio import stdio_server
+except ModuleNotFoundError as e:
+    if e.name not in ("mcp", "jsonschema"):
+        raise
+    sys.exit("MCP deps missing -- run: make mcp-install")  # stderr, exit 1
 
 import config
 import query_tools
@@ -84,6 +91,11 @@ instructions."""
 _SCHEMAS = {d["name"]: d for d in TOOL_DEFINITIONS}
 # Fail fast at import: a missing schema (KeyError) or function (AttributeError) is drift.
 _FUNCS = {n: getattr(query_tools, n) for n in EXPOSED_TOOLS}
+# Compiled once; check_schema makes a malformed schema fail here too.
+_VALIDATORS = {}
+for _n in EXPOSED_TOOLS:
+    jsonschema.Draft202012Validator.check_schema(_SCHEMAS[_n]["input_schema"])
+    _VALIDATORS[_n] = jsonschema.Draft202012Validator(_SCHEMAS[_n]["input_schema"])
 _READ_ONLY = types.ToolAnnotations(read_only_hint=True, destructive_hint=False,
                                    idempotent_hint=True, open_world_hint=False)
 TOOLS = [types.Tool(name=n, title=t, description=_SCHEMAS[n]["description"],
@@ -99,12 +111,12 @@ async def _call_tool(ctx, params):
     fn = _FUNCS.get(params.name)
     if fn is None:
         raise MCPError(types.INVALID_PARAMS, f"Unknown tool: {params.name}")
-    args = params.arguments or {}
+    # Some clients send null for every unset optional; every tool reads None as omitted.
+    args = {k: v for k, v in (params.arguments or {}).items() if v is not None}
     # The SDK does not validate arguments; a failure is a tool error the model can fix.
-    try:
-        jsonschema.validate(args, _SCHEMAS[params.name]["input_schema"])
-    except jsonschema.ValidationError as e:
-        return _result({"error": f"invalid arguments: {e.message}"})
+    error = jsonschema.exceptions.best_match(_VALIDATORS[params.name].iter_errors(args))
+    if error is not None:
+        return _result({"error": f"invalid arguments: {error.message}"})
     # An uncaught exception would reach the model as an opaque -32603.
     try:
         result = await asyncio.to_thread(fn, **args)
@@ -115,7 +127,11 @@ async def _call_tool(ctx, params):
 
 
 def _result(result):
-    text = cap_tool_result_json(result, json.dumps(result), config.MCP_RESULT_MAX_CHARS)
+    # default=str: an unencodable value must not escape as -32603. ensure_ascii stays
+    # on: raw non-ASCII packs more tokens per char, so the char cap would stop
+    # bounding tokens (config.MCP_RESULT_MAX_CHARS).
+    result_json = json.dumps(result, separators=(",", ":"), default=str)
+    text = cap_tool_result_json(result, result_json, config.MCP_RESULT_MAX_CHARS)
     is_error = isinstance(result, dict) and bool(result.get("error"))
     return types.CallToolResult(content=[types.TextContent(type="text", text=text)],
                                 is_error=is_error)

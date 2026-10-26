@@ -162,17 +162,25 @@ MAX_TOOL_ITERATIONS = int(os.getenv("MAX_TOOL_ITERATIONS", "20"))  # tool round-
 # Minimum gap (minutes) between two consecutive same-sender messages for the
 # second to count as a double-text rather than a multi-part message.
 DOUBLE_TEXT_MIN_MINUTES = int(os.getenv("DOUBLE_TEXT_MIN_MINUTES", "10"))
+def _positive_int_env(name, default):
+    """An int knob that must be > 0; an empty value means unset."""
+    raw = os.getenv(name) or str(default)
+    if int(raw) <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {raw!r}")
+    return int(raw)
+
+
 # Hard cap on one tool result's JSON (chars) before it enters the chat context.
 # Ollama truncates per whole MESSAGE: a single message larger than the window is
 # dropped along with everything before it, leaving only the system prompt, so an
 # oversized result must be cut client-side. ~60k chars is ~20k tokens.
-TOOL_RESULT_MAX_CHARS = int(os.getenv("TOOL_RESULT_MAX_CHARS", "60000"))
+TOOL_RESULT_MAX_CHARS = _positive_int_env("TOOL_RESULT_MAX_CHARS", 60000)
 # Hard cap on one MCP tool result's JSON (chars; mcp_server). Sized under Claude
 # Code's default 25k-token MCP output limit even at the worst case of ~2
 # chars/token for \u-escaped emoji. Over the cap, the result is cut at row
 # boundaries with a note rather than mangled by the client. Separate from
 # TOOL_RESULT_MAX_CHARS, which is sized to Ollama's whole-message window drop.
-MCP_RESULT_MAX_CHARS = int(os.getenv("MCP_RESULT_MAX_CHARS") or "40000")
+MCP_RESULT_MAX_CHARS = _positive_int_env("MCP_RESULT_MAX_CHARS", 40000)
 
 # --- Analytics: sessions & response dynamics ----------------------------------
 # Silence gap (minutes) that closes a `sessions` row. Distinct from

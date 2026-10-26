@@ -13,6 +13,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -153,6 +154,12 @@ class ExposedSetTest(unittest.TestCase):
                 self.assertIs(a.open_world_hint, False)
         self.assertTrue(mcp_server.INSTRUCTIONS.strip())
 
+    def test_instructions_name_only_exposed_tools(self):
+        # INSTRUCTIONS is hand-written; a renamed or dropped tool must not linger.
+        named = set(re.findall(r"\b(?:search|get|list|find)_[a-z_]+", mcp_server.INSTRUCTIONS))
+        self.assertTrue(named)
+        self.assertLessEqual(named, set(mcp_server.EXPOSED_TOOLS))
+
 
 @_NEEDS_MCP_DEPS
 class InMemoryServerTest(unittest.TestCase):
@@ -197,6 +204,19 @@ class InMemoryServerTest(unittest.TestCase):
         result = self.call("search_messages_sql", {"limit": "lots"})
         self.assertTrue(result.is_error)
         self.assertIn("invalid arguments", _payload(result)["error"])
+
+    def test_null_optional_arguments_are_omitted(self):
+        result = self.call("search_messages_sql",
+                           {"chat_id": 1, "date_from": None, "limit": None})
+        self.assertFalse(result.is_error, result.content[0].text)
+        self.assertEqual({r["id"] for r in _payload(result)["rows"]}, {1, 2})
+
+    def test_unencodable_result_is_still_a_result(self):
+        result = mcp_server._result([{"raw": b"\x00", "day": {1}}])
+        self.assertFalse(result.is_error)
+        self.assertEqual(_payload(result)[0]["raw"], "b'\\x00'")
+        with mock.patch.object(config, "MCP_RESULT_MAX_CHARS", 30):  # the capped path too
+            json.loads(mcp_server._result([{"raw": b"\x00"}] * 5).content[0].text)
 
     def test_tool_exception_is_a_tool_error(self):
         def boom(**kwargs):

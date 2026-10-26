@@ -459,12 +459,12 @@ def _resolve_scope(con, chat_id, handle_id, contact_id):
 
 def cap_tool_result_json(result, result_json, max_chars):
     """Cap one tool result's JSON at ``max_chars`` while keeping it
-    valid JSON. An oversized tool message makes Ollama silently drop it AND
-    every message before it (only the system prompt survives), so the model
-    would answer with no user question in context. List results (the only
-    shape that gets big in practice) are cut at whole-row boundaries so every
-    kept row stays parseable; anything else keeps a prefix explicitly labeled
-    as a fragment."""
+    valid JSON. Shared by both transports, each passing its own cap:
+    chat.py (TOOL_RESULT_MAX_CHARS: an oversized message makes Ollama drop it
+    and everything before it) and mcp_server (MCP_RESULT_MAX_CHARS: the
+    client's output-token limit). List results (the only shape that gets big
+    in practice) are cut at whole-row boundaries so every kept row stays
+    parseable; anything else keeps a prefix explicitly labeled as a fragment."""
     if len(result_json) <= max_chars:
         return result_json
     note = (
@@ -494,7 +494,7 @@ def cap_tool_result_json(result, result_json, max_chars):
                      if k not in capped_result and k != "returned"}
                 )
                 capped_result["returned"] = keep
-            capped = json.dumps(capped_result)
+            capped = json.dumps(capped_result, default=str)
             if len(capped) <= max_chars:
                 return capped
             if keep == 1:

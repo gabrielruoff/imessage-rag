@@ -219,6 +219,16 @@ class EnvParsingTest(unittest.TestCase):
         self.assertTrue(tolerant)
         self.assertEqual(strict & tolerant, set(), "a knob parsed both ways")
 
+    def test_positive_int_env_reads_empty_as_unset_and_refuses_non_positive(self):
+        with mock.patch.dict(os.environ, {"MCP_RESULT_MAX_CHARS": ""}, clear=False):
+            self.assertEqual(config._positive_int_env("MCP_RESULT_MAX_CHARS", 40000), 40000)
+        for bad in ("0", "-40000"):
+            with self.subTest(value=bad), \
+                    mock.patch.dict(os.environ, {"MCP_RESULT_MAX_CHARS": bad}, clear=False):
+                with self.assertRaises(ValueError) as ctx:
+                    config._positive_int_env("MCP_RESULT_MAX_CHARS", 40000)
+                self.assertIn("MCP_RESULT_MAX_CHARS", str(ctx.exception))
+
     def test_parse_json_dict_env_raises_naming_the_variable(self):
         # config.py:496-509 fails LOUDLY at import on a malformed drift knob,
         # and the message names the var so the .env line is findable.
@@ -363,19 +373,21 @@ class EnvExampleParityTest(unittest.TestCase):
         # exists is a lie that `make env` copies verbatim.
         #
         # The scanner must recognize the HELPER forms too. A naive
-        # `os.getenv("NAME"` regex reports 7 false positives -- CHAT_THINK,
+        # `os.getenv("NAME"` regex reports 9 false positives -- CHAT_THINK,
         # CONFLICT_THINK, NUDGES_THINK, TOPIC_THINK, WRAPPED_THINK,
-        # DRIFT_WEIGHTS, DRIFT_PHASE_THRESHOLDS -- because those are read
-        # through _think(...) / _parse_json_dict_env(...) instead.
+        # DRIFT_WEIGHTS, DRIFT_PHASE_THRESHOLDS, MCP_RESULT_MAX_CHARS,
+        # TOOL_RESULT_MAX_CHARS -- because those are read through _think(...)
+        # / _parse_json_dict_env(...) / _positive_int_env(...) instead.
         root = pathlib.Path(config.__file__).resolve().parent
         src = (root / "config.py").read_text()
         declared = set(re.findall(
-            r'(?:os\.getenv|_think|_parse_json_dict_env)\(\s*"([A-Z][A-Z0-9_]*)"', src))
+            r'(?:os\.getenv|_think|_parse_json_dict_env|_positive_int_env)\(\s*"([A-Z][A-Z0-9_]*)"', src))
         naive = set(re.findall(r'os\.getenv\(\s*"([A-Z][A-Z0-9_]*)"', src))
         self.assertEqual(
             sorted(declared - naive),
             ["CHAT_THINK", "CONFLICT_THINK", "DRIFT_PHASE_THRESHOLDS",
-             "DRIFT_WEIGHTS", "NUDGES_THINK", "TOPIC_THINK", "WRAPPED_THINK"])
+             "DRIFT_WEIGHTS", "MCP_RESULT_MAX_CHARS", "NUDGES_THINK",
+             "TOOL_RESULT_MAX_CHARS", "TOPIC_THINK", "WRAPPED_THINK"])
 
         # .env.example is a bare commented inventory: `# VAR=default` lines,
         # every one of which must STAY commented (make env copies it verbatim).

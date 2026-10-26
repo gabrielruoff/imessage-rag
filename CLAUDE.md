@@ -72,7 +72,9 @@ App DB (web UI only, `config.APP_DB`): `api/store.py`.
   `query_tools/__init__.py` + schema in `tool_schemas.py` (same `name`) + one
   line in `chat.py`'s `SYSTEM_PROMPT` tool list. Keep all four in sync. MCP
   exposure is a separate explicit allow-list (`mcp_server.EXPOSED_TOOLS`), never
-  automatic, and never for a tool that writes or relies on a turn floor.
+  automatic, and never for a tool that writes or relies on a turn floor. A
+  contract change to an exposed tool (id shapes, envelope keys, date semantics)
+  also updates `mcp_server.INSTRUCTIONS`, its hand-written usage guide.
 - **All tunables live in `config.py`**; never hardcode one elsewhere. Runtime
   deps → `requirements.txt`, dev → `requirements-dev.txt`, web →
   `requirements-api.txt`, MCP → `requirements-mcp.txt`. All pinned.

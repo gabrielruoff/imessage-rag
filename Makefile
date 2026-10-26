@@ -407,7 +407,6 @@ mcp-install:  ## Install the MCP server deps (requirements-mcp.txt) into .venv
 	.venv/bin/python -m pip install -r requirements-mcp.txt
 
 mcp:  ## Run the MCP server on stdio for agent clients (see docs/MCP.md)
-	@.venv/bin/python3 -c 'import mcp' 2>/dev/null || { echo "MCP deps missing -- run: make mcp-install" >&2; exit 1; }
 	@exec .venv/bin/python3 -m mcp_server
 
 # --- Analytics eval (evalkit) ------------------------------------------------
