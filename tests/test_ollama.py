@@ -26,6 +26,9 @@ class TestThinkTriState(unittest.TestCase):
             def __init__(self, *a, **k):
                 pass
 
+            def connect(self):
+                pass
+
             def request(self, _method, path, body=None, **_kwargs):
                 sent.update(json.loads(body))
 
@@ -105,3 +108,29 @@ class TestEmptyThinkFalseDegrades(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestUnreachableIsClassifiedAtConnect(unittest.TestCase):
+    """chat_once wraps every failure to OPEN a connection as OllamaUnreachable
+    (callers treat it as a config error) and leaves a failure after connecting
+    -- a read timeout -- as the raw transport error."""
+
+    def test_every_connect_failure_is_unreachable(self):
+        import socket
+        for exc in (ConnectionRefusedError(), socket.gaierror("nodename"),
+                    OSError(65, "No route to host"), TimeoutError()):
+            with self.subTest(exc=type(exc).__name__):
+                with mock.patch("http.client.HTTPConnection.connect",
+                                side_effect=exc):
+                    with self.assertRaises(ollama.OllamaUnreachable):
+                        ollama.chat_once([{"role": "user", "content": "x"}],
+                                         model="test-model")
+
+    def test_a_timeout_after_connecting_stays_a_transport_failure(self):
+        with mock.patch("http.client.HTTPConnection.connect"), \
+                mock.patch("http.client.HTTPConnection.request",
+                           side_effect=TimeoutError()):
+            with self.assertRaises(TimeoutError) as caught:
+                ollama.chat_once([{"role": "user", "content": "x"}],
+                                 model="test-model")
+        self.assertNotIsInstance(caught.exception, ollama.OllamaUnreachable)

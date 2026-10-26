@@ -485,11 +485,16 @@ class _LadderLLM:
     per-chunk singles); chat_once serves the schema-constrained retry and is
     the only place a dict `format` may ever appear. `schema` is what that retry
     gets back: _COVER_ASKED (a well-formed reply covering every id it asked
-    for), an Exception to raise, or a canned message dict."""
+    for), an Exception to raise, or a canned message dict. `batch` is an
+    Exception the batched request raises (None: answer per `covered`), and
+    `singles` lists per-single outcomes in call order -- an Exception to raise
+    or a value to return; once exhausted, singles return an annotation."""
 
-    def __init__(self, covered=(), schema=_COVER_ASKED):
+    def __init__(self, covered=(), schema=_COVER_ASKED, batch=None, singles=()):
         self.covered = set(covered)
         self.schema = schema
+        self.batch = batch
+        self.singles = list(singles)
         self.log = []                           # (rung, ids) in call order
         self.formats = []                       # every `format` chat_once saw
         self.thinks = []                        # every `think` chat_once saw
@@ -499,9 +504,16 @@ class _LadderLLM:
         ids = _chunk_ids_in(messages[-1]["content"])
         if len(ids) > 1:
             self.log.append(("batch", ids))
+            if self.batch is not None:
+                raise self.batch
             return {str(chunk_id): dict(_ANNOTATION)
                     for chunk_id in ids if chunk_id in self.covered}
         self.log.append(("single", ids))
+        if self.singles:
+            outcome = self.singles.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
         return dict(_ANNOTATION)
 
     def chat_once(self, messages, model=None, format=None, timeout=None,
@@ -523,11 +535,13 @@ class TestAnnotateGroupLadder(unittest.TestCase):
 
     GROUP = [(1, "chunk 1: alpha"), (2, "chunk 2: beta"), (3, "chunk 3: gamma")]
 
-    def run_group(self, llm, group=None, model="test-annotate-model"):
+    def run_group(self, llm, group=None, model="test-annotate-model",
+                  fail_fast=False):
         with mock.patch.object(ollama, "chat_once_json", llm.chat_once_json):
             with mock.patch.object(ollama, "chat_once", llm.chat_once):
                 return annotate._annotate_group(
-                    self.GROUP if group is None else group, model, False)
+                    self.GROUP if group is None else group, model, False,
+                    fail_fast=fail_fast)
 
     def assertCovered(self, out):
         self.assertEqual(sorted(out), [1, 2, 3])
@@ -554,7 +568,7 @@ class TestAnnotateGroupLadder(unittest.TestCase):
         # Expected ~never, but the group must still complete: the per-chunk
         # rung stays underneath as belt and braces.
         for label, schema_reply in (
-                ("transport error", RuntimeError("boom")),
+                ("server error body", RuntimeError("boom")),
                 ("unparseable content", _reply("not json {")),
                 ("empty reply", {}),
                 ("not a JSON object", _reply("[1, 2]")),
@@ -566,6 +580,83 @@ class TestAnnotateGroupLadder(unittest.TestCase):
                                            ("schema", [2, 3]),
                                            ("single", [2]), ("single", [3])])
                 self.assertCovered(out)
+                # An unusable reply is not a transport failure.
+                self.assertFalse(out.failed)
+
+    def test_a_batch_timeout_skips_the_schema_rung_and_buys_singles(self):
+        llm = _LadderLLM(batch=TimeoutError())
+        out = self.run_group(llm)
+        self.assertEqual(llm.log, [("batch", [1, 2, 3]), ("single", [1]),
+                                   ("single", [2]), ("single", [3])])
+        self.assertCovered(out)
+        self.assertTrue(out.failed)
+
+    def test_a_second_transport_failure_ends_the_ladder(self):
+        llm = _LadderLLM(batch=TimeoutError(), singles=[TimeoutError()])
+        out = self.run_group(llm)
+        self.assertEqual(llm.log, [("batch", [1, 2, 3]), ("single", [1])])
+        self.assertEqual(out, {1: None, 2: None, 3: None})
+        self.assertTrue(out.failed)
+
+    def test_fail_fast_stops_at_the_first_transport_failure(self):
+        llm = _LadderLLM(batch=TimeoutError())
+        out = self.run_group(llm, fail_fast=True)
+        self.assertEqual(llm.log, [("batch", [1, 2, 3])])
+        self.assertEqual(out, {1: None, 2: None, 3: None})
+        self.assertTrue(out.failed)
+
+    def test_fail_fast_keeps_rows_an_earlier_rung_covered(self):
+        llm = _LadderLLM(covered=(1,), schema=TimeoutError())
+        out = self.run_group(llm, fail_fast=True)
+        self.assertEqual(llm.log, [("batch", [1, 2, 3]), ("schema", [2, 3])])
+        self.assertIsInstance(out[1], dict)
+        self.assertEqual((out[2], out[3]), (None, None))
+        self.assertTrue(out.failed)
+
+    def test_an_unreachable_server_propagates_from_every_rung(self):
+        # No reachable server is a config error: fail loudly, never skip rows.
+        down = ollama.OllamaUnreachable("cannot reach Ollama")
+        for fail_fast in (False, True):
+            with self.subTest(rung="batch", fail_fast=fail_fast):
+                llm = _LadderLLM(batch=down)
+                with self.assertRaises(ollama.OllamaUnreachable):
+                    self.run_group(llm, fail_fast=fail_fast)
+                self.assertEqual(llm.log, [("batch", [1, 2, 3])])
+            with self.subTest(rung="schema", fail_fast=fail_fast):
+                llm = _LadderLLM(covered=(1,), schema=down)
+                with self.assertRaises(ollama.OllamaUnreachable):
+                    self.run_group(llm, fail_fast=fail_fast)
+                self.assertEqual(llm.log, [("batch", [1, 2, 3]), ("schema", [2, 3])])
+            with self.subTest(rung="single", fail_fast=fail_fast):
+                # The batch-size-1 presets (max/balanced/distilled) only ever
+                # reach this rung.
+                llm = _LadderLLM(singles=[down])
+                with self.assertRaises(ollama.OllamaUnreachable):
+                    self.run_group(llm, group=self.GROUP[:1], fail_fast=fail_fast)
+                self.assertEqual(llm.log, [("single", [1])])
+
+    def test_a_schema_timeout_flags_the_group_and_singles_still_run(self):
+        llm = _LadderLLM(covered=(1,), schema=TimeoutError())
+        out = self.run_group(llm)
+        self.assertEqual(llm.log, [("batch", [1, 2, 3]), ("schema", [2, 3]),
+                                   ("single", [2]), ("single", [3])])
+        self.assertCovered(out)
+        self.assertTrue(out.failed)
+
+    def test_an_error_body_on_a_single_still_propagates(self):
+        # A config error (e.g. a model that is not pulled) must stay loud.
+        llm = _LadderLLM(covered=(1,), schema=_reply("not json {"),
+                         singles=[RuntimeError("model not found")])
+        with self.assertRaises(RuntimeError):
+            self.run_group(llm)
+
+    def test_only_a_transport_failure_makes_a_group_unbankable(self):
+        malformed = self.run_group(_LadderLLM(schema=_reply("not json {"),
+                                              singles=[None, None, None]))
+        self.assertEqual(malformed, {1: None, 2: None, 3: None})
+        self.assertTrue(annotate._group_bankable(malformed))
+        failed = self.run_group(_LadderLLM(batch=TimeoutError()), fail_fast=True)
+        self.assertFalse(annotate._group_bankable(failed))
 
     def test_ctrl_c_in_the_schema_request_still_propagates(self):
         # The blanket except is `Exception`, deliberately: swallowing a

@@ -21,8 +21,6 @@ from config import (
 )
 from db import like_escape
 
-import annotate
-
 
 # ---------------------------------------------------------------------------
 # Dyad-term curation (--terms)
@@ -271,3 +269,11 @@ def curate_terms(con, model, limit=None, dry_run=False, think=False, workers=1,
     print(f"Curated {n_done} terms ({n_skipped} skipped)")
     _report_parked(parked, max_failures)
     return n_done
+
+# Bottom import: this module is one half of a cycle -- `annotate` re-exports the
+# names below, so importing it from the TOP here makes annotate_terms unimportable
+# on its own (the parent would run its own re-export against a still-empty
+# annotate_terms). Down here every name above is already bound, so the cycle
+# resolves whichever module a caller reaches first. Only used inside functions,
+# so the late binding costs nothing.
+import annotate  # noqa: E402

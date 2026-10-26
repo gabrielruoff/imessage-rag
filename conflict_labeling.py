@@ -20,8 +20,6 @@ import progress
 from db import get_float_state, set_float_state
 from eval.evalkit.gates import eval_gate_passed
 
-import conflict_detect
-
 
 # ---------------------------------------------------------------------------
 # Label write path (eval-gated)
@@ -311,8 +309,7 @@ def _report_labeling(rows, labeled, free, stopped, n_calls, rate, max_label_turn
               f"({left} left unlabeled)")
 
 
-def label_top_conflicts(con, model, n=None,
-                        max_label_turns=conflict_detect.CONFLICT_MAX_LABEL_TURNS,
+def label_top_conflicts(con, model, n=None, max_label_turns=None,
                         classify_fn=None, think=None, deadline=None,
                         monotonic=time.monotonic, rate=None, chat_ids=None):
     """Second pass over already-detected windows: label the strongest first (by
@@ -340,6 +337,15 @@ def label_top_conflicts(con, model, n=None,
     Commits per window (Ctrl-C safe) and banks the observed per-call seconds
     for the next run."""
     conflict_detect._check_model_guard(con, model)
+    # Resolved here rather than as a default, joining `think` / `classify_fn` /
+    # `rate` below. A default expression evaluates at DEF time, which both
+    # forced this module to import conflict_detect from the top -- the one
+    # thing that made it unimportable on its own -- and quietly broke the
+    # late-binding this module's docstring promises: the value would freeze at
+    # import, so patching conflict_detect.CONFLICT_MAX_LABEL_TURNS moved every
+    # other read here except this one.
+    if max_label_turns is None:
+        max_label_turns = conflict_detect.CONFLICT_MAX_LABEL_TURNS
     if think is None:
         think = conflict_detect._resolve_think(model)
     if classify_fn is None:
@@ -439,3 +445,11 @@ def label_top_conflicts(con, model, n=None,
     _report_labeling(rows, labeled, free, stopped, calls["n"], rate,
                      max_label_turns)
     return labeled
+
+# Bottom import: this module is one half of a cycle -- `conflict_detect` re-exports the
+# names below, so importing it from the TOP here makes conflict_labeling unimportable
+# on its own (the parent would run its own re-export against a still-empty
+# conflict_labeling). Down here every name above is already bound, so the cycle
+# resolves whichever module a caller reaches first. Only used inside functions,
+# so the late binding costs nothing.
+import conflict_detect  # noqa: E402

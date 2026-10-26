@@ -56,6 +56,7 @@ Usage (terms):  annotate.py --terms [--limit N] [--model NAME]
 """
 
 import argparse
+import http.client
 import json
 
 import annotate_distill
@@ -220,6 +221,11 @@ You will receive SEVERAL terms, each starting with a line '### term <n>'.
 Classify each term independently of the others. Respond with ONLY one JSON
 object mapping each term's number (as a string) to its verdict, one of
 {_TERM_VERDICT_LIST}: {{"0": "ordinary", "1": "inside_joke", ...}}."""
+
+# Transport failures (timeout, reset, dropped): the request never produced a reply.
+# _annotate_group re-raises ollama.OllamaUnreachable (an OSError) ahead of these --
+# no reachable server is a config error and stays loud.
+_REQUEST_FAILURES = (OSError, http.client.HTTPException)
 
 # chat_once_json's default nudge only says "one JSON object"; a correction
 # that names the exact shape recovers replies that would otherwise cost the
@@ -468,7 +474,10 @@ def _resolve_event_message_ids(con, chunk_id, events):
 def _annotate_batch(group, model, think):
     """One JSON-mode request annotating several chunks at once; returns
     {chunk_id: annotation dict} for the ids the reply actually covered --
-    the caller retries any missing/mangled id with a single-chunk request."""
+    the caller retries any missing/mangled id with a single-chunk request.
+    A malformed reply covers nothing; a transport failure raises, and
+    _annotate_group handles it. See docs/DECISIONS.md, "2026-08-05: the
+    budget gate latched itself shut"."""
     user = "\n\n".join(f"### chunk {cid}\n{text}" for cid, text in group)
     data = ollama.chat_once_json(
         [{"role": "system", "content": _ANNOTATE_SYSTEM + _BATCH_SYSTEM_SUFFIX},
@@ -484,7 +493,7 @@ def _annotate_batch(group, model, think):
 def _annotate_schema_retry(rows, model, think):
     """One SCHEMA-CONSTRAINED request re-asking for exactly the ids a batched
     free-JSON reply missed; returns {chunk_id: annotation dict} for whatever
-    came back, and {} on any failure at all.
+    came back, and {} on an unusable reply.
 
     Why a second batched request instead of going straight to singles: measured
     2026-07-28 (qwen3.5:4b), free-JSON is bimodal. With full id coverage it is
@@ -510,20 +519,13 @@ def _annotate_schema_retry(rows, model, think):
     always already resolved by the time this runs: the rung is reachable only
     behind a batched request, which went through chat_once_json.
 
-    Failure is total and silent by design. The caller's per-chunk fallback is
-    still behind this, so a transport error, a timeout, a server that rejects
-    the schema, a non-dict reply, unparseable content -- all of it has to
-    degrade to "covered nothing" rather than propagate. Not because a raise
-    would kill the worker: _pooled hands a worker exception to the future and it
-    surfaces on the CALLER's thread at done.result(), where it aborts the whole
-    PHASE (the group included) and _run_upgrades' finally can only commit what
-    already landed. An Ollama build that will not take a dict `format` -- or a
-    grammar that runs past ANNOTATE_TIMEOUT -- must cost this group its retry,
-    never the run. The rung above (_annotate_batch) is deliberately unguarded by
-    contrast: chat_once_json already returns None rather than raising on a
-    malformed reply, so its failures are values, not exceptions.
-    KeyboardInterrupt still propagates (it is not an Exception), which is what
-    keeps the tier Ctrl-C safe."""
+    An unusable reply -- a server that rejects the dict `format` (a
+    RuntimeError), a non-dict reply, unparseable content -- covers nothing,
+    since the per-chunk fallback is still behind this. A transport failure
+    (_REQUEST_FAILURES) raises, and _annotate_group handles it: were it
+    swallowed here, a schema-rejecting server would look like a failed request
+    on every group. KeyboardInterrupt is not an Exception and propagates.
+    See docs/DECISIONS.md, "2026-08-05: the budget gate latched itself shut"."""
     ids = [cid for cid, _text in rows]
     user = "\n\n".join(f"### chunk {cid}\n{text}" for cid, text in rows)
     try:
@@ -540,6 +542,8 @@ def _annotate_schema_retry(rows, model, think):
         # preamble, and the per-chunk fallback already is the retry for
         # anything that somehow does.
         data = json.loads((reply or {}).get("content") or "")
+    except _REQUEST_FAILURES:
+        raise
     except Exception:
         return {}
     if not isinstance(data, dict):
@@ -548,26 +552,53 @@ def _annotate_schema_retry(rows, model, think):
             if isinstance(data.get(str(cid)), dict)}
 
 
-def _annotate_group(group, model, think):
+class _GroupResults(dict):
+    """_annotate_group's return: {chunk_id: annotation dict | None}, flagged
+    `failed` when any request in the group's ladder failed in transport."""
+    failed = False
+
+
+def _annotate_group(group, model, think, fail_fast=False):
     """All LLM work for one group of (chunk_id, text) rows: a batched request
     for a multi-chunk group -- then one schema-constrained request naming
     exactly the ids that reply missed, then a single-chunk request for anything
     STILL missing -- or just the single request for a singleton. Runs on worker
-    threads; returns {chunk_id: annotation dict | None}.
+    threads; returns a _GroupResults {chunk_id: annotation dict | None}.
 
     The ladder is ordered by what each rung costs when it works. Free-JSON with
     full coverage is the cheapest thing available and stays the fast path: a
     fully covered batch issues exactly ONE request and nothing else. The schema
     retry (see _annotate_schema_retry) caps the failure mode at one extra
-    request instead of one per miss. The per-chunk singles stay underneath as
-    belt and braces for a schema request that errored, timed out or came back
-    unusable -- expected ~never, but the group must still complete.
+    request instead of one per miss. The per-chunk singles stay underneath for
+    a schema request that came back unusable.
+
+    Transport failures (_REQUEST_FAILURES) are owned here, not by the rungs. A
+    failure flags the result `failed`, skips the schema rung if it has not run
+    (it is batch-sized, so it would very likely time out too) and drops to
+    singles. `fail_fast` (budgeted callers) tolerates no failure, otherwise one
+    is tolerated; past that no further request is issued and every uncovered
+    row is None, while rows an earlier rung covered are kept. So failures cost
+    a group at most 2 x ANNOTATE_TIMEOUT ungated and 1 x with fail_fast, plus
+    the requests that succeeded. An unreachable server (ollama.OllamaUnreachable),
+    any other exception (an Ollama error body) and KeyboardInterrupt
+    propagate: those are config errors and stay loud. See docs/DECISIONS.md,
+    "2026-08-05: the budget gate latched itself shut".
 
     Apple FM never reaches the middle rung: its `format` seam is not a guided
     schema (an empty-properties DynamicGenerationSchema pins the reply to {}),
     so handing applefm a dict format is undefined. It keeps today's behavior --
     batch, then a single-chunk request per miss."""
-    batched = _annotate_batch(group, model, think) if len(group) > 1 else {}
+    out = _GroupResults()
+    tolerated = 0 if fail_fast else 1
+    failures = 0
+    batched = {}
+    if len(group) > 1:
+        try:
+            batched = _annotate_batch(group, model, think)
+        except ollama.OllamaUnreachable:
+            raise
+        except _REQUEST_FAILURES:
+            failures += 1
     # Only ids a batch actually attempted and missed are worth a schema retry;
     # a singleton group has had no batched request at all, so its "miss" is
     # just its first request and belongs on the single-chunk path below.
@@ -578,20 +609,37 @@ def _annotate_group(group, model, think):
     # ANNOTATE_MODEL falls back to CHAT_MODEL), but "apple never receives a dict
     # format" is a boundary, and a boundary that agrees with its seam by
     # coincidence is one bug away from not being one.
-    if (len(group) > 1 and missed
+    if (len(group) > 1 and missed and not failures
             and not config.is_apple_model(model or config.CHAT_MODEL)):
-        batched.update(_annotate_schema_retry(missed, model, think))
-    out = {}
+        try:
+            batched.update(_annotate_schema_retry(missed, model, think))
+        except ollama.OllamaUnreachable:
+            raise
+        except _REQUEST_FAILURES:
+            failures += 1
     for chunk_id, text in group:
         data = batched.get(chunk_id)
-        if data is None:
-            data = ollama.chat_once_json(
-                [{"role": "system", "content": _ANNOTATE_SYSTEM},
-                 {"role": "user", "content": text}],
-                model=model, think=think, timeout=ANNOTATE_TIMEOUT,
-            )
+        if data is None and failures <= tolerated:
+            try:
+                data = ollama.chat_once_json(
+                    [{"role": "system", "content": _ANNOTATE_SYSTEM},
+                     {"role": "user", "content": text}],
+                    model=model, think=think, timeout=ANNOTATE_TIMEOUT,
+                )
+            except ollama.OllamaUnreachable:
+                raise
+            except _REQUEST_FAILURES:
+                failures += 1
         out[chunk_id] = data if isinstance(data, dict) else None
+    out.failed = failures > 0
     return out
+
+
+def _group_bankable(results):
+    """May this group's latency become the phase's banked worst()? Only if
+    no request in its ladder failed in transport: a malformed or partial
+    reply still cost real latency, a timeout measured the timeout."""
+    return not getattr(results, "failed", False)
 
 
 def _write_annotation(con, chunk_id, data, source="llm"):

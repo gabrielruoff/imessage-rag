@@ -89,11 +89,19 @@ class _GroupRate:
             self.prior = (self._cold_per_chunk * max(1.0, rows_per_group)
                           * self._workers)
 
-    def record(self, seconds):
+    def record(self, seconds, ok=True):
+        """Feed one completed group's wall-clock in.
+
+        `ok=False` marks a group whose ladder contained a failed request (or
+        whose request raised). Such a group still counts toward the mean (the
+        budget really did lose that time, and the in-run gate has to plan
+        around it) but never toward worst(), which is the number banked for the
+        next run. See worst()."""
         with self._lock:                    # worker threads; a paired update
             self._n += 1
             self._total += seconds
-            self._worst = max(self._worst, seconds)
+            if ok:
+                self._worst = max(self._worst, seconds)
 
     def mean(self):
         """Mean seconds per group, or None when nothing has completed yet."""
@@ -101,14 +109,19 @@ class _GroupRate:
             return self._total / self._n if self._n else None
 
     def worst(self):
-        """Slowest group seen, or None when nothing has completed yet. This is
-        what gets carried to the NEXT run: group latency is noisy (a batched
-        reply that covers only some ids costs an extra request -- the schema
-        retry, or a single-chunk request per miss when that fails too -- so the
-        same phase measured a 106.4 s mean one run and 148 s the next), and the
-        failure this whole gate exists to prevent is one-sided -- under-buying
-        costs coverage a rerun recovers, overrunning breaks the only promise
-        the tier makes."""
+        """Slowest group recorded with ok=True, or None when there is none.
+        This is what gets carried to the NEXT run. The slowest rather than the
+        mean because group latency is noisy (a batched reply that covers only
+        some ids costs an extra request -- the schema retry, or a single-chunk
+        request per miss), and the failure this gate exists to prevent is
+        one-sided: under-buying costs coverage a rerun recovers, overrunning
+        breaks the only promise the tier makes.
+
+        A group containing a failed request is excluded: its latency measured a
+        timeout, not throughput. Malformed-only and partial groups count -- their
+        latency is real, and the retry rungs they paid for are exactly the noise
+        this is conservative about.
+        See docs/DECISIONS.md, "2026-08-05: the budget gate latched itself shut"."""
         with self._lock:
             return self._worst or None
 
@@ -212,7 +225,11 @@ def _save_group_rate(con, rate, phase, model, batch_size, workers):
     """Persist what this run actually measured, so the next one is not blind.
     Only a MEASURED value is stored -- writing the prior back would freeze a
     cold guess into the DB where nothing would ever correct it -- and the
-    slowest group rather than the mean, for the reason _GroupRate.worst gives.
+    slowest BANKABLE group rather than the mean, for the reason
+    _GroupRate.worst gives. A run whose every group failed measured nothing
+    bankable, so worst() is None and set_float_state's falsy guard leaves the
+    stored value alone: the next run starts from the last honest number rather
+    than from a wall of timeouts.
     Within a run the live mean still wins, so the conservative number only
     governs the dispatches made before this run has measured anything."""
     set_float_state(con, _group_rate_key(phase, model, batch_size, workers),
@@ -240,7 +257,10 @@ class _DispatchDeadline:
     seconds-per-group an earlier run measured for the same model/batch/workers
     (falling back to _COLD_GROUP_SECONDS_PER_CHUNK, which the dispatch loop then
     denominates in its packing's real rows-per-group), so reserve() is honest at
-    group #1 and the wave is never committed blind. Each phase brings its OWN
+    group #1 and the wave is never committed blind. The one exception is the
+    probe (see dispatchable): with nothing measured THIS run, the first group
+    goes regardless of the prior, so a stale or poisoned prior is re-measured
+    rather than latching the phase shut. Each phase brings its OWN
     `rate` under its own key -- 3a's event groups and 3b's confidence groups
     are different populations, and one shared estimator would let whichever
     phase ran first anchor the other wrong (see _load_group_rate).
@@ -260,15 +280,26 @@ class _DispatchDeadline:
         self._dispatched = 0
         self._finished = 0
 
-    def timed(self, request_fn):
+    def timed(self, request_fn, bankable=None):
         """Wrap the per-group request so completions feed both the shared rate
-        and THIS gate's outstanding count."""
+        and THIS gate's outstanding count.
+
+        `bankable` is Callable[result, bool]: may this group's wall-clock become
+        the number banked for the next run? It decides `ok` on the record()
+        call (see _GroupRate.worst). It is the TIER's question, not this
+        module's (annotate._group_bankable answers it for the annotation
+        ladder), so the default keeps every group eligible, and the outstanding
+        count is updated on every path regardless. A request that RAISES is
+        never eligible: `ok` is False."""
         def run(group):
             started = self._monotonic()
+            ok = False
             try:
-                return request_fn(group)
+                result = request_fn(group)
+                ok = bankable is None or bool(bankable(result))
+                return result
             finally:
-                self.rate.record(self._monotonic() - started)
+                self.rate.record(self._monotonic() - started, ok=ok)
                 with self._lock:
                     self._finished += 1
         return run
@@ -301,9 +332,20 @@ class _DispatchDeadline:
         documented contract), so a generator that simply stops yielding is
         exactly the semantics wanted: the clock is read immediately before a
         group is handed to the pool, and everything already dispatched still
-        completes and commits."""
+        completes and commits.
+
+        Probe: while this run has measured nothing and dispatched nothing, the
+        first group goes even if the prior says it will not fit (never once the
+        deadline itself has passed), so a stale or poisoned prior is re-measured
+        instead of latching the phase shut. The price is a bounded overrun: a
+        budget smaller than one group dispatches exactly one group and overruns
+        by its latency.
+        See docs/DECISIONS.md, "2026-08-05: the budget gate latched itself shut"."""
         for group in groups:
-            if self._monotonic() + self.reserve() >= self.deadline:
+            now = self._monotonic()
+            probe = self._dispatched == 0 and self.rate.mean() is None
+            if now >= self.deadline or (
+                    not probe and now + self.reserve() >= self.deadline):
                 self.stopped = True
                 return
             with self._lock:

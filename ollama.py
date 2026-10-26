@@ -22,6 +22,12 @@ class OllamaResponseError(RuntimeError):
     the same request lets the model re-sample."""
 
 
+class OllamaUnreachable(ConnectionError):
+    """No connection to the Ollama server at all -- refused, unresolvable host,
+    unreachable network, connect timeout. Raised before anything is sent: a
+    config error (server not running, wrong OLLAMA_HOST), not a failed request."""
+
+
 # think= needs three states, so the default can't be None: None already means
 # "omit the flag entirely" (for models that reject a think option), which is
 # distinct from False ("send think: false"). _UNSET is the fourth state --
@@ -40,7 +46,8 @@ def _apply_think(body, think):
 def chat_once(messages, model=None, format=None, timeout=None, think=_UNSET):
     """POST a non-streaming request to the chat endpoint and return the
     response's `message` dict. format='json' turns on Ollama JSON mode (the
-    batch annotation/labeling path). Raises RuntimeError on an error body.
+    batch annotation/labeling path). Raises RuntimeError on an error body and
+    OllamaUnreachable when no connection could be opened.
 
     think: True/False for toggle models (qwen3), or an effort level string
     ('low'/'medium'/'high') for reasoning-effort models (gpt-oss); False
@@ -66,6 +73,11 @@ def chat_once(messages, model=None, format=None, timeout=None, think=_UNSET):
         body["format"] = format
     _apply_think(body, think)
     try:
+        try:
+            conn.connect()
+        except OSError as exc:
+            raise OllamaUnreachable(
+                f"cannot reach Ollama at {OLLAMA_HOST}:{OLLAMA_PORT}: {exc}") from exc
         conn.request(
             "POST", OLLAMA_CHAT_PATH, body=json.dumps(body).encode(),
             headers={"Content-Type": "application/json"},

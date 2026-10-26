@@ -29,7 +29,8 @@ import annotate_sampling
 import config
 import ollama
 import schema
-from db import get_state, load_vec_extension, set_state
+from db import (get_float_state, get_state, load_vec_extension, set_float_state,
+                set_state)
 
 try:
     import sqlite_vec
@@ -186,10 +187,14 @@ class FakeLLM:
                      grammar, answers them.
       raise_after -- the REQUEST itself blows up mid-pass, and `retry_raises`
                      is the same for the schema rung, which must cost the group
-                     its retry rather than the run."""
+                     its retry rather than the run.
+      timeout_ids -- a BATCHED request naming any of these ids times out
+                     (TimeoutError, a transport failure the ladder owns) after
+                     charging the clock; single-chunk requests still answer."""
 
     def __init__(self, clock=None, seconds=0.0, fail_ids=(), interrupt_after=None,
-                 raise_after=None, batch_drops=(), retry_raises=False):
+                 raise_after=None, batch_drops=(), retry_raises=False,
+                 timeout_ids=()):
         self.clock = clock
         self.seconds = seconds
         self.fail_ids = set(fail_ids)
@@ -197,6 +202,7 @@ class FakeLLM:
         self.raise_after = raise_after
         self.batch_drops = set(batch_drops)
         self.retry_raises = retry_raises
+        self.timeout_ids = set(timeout_ids)
         self.requests = []          # ids per request
         self.order = []             # ids in dispatch order, flattened
         self.retry_requests = []    # ids per SCHEMA-RETRY request
@@ -212,6 +218,8 @@ class FakeLLM:
         self.order.extend(ids)
         if self.clock is not None and self.seconds:
             self.clock.advance(self.seconds)
+        if len(ids) > 1 and self.timeout_ids.intersection(ids):
+            raise TimeoutError("timed out")
         if len(ids) > 1:
             return {str(cid): dict(_ANNOTATION) for cid in ids
                     if cid not in self.fail_ids and cid not in self.batch_drops}
@@ -1913,17 +1921,58 @@ class TestDispatchDeadline(unittest.TestCase):
         second = annotate._DispatchDeadline(1000.0, 1, clock.monotonic, rate)
         self.assertEqual(second.reserve(), 40.0)
 
-    def test_a_prior_makes_the_very_first_dispatch_honest(self):
-        # The blind wave is the residual overshoot: _pooled commits 2x workers
-        # groups before any timing exists, measured as a 2-min budget landing
-        # at 2.6 min with phase 3b starved to zero. A prior from an earlier run
-        # closes it -- the gate can decline before ever measuring anything.
+    def test_a_prior_that_does_not_fit_still_lets_one_probe_through(self):
+        # A prior governs every dispatch but the probe: with nothing measured
+        # this run, one group goes so a stale or poisoned prior is re-measured
+        # rather than latching the phase shut. The next one is gated as before.
         clock = FakeClock(0.0)
         gate = annotate._DispatchDeadline(30.0, 4, clock.monotonic,
                                           annotate._GroupRate(prior=40.0))
         self.assertEqual(gate.reserve(), 40.0)
+        self.assertEqual(list(gate.dispatchable(["a", "b"])), ["a"])
+        self.assertTrue(gate.stopped)
+
+    def test_no_probe_once_the_rate_has_a_measurement(self):
+        clock = FakeClock(0.0)
+        rate = annotate._GroupRate()
+        rate.record(40.0)
+        gate = annotate._DispatchDeadline(30.0, 4, clock.monotonic, rate)
         self.assertEqual(list(gate.dispatchable(["a", "b"])), [])
         self.assertTrue(gate.stopped)
+
+    def test_no_probe_once_the_deadline_has_passed(self):
+        clock = FakeClock(30.0)
+        gate = annotate._DispatchDeadline(30.0, 4, clock.monotonic,
+                                          annotate._GroupRate(prior=40.0))
+        self.assertEqual(list(gate.dispatchable(["a", "b"])), [])
+        self.assertTrue(gate.stopped)
+
+    def test_only_a_failed_group_is_kept_out_of_the_banked_worst(self):
+        clock = FakeClock(0.0)
+        gate = annotate._DispatchDeadline(1000.0, 1, clock.monotonic)
+
+        def returning(seconds, failed):
+            def request(group):
+                clock.advance(seconds)
+                out = annotate._GroupResults({1: None})
+                out.failed = failed
+                return out
+            return gate.timed(request, bankable=annotate._group_bankable)
+
+        returning(100.0, failed=True)("g")      # a timeout: mean only
+        self.assertEqual(gate.rate.mean(), 100.0)
+        self.assertIsNone(gate.rate.worst())
+        returning(30.0, failed=False)("g")      # malformed-only: both
+        self.assertEqual(gate.rate.mean(), 65.0)
+        self.assertEqual(gate.rate.worst(), 30.0)
+
+        def raising(group):
+            clock.advance(200.0)
+            raise TimeoutError("timed out")
+        with self.assertRaises(TimeoutError):
+            gate.timed(raising, bankable=annotate._group_bankable)("g")
+        self.assertEqual(gate.rate.worst(), 30.0)
+        self.assertEqual(gate._finished, 3)
 
     def test_a_measurement_always_beats_the_prior(self):
         clock = FakeClock(0.0)
@@ -2217,6 +2266,88 @@ class TestSeedPassKeepsPaidForWork(HybridFixture):
                     annotate_distill._seed_chunks(
                         self.con, _MODEL, False, 1, _SEEDS + 10,
                         sampler=lambda con, pending, need: pending[:need])
+
+
+class TestATimeoutCannotLatchTheGate(HybridFixture):
+    """A banked rate too large for the phase's share used to stop every rerun
+    before it measured anything. The probe re-measures it, and a group whose
+    request failed in transport can never become the banked number."""
+
+    def test_a_latched_seed_rate_heals_on_the_next_run(self):
+        key = annotate._group_rate_key("seed", _MODEL, 1, 1)
+        set_float_state(self.con, key, 5825.0)
+        rate = annotate._load_group_rate(self.con, "seed", _MODEL, 1, 1)
+        clock = FakeClock(0.0)
+        llm = FakeLLM(clock=clock, seconds=25.0)
+        with mock.patch.object(annotate_distill, "time", clock):
+            with mock.patch.object(ollama, "chat_once_json", llm):
+                with mock.patch("builtins.print"):
+                    n = annotate_distill._seed_chunks(
+                        self.con, _MODEL, False, 1, _SEEDS + 5,
+                        sampler=lambda con, p, need: p[:need],
+                        deadline=900.0, rate=rate)
+        self.assertGreaterEqual(n, 1)
+        annotate._save_group_rate(self.con, rate, "seed", _MODEL, 1, 1)
+        self.assertAlmostEqual(get_float_state(self.con, key), 25.0)
+
+    def test_a_timed_out_seed_batch_neither_buys_singles_nor_banks(self):
+        key = annotate._group_rate_key("seed", _MODEL, 4, 1)
+        set_float_state(self.con, key, 50.0)
+        rate = annotate._load_group_rate(self.con, "seed", _MODEL, 4, 1)
+        clock = FakeClock(0.0)
+        llm = FakeLLM(clock=clock, seconds=25.0,
+                      timeout_ids=range(_FIRST_PENDING, _LAST + 1))
+        with mock.patch.object(annotate_distill, "time", clock):
+            with mock.patch.object(ollama, "chat_once_json", llm):
+                with mock.patch("builtins.print"):
+                    n = annotate_distill._seed_chunks(
+                        self.con, _MODEL, False, 1, _SEEDS + 4,
+                        sampler=lambda con, p, need: p[:need],
+                        batch_size=4, deadline=900.0, rate=rate)
+        self.assertEqual(n, 0)
+        self.assertEqual([len(ids) for ids in llm.requests], [4])   # fail_fast
+        annotate._save_group_rate(self.con, rate, "seed", _MODEL, 4, 1)
+        self.assertEqual(get_float_state(self.con, key), 50.0)       # bankable
+
+    def test_a_timed_out_upgrade_batch_neither_writes_nor_banks(self):
+        key = annotate._group_rate_key("event", _MODEL, 8, 1)
+        set_float_state(self.con, key, 50.0)
+        clock = FakeClock()
+        llm = FakeLLM(clock=clock, seconds=25.0, timeout_ids=_EVENT_IDS)
+        with self.fake_clock(clock):
+            with mock.patch("builtins.print") as printed:
+                self.hybrid(llm, budget_minutes=60, batch_size=8)
+        # fail_fast: no single-chunk request bought the rows back...
+        self.assertFalse(any(ids == [cid] for ids in llm.requests
+                             for cid in _EVENT_IDS))
+        sources = dict(self.con.execute(
+            "SELECT chunk_id, source FROM chunk_annotations WHERE chunk_id IN "
+            f"({','.join('?' * len(_EVENT_IDS))})", _EVENT_IDS).fetchall())
+        self.assertEqual(set(sources.values()), {"distilled"})
+        # ...and the timeout's latency was not banked over the honest number.
+        self.assertEqual(get_float_state(self.con, key), 50.0)
+        said = " ".join(str(a) for call in printed.call_args_list for a in call.args)
+        self.assertIn("request failed (timeout/transport)", said)
+
+
+class TestUpgradePhaseWithItsShareSpent(DBFixture):
+    def test_a_phase_started_past_its_deadline_says_its_share_was_spent(self):
+        clock = FakeClock(100.0)
+        llm = FakeLLM(clock=clock)
+        stats = {"done": 0, "skipped": 0}
+        rate = annotate._load_group_rate(self.con, "event", _MODEL, 8, 1)
+        rows = [(1, _chunk_text(1, _PLAIN)), (2, _chunk_text(2, _PLAIN))]
+        with mock.patch.object(annotate_hybrid, "time", clock):
+            with mock.patch.object(ollama, "chat_once_json", llm):
+                with mock.patch("builtins.print") as printed:
+                    annotate_hybrid._run_upgrades(
+                        self.con, rows, _MODEL, False, 1, 8, 50.0, "Upgrading",
+                        set(), stats, rate, "event")
+        self.assertEqual(llm.requests, [])
+        self.assertTrue(stats["stopped"])
+        said = " ".join(str(a) for call in printed.call_args_list for a in call.args)
+        self.assertIn("dispatched nothing: this phase's share of the budget was "
+                      "spent before its first request (2 candidates left)", said)
 
 
 class TestBudgetResolution(unittest.TestCase):

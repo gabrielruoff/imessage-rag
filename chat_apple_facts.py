@@ -14,8 +14,6 @@ Every name is re-exported from chat_apple, so `chat_apple._derive_summary_facts`
 
 import re
 
-from chat_apple import _clip
-
 _WEEKDAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
                   "Saturday", "Sunday")
 
@@ -748,3 +746,11 @@ def _compose_no_fault_answer(scratchpad):
         + (f"What the signals do show: {body}. " if body else "")
         + "Treat this as a prompt to reflect on the pattern, not a verdict on either "
         "person.")
+
+# Bottom import: this module is one half of a cycle -- `chat_apple` re-exports the
+# names below, so importing it from the TOP here makes chat_apple_facts unimportable
+# on its own (the parent would run its own re-export against a still-empty
+# chat_apple_facts). Down here every name above is already bound, so the cycle
+# resolves whichever module a caller reaches first. Only used inside functions,
+# so the late binding costs nothing.
+from chat_apple import _clip  # noqa: E402

@@ -23,6 +23,7 @@ __pycache__/
 REPO_REVIEW.md
 REPO_FIX_PLAN.md
 APPLE_FM_PLAN.md
+gabe_pipeline.sh
 # analytical-suite detector audit (throwaway working files)
 analytical_audit.py
 analytical_audit.txt

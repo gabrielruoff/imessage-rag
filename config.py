@@ -229,11 +229,18 @@ ANNOTATE_QUALITY = (os.getenv("ANNOTATE_QUALITY", "") or "distilled").strip().lo
 # control for the rest of the run rather than failing every row.
 ANNOTATE_THINK = os.getenv("ANNOTATE_THINK", "").strip().lower()
 ANNOTATE_BATCH_SIZE = int(os.getenv("ANNOTATE_BATCH_SIZE") or "0")
-# Unset = inherit CHAT_TIMEOUT. Worth setting independently: an annotation is
-# one short JSON answer, but a thinking model can spend minutes on it, and a
-# timeout raises out of the pass rather than skipping the row.
+# Unset = 900s, NOT CHAT_TIMEOUT -- the one *_TIMEOUT that does not inherit.
+# CHAT_TIMEOUT budgets one interactive turn; an annotate request budgets a
+# BATCH (ANNOTATE_BATCH_SIZE / the --quality preset, 8 under 'hybrid') of
+# chunks, issued ANNOTATE_WORKERS-at-a-time against a server with a fixed
+# number of parallel slots, so the wall clock a batched request sees is
+# batch x per-chunk x contention. Inheriting 300 timed out the seed pass on a
+# 9b model at batch 8 (2026-08-03) -- and a thinking model can spend minutes
+# on a single row besides. A too-generous ceiling costs only latency on the
+# rare runaway, since a timed-out batch now drops to the cheaper rungs
+# (annotate._annotate_batch) rather than aborting the pass.
 _annotate_timeout = os.getenv("ANNOTATE_TIMEOUT", "").strip()
-ANNOTATE_TIMEOUT = int(_annotate_timeout) if _annotate_timeout else CHAT_TIMEOUT
+ANNOTATE_TIMEOUT = int(_annotate_timeout) if _annotate_timeout else 900
 # Concurrent LLM requests for the annotate/terms/seed passes. >1 only pays off
 # when the Ollama server runs parallel slots (`make ollama-start` sets 4);
 # against a serial server extra workers queue harmlessly. The payoff is
