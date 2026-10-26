@@ -13,7 +13,20 @@ from config import (
     OLLAMA_HOST,
     OLLAMA_PORT,
     is_apple_model,
+    is_openrouter_model,
 )
+
+
+def _refuse_hosted(model):
+    """openrouter/ models are annotate-only. This seam is the one path every
+    other pipeline (and its --model flag) goes through, so refusing here keeps
+    them all local; there is deliberately no OpenRouter dispatch. See
+    docs/DECISIONS.md, 2026-10-26: hosted embeddings (Voyage) and hosted
+    annotation (OpenRouter)."""
+    if is_openrouter_model(model or CHAT_MODEL):
+        raise RuntimeError(
+            "openrouter/ models are annotate-only (annotate.py per-chunk tiers); "
+            "set a local or apple model for this pipeline")
 
 
 class OllamaResponseError(RuntimeError):
@@ -55,6 +68,7 @@ def chat_once(messages, model=None, format=None, timeout=None, think=_UNSET):
     omitted uses CHAT_THINK. Per-call because the batch pipelines want it
     low/off (it is pure latency on a short JSON answer) while interactive
     chat may want it on."""
+    _refuse_hosted(model)
     # apple sentinel -> Foundation Models backend; imported lazily so
     # Ollama-only users never pay the import. Forward every arg unchanged.
     if is_apple_model(model or CHAT_MODEL):
@@ -167,6 +181,7 @@ def chat_once_json(messages, model=None, retry_nudge=_JSON_RETRY_NUDGE,
     can't take the `think` value we send -- by rejecting it, or by answering
     think=false with empty content -- degrade to no reasoning control for the
     rest of the process instead of failing every request."""
+    _refuse_hosted(model)
     # apple sentinel -> Foundation Models backend (no _think_unsupported logic
     # there; FM has no think flag). Dispatch before any think handling.
     if is_apple_model(model or CHAT_MODEL):
@@ -225,6 +240,7 @@ def chat_stream(messages, tools=None, model=None, timeout=None, think=_UNSET):
     Pass tools=None to withhold the tool schemas entirely, which is the only
     reliable way to stop the model from calling one. model=None uses
     CHAT_MODEL from config; think= behaves as in chat_once."""
+    _refuse_hosted(model)
     # apple sentinel -> Foundation Models backend. This is a generator, so we
     # `yield from` the delegate (a bare `return applefm.chat_stream(...)` would
     # set StopIteration.value and yield the caller NOTHING) then stop.

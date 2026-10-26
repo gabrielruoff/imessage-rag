@@ -386,7 +386,8 @@ class EnvExampleParityTest(unittest.TestCase):
         self.assertEqual(
             sorted(declared - naive),
             ["CHAT_THINK", "CONFLICT_THINK", "DRIFT_PHASE_THRESHOLDS",
-             "DRIFT_WEIGHTS", "MCP_RESULT_MAX_CHARS", "NUDGES_THINK",
+             "DRIFT_WEIGHTS", "HOSTED_LIMIT_RECOVER_AFTER", "HOSTED_MAX_PARALLEL",
+             "MCP_RESULT_MAX_CHARS", "NUDGES_THINK",
              "TOOL_RESULT_MAX_CHARS", "TOPIC_THINK", "WRAPPED_THINK"])
 
         # .env.example is a bare commented inventory: `# VAR=default` lines,
@@ -405,6 +406,59 @@ class EnvExampleParityTest(unittest.TestCase):
                 if ln.strip() and not ln.lstrip().startswith("#")]
         self.assertEqual(live, [], "make env copies verbatim: an uncommented "
                                    "line becomes a live override")
+
+
+class HostedConfigTest(unittest.TestCase):
+    def test_hosted_predicates_match_only_their_prefix(self):
+        self.assertTrue(config.is_openrouter_model("openrouter/anthropic/claude-haiku-5.5"))
+        self.assertTrue(config.is_voyage_model("voyage/voyage-4-large"))
+        for name in ("voyage-4-large", "qwen3.5:4b", "apple", "", None, 3):
+            with self.subTest(name=name):
+                self.assertFalse(config.is_openrouter_model(name))
+                self.assertFalse(config.is_voyage_model(name))
+        self.assertFalse(config.is_openrouter_model("voyage/voyage-4-large"))
+        self.assertFalse(config.is_voyage_model("openrouter/x"))
+
+    def test_hosted_model_id_strips_only_the_backend_prefix(self):
+        self.assertEqual(config.hosted_model_id("openrouter/anthropic/claude-haiku-5.5"),
+                         "anthropic/claude-haiku-5.5")
+        self.assertEqual(config.hosted_model_id("voyage/voyage-4-large"), "voyage-4-large")
+        self.assertEqual(config.hosted_model_id("qwen3.5:4b"), "qwen3.5:4b")
+
+    def test_hosted_budget_has_no_default_and_refuses_non_positive(self):
+        for unset in (None, "", "  "):
+            with self.subTest(value=unset), _reloaded_config(HOSTED_BUDGET_USD=unset) as cfg:
+                self.assertIsNone(cfg.HOSTED_BUDGET_USD)
+        with _reloaded_config(HOSTED_BUDGET_USD="2.5") as cfg:
+            self.assertEqual(cfg.HOSTED_BUDGET_USD, 2.5)
+        for bad in ("0", "-1", "nan", "inf", "-inf"):
+            with self.subTest(value=bad), self.assertRaises(ValueError) as ctx:
+                with _reloaded_config(HOSTED_BUDGET_USD=bad):
+                    pass
+            self.assertIn("HOSTED_BUDGET_USD", str(ctx.exception))
+
+    def test_hosted_max_parallel_defaults_to_sequential_and_refuses_below_one(self):
+        with _reloaded_config(HOSTED_MAX_PARALLEL=None) as cfg:
+            self.assertEqual(cfg.HOSTED_MAX_PARALLEL, 1)
+        with self.assertRaises(ValueError) as ctx:
+            with _reloaded_config(HOSTED_MAX_PARALLEL="0"):
+                pass
+        self.assertIn("HOSTED_MAX_PARALLEL", str(ctx.exception))
+
+    def test_voyage_embed_dim_defaults_to_1024_and_refuses_unsupported_values(self):
+        with _reloaded_config(EMBED_MODEL="voyage/voyage-4-large", EMBED_DIM=None) as cfg:
+            self.assertEqual(cfg.EMBED_DIM, 1024)
+        with _reloaded_config(EMBED_MODEL="voyage/voyage-4-large", EMBED_DIM="512") as cfg:
+            self.assertEqual(cfg.EMBED_DIM, 512)
+        with self.assertRaises(ValueError) as ctx:
+            with _reloaded_config(EMBED_MODEL="voyage/voyage-4-large", EMBED_DIM="768"):
+                pass
+        self.assertIn("EMBED_DIM", str(ctx.exception))
+        # A local model keeps the old meaning: 0 = probe, any value = truncate.
+        with _reloaded_config(EMBED_MODEL="nomic-embed-text", EMBED_DIM=None) as cfg:
+            self.assertEqual(cfg.EMBED_DIM, 0)
+        with _reloaded_config(EMBED_MODEL="nomic-embed-text", EMBED_DIM="768") as cfg:
+            self.assertEqual(cfg.EMBED_DIM, 768)
 
 
 if __name__ == "__main__":
