@@ -3242,11 +3242,19 @@ Review of the fix above (PR #48) found it partly wrong, in four places.
   back `None` and the group is flagged. The cost bound per group is at most
   2 × `ANNOTATE_TIMEOUT` of failed requests ungated, and 1 × under a budget,
   plus the requests that succeeded. Two failures still propagate, because they
-  are config errors and must stay loud: a `ConnectionRefusedError` (no server
-  running; `_annotate_group` re-raises it ahead of `_REQUEST_FAILURES`, so
-  `make annotate` against a stopped Ollama fails instead of skipping every
-  chunk) and a `RuntimeError` (an Ollama error body, e.g. a model that is not
-  pulled).
+  are config errors and must stay loud: an `ollama.OllamaUnreachable` (no
+  reachable server; `_annotate_group` re-raises it ahead of
+  `_REQUEST_FAILURES`, so `make annotate` against a stopped Ollama fails
+  instead of skipping every chunk) and a `RuntimeError` (an Ollama error body,
+  e.g. a model that is not pulled). The first cut carved out only
+  `ConnectionRefusedError`, which left an unresolvable `OLLAMA_HOST`
+  (`socket.gaierror`), an unreachable network and a connect timeout to a
+  firewalled host skipping rows silently. Only the transport can tell a
+  connect failure from a read timeout (both can be `TimeoutError`), so
+  `ollama.chat_once` now opens the connection explicitly and wraps any
+  `OSError` there as `OllamaUnreachable` (a `ConnectionError`, so existing
+  `except OSError` callers are unaffected); a failure after connecting stays
+  the raw transport error and keeps the tolerant handling.
   Apple FM signals a timeout as `AppleFMError`, a `RuntimeError`, so Apple is
   outside this and behaves as it did before the batch swallow was added.
 - **The 900 s `ANNOTATE_TIMEOUT` made full fall-through very expensive.** At

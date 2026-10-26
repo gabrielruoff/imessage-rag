@@ -32,6 +32,9 @@ class _StubHTTP:
     def __init__(self, *a, **k):
         pass
 
+    def connect(self):
+        pass
+
     def request(self, *a, **k):
         pass
 

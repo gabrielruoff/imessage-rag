@@ -613,14 +613,27 @@ class TestAnnotateGroupLadder(unittest.TestCase):
         self.assertEqual((out[2], out[3]), (None, None))
         self.assertTrue(out.failed)
 
-    def test_a_refused_connection_propagates(self):
-        # No server running is a config error: fail loudly, never skip rows.
+    def test_an_unreachable_server_propagates_from_every_rung(self):
+        # No reachable server is a config error: fail loudly, never skip rows.
+        down = ollama.OllamaUnreachable("cannot reach Ollama")
         for fail_fast in (False, True):
-            with self.subTest(fail_fast=fail_fast):
-                llm = _LadderLLM(batch=ConnectionRefusedError())
-                with self.assertRaises(ConnectionRefusedError):
+            with self.subTest(rung="batch", fail_fast=fail_fast):
+                llm = _LadderLLM(batch=down)
+                with self.assertRaises(ollama.OllamaUnreachable):
                     self.run_group(llm, fail_fast=fail_fast)
                 self.assertEqual(llm.log, [("batch", [1, 2, 3])])
+            with self.subTest(rung="schema", fail_fast=fail_fast):
+                llm = _LadderLLM(covered=(1,), schema=down)
+                with self.assertRaises(ollama.OllamaUnreachable):
+                    self.run_group(llm, fail_fast=fail_fast)
+                self.assertEqual(llm.log, [("batch", [1, 2, 3]), ("schema", [2, 3])])
+            with self.subTest(rung="single", fail_fast=fail_fast):
+                # The batch-size-1 presets (max/balanced/distilled) only ever
+                # reach this rung.
+                llm = _LadderLLM(singles=[down])
+                with self.assertRaises(ollama.OllamaUnreachable):
+                    self.run_group(llm, group=self.GROUP[:1], fail_fast=fail_fast)
+                self.assertEqual(llm.log, [("single", [1])])
 
     def test_a_schema_timeout_flags_the_group_and_singles_still_run(self):
         llm = _LadderLLM(covered=(1,), schema=TimeoutError())
