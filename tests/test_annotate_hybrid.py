@@ -2290,6 +2290,25 @@ class TestATimeoutCannotLatchTheGate(HybridFixture):
         annotate._save_group_rate(self.con, rate, "seed", _MODEL, 1, 1)
         self.assertAlmostEqual(get_float_state(self.con, key), 25.0)
 
+    def test_a_timed_out_seed_batch_neither_buys_singles_nor_banks(self):
+        key = annotate._group_rate_key("seed", _MODEL, 4, 1)
+        set_float_state(self.con, key, 50.0)
+        rate = annotate._load_group_rate(self.con, "seed", _MODEL, 4, 1)
+        clock = FakeClock(0.0)
+        llm = FakeLLM(clock=clock, seconds=25.0,
+                      timeout_ids=range(_FIRST_PENDING, _LAST + 1))
+        with mock.patch.object(annotate_distill, "time", clock):
+            with mock.patch.object(ollama, "chat_once_json", llm):
+                with mock.patch("builtins.print"):
+                    n = annotate_distill._seed_chunks(
+                        self.con, _MODEL, False, 1, _SEEDS + 4,
+                        sampler=lambda con, p, need: p[:need],
+                        batch_size=4, deadline=900.0, rate=rate)
+        self.assertEqual(n, 0)
+        self.assertEqual([len(ids) for ids in llm.requests], [4])   # fail_fast
+        annotate._save_group_rate(self.con, rate, "seed", _MODEL, 4, 1)
+        self.assertEqual(get_float_state(self.con, key), 50.0)       # bankable
+
     def test_a_timed_out_upgrade_batch_neither_writes_nor_banks(self):
         key = annotate._group_rate_key("event", _MODEL, 8, 1)
         set_float_state(self.con, key, 50.0)
@@ -2309,6 +2328,26 @@ class TestATimeoutCannotLatchTheGate(HybridFixture):
         self.assertEqual(get_float_state(self.con, key), 50.0)
         said = " ".join(str(a) for call in printed.call_args_list for a in call.args)
         self.assertIn("request failed (timeout/transport)", said)
+
+
+class TestUpgradePhaseWithItsShareSpent(DBFixture):
+    def test_a_phase_started_past_its_deadline_says_its_share_was_spent(self):
+        clock = FakeClock(100.0)
+        llm = FakeLLM(clock=clock)
+        stats = {"done": 0, "skipped": 0}
+        rate = annotate._load_group_rate(self.con, "event", _MODEL, 8, 1)
+        rows = [(1, _chunk_text(1, _PLAIN)), (2, _chunk_text(2, _PLAIN))]
+        with mock.patch.object(annotate_hybrid, "time", clock):
+            with mock.patch.object(ollama, "chat_once_json", llm):
+                with mock.patch("builtins.print") as printed:
+                    annotate_hybrid._run_upgrades(
+                        self.con, rows, _MODEL, False, 1, 8, 50.0, "Upgrading",
+                        set(), stats, rate, "event")
+        self.assertEqual(llm.requests, [])
+        self.assertTrue(stats["stopped"])
+        said = " ".join(str(a) for call in printed.call_args_list for a in call.args)
+        self.assertIn("dispatched nothing: this phase's share of the budget was "
+                      "spent before its first request (2 candidates left)", said)
 
 
 class TestBudgetResolution(unittest.TestCase):
