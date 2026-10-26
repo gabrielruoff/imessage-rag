@@ -90,8 +90,9 @@ make mcp           # serves on stdio
 
 `make mcp` sits silently waiting on stdin. That is normal: an MCP client is
 supposed to launch it and talk JSON-RPC over stdin/stdout. A one-line banner
-(`imessage-rag MCP server: 21 read-only tools over <db> (stdio; Ctrl-C to stop)`)
-goes to stderr. Ctrl-C stops it. `.venv/bin/python3 -m mcp_server --help`
+(`imessage-rag MCP server: 21 read-only tools over <db> (stdio; Ctrl-D to stop)`)
+goes to stderr. Ctrl-D (closing stdin) stops it; Ctrl-C does not, because the
+SDK's stdin reader thread can't be interrupted. `.venv/bin/python3 -m mcp_server --help`
 prints usage and exits.
 
 ## Client setup
@@ -134,7 +135,11 @@ If Desktop can't find `make`, use its absolute path (`/usr/bin/make`).
 ### Any other stdio client
 
 Launch `.venv/bin/python3 -m mcp_server` with the working directory at the repo
-root, or set `PYTHONPATH` to the repo root. This skips `make mcp`'s
+root. This is a MUST, not a convenience: `python -m` puts the cwd first on
+`sys.path`, so launched from another directory the server would import that
+directory's `config.py`, `db.py`, `json.py` and so on into a process holding your
+message DB. Don't use `PYTHONPATH` instead; it leaves the cwd ahead of it. The
+make launch guarantees the cwd. A direct launch skips `make mcp`'s
 missing-dependency check.
 
 ### Testing with MCP Inspector

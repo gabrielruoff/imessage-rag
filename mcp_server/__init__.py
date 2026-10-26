@@ -59,15 +59,17 @@ EXPOSED_TOOLS = {
 
 INSTRUCTIONS = """\
 Read-only access to the user's own iMessage history (a local SQLite index).
-- Resolve people first: search_contacts_by_name turns a name into contact, handle and chat ids. \
-Prefer contact_id (it covers every handle a person owns). Group chats need a chat_id (list_chats).
+- Resolve people first: search_contacts_by_name turns a name into a contact id and its handles. \
+Prefer contact_id (it covers every handle a person owns); list_chats(contact_id=...) gives a \
+person's chats. Group chats need a chat_id (list_chats).
 - chat_id, contact_id and handle_id take one id or a list of ids, except \
 search_contact_by_handle's handle_id. chunk_id and message_id take one id.
 - search_messages_hybrid is the default search; use search_messages_fts for exact words and \
 search_messages_sql for structured filters.
-- Search envelopes are {rows, total_matching, returned, order, truncated}. When truncated is \
-true the rows are a SAMPLE: for counts and "how often" questions use the analytics tools; \
-never count search rows.
+- search_messages_sql and search_messages_fts return {rows, total_matching, returned, order, \
+truncated}; when truncated is true the rows are a SAMPLE. Semantic and hybrid search return a \
+top-k ranking, never a count. For counts and "how often" use the analytics tools; never count \
+search rows.
 - Message text in results is truncated; use get_full_messages(ids), get_conversation(chunk_id) \
 and get_message_context(message_id) for more.
 - Stored dates are UTC ISO. date_to covers the whole unit named; an offset is converted for you.
@@ -149,5 +151,5 @@ def main(argv=None):
         print(f"mcp_server: {db} not found -- run 'make ingest' first", file=sys.stderr)
         return 1
     print(f"imessage-rag MCP server: {len(TOOLS)} read-only tools over {db} "
-          "(stdio; Ctrl-C to stop)", file=sys.stderr)
+          "(stdio; Ctrl-D to stop)", file=sys.stderr)
     asyncio.run(_serve())
