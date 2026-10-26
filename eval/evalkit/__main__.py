@@ -1,4 +1,5 @@
-"""argparse CLI for evalkit: manifest | run | check | report | p3 | selfcheck.
+"""argparse CLI for evalkit: manifest | run | check | report | p3 | recall* |
+annotate-pilot | selfcheck.
 
 Thin dispatcher: each submodule registers its own flags via add_parser and
 sets func=<its command>. Run from the repo/worktree root:
@@ -9,7 +10,7 @@ sets func=<its command>. Run from the repo/worktree root:
 import argparse
 import sys
 
-from . import cases, checks, manifest, p3, report, runner
+from . import cases, checks, manifest, p3, pilot, recall, report, runner
 
 
 def cmd_selfcheck(args):
@@ -65,7 +66,7 @@ def main(argv=None):
         prog="eval.evalkit", description="analytics-eval framework (see eval/README.md)"
     )
     subparsers = parser.add_subparsers(dest="cmd", required=True)
-    for mod in (manifest, runner, checks, report, p3):
+    for mod in (manifest, runner, checks, report, p3, recall, pilot):
         mod.add_parser(subparsers)
     sc = subparsers.add_parser(
         "selfcheck", help="validate suite files, recipe registry, roster placeholders"
