@@ -322,9 +322,14 @@ def _run_upgrades(con, rows, model, think, workers, batch_size, deadline,
                             header=False) as p:
             for group, results in annotate._pooled(
                     gate.dispatchable(groups),
-                    gate.timed(lambda g: annotate._annotate_group(g, model, think),
-                               produced=annotate._group_produced),
+                    gate.timed(lambda g: annotate._annotate_group(
+                                   g, model, think, fail_fast=True),
+                               bankable=annotate._group_bankable),
                     workers):
+                failed = getattr(results, "failed", False)
+                if failed:
+                    print(f"  group of {len(group)}: request failed "
+                          f"(timeout/transport), rows retried next run")
                 for chunk_id, _text in group:
                     # Dispatched, so never a candidate again this run -- even if
                     # it came back unusable, since a second identical request
@@ -333,8 +338,9 @@ def _run_upgrades(con, rows, model, think, workers, batch_size, deadline,
                     data = results.get(chunk_id)
                     if data is None:
                         stats["skipped"] += 1
-                        print(f"  chunk {chunk_id}: unparseable response, skipped "
-                              f"(retried next run)")
+                        if not failed:
+                            print(f"  chunk {chunk_id}: unparseable response, "
+                                  f"skipped (retried next run)")
                         p.advance()
                         continue
                     annotate._write_annotation(con, chunk_id, data)
@@ -353,9 +359,10 @@ def _run_upgrades(con, rows, model, think, workers, batch_size, deadline,
         stats["stopped"] = gate.stopped
         annotate._save_group_rate(con, gate.rate, phase, model, batch_size,
                                   workers)
-    if gate.stopped and not stats["done"] and groups:
-        # Declining every candidate is the correct answer to a budget smaller
-        # than one request, but silence would read as "there was nothing to do".
+    if gate.stopped and not gate._dispatched and groups:
+        # Keyed on groups DISPATCHED, not written: a probe that came back empty
+        # did dispatch. Declining every candidate is the correct answer to a
+        # spent share, but silence would read as "there was nothing to do".
         # len(groups[0]), not batch_size: apple packs by char budget instead.
         # The estimate is guarded even though every production rate carries a
         # prior (_load_group_rate falls back to the cold constant): a rate with

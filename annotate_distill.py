@@ -142,7 +142,8 @@ def _seed_chunks(con, model, think, workers, target, dry_run=False, sampler=None
         gate.rate.denominate(annotate._mean_group_rows(groups))
 
     def request(group):
-        return annotate._annotate_group(group, model, think)
+        return annotate._annotate_group(group, model, think,
+                                        fail_fast=gate is not None)
 
     items = groups if gate is None else gate.dispatchable(groups)
     n_done = n_skipped = 0
@@ -156,7 +157,7 @@ def _seed_chunks(con, model, think, workers, target, dry_run=False, sampler=None
                 for group, results in annotate._pooled(
                         items,
                         request if gate is None else gate.timed(
-                            request, produced=annotate._group_produced),
+                            request, bankable=annotate._group_bankable),
                         workers):
                     for chunk_id, _text in group:
                         data = results.get(chunk_id)
