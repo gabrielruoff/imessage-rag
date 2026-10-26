@@ -18,9 +18,11 @@ from config import (
 
 
 def _refuse_hosted(model):
-    """D2: openrouter/ models are annotate-only. This seam is the one path every
+    """openrouter/ models are annotate-only. This seam is the one path every
     other pipeline (and its --model flag) goes through, so refusing here keeps
-    them all local; there is deliberately no OpenRouter dispatch."""
+    them all local; there is deliberately no OpenRouter dispatch. See
+    docs/DECISIONS.md, 2026-10-26: hosted embeddings (Voyage) and hosted
+    annotation (OpenRouter)."""
     if is_openrouter_model(model or CHAT_MODEL):
         raise RuntimeError(
             "openrouter/ models are annotate-only (annotate.py per-chunk tiers); "

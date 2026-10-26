@@ -7,6 +7,7 @@ measurements and dead ends behind the defaults live in docs/DECISIONS.md;
 comments here state the contract, not the history.
 """
 
+import math
 import os
 from pathlib import Path
 
@@ -181,8 +182,11 @@ VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY", "")
 HOSTED_BUDGET_USD = os.getenv("HOSTED_BUDGET_USD", "").strip() or None
 if HOSTED_BUDGET_USD is not None:
     HOSTED_BUDGET_USD = float(HOSTED_BUDGET_USD)
-if HOSTED_BUDGET_USD is not None and HOSTED_BUDGET_USD <= 0:
-    raise ValueError(f"HOSTED_BUDGET_USD must be > 0, got {HOSTED_BUDGET_USD!r}")
+# nan/inf would disable the cap, so only a finite positive value is accepted.
+if HOSTED_BUDGET_USD is not None and not (
+        math.isfinite(HOSTED_BUDGET_USD) and HOSTED_BUDGET_USD > 0):
+    raise ValueError(
+        f"HOSTED_BUDGET_USD must be finite and > 0, got {HOSTED_BUDGET_USD!r}")
 # Max hosted requests in flight per client per run (--max-parallel). 1 = strictly
 # sequential. Separate from EMBED_MAX_WORKERS/ANNOTATE_WORKERS (Ollama only).
 HOSTED_MAX_PARALLEL = _positive_int_env("HOSTED_MAX_PARALLEL", 1)

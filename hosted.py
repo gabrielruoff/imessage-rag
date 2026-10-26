@@ -9,6 +9,7 @@ HostedStop, leaving the item pending for the next run.
 
 import asyncio
 import email.utils
+import math
 import random
 import threading
 import time
@@ -50,8 +51,8 @@ def resolve_budget_usd(flag):
     if usd is None:
         raise SystemExit("hosted runs need a spend cap: pass --budget USD or set "
                          "HOSTED_BUDGET_USD")
-    if usd <= 0:
-        raise SystemExit(f"--budget / HOSTED_BUDGET_USD must be > 0, got {usd}")
+    if not (math.isfinite(usd) and usd > 0):  # nan/inf would disable the cap
+        raise SystemExit(f"--budget / HOSTED_BUDGET_USD must be finite and > 0, got {usd}")
     return usd
 
 
@@ -68,32 +69,36 @@ def retry_delay(attempt, response=None):
     raw = response.headers.get("retry-after") if response is not None else None
     if raw:
         try:
-            return max(0.0, float(raw))
+            delay = float(raw)
         except ValueError:
             try:
-                return max(0.0, email.utils.parsedate_to_datetime(raw).timestamp()
-                           - time.time())
+                delay = email.utils.parsedate_to_datetime(raw).timestamp() - time.time()
             except (TypeError, ValueError):
-                pass  # unparseable header: fall back to backoff
+                delay = math.nan
+        if math.isfinite(delay):  # inf/nan/garbage: fall back to backoff
+            return max(0.0, delay)
     cap = config.HOSTED_BACKOFF_MAX_SECONDS
-    return min(cap, 2.0 * 2 ** attempt) * random.uniform(0.5, 1.0)
+    # exponent clamped: retries are unbounded and 2.0 ** 1024 overflows a float
+    return min(cap, 2.0 * 2 ** min(attempt, 30)) * random.uniform(0.5, 1.0)
 
 
 def classify(response_or_exc):
-    """One retry table for both clients: "ok" (2xx), "retry" (429, 5xx,
-    connect/read errors, timeouts), "moderation" (an OpenRouter 403 whose body
-    says moderation/flagged: reroute away from that provider), else "stop"
-    (401/402/400 and every other 4xx)."""
+    """One retry table for both clients: "ok" (2xx), "retry" (408, 429, 5xx,
+    timeouts, network errors, a server-side protocol error), "moderation" (an
+    OpenRouter 403 whose body says moderation/flagged: reroute away from that
+    provider), else "stop" (401/402/400, every other 4xx, and transport errors
+    that cannot heal)."""
     if isinstance(response_or_exc, httpx.HTTPStatusError):
         response_or_exc = response_or_exc.response
-    if isinstance(response_or_exc, httpx.TransportError):  # incl. timeouts
-        return "retry"
+    if isinstance(response_or_exc, (httpx.TimeoutException, httpx.NetworkError,
+                                    httpx.RemoteProtocolError)):
+        return "retry"  # other TransportErrors (bad URL, bad header, proxy) never heal
     if not isinstance(response_or_exc, httpx.Response):
         return "stop"
     status = response_or_exc.status_code
     if 200 <= status < 300:
         return "ok"
-    if status == 429 or status >= 500:
+    if status in (408, 429) or status >= 500:
         return "retry"
     if status == 403:
         try:
@@ -118,7 +123,11 @@ class Limiter:
     """Async concurrency gate: `async with limiter:` around each request. The
     effective limit starts at max_parallel, halves (min 1) on throttled() and
     climbs back by 1 after HOSTED_LIMIT_RECOVER_AFTER consecutive succeeded()
-    calls, never above max_parallel. max_parallel=1 is strictly sequential."""
+    calls, never above max_parallel. max_parallel=1 is strictly sequential.
+
+    Its asyncio.Condition binds to the first event loop that waits on it, so
+    create one Limiter per event loop (per asyncio.run) and never share it
+    across runs."""
 
     def __init__(self, max_parallel, recover_after=None):
         self.max_parallel = self.limit = check_max_parallel(max_parallel)
@@ -153,6 +162,8 @@ class Limiter:
 
 
 def upload_notice(service, what):
-    """D3: choosing the hosted model is the consent; say what goes where.
-    CLI runs only -- never on the chat-time query path (MCP stdout is the wire)."""
+    """Choosing the hosted model is the consent; say what goes where. See
+    docs/DECISIONS.md, 2026-10-26: hosted embeddings (Voyage) and hosted
+    annotation (OpenRouter). CLI runs only -- never on the chat-time query
+    path (MCP stdout is the wire)."""
     print(f"uploading {what} to {service}")

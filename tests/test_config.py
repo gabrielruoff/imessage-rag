@@ -431,7 +431,7 @@ class HostedConfigTest(unittest.TestCase):
                 self.assertIsNone(cfg.HOSTED_BUDGET_USD)
         with _reloaded_config(HOSTED_BUDGET_USD="2.5") as cfg:
             self.assertEqual(cfg.HOSTED_BUDGET_USD, 2.5)
-        for bad in ("0", "-1"):
+        for bad in ("0", "-1", "nan", "inf", "-inf"):
             with self.subTest(value=bad), self.assertRaises(ValueError) as ctx:
                 with _reloaded_config(HOSTED_BUDGET_USD=bad):
                     pass

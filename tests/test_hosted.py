@@ -66,9 +66,12 @@ class ResolveTest(unittest.TestCase):
         self.assertIn("HOSTED_BUDGET_USD", str(ctx.exception))
 
     def test_non_positive_budget_is_refused(self):
-        for bad in (0, -1.0):
+        for bad in (0, -1.0, float("nan"), float("inf")):
             with self.subTest(value=bad), self.assertRaises(SystemExit):
                 hosted.resolve_budget_usd(bad)
+        with mock.patch.object(config, "HOSTED_BUDGET_USD", float("nan")), \
+                self.assertRaises(SystemExit):
+            hosted.resolve_budget_usd(None)
 
     def test_max_parallel_below_one_is_refused_naming_the_flag(self):
         self.assertEqual(hosted.check_max_parallel(3), 3)
@@ -98,18 +101,37 @@ class RetryDelayTest(unittest.TestCase):
             self.assertLessEqual(
                 hosted.retry_delay(9, _resp(503, headers={"Retry-After": "soon"})), 60.0)
 
+    def test_retries_are_unbounded_so_a_huge_attempt_must_not_overflow(self):
+        with mock.patch.object(config, "HOSTED_BACKOFF_MAX_SECONDS", 60):
+            for attempt in (1024, 10 ** 6):
+                self.assertTrue(30.0 <= hosted.retry_delay(attempt) <= 60.0)
+
+    def test_a_non_finite_retry_after_falls_back_to_backoff(self):
+        with mock.patch.object(config, "HOSTED_BACKOFF_MAX_SECONDS", 60):
+            for raw in ("inf", "1e999", "nan", "-inf"):
+                with self.subTest(value=raw):
+                    delay = hosted.retry_delay(0, _resp(429, headers={"Retry-After": raw}))
+                    self.assertTrue(1.0 <= delay <= 2.0, delay)
+
 
 class ClassifyTest(unittest.TestCase):
     def test_the_table(self):
         req = httpx.Request("POST", "https://example.invalid/x")
         cases = [
             (_resp(200), "ok"),
+            (_resp(408), "retry"),
             (_resp(429), "retry"),
             (_resp(500), "retry"),
             (_resp(503), "retry"),
             (httpx.ConnectError("refused", request=req), "retry"),
             (httpx.ReadError("reset", request=req), "retry"),
             (httpx.ReadTimeout("slow", request=req), "retry"),
+            (httpx.ConnectTimeout("slow", request=req), "retry"),
+            (httpx.RemoteProtocolError("peer closed", request=req), "retry"),
+            # transport errors that can never succeed on retry
+            (httpx.UnsupportedProtocol("ftp://", request=req), "stop"),
+            (httpx.LocalProtocolError("illegal header value", request=req), "stop"),
+            (httpx.ProxyError("proxy refused", request=req), "stop"),
             (_resp(403, '{"error": {"message": "requires moderation on Placeholder. '
                         'Your input was flagged for x"}}'), "moderation"),
             (_resp(403, '{"error": {"message": "forbidden"}}'), "stop"),
@@ -188,7 +210,7 @@ class UploadNoticeTest(unittest.TestCase):
 
 
 class OllamaSeamTest(unittest.TestCase):
-    """D2: every non-annotate pipeline reaches a model through these three
+    """openrouter/ is annotate-only: every other pipeline reaches a model through these three
     functions, so an openrouter/ name must be refused before any connection."""
 
     def setUp(self):
