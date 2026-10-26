@@ -74,6 +74,10 @@ class HostedFixture(unittest.TestCase):
             mock.patch.object(annotate, "DB_PATH", self.db_path),
             mock.patch.object(annotate, "ANNOTATE_MODEL", HOSTED),
             mock.patch.object(annotate, "ANNOTATE_QUALITY", "balanced"),
+            # env-sourced knobs pinned to their unset state (a .env must not leak in)
+            mock.patch.object(annotate, "ANNOTATE_THINK", ""),
+            mock.patch.object(annotate, "ANNOTATE_BATCH_SIZE", 0),
+            mock.patch.object(config, "HOSTED_MAX_PARALLEL", 1),
             mock.patch.object(config, "OPEN_ROUTER_API_KEY", "placeholder-key"),
             mock.patch.object(config, "HOSTED_BUDGET_USD", None),
             mock.patch.object(config, "CHAT_MODEL", LOCAL),
