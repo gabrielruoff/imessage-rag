@@ -3201,9 +3201,11 @@ Three things deliberately *not* changed:
 
 A run whose every group fails now banks nothing at all: `worst()` is None and
 `db.set_float_state`'s falsy guard leaves the previous honest number in place.
-Recovery for a DB already latched is `DELETE FROM ingest_state WHERE key LIKE
-'annotate_group_seconds:%'` — the keys are a pure cache, and a missing one
-falls back to `_COLD_GROUP_SECONDS_PER_CHUNK`.
+Recovery for a DB already latched: a rerun now heals it (the probe, see the
+follow-up below). The manual `DELETE FROM ingest_state WHERE key LIKE
+'annotate_group_seconds:%'` still works — the keys are a pure cache, and a
+missing one falls back to `_COLD_GROUP_SECONDS_PER_CHUNK` — but is no longer
+needed.
 
 The proximate trigger was `ANNOTATE_TIMEOUT` inheriting `CHAT_TIMEOUT` (300 s),
 which budgets one interactive turn rather than a batch of 8; it now defaults to
@@ -3211,6 +3213,58 @@ which budgets one interactive turn rather than a batch of 8; it now defaults to
 instead of aborting the phase. Both were necessary and neither was sufficient:
 they stop the timeout from killing a run, and this stops a killed run from
 killing every run after it.
+
+### 2026-10-26: follow-up
+
+Review of the fix above (PR #48) found it partly wrong, in four places.
+
+- **The `produced` predicate tested the wrong thing.** A timeout *raises* out
+  of the request; it never comes back as an all-`None` result. An all-`None`
+  group means every rung returned a *malformed* reply, and that latency is
+  real. So the predicate excluded real measurements and never saw the timeouts
+  it was written for. It is replaced by a `failed` flag on `_annotate_group`'s
+  result (`_GroupResults`), set when any request in the ladder failed in
+  transport (`_REQUEST_FAILURES = (OSError, http.client.HTTPException)`).
+  `annotate._group_bankable` is the new `bankable=` predicate: only a flagged
+  group is barred from `worst()`. Malformed-only and partial groups count. The
+  mean still counts every group.
+- **Swallowing in `_annotate_batch` only moved the abort two rungs down.** A
+  timed-out batch fell to the schema retry and then to the singles, and a
+  single that timed out still raised out of `_pooled` and killed the phase.
+  The ladder now owns transport failures. `_annotate_batch` raises,
+  `_annotate_schema_retry` re-raises transport failures and still swallows
+  unusable replies (a server that rejects a dict `format` would otherwise flag
+  every group), and `_annotate_group` catches them. After a failure it skips the
+  schema rung (it is batch-sized, so it would very likely time out too) and
+  drops to singles. One failure is tolerated ungated; budgeted callers pass
+  `fail_fast=True` and tolerate none. Past the tolerance, uncovered rows come
+  back `None` and the group is flagged. The cost bound per group is at most
+  2 × `ANNOTATE_TIMEOUT` of failed requests ungated, and 1 × under a budget,
+  plus the requests that succeeded. A `RuntimeError` (an Ollama error body,
+  e.g. a model that is not pulled) still propagates; it is a config error.
+  Apple FM signals a timeout as `AppleFMError`, a `RuntimeError`, so Apple is
+  outside this and behaves as it did before the batch swallow was added.
+- **The 900 s `ANNOTATE_TIMEOUT` made full fall-through very expensive.** A
+  batch of 8 that times out on every rung is ten requests, about 9,000 s on
+  timeouts alone. Slow-but-malformed replies also buy `chat_once_json`'s nudge
+  retry, which pushes one group toward the ~16,000 s the review estimated.
+  Fail-fast under a budget bounds the failure cost to about one
+  `ANNOTATE_TIMEOUT`.
+- **The latch needed a manual `DELETE` to recover.** `_DispatchDeadline.
+  dispatchable` now probes: while this run has measured nothing and dispatched
+  nothing, the first group goes even if the prior says it will not fit, so a
+  stale or poisoned prior is re-measured. If the probe is bankable,
+  `_save_group_rate` overwrites the poisoned value. Only one probe can happen
+  (after it `_dispatched` is 1), a rate shared with a phase that already
+  measured never probes, and a deadline that has already passed still
+  dispatches nothing. The cost is a contract change: a budget smaller than one
+  group used to dispatch nothing, and now dispatches exactly one group and
+  overruns by that group's latency. That is the price of not latching.
+
+Still open: a gated run can overrun by about one `ANNOTATE_TIMEOUT` per stuck
+in-flight group, all of them concurrent. The next step, if that is too much,
+is a per-rung `timeout = min(ANNOTATE_TIMEOUT, deadline - now)` supplied by
+the gate. That is a separate change.
 
 ## 2026-10-26: a script is a second copy of its own module
 
