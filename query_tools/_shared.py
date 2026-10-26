@@ -502,7 +502,7 @@ def cap_tool_result_json(result, result_json, max_chars):
             keep = max(1, keep // 2)
     # JSON-escaping the fragment can inflate it, so leave envelope headroom
     # and halve on the (rare) overshoot.
-    cut = max_chars - 200
+    cut = max(0, max_chars - 200)  # negative never halves to 0: -1 // 2 == -1
     while True:
         capped = json.dumps({"truncated": True, "note": note,
                              "partial_json": result_json[:cut]})

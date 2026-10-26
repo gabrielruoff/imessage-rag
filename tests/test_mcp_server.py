@@ -17,6 +17,8 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -239,6 +241,45 @@ class InMemoryServerTest(unittest.TestCase):
         self.assertIs(body["truncated"], True)
         self.assertIn("note", body)
 
+    def test_tiny_cap_returns_promptly_as_valid_json(self):
+        # A cap under the fragment headroom once looped forever (-1 // 2 == -1),
+        # freezing the event loop; run in a thread so a regression fails, not hangs.
+        cases = [{"blob": "x" * 500}, [{"text": "y" * 500}]]  # non-list; one huge row
+        out = []
+
+        def go():
+            for case in cases:
+                out.append(mcp_server._result(case).content[0].text)
+        with mock.patch.object(config, "MCP_RESULT_MAX_CHARS", 50):
+            t = threading.Thread(target=go, daemon=True)
+            t.start()
+            t.join(timeout=10)
+        self.assertFalse(t.is_alive(), "cap_tool_result_json hung on a tiny cap")
+        self.assertEqual(len(out), len(cases))
+        for text in out:
+            self.assertIs(json.loads(text)["truncated"], True)
+
+    def test_no_exposed_tool_emits_floor_output(self):
+        # The turn-level floors (epilogue, wellbeing support block) can't be
+        # enforced over MCP; no exposed tool may produce them.
+        by_name = {"chunk_id": self.chunk_ids[0], "chat_id": 2}
+        by_type = {"string": "picnic", "integer": 1, "array": [1]}
+        for tool in mcp_server.TOOLS:
+            schema = tool.input_schema
+            args = {}
+            for p in schema.get("required", []):
+                typ = schema["properties"][p]["type"]
+                args[p] = by_name.get(p, by_type[typ[0] if isinstance(typ, list) else typ])
+            # Thin-fixture errors are fine here; keep their tracebacks out of the log.
+            with self.subTest(tool=tool.name), \
+                    mock.patch.object(mcp_server.log, "disabled", True):
+                body = _payload(self.call(tool.name, args))
+                rows = body.get("rows", []) if isinstance(body, dict) else body
+                for d in [body, *rows]:
+                    if isinstance(d, dict):
+                        self.assertNotIn("_epilogue", d)
+                        self.assertNotIn("support_block", d)
+
 
 @_NEEDS_MCP_DEPS
 class StdioEntrypointTest(unittest.TestCase):
@@ -277,6 +318,66 @@ class StdioEntrypointTest(unittest.TestCase):
         self.assertEqual([t.name for t in tools.tools], EXPECTED_TOOLS)
         self.assertFalse(result.is_error)
         self.assertTrue(_payload(result))
+
+    def test_raw_stdio_stdout_stays_json_rpc_through_exit(self):
+        # A tool that print()s must not reach the wire, including the stdout
+        # buffer flushed at exit; also pins the legacy (pre-session) handshake.
+        db_path, _ = _make_fixture_db(self)
+        code = (
+            "import sys, mcp_server\n"
+            "def noisy(**kw):\n"
+            "    print('stray line from a tool')\n"
+            "    return [{'ok': 1}]\n"
+            "mcp_server._FUNCS['list_chats'] = noisy\n"
+            "sys.exit(mcp_server.main([]))\n")
+        proc = subprocess.Popen(
+            [sys.executable, "-c", code], cwd=REPO_ROOT,
+            env={**os.environ, "TARGET_DB": db_path}, stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(proc.kill)
+        lines = []
+
+        def reader():
+            for line in proc.stdout:
+                lines.append(line)
+        t = threading.Thread(target=reader, daemon=True)
+        t.start()
+
+        def send(msg):
+            proc.stdin.write(json.dumps(msg) + "\n")
+            proc.stdin.flush()
+
+        def wait_for(msg_id, timeout=30):
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                for line in list(lines):
+                    with contextlib.suppress(ValueError):
+                        msg = json.loads(line)
+                        if isinstance(msg, dict) and msg.get("id") == msg_id:
+                            return msg
+                time.sleep(0.05)
+            self.fail(f"no response to id {msg_id}; stdout={lines!r}")
+
+        send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-11-25", "capabilities": {},
+            "clientInfo": {"name": "raw-test", "version": "0"}}})
+        init = wait_for(1)
+        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        send({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+              "params": {"name": "list_chats", "arguments": {}}})
+        call = wait_for(2)  # stdin stays open until here, else -32000 Connection closed
+        proc.stdin.close()
+        proc.wait(timeout=30)
+        t.join(timeout=10)
+        proc.stdout.close()
+        proc.stderr.close()
+
+        self.assertEqual(init["result"]["protocolVersion"], "2025-11-25")
+        self.assertIn("result", call)
+        self.assertFalse(call["result"].get("isError"))
+        for line in lines:
+            if line.strip():
+                json.loads(line)  # anything else on stdout corrupts the wire
 
 
 if __name__ == "__main__":
