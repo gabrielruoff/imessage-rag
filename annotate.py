@@ -933,24 +933,9 @@ def main(argv=None):
         con.close()
 
 
-# Runs BEFORE the bottom import, and re-enters through the real module name
-# rather than calling the local `main` -- the same shim conflict_detect.py uses,
-# for the same reason. As `__main__` this file is a SECOND module object,
-# distinct from the `annotate` that annotate_terms imports, and only the copy
-# that finishes the cycle has `curate_terms` bound. Calling the local `main`
-# from here instead would raise NameError on `annotate.py --terms`.
-#
-# The bare `import annotate_distill` at the top happens to force that full load
-# already (annotate_distill imports annotate), so a plain guard below the bottom
-# import also works today -- but only by accident: both sibling imports are used
-# only inside main(), so moving them there to trim startup is a lint-clean,
-# suite-green edit that would silently restore the breakage. The shim does not
-# depend on them. The module body is definitions and config reads only, so the
-# double execution it costs is free.
+# Above the bottom import on purpose; db.run_cli re-enters via the real module.
 if __name__ == "__main__":
-    import annotate
-
-    run_cli(annotate.main)
+    run_cli(main)
 
 
 # --terms is its own pipeline and lives in annotate_terms; re-exported so

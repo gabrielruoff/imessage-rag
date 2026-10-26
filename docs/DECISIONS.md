@@ -3145,3 +3145,52 @@ The cost is a step for anyone genuinely switching models, which is the trade
 every other guard in this repo already makes; the refusal prints the exact
 `UPDATE` to run. `make pipeline` on an upgraded install now stops at nudges the
 same way it stops at annotate and conflict, and for the same reason.
+
+## 2026-10-26: a script is a second copy of its own module
+
+`python3 annotate.py` loads the file as `__main__`, a module object distinct
+from the `annotate` that `annotate_terms` and `annotate_distill` import by name.
+`conflict_detect` and its `conflict_signals` / `conflict_labeling` children have
+the same shape: each child imports the parent at the top to read its knobs late,
+and the parent re-exports child names from a from-import at its BOTTOM. That
+shape has two script-only failures, and both shipped. CLASS 1: the `__main__`
+guard sat above the bottom import and called the local `main`, which read a
+name not yet bound in `__main__` — `annotate.py --terms` (and so
+`make pipeline`) died on `NameError: curate_terms`. CLASS 2: moving the guard
+below the bottom import makes `__main__` execute that import itself, which
+re-enters a half-initialized child — `conflict_detect.py` died on ImportError.
+
+Nothing saw CLASS 1. Every test imports `annotate`, which runs the whole module
+before anything calls `main`, so the name is bound. ruff sees a module-level
+binding. `--help` exits inside argparse before `main()` reaches the late name.
+`annotate.py` itself had only worked earlier by accident: its top-level
+`import annotate_distill` forced the full load, so a plain guard below the
+bottom import resolved — until an edit moving that import into `main()`, which
+is lint-clean and suite-green, would have restored the break.
+
+The first fix was a per-file self-import shim (`import annotate;
+run_cli(annotate.main)`). It worked, but every future split parent — topics,
+wrapped and loose_ends already have siblings — would have had to rediscover it,
+and the two copies' comments had already drifted into contradicting each other.
+`db.run_cli` now does the re-entry once: when `main.__module__ == "__main__"` it
+imports the real module (by `__spec__.name` under `-m`, by file name otherwise)
+and calls that copy's `main`. A guard above the bottom import is then just
+`run_cli(main)`, which never runs the bottom import as `__main__` (CLASS 2) and
+reads every name off a fully-initialized module (CLASS 1). The cost is executing
+the module body twice, which is free because the `run_cli` users' bodies are
+definitions and config reads only.
+
+The shim was policed by a ~600-line static reachability analyzer in
+`tests/test_entrypoints.py`, and reviewers kept finding ways past it: an
+earliest-binding-line heuristic, a cosmetic self-reference
+that read as delegation, a vacuity self-test that never asserted its verdict.
+With the re-entry in `run_cli` no reachability model is needed. The test is now
+a shape rule — every guard is the last module-level statement or exactly
+`run_cli(<name>)` / `db.run_cli(<name>)` with `run_cli` really `db`'s — plus a
+runtime test that runs a planted parent/child cycle both ways, with a bare
+`main()` negative control that must raise NameError, and the existing `--help`
+leg for CLASS 2. Discovery reads `git ls-files`, so an untracked scratch script
+is never executed.
+
+PR #48 later lets children import the parent at the bottom; that is compatible
+with this fix and does not change the guard shape.
