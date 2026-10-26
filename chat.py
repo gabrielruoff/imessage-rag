@@ -26,6 +26,7 @@ import ollama
 import query_tools
 import wellbeing  # feature: wellbeing — dependency-free (stats + re), no config/Ollama pulled
 from config import CHAT_MODEL, MAX_TOOL_ITERATIONS, TOOL_RESULT_MAX_CHARS
+from query_tools._shared import cap_tool_result_json
 from tool_schemas import TOOL_DEFINITIONS
 
 console = Console()
@@ -389,57 +390,9 @@ def _estimate_tokens(text):
 
 
 def _cap_tool_result(result, result_json):
-    """Cap one tool result's JSON at TOOL_RESULT_MAX_CHARS while keeping it
-    valid JSON. An oversized tool message makes Ollama silently drop it AND
-    every message before it (only the system prompt survives), so the model
-    would answer with no user question in context. List results (the only
-    shape that gets big in practice) are cut at whole-row boundaries so every
-    kept row stays parseable; anything else keeps a prefix explicitly labeled
-    as a fragment."""
-    if len(result_json) <= TOOL_RESULT_MAX_CHARS:
-        return result_json
-    note = (
-        f"result was {len(result_json)} chars, over the {TOOL_RESULT_MAX_CHARS}-char "
-        "cap; re-call with narrower filters or a smaller limit"
-    )
-    # Enveloped results ({"rows": [...], ...}) get their rows cut the same
-    # way as bare lists, with the other envelope keys preserved.
-    envelope = (
-        result if isinstance(result, dict) and isinstance(result.get("rows"), list)
-        else None
-    )
-    rows = envelope["rows"] if envelope is not None else result
-    if isinstance(rows, list) and rows:
-        # Proportional first guess, then halve until the wrapper fits.
-        keep = max(1, len(rows) * TOOL_RESULT_MAX_CHARS // len(result_json))
-        while True:
-            capped_result = {
-                "truncated": True, "rows_total": len(rows), "rows_returned": keep,
-                "note": note, "rows": rows[:keep],
-            }
-            if envelope is not None:
-                # Carry the envelope's context keys; "returned" would now lie
-                # (it counted the pre-cap rows), so it is recomputed.
-                capped_result.update(
-                    {k: v for k, v in envelope.items()
-                     if k not in capped_result and k != "returned"}
-                )
-                capped_result["returned"] = keep
-            capped = json.dumps(capped_result)
-            if len(capped) <= TOOL_RESULT_MAX_CHARS:
-                return capped
-            if keep == 1:
-                break  # a single row alone busts the cap -- fragment it below
-            keep = max(1, keep // 2)
-    # JSON-escaping the fragment can inflate it, so leave envelope headroom
-    # and halve on the (rare) overshoot.
-    cut = TOOL_RESULT_MAX_CHARS - 200
-    while True:
-        capped = json.dumps({"truncated": True, "note": note,
-                             "partial_json": result_json[:cut]})
-        if len(capped) <= TOOL_RESULT_MAX_CHARS or cut == 0:
-            return capped
-        cut //= 2
+    """Chat's seam over ``query_tools._shared.cap_tool_result_json`` at this
+    module's TOOL_RESULT_MAX_CHARS (read at call time, so tests can patch it)."""
+    return cap_tool_result_json(result, result_json, TOOL_RESULT_MAX_CHARS)
 
 
 class _CliProducer:
