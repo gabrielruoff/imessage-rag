@@ -578,7 +578,7 @@ WRAPPED_VOICEPRINT_CONSENT_IDS=<id[,id2]> .venv/bin/python3 wrapped.py --yes
 
 ---
 
-## The two demo surfaces
+## The demo surfaces
 
 ### Chat CLI
 
@@ -631,6 +631,26 @@ open wrapped_2025_all.html                                      # self-contained
   `--out PATH`.
 - `--wellbeing` opts the wellbeing section in; `WRAPPED_VOICEPRINT_CONSENT_IDS` lights the
   third-party voiceprint card. Both are default-off/redacted.
+
+### MCP (agent clients)
+
+The same retrieval layer, served to an external agent: 21 read-only search,
+contact and analytics tools over stdio. **With a hosted-model agent, retrieved
+messages leave the machine**, and none of the suite's features (conflict,
+nudges, drift, voiceprint, wellbeing) are exposed. Full reference:
+[`MCP.md`](MCP.md).
+
+```bash
+# 1. Install the optional deps (after make ingest):
+make mcp-install
+
+# 2. Register it with Claude Code (keep -s --no-print-directory: stdout is the wire):
+claude mcp add imessage --scope user -- make -s --no-print-directory -C /ABS/PATH/imessage-rag mcp
+
+# 3. Start `claude`, ask "Who did I text most in June?", and watch the
+#    mcp__imessage__* tool calls (approve each one as it is asked for).
+claude
+```
 
 ---
 
