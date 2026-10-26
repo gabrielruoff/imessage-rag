@@ -3,6 +3,7 @@ result-size ceilings, id-list/scope normalization, date-bound parsing, and
 the message SELECT fragments every message-returning tool shares."""
 
 import datetime
+import json
 import zoneinfo
 
 import config
@@ -454,3 +455,57 @@ def _resolve_scope(con, chat_id, handle_id, contact_id):
     # so a requested chat scope is always non-empty after normalization.
     empty = handle_requested and not handle_ids
     return chat_ids, handle_ids, empty
+
+
+def cap_tool_result_json(result, result_json, max_chars):
+    """Cap one tool result's JSON at ``max_chars`` while keeping it
+    valid JSON. Shared by both transports, each passing its own cap:
+    chat.py (TOOL_RESULT_MAX_CHARS: an oversized message makes Ollama drop it
+    and everything before it) and mcp_server (MCP_RESULT_MAX_CHARS: the
+    client's output-token limit). List results (the only shape that gets big
+    in practice) are cut at whole-row boundaries so every kept row stays
+    parseable; anything else keeps a prefix explicitly labeled as a fragment."""
+    if len(result_json) <= max_chars:
+        return result_json
+    note = (
+        f"result was {len(result_json)} chars, over the {max_chars}-char "
+        "cap; re-call with narrower filters or a smaller limit"
+    )
+    # Enveloped results ({"rows": [...], ...}) get their rows cut the same
+    # way as bare lists, with the other envelope keys preserved.
+    envelope = (
+        result if isinstance(result, dict) and isinstance(result.get("rows"), list)
+        else None
+    )
+    rows = envelope["rows"] if envelope is not None else result
+    if isinstance(rows, list) and rows:
+        # Proportional first guess, then halve until the wrapper fits.
+        keep = max(1, len(rows) * max_chars // len(result_json))
+        while True:
+            capped_result = {
+                "truncated": True, "rows_total": len(rows), "rows_returned": keep,
+                "note": note, "rows": rows[:keep],
+            }
+            if envelope is not None:
+                # Carry the envelope's context keys; "returned" would now lie
+                # (it counted the pre-cap rows), so it is recomputed.
+                capped_result.update(
+                    {k: v for k, v in envelope.items()
+                     if k not in capped_result and k != "returned"}
+                )
+                capped_result["returned"] = keep
+            capped = json.dumps(capped_result, default=str)
+            if len(capped) <= max_chars:
+                return capped
+            if keep == 1:
+                break  # a single row alone busts the cap -- fragment it below
+            keep = max(1, keep // 2)
+    # JSON-escaping the fragment can inflate it, so leave envelope headroom
+    # and halve on the (rare) overshoot.
+    cut = max(0, max_chars - 200)  # negative never halves to 0: -1 // 2 == -1
+    while True:
+        capped = json.dumps({"truncated": True, "note": note,
+                             "partial_json": result_json[:cut]})
+        if len(capped) <= max_chars or cut == 0:
+            return capped
+        cut //= 2

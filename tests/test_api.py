@@ -32,12 +32,11 @@ _HAS_API_DEPS = all(
 
 if _HAS_API_DEPS:
     from fastapi.testclient import TestClient
-    from sse_starlette.sse import AppStatus
 
     from api import store
     from api.main import app
 else:                                                     # pragma: no cover
-    TestClient = AppStatus = store = app = None
+    TestClient = store = app = None
 
 _NEEDS_API_DEPS = unittest.skipUnless(
     _HAS_API_DEPS, "web-API deps not installed (run `make api-install`)")
@@ -64,10 +63,6 @@ class ApiTestBase(unittest.TestCase):
         store.DB_PATH = self._db_path
         store.init_db()
         self.addCleanup(self._teardown_db)
-        # sse-starlette caches a module-global exit Event on first use, binding
-        # it to that event loop; each TestClient spins a fresh loop, so reset it
-        # or the second streaming test hits "bound to a different event loop".
-        AppStatus.should_exit_event = None
         self.client = TestClient(app)
 
     def _teardown_db(self):

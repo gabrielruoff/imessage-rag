@@ -19,8 +19,12 @@ sent or received, and every message anyone has ever sent *you*.
 - **The other people in your threads never consented to this analysis.**
   Treat the corpus, the derived DB, and anything you generate from it as
   their private data as much as yours.
-- **Everything stays local.** The only network calls go to your own Ollama
-  instance on `localhost`. No message content is sent to any hosted API.
+- **Everything stays local by default.** The core tools make network calls only
+  to your own Ollama instance on `localhost`, and send no message content to any
+  hosted API. **The optional MCP server is the exception:** it hands the messages
+  its tools retrieve to whatever agent you connect, and an agent running a hosted
+  model (Claude Code, Claude Desktop, …) sends them to that model's provider. See
+  [`docs/MCP.md`](docs/MCP.md#privacy--security-model).
 - **`imessage_analysis.db` is unencrypted** and contains full message text.
   It is gitignored — keep it that way, and don't sync it to cloud storage.
 - **Generated Wrapped reports quote real messages verbatim**, including
@@ -403,6 +407,26 @@ percentage and an ETA; piped to a file it degrades to periodic
 `make annotate-all > run.log` stays readable. `PROGRESS_STYLE=plain` forces the
 line style, `PROGRESS_STYLE=off` silences progress entirely.
 
+## Use it from an AI agent (MCP)
+
+An optional MCP server exposes 21 read-only tools to any MCP client (Claude
+Code, Claude Desktop, …): search (keyword, semantic, hybrid), message and
+conversation retrieval, contact and chat lookup, and the analytics tools
+(counts, activity patterns, response dynamics, reactions, word trends,
+milestones, group dynamics). It runs over stdio only. **Retrieved messages go to
+the agent's model, which with a hosted model means off your machine.** Read
+[`docs/MCP.md`](docs/MCP.md) first.
+
+```sh
+make mcp-install   # once, after make ingest
+claude mcp add imessage --scope user -- make -s --no-print-directory -C /ABS/PATH/imessage-rag mcp
+```
+
+Keep `-s --no-print-directory`: stdout is the protocol wire, and make's
+directory messages would corrupt it. `make mcp` runs the server by hand (it
+waits silently on stdin). Client setup for Claude Desktop and others, the
+privacy model, and troubleshooting are in [`docs/MCP.md`](docs/MCP.md).
+
 ## Other commands
 
 ```sh
@@ -414,6 +438,8 @@ make ollama-stop      # stop the Ollama brew service
 make lint             # ruff check .
 make test             # test suite, no Ollama/chat.db needed
 make check            # everything CI enforces: lint + tests + compile check
+make mcp-install      # install the optional MCP server deps (requirements-mcp.txt)
+make mcp              # run the MCP server on stdio for agent clients (docs/MCP.md)
 make env              # create .env from .env.example (optional — all defaults work)
 make reset-db         # wipe imessage_analysis.db's data, keep schema
 ```

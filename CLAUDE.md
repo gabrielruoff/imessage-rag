@@ -25,6 +25,7 @@ Run `make` for the full self-documented target list. The ones you need:
 | Everything, in order | `make pipeline` (ingest → annotate → suite → topics) |
 | Chat | `make chat ARGS='-p "..."'` · `python3 chat.py` |
 | Year-in-review | `make wrapped ARGS='--year 2025'` |
+| MCP server (optional) | `make mcp-install` once, then `make mcp` (stdio; see `docs/MCP.md`) |
 | Lint | `make lint` (ruff, E+F, line-length 100) |
 | Test | `make test` — **slow; run only when you touched `tests/` or were asked.** Prefer `python3 -m unittest tests.test_foo` |
 | Everything CI enforces | `make check` (lint + test + compileall) |
@@ -59,6 +60,7 @@ gotcha.
 | Shared libs | `config.py`, `db.py`, `ollama.py`/`applefm.py`, `embeddings.py`, `progress.py`, `stats.py`, `consent.py`, `wellbeing.py`, `chat_floor.py` |
 | Retrieval tools | `query_tools/` (37 schemas, 5 flag-gated); `_shared.py` owns connection/caps/date-bounds/scope/identity |
 | Optional web layer | `api/` (FastAPI SSE over `chat.run_turn_events`) + `frontend/` (Vite/React) — transport only |
+| Optional MCP layer | `mcp_server/` (stdio, 21 read-only tools; transport only) |
 | Eval | `eval/evalkit/` (S1–S17 regression + F4 gates) |
 
 Schema: read `schema.py` — it is the DDL and the migration in one place.
@@ -68,10 +70,14 @@ App DB (web UI only, `config.APP_DB`): `api/store.py`.
 
 - **New tool** = function in the right `query_tools/` module + re-export from
   `query_tools/__init__.py` + schema in `tool_schemas.py` (same `name`) + one
-  line in `chat.py`'s `SYSTEM_PROMPT` tool list. Keep all four in sync.
+  line in `chat.py`'s `SYSTEM_PROMPT` tool list. Keep all four in sync. MCP
+  exposure is a separate explicit allow-list (`mcp_server.EXPOSED_TOOLS`), never
+  automatic, and never for a tool that writes or relies on a turn floor. A
+  contract change to an exposed tool (id shapes, envelope keys, date semantics)
+  also updates `mcp_server.INSTRUCTIONS`, its hand-written usage guide.
 - **All tunables live in `config.py`**; never hardcode one elsewhere. Runtime
   deps → `requirements.txt`, dev → `requirements-dev.txt`, web →
-  `requirements-api.txt`. All pinned.
+  `requirements-api.txt`, MCP → `requirements-mcp.txt`. All pinned.
 - **Comments state contracts; `docs/DECISIONS.md` states history.** If you are
   writing a paragraph about why a previous approach was wrong, it goes in
   `DECISIONS.md` with a one-line pointer from the code.
@@ -139,7 +145,10 @@ App DB (web UI only, `config.APP_DB`): `api/store.py`.
   gate (`eval_gate_passed`, default-closed) and the wellbeing deny-list /
   Wrapped consent allow-list (`consent.py`) are enforced in code. An enable-flag
   gates a feature's tool *registration* or pipeline *build*, never the prompt.
-  Removing the capability is the control — do not try to prompt around it.
+  Removing the capability is the control — do not try to prompt around it. The
+  MCP server runs no turn floor, so floor-dependent tools are not exposed there.
+- **MCP stdio: stdout is the wire.** Nothing in `mcp_server/` may print to stdout;
+  client launches use `make -s --no-print-directory -C … mcp`.
 - **Never read the live `chat.db`** (WAL sidecars) — only the snapshot from
   `ingest.snapshot_source`. Ingestion is append-only; `--senders`/`--lookback`
   scope what a run reads, never what it deletes.
