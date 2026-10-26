@@ -1,0 +1,7 @@
+# Optional MCP server (mcp_server/). Installed separately from the core
+# requirements.txt (which stays minimal so the CLIs/pipelines clone-and-run)
+# via `make mcp-install`.
+mcp==2.3.0
+# Imported directly by the server for argument validation, so it is declared
+# here rather than relied on as an mcp transitive that an mcp bump could move.
+jsonschema==4.26.0
