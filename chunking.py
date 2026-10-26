@@ -359,9 +359,22 @@ def embed_chunks(
 # ---------------------------------------------------------------------------
 # Embeddings via the Voyage Batch API (EMBED_MODEL="voyage/<id>")
 # ---------------------------------------------------------------------------
+# ingest_state keys: voyage_batch_ids (JSON list of batches not yet collected),
+# voyage_batch_space ("<EMBED_MODEL>|<EMBED_DIM>" they were submitted under),
+# voyage_pending_input_file (an uploaded input file whose batch id is not yet
+# saved; "" when none).
 
 # Rounds in a row that may leave the missing count unchanged before the run stops.
 _VOYAGE_MAX_STALLED_ROUNDS = 3
+
+
+class _DiscardBatch(Exception):
+    """A batch whose results must not be stored (gone, or another embedding
+    space). Its id is dropped; its chunks stay missing."""
+
+
+def _voyage_space():
+    return f"{EMBED_MODEL}|{config.EMBED_DIM}"
 
 
 def _saved_batch_ids(tgt):
@@ -371,6 +384,14 @@ def _saved_batch_ids(tgt):
 def _save_batch_ids(tgt, ids):
     set_state(tgt, "voyage_batch_ids", json.dumps(ids))
     tgt.commit()
+
+
+def _track_batch(tgt, batch_id):
+    """Save a new batch id (and its space) and clear the pending input file,
+    in one commit."""
+    set_state(tgt, "voyage_batch_space", _voyage_space())
+    set_state(tgt, "voyage_pending_input_file", "")
+    _save_batch_ids(tgt, _saved_batch_ids(tgt) + [batch_id])
 
 
 def _voyage_row(tgt, custom_id, vec):
@@ -387,6 +408,22 @@ def _voyage_row(tgt, custom_id, vec):
     return (chunk_id, *row[:3], vec)
 
 
+async def _reconcile_pending_input(tgt, client):
+    """A previous run uploaded an input file but never saved its batch id:
+    adopt the batch Voyage created from it, else delete the file."""
+    file_id = get_state(tgt, "voyage_pending_input_file")
+    if not file_id:
+        return
+    batch = await client.find_batch(file_id)
+    if batch:
+        print(f"Adopting Voyage batch {batch['id']} from an interrupted submit")
+        _track_batch(tgt, batch["id"])
+    else:
+        await client.delete_file(file_id)
+        set_state(tgt, "voyage_pending_input_file", "")
+        tgt.commit()
+
+
 async def _submit_voyage_batch(tgt, client, budget, batch_rows, lines):
     """Reserve the worst case, upload, create, and persist the batch id before
     any polling. Returns (batch_id, reserved_usd)."""
@@ -398,23 +435,27 @@ async def _submit_voyage_batch(tgt, client, budget, batch_rows, lines):
         raise hosted.HostedStop(f"budget cap reached: the next batch needs up to "
                                 f"${reserved:.4f} ({budget.report()})")
     file_id = await client.upload(b"".join(lines))
-    try:
-        batch = await client.create_batch(file_id)
-    except hosted.HostedStop:
-        await client.delete_file(file_id)  # it holds message text
-        raise
-    _save_batch_ids(tgt, _saved_batch_ids(tgt) + [batch["id"]])
+    # Saved first: if create_batch's outcome is lost, the next run reconciles.
+    set_state(tgt, "voyage_pending_input_file", file_id)
+    tgt.commit()
+    batch = await client.create_batch(file_id)
+    _track_batch(tgt, batch["id"])
     print(f"Submitted Voyage batch {batch['id']} ({len(lines)} chunks)")
     return batch["id"], reserved
 
 
-async def _finish_voyage_batch(tgt, client, budget, batch_id, reserved, commit_every):
+async def _collect_voyage_batch(tgt, client, budget, batch_id, reserved, commit_every,
+                                resumed):
     """Poll to a terminal state, stream the output into chunk_vectors, count
     the error file, settle the budget, forget the id, then delete its files
     (only after the results are committed)."""
     import voyage
 
     batch = await client.get_batch(batch_id)
+    if resumed and (
+            get_state(tgt, "voyage_batch_space", _voyage_space()) != _voyage_space()
+            or batch.get("model", voyage.model_id()) != voyage.model_id()):
+        raise _DiscardBatch(batch, "it was submitted under another EMBED_MODEL/EMBED_DIM")
     total = (batch.get("request_counts") or {}).get("total") or None
     with progress.track(f"Waiting on Voyage batch {batch_id}", total=total) as p:
         seen = 0
@@ -428,16 +469,21 @@ async def _finish_voyage_batch(tgt, client, budget, batch_id, reserved, commit_e
             await asyncio.sleep(config.VOYAGE_POLL_SECONDS)
             batch = await client.get_batch(batch_id)
 
-    n_stored, n_stale, n_errored, tokens, pending = 0, 0, 0, 0, []
+    n_stored, n_stale, n_failed, n_errored, tokens, pending = 0, 0, 0, 0, 0, []
     if batch.get("output_file_id"):
         async for line in client.stream_file(batch["output_file_id"]):
             rec = json.loads(line)
             response = rec.get("response") or {}
             if response.get("status_code") != 200:
-                continue  # stays missing; the next round resubmits it
+                n_failed += 1  # stays missing; the next round resubmits it
+                continue
             body = response["body"]
             tokens += (body.get("usage") or {}).get("total_tokens", 0)
-            row = _voyage_row(tgt, rec["custom_id"], body["data"][0]["embedding"])
+            vec = body["data"][0]["embedding"]
+            if len(vec) != config.EMBED_DIM:
+                raise _DiscardBatch(batch, f"it returned {len(vec)}-dim vectors, "
+                                           f"EMBED_DIM is {config.EMBED_DIM}")
+            row = _voyage_row(tgt, rec["custom_id"], vec)
             if row is None:
                 n_stale += 1
                 continue
@@ -454,14 +500,44 @@ async def _finish_voyage_batch(tgt, client, budget, batch_id, reserved, commit_e
     if batch.get("error_file_id"):
         async for _ in client.stream_file(batch["error_file_id"]):
             n_errored += 1  # their chunks stay missing and join the next round
-    print(f"Voyage batch {batch_id} {batch['status']}: {n_stored} vectors stored, "
-          f"{n_stale} stale discarded, {n_errored} errored")
+    summary = (f"Voyage batch {batch_id} {batch['status']}: {n_stored} vectors stored, "
+               f"{n_stale} stale discarded, {n_failed} failed, {n_errored} errored")
+    if batch["status"] == "failed":
+        # codes and line numbers only: an error message may quote input text
+        errors = (batch.get("errors") or {}).get("data") or []
+        summary += f" ({[(e.get('code'), e.get('line')) for e in errors]})"
+    print(summary)
 
     _save_batch_ids(tgt, [b for b in _saved_batch_ids(tgt) if b != batch_id])
+    await _delete_batch_files(client, batch)
+
+
+async def _delete_batch_files(client, batch):
     for file_id in (batch.get("input_file_id"), batch.get("output_file_id"),
                     batch.get("error_file_id")):
         if file_id:
             await client.delete_file(file_id)
+
+
+async def _finish_voyage_batch(tgt, client, budget, batch_id, reserved, commit_every,
+                               resumed=False):
+    """_collect_voyage_batch, dropping a batch that must not be stored: one
+    from another embedding space, or (on resume only) one Voyage no longer
+    serves. Its chunks stay missing, so nothing is paid twice."""
+    import voyage
+
+    try:
+        await _collect_voyage_batch(tgt, client, budget, batch_id, reserved, commit_every,
+                                    resumed)
+    except (_DiscardBatch, voyage.NotFound) as e:
+        if isinstance(e, voyage.NotFound) and not resumed:
+            raise
+        why = e.args[1] if isinstance(e, _DiscardBatch) else "Voyage no longer has it"
+        print(f"warning: dropping Voyage batch {batch_id}: {why}; its chunks are resubmitted")
+        budget.settle(reserved, reserved)
+        _save_batch_ids(tgt, [b for b in _saved_batch_ids(tgt) if b != batch_id])
+        if isinstance(e, _DiscardBatch):
+            await _delete_batch_files(client, e.args[0])
 
 
 async def _embed_voyage(tgt, budget, max_parallel, min_chars, commit_every):
@@ -471,8 +547,10 @@ async def _embed_voyage(tgt, budget, max_parallel, min_chars, commit_every):
     # One Limiter per event loop; every batch of this run shares it.
     async with voyage.BatchClient(hosted.Limiter(max_parallel)) as client:
         # Saved batches finish before anything new is submitted: never pay twice.
+        await _reconcile_pending_input(tgt, client)
         await asyncio.gather(*(
-            _finish_voyage_batch(tgt, client, budget, batch_id, 0.0, commit_every)
+            _finish_voyage_batch(tgt, client, budget, batch_id, 0.0, commit_every,
+                                 resumed=True)
             for batch_id in _saved_batch_ids(tgt)))
         stalled = 0
         while True:

@@ -54,7 +54,19 @@ class FakeVoyage:
         self.requests.append((method, path))
         for (m, prefix), queue in self.script.items():
             if m == method and path.startswith(prefix) and queue:
-                return queue.pop(0)
+                item = queue.pop(0)
+                return item(request) if callable(item) else item
+        if method == "GET" and path == "/v1/batches":
+            # newest first, two per page, to exercise pagination
+            ids = list(reversed(self.batches))
+            start = ids.index(request.url.params["after"]) + 1 if "after" in request.url.params else 0
+            page = ids[start:start + 2]
+            return httpx.Response(200, json={
+                "data": [self.batches[i] for i in page],
+                "has_more": start + 2 < len(ids), "last_id": page[-1] if page else None})
+        if method == "GET" and path.startswith("/v1/batches/") \
+                and path.rsplit("/", 1)[1] not in self.batches:
+            return httpx.Response(404, json={"detail": "not found"})
         if method == "POST" and path == "/v1/embeddings":
             body = json.loads(request.content)
             self.last_sync_body = body
@@ -68,13 +80,7 @@ class FakeVoyage:
             self.files[file_id] = lines
             return httpx.Response(200, json={"id": file_id})
         if method == "POST" and path == "/v1/batches":
-            body = json.loads(request.content)
-            self.last_batch_body = body
-            batch_id = f"batch-{len(self.batches)}"
-            self.batches[batch_id] = {"id": batch_id, "status": "validating",
-                                      "input_file_id": body["input_file_id"],
-                                      "request_counts": {"total": 0}, "polls": 0}
-            return httpx.Response(200, json=self.batches[batch_id])
+            return self.create(request)
         if method == "GET" and path.startswith("/v1/batches/"):
             batch = self.batches[path.rsplit("/", 1)[1]]
             batch["polls"] += 1
@@ -90,6 +96,15 @@ class FakeVoyage:
             self.deleted.append(path.rsplit("/", 1)[1])
             return httpx.Response(200, json={"deleted": True})
         return httpx.Response(404)
+
+    def create(self, request):
+        body = json.loads(request.content)
+        self.last_batch_body = body
+        batch_id = f"batch-{len(self.batches)}"
+        self.batches[batch_id] = {"id": batch_id, "status": "validating", "model": "voyage-4-large",
+                                  "input_file_id": body["input_file_id"],
+                                  "request_counts": {"total": 0}, "polls": 0}
+        return httpx.Response(200, json=self.batches[batch_id])
 
     def _complete(self, batch):
         out, err = [], []
@@ -362,7 +377,178 @@ class TestBatchRun(VoyageFixture):
             self.run_voyage()
 
 
+class TestReviewRegressions(VoyageFixture):
+    def save_batch(self, batch_id, rows, **fields):
+        """Plant a batch a previous run submitted, its id saved in ingest_state."""
+        ((_, lines),) = voyage.pack_lines(rows)
+        file_id = f"file-{len(self.fake.files)}"
+        self.fake.files[file_id] = [ln.rstrip(b"\n") for ln in lines]
+        self.fake.batches[batch_id] = {"id": batch_id, "status": "in_progress",
+                                       "model": "voyage-4-large", "input_file_id": file_id,
+                                       "request_counts": {"total": len(rows)}, "polls": 1,
+                                       **fields}
+        self.con.execute("INSERT OR REPLACE INTO ingest_state(key, value) "
+                         "VALUES ('voyage_batch_ids', ?)", (json.dumps([batch_id]),))
+        self.con.commit()
+
+    def test_m1_lost_create_reply_adopts_the_batch_instead_of_duplicating(self):
+        self.add_chunks(["placeholder one", "placeholder two", "placeholder three"])
+        def create_then_drop(request):
+            self.fake.create(request)
+            for i in range(3):  # newer, unrelated batches: reconciliation must page
+                self.fake.batches[f"other-{i}"] = {"id": f"other-{i}", "status": "completed",
+                                                   "input_file_id": f"file-other-{i}"}
+            raise httpx.RemoteProtocolError("connection dropped", request=request)
+        self.fake.script[("POST", "/v1/batches")] = [create_then_drop]
+        self.run_voyage()
+        created = [b for b in self.fake.batches if b.startswith("batch-")]
+        self.assertEqual(len(created), 1)
+        self.assertEqual(self.fake.requests.count(("GET", "/v1/batches")), 2)  # paged
+        self.assertEqual(sorted(self.vectors()), [1, 2, 3])
+        self.assertEqual(get_state(self.con, "voyage_pending_input_file"), "")
+
+    def test_m1_resume_adopts_a_batch_from_a_saved_pending_input_file(self):
+        self.add_chunks(["placeholder one", "placeholder two"])
+        self.save_batch("batch-orphan", [(1, "placeholder one"), (2, "placeholder two")])
+        self.con.execute("UPDATE ingest_state SET value = '[]' WHERE key = 'voyage_batch_ids'")
+        self.con.execute("INSERT INTO ingest_state(key, value) VALUES "
+                         "('voyage_pending_input_file', ?)",
+                         (self.fake.batches["batch-orphan"]["input_file_id"],))
+        self.con.commit()
+        self.run_voyage()
+        self.assertEqual(self.fake.n_created(), 0)
+        self.assertEqual(sorted(self.vectors()), [1, 2])
+
+    def test_m1_resume_deletes_a_pending_input_file_with_no_batch(self):
+        self.add_chunks(["placeholder one"])
+        self.fake.files["file-orphan"] = []
+        self.con.execute("INSERT INTO ingest_state(key, value) VALUES "
+                         "('voyage_pending_input_file', 'file-orphan')")
+        self.con.commit()
+        self.run_voyage()
+        self.assertIn("file-orphan", self.fake.deleted)
+        self.assertEqual(self.fake.n_created(), 1)
+
+    def test_m2_a_saved_batch_voyage_no_longer_serves_is_dropped(self):
+        self.add_chunks(["placeholder one"])
+        self.con.execute("INSERT INTO ingest_state(key, value) "
+                         "VALUES ('voyage_batch_ids', '[\"batch-gone\"]')")
+        self.con.commit()
+        out = self.run_voyage()
+        self.assertIn("dropping Voyage batch batch-gone", out)
+        self.assertEqual(self.fake.n_created(), 1)
+        self.assertEqual(sorted(self.vectors()), [1])
+        self.assertEqual(json.loads(get_state(self.con, "voyage_batch_ids")), [])
+
+    def test_m2_a_404_outside_resume_still_stops(self):
+        self.add_chunks(["placeholder one"])
+        self.fake.script[("GET", "/v1/batches/batch-0")] = [httpx.Response(404)]
+        with self.assertRaises(voyage.NotFound):
+            self.run_voyage()
+
+    def test_m3_resumed_batch_from_another_model_is_discarded(self):
+        self.add_chunks(["placeholder one"])
+        self.save_batch("batch-old", [(1, "placeholder one")], model="voyage-3")
+        out = self.run_voyage()
+        self.assertIn("dropping Voyage batch batch-old", out)
+        # its vector never landed; the chunk was resubmitted under the current model
+        self.assertEqual(self.fake.n_created(), 1)
+        self.assertEqual(json.loads(self.vectors()[1]), self.fake._vec(1))
+
+    def test_m3_resumed_batch_from_another_space_key_is_discarded(self):
+        self.add_chunks(["placeholder one"])
+        self.save_batch("batch-old", [(1, "placeholder one")])
+        self.con.execute("INSERT INTO ingest_state(key, value) "
+                         "VALUES ('voyage_batch_space', 'voyage/voyage-4-large|2048')")
+        self.con.commit()
+        out = self.run_voyage()
+        self.assertIn("dropping Voyage batch batch-old", out)
+        self.assertEqual(self.fake.n_created(), 1)
+
+    def test_m3_wrong_length_vectors_are_never_inserted(self):
+        self.add_chunks(["placeholder one"])
+        self.save_batch("batch-old", [(1, "placeholder one")])
+        self.fake._vec = lambda cid: [1.0, 0.0]  # 2-dim from the resumed batch
+        with self.assertRaisesRegex(hosted.HostedStop, "embedded nothing"):
+            self.run_voyage()
+        self.assertEqual(self.vectors(), {})
+
+    def test_l1_key_never_reaches_error_messages(self):
+        key = "sk-placeholder-secret\n"
+
+        def leak(request):
+            raise httpx.LocalProtocolError(f"Illegal header value {key!r}")
+        with mock.patch.object(config, "VOYAGE_API_KEY", key):
+            fake = httpx.MockTransport(leak)
+            with self.assertRaises(RuntimeError) as ctx:
+                voyage.embed_sync(["q"], "query", transport=fake)
+            self.assertNotIn("sk-placeholder", str(ctx.exception))
+            self.assertEqual(voyage._headers()["Authorization"],
+                             "Bearer sk-placeholder-secret")
+            self.add_chunks(["placeholder one"])
+            self.fake.script[("POST", "/v1/files")] = [leak]
+            with self.assertRaises(hosted.HostedStop) as ctx:
+                self.run_voyage()
+            self.assertNotIn("sk-placeholder", ctx.exception.cause)
+            self.assertIn("LocalProtocolError", ctx.exception.cause)
+
+    def test_l3_interrupt_while_polling_keeps_the_batch_id(self):
+        self.add_chunks(["placeholder one"])
+
+        def interrupt(request):
+            raise KeyboardInterrupt
+        self.fake.script[("GET", "/v1/batches/batch-0")] = [interrupt]
+        with self.assertRaises(KeyboardInterrupt), \
+                contextlib.redirect_stdout(io.StringIO()):
+            chunking.embed_chunks_voyage(self.con, hosted.Budget(1.0), 1)
+        self.assertEqual(json.loads(get_state(self.con, "voyage_batch_ids")), ["batch-0"])
+
+    def test_l3_spent_equals_reported_tokens_times_price(self):
+        self.add_chunks(["placeholder one", "placeholder two", "placeholder three"])
+        budget = hosted.Budget(1.0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            chunking.embed_chunks_voyage(self.con, budget, 1)
+        self.assertAlmostEqual(budget.spent, 3 * 10 * config.VOYAGE_BATCH_PRICE_PER_M / 1e6)
+        self.assertAlmostEqual(budget.reserved, 0.0)
+
+    def test_failed_batch_summary_shows_error_codes_and_failed_lines(self):
+        self.add_chunks(["placeholder one"])
+        self.fake.batch_status = "failed"
+        orig = self.fake._complete
+
+        def complete_failed(batch):
+            orig(batch)
+            batch["errors"] = {"data": [{"code": "invalid_line", "line": 1,
+                                         "message": "quoted input text"}]}
+            self.fake.files[batch["output_file_id"]] = [json.dumps(
+                {"custom_id": "1:x", "response": {"status_code": 500}}).encode()]
+        self.fake._complete = complete_failed
+        with contextlib.redirect_stdout(io.StringIO()) as out, \
+                self.assertRaises(hosted.HostedStop):
+            chunking.embed_chunks_voyage(self.con, hosted.Budget(1.0), 1)
+        self.assertIn("1 failed", out.getvalue())
+        self.assertIn("('invalid_line', 1)", out.getvalue())
+        self.assertNotIn("quoted input text", out.getvalue())
+
+
 class TestIngestFlags(unittest.TestCase):
+    def test_voyage_refuses_without_key_before_snapshot(self):
+        with mock.patch.object(ingest, "EMBED_MODEL", MODEL), \
+                mock.patch.object(ingest, "VOYAGE_API_KEY", " \n"), \
+                mock.patch.object(ingest, "snapshot_source") as snap, \
+                mock.patch("sys.argv", ["ingest.py", "--budget", "1"]), \
+                self.assertRaisesRegex(SystemExit, "VOYAGE_API_KEY"):
+            ingest.main()
+        snap.assert_not_called()
+
+    def test_flags_with_no_embed_are_refused(self):
+        with mock.patch.object(ingest, "EMBED_MODEL", MODEL), \
+                mock.patch("sys.argv", ["ingest.py", "--no-embed", "--budget", "1"]), \
+                contextlib.redirect_stderr(io.StringIO()) as err, \
+                self.assertRaises(SystemExit):
+            ingest.main()
+        self.assertIn("no effect with --no-embed", err.getvalue())
+
     def test_budget_and_max_parallel_refused_for_local_model(self):
         for argv in (["--budget", "1"], ["--max-parallel", "2"]):
             with self.subTest(argv=argv), \

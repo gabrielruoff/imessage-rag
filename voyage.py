@@ -8,8 +8,11 @@ Contracts:
   (the semantic tools fall back to FTS). It prints nothing -- under the MCP
   server stdout is the wire.
 - BatchClient retries transient errors without limit and raises HostedStop on
-  anything else. Input JSONL is built in memory and uploaded from bytes; it is
-  never written to disk (it holds message text). Output is streamed by line.
+  anything else (NotFound for a 404). Input JSONL is built in memory and
+  uploaded from bytes; it is never written to disk (it holds message text).
+  Output is streamed by line.
+- No error message carries a transport exception's text: its repr can quote
+  request headers, i.e. the API key. Only the exception's type name is used.
 """
 
 import asyncio
@@ -27,19 +30,25 @@ API = "https://api.voyageai.com/v1"
 TERMINAL = {"completed", "failed", "cancelled", "expired"}
 # The query path's attempt bound (a chat turn must not hang on a dead API).
 SYNC_ATTEMPTS = 3
+# GET /v1/batches page size (Voyage's maximum).
+_LIST_PAGE = 100
+
+
+class NotFound(hosted.HostedStop):
+    """A 404: the batch or file is gone on Voyage's side."""
 
 
 def _headers():
-    return {"Authorization": f"Bearer {config.VOYAGE_API_KEY}"}
+    return {"Authorization": f"Bearer {config.VOYAGE_API_KEY.strip()}"}
 
 
-def _model():
+def model_id():
     return config.hosted_model_id(config.EMBED_MODEL)
 
 
 def embed_sync(texts, input_type, transport=None):
     """POST /v1/embeddings; one vector per text, in input order."""
-    body = {"input": list(texts), "model": _model(), "input_type": input_type,
+    body = {"input": list(texts), "model": model_id(), "input_type": input_type,
             "output_dimension": config.EMBED_DIM, "output_dtype": "float"}
     with httpx.Client(timeout=config.HOSTED_TIMEOUT, transport=transport) as client:
         for attempt in range(SYNC_ATTEMPTS):
@@ -48,7 +57,7 @@ def embed_sync(texts, input_type, transport=None):
                 response = client.post(f"{API}/embeddings", json=body, headers=_headers())
                 verdict = hosted.classify(response)
             except httpx.TransportError as e:
-                verdict, cause = hosted.classify(e), repr(e)
+                verdict, cause = hosted.classify(e), type(e).__name__
             else:
                 cause = f"HTTP {response.status_code}"
             if verdict == "ok":
@@ -126,29 +135,33 @@ class BatchClient:
     async def __aexit__(self, *exc):
         await self.http.aclose()
 
-    def _verdict(self, response, attempt_cause):
+    async def _attempt(self, method, path, **kwargs):
+        """One request -> (response, None) or (None, (verdict, exc type name))."""
+        async with self.limiter:
+            try:
+                return await self.http.request(method, path, **kwargs), None
+            except httpx.TransportError as e:
+                return None, (hosted.classify(e), type(e).__name__)
+
+    def _verdict(self, response, cause):
         """Shared bookkeeping after one attempt; raises HostedStop on a stop."""
-        verdict = hosted.classify(response) if response is not None else attempt_cause[0]
+        verdict = hosted.classify(response) if response is not None else cause[0]
         if verdict == "ok":
             self.limiter.succeeded()
         elif verdict == "retry":
             if response is not None and response.status_code == 429:
                 self.limiter.throttled()
+        elif response is not None:
+            stop = NotFound if response.status_code == 404 else hosted.HostedStop
+            raise stop(f"Voyage: HTTP {response.status_code} {response.text[:200]}")
         else:
-            detail = (f"HTTP {response.status_code} {response.text[:200]}"
-                      if response is not None else attempt_cause[1])
-            raise hosted.HostedStop(f"Voyage: {detail}")
+            raise hosted.HostedStop(f"Voyage: {cause[1]}")
         return verdict
 
     async def _request(self, method, path, **kwargs):
         attempt = 0
         while True:
-            response, cause = None, None
-            async with self.limiter:
-                try:
-                    response = await self.http.request(method, path, **kwargs)
-                except httpx.TransportError as e:
-                    cause = (hosted.classify(e), repr(e))
+            response, cause = await self._attempt(method, path, **kwargs)
             if self._verdict(response, cause) == "ok":
                 return response
             await asyncio.sleep(hosted.retry_delay(attempt, response))
@@ -161,16 +174,41 @@ class BatchClient:
             files={"file": ("input.jsonl", jsonl_bytes, "application/jsonl")})
         return response.json()["id"]
 
+    async def find_batch(self, input_file_id):
+        """The batch created from `input_file_id`, or None (pages through
+        GET /v1/batches)."""
+        params = {"limit": _LIST_PAGE}
+        while True:
+            page = (await self._request("GET", "/batches", params=params)).json()
+            for batch in page.get("data") or []:
+                if batch.get("input_file_id") == input_file_id:
+                    return batch
+            if not page.get("has_more") or not page.get("last_id"):
+                return None
+            params = {"limit": _LIST_PAGE, "after": page["last_id"]}
+
     async def create_batch(self, input_file_id):
-        response = await self._request("POST", "/batches", json={
+        """POST /v1/batches. A failed attempt may still have created the batch
+        (the reply was lost), so every non-ok attempt reconciles through
+        find_batch before re-POSTing: never two batches for one file."""
+        body = {
             "endpoint": "/v1/embeddings",
             "completion_window": "12h",
             "input_file_id": input_file_id,
-            "request_params": {"model": _model(), "input_type": "document",
+            "request_params": {"model": model_id(), "input_type": "document",
                                "output_dimension": config.EMBED_DIM,
                                "output_dtype": "float"},
-        })
-        return response.json()
+        }
+        attempt = 0
+        while True:
+            response, cause = await self._attempt("POST", "/batches", json=body)
+            ok = response is not None and hosted.classify(response) == "ok"
+            if not ok and (found := await self.find_batch(input_file_id)):
+                return found
+            if self._verdict(response, cause) == "ok":
+                return response.json()
+            await asyncio.sleep(hosted.retry_delay(attempt, response))
+            attempt += 1
 
     async def get_batch(self, batch_id):
         return (await self._request("GET", f"/batches/{batch_id}")).json()
@@ -197,7 +235,7 @@ class BatchClient:
                             await r.aread()
                         response = r
                 except httpx.TransportError as e:
-                    response, cause = None, (hosted.classify(e), repr(e))
+                    response, cause = None, (hosted.classify(e), type(e).__name__)
             if self._verdict(response, cause) == "ok":
                 return
             await asyncio.sleep(hosted.retry_delay(attempt, response))
@@ -205,12 +243,7 @@ class BatchClient:
 
     async def delete_file(self, file_id):
         """DELETE /v1/files/{id}, best-effort: one attempt, warn on failure."""
-        try:
-            async with self.limiter:
-                response = await self.http.delete(f"/files/{file_id}")
-            ok = hosted.classify(response) == "ok"
-        except httpx.TransportError:
-            ok = False
-        if not ok:
+        response, _ = await self._attempt("DELETE", f"/files/{file_id}")
+        if response is None or hosted.classify(response) != "ok":
             print(f"warning: could not delete Voyage file {file_id}; delete it from "
                   f"the Voyage dashboard (it holds message text or derived vectors)")

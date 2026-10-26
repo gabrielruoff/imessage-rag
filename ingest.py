@@ -56,6 +56,7 @@ from config import (
     SNAPSHOT_DB,
     SOURCE_DB,
     TARGET_DB,
+    VOYAGE_API_KEY,
     hosted_model_id,
     is_voyage_model,
 )
@@ -575,6 +576,8 @@ def main():
     if not use_voyage and (args.budget is not None or args.max_parallel is not None):
         ap.error("--budget / --max-parallel only apply to hosted models "
                  f"(EMBED_MODEL={EMBED_MODEL})")
+    if args.no_embed and (args.budget is not None or args.max_parallel is not None):
+        ap.error("--budget / --max-parallel have no effect with --no-embed")
 
     senders = _split_csv(args.senders)
     excluded = _split_csv(args.exclude)
@@ -584,6 +587,9 @@ def main():
     if use_voyage and not args.no_embed:
         import hosted
 
+        if not VOYAGE_API_KEY.strip():
+            raise SystemExit(f"EMBED_MODEL={EMBED_MODEL} needs VOYAGE_API_KEY (set it in "
+                             f".env), or re-run with --no-embed")
         budget = hosted.Budget(hosted.resolve_budget_usd(args.budget))
         max_parallel = hosted.check_max_parallel(
             HOSTED_MAX_PARALLEL if args.max_parallel is None else args.max_parallel)
