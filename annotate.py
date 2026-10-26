@@ -222,7 +222,9 @@ Classify each term independently of the others. Respond with ONLY one JSON
 object mapping each term's number (as a string) to its verdict, one of
 {_TERM_VERDICT_LIST}: {{"0": "ordinary", "1": "inside_joke", ...}}."""
 
-# Transport failures (timeout, refused, reset): the request never produced a reply.
+# Transport failures (timeout, reset, dropped): the request never produced a reply.
+# _annotate_group re-raises ConnectionRefusedError ahead of these -- no server
+# running is a config error and stays loud.
 _REQUEST_FAILURES = (OSError, http.client.HTTPException)
 
 # chat_once_json's default nudge only says "one JSON object"; a correction
@@ -522,7 +524,8 @@ def _annotate_schema_retry(rows, model, think):
     since the per-chunk fallback is still behind this. A transport failure
     (_REQUEST_FAILURES) raises, and _annotate_group handles it: were it
     swallowed here, a schema-rejecting server would look like a failed request
-    on every group. KeyboardInterrupt is not an Exception and propagates."""
+    on every group. KeyboardInterrupt is not an Exception and propagates.
+    See docs/DECISIONS.md, "2026-08-05: the budget gate latched itself shut"."""
     ids = [cid for cid, _text in rows]
     user = "\n\n".join(f"### chunk {cid}\n{text}" for cid, text in rows)
     try:
@@ -576,8 +579,9 @@ def _annotate_group(group, model, think, fail_fast=False):
     is tolerated; past that no further request is issued and every uncovered
     row is None, while rows an earlier rung covered are kept. So failures cost
     a group at most 2 x ANNOTATE_TIMEOUT ungated and 1 x with fail_fast, plus
-    the requests that succeeded. Any other exception (an Ollama error body is a
-    config error) and KeyboardInterrupt propagate. See docs/DECISIONS.md,
+    the requests that succeeded. A refused connection (no server running),
+    any other exception (an Ollama error body) and KeyboardInterrupt
+    propagate: those are config errors and stay loud. See docs/DECISIONS.md,
     "2026-08-05: the budget gate latched itself shut".
 
     Apple FM never reaches the middle rung: its `format` seam is not a guided
@@ -591,6 +595,8 @@ def _annotate_group(group, model, think, fail_fast=False):
     if len(group) > 1:
         try:
             batched = _annotate_batch(group, model, think)
+        except ConnectionRefusedError:
+            raise
         except _REQUEST_FAILURES:
             failures += 1
     # Only ids a batch actually attempted and missed are worth a schema retry;
@@ -607,6 +613,8 @@ def _annotate_group(group, model, think, fail_fast=False):
             and not config.is_apple_model(model or config.CHAT_MODEL)):
         try:
             batched.update(_annotate_schema_retry(missed, model, think))
+        except ConnectionRefusedError:
+            raise
         except _REQUEST_FAILURES:
             failures += 1
     for chunk_id, text in group:
@@ -618,6 +626,8 @@ def _annotate_group(group, model, think, fail_fast=False):
                      {"role": "user", "content": text}],
                     model=model, think=think, timeout=ANNOTATE_TIMEOUT,
                 )
+            except ConnectionRefusedError:
+                raise
             except _REQUEST_FAILURES:
                 failures += 1
         out[chunk_id] = data if isinstance(data, dict) else None

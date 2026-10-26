@@ -605,6 +605,23 @@ class TestAnnotateGroupLadder(unittest.TestCase):
         self.assertEqual(out, {1: None, 2: None, 3: None})
         self.assertTrue(out.failed)
 
+    def test_fail_fast_keeps_rows_an_earlier_rung_covered(self):
+        llm = _LadderLLM(covered=(1,), schema=TimeoutError())
+        out = self.run_group(llm, fail_fast=True)
+        self.assertEqual(llm.log, [("batch", [1, 2, 3]), ("schema", [2, 3])])
+        self.assertIsInstance(out[1], dict)
+        self.assertEqual((out[2], out[3]), (None, None))
+        self.assertTrue(out.failed)
+
+    def test_a_refused_connection_propagates(self):
+        # No server running is a config error: fail loudly, never skip rows.
+        for fail_fast in (False, True):
+            with self.subTest(fail_fast=fail_fast):
+                llm = _LadderLLM(batch=ConnectionRefusedError())
+                with self.assertRaises(ConnectionRefusedError):
+                    self.run_group(llm, fail_fast=fail_fast)
+                self.assertEqual(llm.log, [("batch", [1, 2, 3])])
+
     def test_a_schema_timeout_flags_the_group_and_singles_still_run(self):
         llm = _LadderLLM(covered=(1,), schema=TimeoutError())
         out = self.run_group(llm)
