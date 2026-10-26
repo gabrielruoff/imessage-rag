@@ -3218,11 +3218,12 @@ killing every run after it.
 
 Review of the fix above (PR #48) found it partly wrong, in four places.
 
-- **The `produced` predicate tested the wrong thing.** A timeout *raises* out
-  of the request; it never comes back as an all-`None` result. An all-`None`
-  group means every rung returned a *malformed* reply, and that latency is
-  real. So the predicate excluded real measurements and never saw the timeouts
-  it was written for. It is replaced by a `failed` flag on `_annotate_group`'s
+- **The `produced` predicate tested the wrong thing.** A timeout on a single
+  *raises* out of the group; it never comes back as an all-`None` result. An
+  all-`None` group meant the singles all returned *malformed* replies. The
+  swallowed batch and schema rungs could hide timeouts inside one, but the
+  singles' latency was real either way. So the predicate excluded real
+  measurements and never saw the single-chunk timeouts it was written for. It is replaced by a `failed` flag on `_annotate_group`'s
   result (`_GroupResults`), set when any request in the ladder failed in
   transport (`_REQUEST_FAILURES = (OSError, http.client.HTTPException)`).
   `annotate._group_bankable` is the new `bankable=` predicate: only a flagged
@@ -3240,16 +3241,23 @@ Review of the fix above (PR #48) found it partly wrong, in four places.
   `fail_fast=True` and tolerate none. Past the tolerance, uncovered rows come
   back `None` and the group is flagged. The cost bound per group is at most
   2 × `ANNOTATE_TIMEOUT` of failed requests ungated, and 1 × under a budget,
-  plus the requests that succeeded. A `RuntimeError` (an Ollama error body,
-  e.g. a model that is not pulled) still propagates; it is a config error.
+  plus the requests that succeeded. Two failures still propagate, because they
+  are config errors and must stay loud: a `ConnectionRefusedError` (no server
+  running; `_annotate_group` re-raises it ahead of `_REQUEST_FAILURES`, so
+  `make annotate` against a stopped Ollama fails instead of skipping every
+  chunk) and a `RuntimeError` (an Ollama error body, e.g. a model that is not
+  pulled).
   Apple FM signals a timeout as `AppleFMError`, a `RuntimeError`, so Apple is
   outside this and behaves as it did before the batch swallow was added.
-- **The 900 s `ANNOTATE_TIMEOUT` made full fall-through very expensive.** A
-  batch of 8 that times out on every rung is ten requests, about 9,000 s on
-  timeouts alone. Slow-but-malformed replies also buy `chat_once_json`'s nudge
-  retry, which pushes one group toward the ~16,000 s the review estimated.
-  Fail-fast under a budget bounds the failure cost to about one
-  `ANNOTATE_TIMEOUT`.
+- **The 900 s `ANNOTATE_TIMEOUT` made full fall-through very expensive.** At
+  8ae4d7e the first single-chunk timeout raised, so the expensive group was
+  not one that timed out everywhere. It was one whose replies landed just under
+  the timeout and came back malformed. For a batch of 8, that is the batch and
+  its `chat_once_json` nudge retry, the schema retry, and eight singles each
+  with a nudge retry: up to 19 requests (16 or more in practice), about
+  16,000 s. Fail-fast under a budget bounds the *failure* cost to about one
+  `ANNOTATE_TIMEOUT`. Slow malformed replies are not failures and are still
+  paid in full.
 - **The latch needed a manual `DELETE` to recover.** `_DispatchDeadline.
   dispatchable` now probes: while this run has measured nothing and dispatched
   nothing, the first group goes even if the prior says it will not fit, so a
