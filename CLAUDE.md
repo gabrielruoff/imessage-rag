@@ -97,6 +97,10 @@ App DB (web UI only, `config.APP_DB`): `api/store.py`.
   Search tools return an envelope
   (`rows`/`total_matching`/`returned`/`order`/`truncated`), not a bare list.
 - `REPO_REVIEW.md` / `REPO_FIX_PLAN.md` are gitignored working files — never commit.
+- **Subagent defaults:** implementing agents (implementation and fix work)
+  default to Opus 5.5 (`model: "opus"`) at `effort: "medium"`; reviewer agents
+  default to Opus 5.5 at `effort: "xhigh"`. An explicit user instruction
+  overrides either default.
 
 ## Gotchas (load-bearing)
 
