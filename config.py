@@ -167,6 +167,12 @@ DOUBLE_TEXT_MIN_MINUTES = int(os.getenv("DOUBLE_TEXT_MIN_MINUTES", "10"))
 # dropped along with everything before it, leaving only the system prompt, so an
 # oversized result must be cut client-side. ~60k chars is ~20k tokens.
 TOOL_RESULT_MAX_CHARS = int(os.getenv("TOOL_RESULT_MAX_CHARS", "60000"))
+# Hard cap on one MCP tool result's JSON (chars; mcp_server). Sized under Claude
+# Code's default 25k-token MCP output limit even at the worst case of ~2
+# chars/token for \u-escaped emoji. Over the cap, the result is cut at row
+# boundaries with a note rather than mangled by the client. Separate from
+# TOOL_RESULT_MAX_CHARS, which is sized to Ollama's whole-message window drop.
+MCP_RESULT_MAX_CHARS = int(os.getenv("MCP_RESULT_MAX_CHARS", "40000"))
 
 # --- Analytics: sessions & response dynamics ----------------------------------
 # Silence gap (minutes) that closes a `sessions` row. Distinct from
