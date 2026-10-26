@@ -14,7 +14,6 @@ is max(OpenRouter-reported cost, tokens x live price).
 import json
 import random
 import sys
-import threading
 import time
 import urllib.error
 import urllib.request
@@ -26,24 +25,6 @@ from .manifest import resolve_db_path, write_json_atomic
 OR_URL = "https://openrouter.ai/api/v1"
 PILOT_DIR = RESULTS_DIR / "pilot"
 MAX_TOKENS = 1024
-
-
-class Budget:
-    def __init__(self, limit):
-        self.limit, self.spent, self.reserved = limit, 0.0, 0.0
-        self.lock = threading.Lock()
-
-    def reserve(self, amount):
-        with self.lock:
-            if self.spent + self.reserved + amount > self.limit:
-                return False
-            self.reserved += amount
-            return True
-
-    def settle(self, reserved, actual):
-        with self.lock:
-            self.reserved -= reserved
-            self.spent += actual
 
 
 def _prices(models):
@@ -165,6 +146,7 @@ def cmd_pilot(args):
     import annotate
     import config  # noqa: F401 -- loads .env
     import db
+    from hosted import Budget
 
     api_key = os.environ.get("OPEN_ROUTER_API_KEY")
     if not api_key:

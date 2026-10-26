@@ -125,7 +125,7 @@ env:  ## Create .env from .env.example (optional -- every value has a default)
 	else cp .env.example .env; \
 	  echo "created .env from .env.example (all values commented out)"; fi
 
-doctor:  ## Check the environment: venv, brew, Ollama, models, source data, DB
+doctor:  ## Check the environment: venv, brew, Ollama, models, hosted keys, source data, DB
 	@ok()   { printf '  [ ok ] %s\n' "$$1"; }; \
 	 warn() { printf '  [warn] %s\n' "$$1"; }; \
 	 bad()  { printf '  [fail] %s\n' "$$1"; fail=1; }; \
@@ -158,6 +158,15 @@ doctor:  ## Check the environment: venv, brew, Ollama, models, source data, DB
 	     else bad "model $$m NOT pulled -- run: make install-ollama"; fi; \
 	   done; \
 	 else bad "not reachable at $$addr -- run: make ollama-start"; fi; \
+	 echo ""; \
+	 echo "Hosted backends (no network calls)"; \
+	 if hk=$$($(HOSTED_KEYS) 2>/dev/null); then \
+	   [ -z "$$hk" ] && ok "none selected (EMBED_MODEL and ANNOTATE_MODEL are local)"; \
+	   for t in $$hk; do \
+	     case $$t in *=1) ok "$${t%=1} set";; \
+	     *) bad "$${t%=0} not set, but a hosted model needs it -- add it to .env";; esac; \
+	   done; \
+	 else bad "config.py failed to load -- run: .venv/bin/python3 -c 'import config'"; fi; \
 	 echo ""; \
 	 echo "Source data"; \
 	 src=$(SOURCE_DB_PATH); \
@@ -203,7 +212,13 @@ doctor:  ## Check the environment: venv, brew, Ollama, models, source data, DB
 # via a subshell inside the recipe and never a top-level $(shell ...) -- that
 # would fork Python on every `make lint` too (same reason as install-ollama's
 # model list below).
-MODEL_LIST = .venv/bin/python3 -c 'import config; print(" ".join(sorted({config.EMBED_MODEL, config.CHAT_MODEL, config.ANNOTATE_MODEL, config.TOPIC_MODEL, config.WRAPPED_MODEL})))'
+#
+# MODEL_LIST is what Ollama must have pulled: apple and hosted (voyage/,
+# openrouter/) names are filtered out through config's own predicates, so
+# install-ollama never pulls them. HOSTED_KEYS prints KEY_VAR=1|0 for each
+# hosted backend the env selects -- whether its key is set, never the key.
+MODEL_LIST = .venv/bin/python3 -c 'import config as c; print(" ".join(sorted(m for m in {c.EMBED_MODEL, c.CHAT_MODEL, c.ANNOTATE_MODEL, c.TOPIC_MODEL, c.WRAPPED_MODEL} if not (c.is_apple_model(m) or c.is_openrouter_model(m) or c.is_voyage_model(m)))))'
+HOSTED_KEYS = .venv/bin/python3 -c 'import config as c; k = {"VOYAGE_API_KEY": c.VOYAGE_API_KEY} if c.is_voyage_model(c.EMBED_MODEL) else {}; k.update({"OPEN_ROUTER_API_KEY": c.OPEN_ROUTER_API_KEY} if c.is_openrouter_model(c.ANNOTATE_MODEL) else {}); print(" ".join(f"{n}={int(bool(v))}" for n, v in k.items()))'
 OLLAMA_ADDR = $$(.venv/bin/python3 -c 'import config; print(f"{config.OLLAMA_HOST}:{config.OLLAMA_PORT}")' 2>/dev/null || echo localhost:11434)
 SOURCE_DB_PATH = $$(.venv/bin/python3 -c 'import config; print(config.SOURCE_DB)' 2>/dev/null || echo source_data/chat.db)
 
