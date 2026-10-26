@@ -4,6 +4,8 @@ the ISO-date -> day-number conversion used by chunk_vectors' metadata
 columns, and the ingest_state key/value accessors."""
 
 import datetime
+import importlib
+import os
 import re
 import sqlite3
 import sys
@@ -40,9 +42,17 @@ def connect_default(path, *, vec=True, rows=True):
 
 
 def run_cli(main):
-    """Shared ``__main__`` tail for the batch CLIs (annotate.py, topics.py,
-    wrapped.py): exit with main()'s return code (None -> 0) and turn
-    Ctrl-C / EOF into the conventional exit 130."""
+    """Shared ``__main__`` tail for the batch CLIs: exit with main()'s return
+    code (None -> 0) and turn Ctrl-C / EOF into the conventional exit 130.
+
+    A script is a second module object beside the one its children import, so
+    ``main`` is re-read off the real module (DECISIONS: "a script is a second
+    copy of its own module")."""
+    if main.__module__ == "__main__":
+        g = main.__globals__
+        spec = g.get("__spec__")  # set under `python -m x`, None for `python x.py`
+        name = spec.name if spec else os.path.splitext(os.path.basename(g["__file__"]))[0]
+        main = getattr(importlib.import_module(name), main.__name__)
     try:
         sys.exit(main() or 0)
     except (EOFError, KeyboardInterrupt):

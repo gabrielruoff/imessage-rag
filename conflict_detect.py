@@ -818,6 +818,7 @@ def main(argv=None):
         con.close()
 
 
+# Above the bottom imports on purpose; db.run_cli re-enters via the real module.
 if __name__ == "__main__":
     run_cli(main)
 
