@@ -3634,6 +3634,55 @@ deleted. A future implementation should delete each batch once its results are
 written, rather than leave message-derived output on third-party servers for the
 30-day retention.
 
+### Live smoke test, and what it changed
+
+Run against a throwaway `TARGET_DB` over the last 3 days of messages, with
+`--budget 0.10`: 96 chunks, 20 annotations, about **$0.0054** in total ($0.0014
+Voyage, $0.0040 Haiku).
+
+| Check | Result |
+|---|---|
+| Voyage interrupt and resume | One batch was submitted, and its id survived Ctrl-C. The rerun collected it: 96/96 vectors, `voyage_batch_ids` empty, remote files deleted (404 afterwards) |
+| Plain rerun | 0 chunks built, no batch, $0 |
+| Haiku annotate | OpenRouter served `anthropic/claude-haiku-5.5`, `pending: 0`. The cache warning didn't fire in 20 calls, and the guard recorded the configured name |
+| Chat | `search_conversations` returned 15 rows through the Voyage sync query path |
+| `CHAT_MODEL=openrouter/…` | refused at the ollama seam, before any request |
+
+Facts the hermetic tests could not supply:
+
+- **`GET /v1/files/{id}/content` answers 307 to a signed Google Cloud Storage
+  URL.** The first live collect failed on it. The download now follows
+  redirects, on that one request only. httpx drops `Authorization` on the
+  cross-origin hop, so the key never reaches the storage host.
+- **The Batch object has a top-level `model` (`"voyage-4-large"`)**, which the
+  resume check compares. A missing batch is `404 {"detail": "Batch not found"}`,
+  and a new batch shows up in `GET /v1/batches` immediately, which the
+  lost-create reconciliation relies on.
+- **A full ingest rerun duplicated every chunk.** That bug was already on `main`,
+  but the hosted path pays for each duplicate. See "message upsert" below.
+- **The budget reserves the worst case, not the expected cost.** On this corpus
+  that is 55.0 M bytes × $0.0804/M = $4.42 for a batch that costs about $1.31,
+  so a first full Voyage ingest needs `--budget 5`.
+
+Later review hardening, contracts only:
+- The chat-time query gives up instead of sleeping when `Retry-After` exceeds
+  `HOSTED_BACKOFF_MAX_SECONDS`.
+- An OpenRouter model priced ≤ 0 is refused, because it would make every budget
+  reservation pass.
+- Hosted annotate's Ctrl-C commits and then exits non-zero.
+- A Voyage file stream no longer holds a concurrency slot while its body is
+  read, which deadlocked at `HOSTED_MAX_PARALLEL=1`.
+- The fixed retry counts became knobs: `VOYAGE_MAX_STALLED_ROUNDS`,
+  `VOYAGE_SYNC_ATTEMPTS`, `OPENROUTER_UNPARSEABLE_RETRIES` and
+  `OPENROUTER_CACHE_CHECK_CALLS`.
+
+Still open:
+- The semantic tools return a tool error, not an FTS fallback, when the Voyage
+  query fails.
+- `trace_conflict` sends up to `_TRACE_QUERY_CHARS` of episode text as its
+  Voyage query, with no upload notice.
+- A Ctrl-C during the upload POST itself can orphan an input file on Voyage.
+
 ## 2026-10-26: message upsert
 
 `ingest_messages_and_reactions` wrote messages with `INSERT OR REPLACE`. REPLACE

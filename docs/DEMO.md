@@ -719,8 +719,8 @@ first.) What you'll see and what it does:
 - Results stream into `chunk_vectors` and commit every `EMBED_COMMIT_EVERY`. A
   vector whose chunk text changed since submit (ingest rebuilds tail chunks) is
   discarded as stale, and that chunk is resubmitted. Errored lines go into
-  follow-up batches until nothing errors. After three rounds in a row that embed
-  nothing, the run stops.
+  follow-up batches until nothing errors. After `VOYAGE_MAX_STALLED_ROUNDS` (3)
+  rounds in a row that embed nothing, the run stops.
 - Once a batch's results are committed, its input, output and error files are
   deleted on Voyage. This is best-effort and only warns on failure; Voyage would
   otherwise keep them for about 30 days.
@@ -764,13 +764,15 @@ ANNOTATE_THINK=false .venv/bin/python3 annotate.py --all --budget 10 --max-paral
 - What prints: `uploading chunk text (anthropic/claude-haiku-5.5) to OpenRouter`;
   once per run, `OpenRouter served <id>`, which may be a dated snapshot id such as
   `…-20261007` (the guard records your configured value, not this); and a
-  warning if `cached_tokens` stays 0 after the first few calls. In that case every
+  warning if `cached_tokens` stays 0 after the first `OPENROUTER_CACHE_CHECK_CALLS`
+  (3) calls following the first. In that case every
   request pays the full prefix and the cost runs about 2× the estimate.
 - 429s, 5xx and timeouts are retried until they succeed, and a moderation 403 is
   rerouted to another upstream provider. Nothing is skipped. The run ends with
   `pending: N` (recounted from the DB) and the spend, and exits non-zero listing
-  any chunk ids that stayed unparseable or refused. Ctrl-C commits; rerun to
-  resume.
+  any chunk ids that stayed unparseable (after `OPENROUTER_UNPARSEABLE_RETRIES`,
+  3) or refused. Ctrl-C commits what was written, then exits non-zero (chunks
+  are still pending, so a `make pipeline` stops there); rerun to resume.
 
 ### 5. Chat against it
 
