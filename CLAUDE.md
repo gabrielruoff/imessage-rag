@@ -157,7 +157,10 @@ App DB (web UI only, `config.APP_DB`): `api/store.py`.
   client launches use `make -s --no-print-directory -C … mcp`.
 - **Never read the live `chat.db`** (WAL sidecars) — only the snapshot from
   `ingest.snapshot_source`. Ingestion is append-only; `--senders`/`--lookback`
-  scope what a run reads, never what it deletes.
+  scope what a run reads, never what it deletes. `messages` is upserted
+  (`ON CONFLICT(id) DO UPDATE`), never `INSERT OR REPLACE`: REPLACE resets the
+  derived `chunk_id` (every full re-read duplicates chunks) and skips the FTS
+  delete trigger.
 - **Paths resolve relative to `config.py`'s directory**, not the CWD, and
   `load_dotenv` is pinned there — a worktree never inherits a parent `.env`.
 - **`make pipeline`/`suite` must stay serial** (never `-j`): they hold a SQLite

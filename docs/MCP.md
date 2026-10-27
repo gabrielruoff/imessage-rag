@@ -23,9 +23,9 @@ annotated read-only, non-destructive, idempotent and closed-world.
 |---|---|---|
 | `search_messages_sql` | Filter messages | Filter messages by chat, sender or date range. |
 | `search_messages_fts` | Keyword search | FTS5 keyword/phrase search across all message text. |
-| `search_conversations` | Semantic search | Semantic search over conversation chunks. **Needs Ollama** (query embedding). |
-| `search_messages_hybrid` | Hybrid search | The default search: keyword + semantic, merged by reciprocal-rank fusion. **Needs Ollama.** |
-| `find_similar_conversations` | Similar conversations | More-like-this from a `chunk_id`, using its stored vector (no Ollama). |
+| `search_conversations` | Semantic search | Semantic search over conversation chunks. **Needs the query embedder** (Ollama, or Voyage for a `voyage/` `EMBED_MODEL`). |
+| `search_messages_hybrid` | Hybrid search | The default search: keyword + semantic, merged by reciprocal-rank fusion. **Needs the query embedder.** |
+| `find_similar_conversations` | Similar conversations | More-like-this from a `chunk_id`, using its stored vector (no embedder call). |
 | `get_conversation` | Expand a conversation | Expand a chunk into its full messages. |
 | `get_message_context` | Messages around a message | The messages just before and after one message. |
 | `get_full_messages` | Full message text | Untruncated text of messages by id. |
@@ -73,8 +73,10 @@ note. A tool that writes, or that relies on a turn-level floor, is never added.
 - `make ingest` has run, so `imessage_analysis.db` exists. The server refuses to
   start without it.
 - `make mcp-install` has installed `requirements-mcp.txt` into `.venv`.
-- Ollama is running for the two semantic tools (`search_conversations`,
-  `search_messages_hybrid`). The other 19 work without it.
+- The query embedder is reachable for the two semantic tools
+  (`search_conversations`, `search_messages_hybrid`): Ollama running, or, for a DB
+  built with `EMBED_MODEL=voyage/…`, `VOYAGE_API_KEY` set in `.env`. The other 19
+  work without it.
 - `make annotate` has run, if you want the emotion/valence sections of
   `get_word_trends`.
 
@@ -174,6 +176,10 @@ npx @modelcontextprotocol/inspector make -s --no-print-directory -C /ABS/PATH/im
   model (Claude Code, Claude Desktop, any cloud LLM), every message a tool returns
   leaves your machine and goes to that provider. This is unlike `make chat`, which
   talks only to your local Ollama.
+- **With a `voyage/` `EMBED_MODEL`, semantic queries go to Voyage AI.** The two
+  semantic tools send the agent's query text to Voyage's embeddings endpoint (the
+  stored chunk vectors already came from there). The server prints no upload
+  notice: stdout is the MCP wire.
 - **Message text can carry prompt injection.** Other people wrote much of it. A
   message that reads like an instruction is still just data, and the server's
   instructions tell the agent so, but that is guidance, not a guarantee. Be
@@ -198,7 +204,7 @@ like every line in that file; uncomment it in your `.env` to change it.
 |---|---|
 | `TARGET_DB` | The analysis DB to serve (default `imessage_analysis.db`, relative to the repo). |
 | `OLLAMA_HOST`, `OLLAMA_PORT`, `OLLAMA_*` | Where the semantic tools reach Ollama for query embeddings. |
-| `EMBED_MODEL` | Must match the model the DB was ingested with, or semantic results are silently poor. |
+| `EMBED_MODEL` | Must match the model the DB was ingested with, or semantic results are silently poor. A `voyage/` value sends query embeddings to Voyage AI and needs `VOYAGE_API_KEY`. |
 | `MCP_RESULT_MAX_CHARS` | Hard cap on one tool result's JSON (default 40000). Separate from `TOOL_RESULT_MAX_CHARS`, which is sized for the local chat model. |
 
 ## Troubleshooting
@@ -206,8 +212,9 @@ like every line in that file; uncomment it in your `.env` to change it.
 - **`mcp_server: … not found -- run 'make ingest' first`.** No analysis DB at
   `TARGET_DB`. Run `make ingest`, or fix the path.
 - **`MCP deps missing -- run: make mcp-install`.** Run `make mcp-install`.
-- **Semantic tools return an error.** Ollama isn't reachable. Run
-  `make ollama-start`. Meanwhile the agent can fall back to `search_messages_fts`.
+- **Semantic tools return an error.** The query embedder isn't reachable: run
+  `make ollama-start`, or for a Voyage DB check `VOYAGE_API_KEY` and the network.
+  There is no automatic fallback; the agent can use `search_messages_fts` instead.
 - **Semantic results look irrelevant.** `EMBED_MODEL` differs from the model the
   DB was built with. Unset it, or re-ingest (`make reset-db` + `make ingest`).
 - **"database is locked", in both directions.** The DB doesn't use WAL. A tool

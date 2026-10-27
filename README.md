@@ -3,7 +3,8 @@
 Makes iMessage history queryable and analyzable by an LLM. Ingests the
 macOS Messages `chat.db` into a normalized SQLite store
 (`imessage_analysis.db`) with keyword search (FTS5) and semantic search
-over conversation chunks (`sqlite-vec` + local Ollama embeddings), then
+over conversation chunks (`sqlite-vec` + local Ollama embeddings, or opt-in
+Voyage AI embeddings), then
 exposes that store as tool calls for a local Ollama-hosted chat model to
 query — instead of pasting message history into a prompt.
 
