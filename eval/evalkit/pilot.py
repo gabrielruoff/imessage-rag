@@ -63,7 +63,7 @@ def _post(body, prices, ctx):
             actual = max(float(usage.get("cost") or 0.0),
                          (usage.get("prompt_tokens") or 0) * in_price
                          + (usage.get("completion_tokens") or 0) * out_price)
-        elif 400 <= resp.status_code < 500:
+        elif resp.status_code >= 400:  # unbilled, as openrouter.Annotator._post
             actual = 0.0
         return resp, data, actual
     except hosted.REQUEST_ERRORS as exc:
@@ -159,7 +159,7 @@ def cmd_pilot(args):
     import db
     import httpx
     import openrouter
-    from hosted import Budget, HostedStop
+    from hosted import Budget, HostedStop, resolve_budget_usd
 
     if not config.OPEN_ROUTER_API_KEY.strip():
         print("OPEN_ROUTER_API_KEY is not set", file=sys.stderr)
@@ -181,7 +181,7 @@ def cmd_pilot(args):
     http = httpx.Client(
         base_url=openrouter.BASE_URL, timeout=config.HOSTED_TIMEOUT,
         headers={"Authorization": f"Bearer {config.OPEN_ROUTER_API_KEY.strip()}"})
-    ctx = {"prices": prices, "budget": Budget(args.budget), "http": http,
+    ctx = {"prices": prices, "budget": Budget(resolve_budget_usd(args.budget)), "http": http,
            "schema": annotate._annotation_object_schema(), "think": {},
            "session_id": f"pilot-{uuid.uuid4().hex}"}
     print(f"{len(sample)} chunks x {len(models)} models, hard budget ${args.budget:.2f}")

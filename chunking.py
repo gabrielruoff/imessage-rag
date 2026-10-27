@@ -454,10 +454,10 @@ async def _submit_voyage_batch(tgt, client, budget, batch_rows, lines):
 
 
 async def _collect_voyage_batch(tgt, client, budget, batch_id, reserved, commit_every,
-                                resumed):
+                                resumed, bar):
     """Poll to a terminal state, stream the output into chunk_vectors, count
     the error file, settle the budget, forget the id, then delete its files
-    (only after the results are committed)."""
+    (only after the results are committed). `bar` is _collect_all's handle."""
     import voyage
 
     batch = await client.get_batch(batch_id)
@@ -466,7 +466,8 @@ async def _collect_voyage_batch(tgt, client, budget, batch_id, reserved, commit_
             or batch.get("model", voyage.model_id()) != voyage.model_id()):
         raise _DiscardBatch(batch, "it was submitted under another EMBED_MODEL/EMBED_DIM")
     total = (batch.get("request_counts") or {}).get("total") or None
-    with progress.track(f"Waiting on Voyage batch {batch_id}", total=total) as p:
+    with progress.track(f"Waiting on Voyage batch {batch_id}", total=total,
+                        parent=bar) as p:
         seen = 0
         while True:
             counts = batch.get("request_counts") or {}
@@ -529,7 +530,7 @@ async def _delete_batch_files(client, batch):
 
 
 async def _finish_voyage_batch(tgt, client, budget, batch_id, reserved, commit_every,
-                               resumed=False):
+                               resumed, bar):
     """_collect_voyage_batch, dropping a batch that must not be stored: one
     from another embedding space, or (on resume only) one Voyage no longer
     serves. Its chunks stay missing, so nothing is paid twice."""
@@ -537,7 +538,7 @@ async def _finish_voyage_batch(tgt, client, budget, batch_id, reserved, commit_e
 
     try:
         await _collect_voyage_batch(tgt, client, budget, batch_id, reserved, commit_every,
-                                    resumed)
+                                    resumed, bar)
     except (_DiscardBatch, voyage.NotFound) as e:
         if isinstance(e, voyage.NotFound) and not resumed:
             raise
@@ -549,6 +550,20 @@ async def _finish_voyage_batch(tgt, client, budget, batch_id, reserved, commit_e
             await _delete_batch_files(client, e.args[0])
 
 
+async def _collect_all(tgt, client, budget, batches, commit_every, resumed=False):
+    """Finish (batch_id, reserved) pairs concurrently under one live display.
+    Each batch's bar nests under this one: a second top-level track would see
+    sys.stdout already redirected by the first's Live (not a tty) and fall
+    back to plain lines."""
+    with progress.track("Collecting Voyage batches", total=len(batches),
+                        bar_only=True) as bar:
+        async def finish(batch_id, reserved):
+            await _finish_voyage_batch(tgt, client, budget, batch_id, reserved,
+                                       commit_every, resumed, bar)
+            bar.advance()
+        await asyncio.gather(*(finish(b, r) for b, r in batches))
+
+
 async def _embed_voyage(tgt, budget, max_parallel, min_chars, commit_every):
     import hosted
     import voyage
@@ -557,10 +572,9 @@ async def _embed_voyage(tgt, budget, max_parallel, min_chars, commit_every):
     async with voyage.BatchClient(hosted.Limiter(max_parallel)) as client:
         # Saved batches finish before anything new is submitted: never pay twice.
         await _reconcile_pending_input(tgt, client)
-        await asyncio.gather(*(
-            _finish_voyage_batch(tgt, client, budget, batch_id, 0.0, commit_every,
-                                 resumed=True)
-            for batch_id in _saved_batch_ids(tgt)))
+        await _collect_all(tgt, client, budget,
+                           [(b, 0.0) for b in _saved_batch_ids(tgt)], commit_every,
+                           resumed=True)
         stalled = 0
         while True:
             rows = unembedded_chunks(tgt, min_chars)
@@ -571,9 +585,7 @@ async def _embed_voyage(tgt, budget, max_parallel, min_chars, commit_every):
             submitted = [
                 await _submit_voyage_batch(tgt, client, budget, batch_rows, lines)
                 for batch_rows, lines in voyage.pack_lines([(r[0], r[4]) for r in rows])]
-            await asyncio.gather(*(
-                _finish_voyage_batch(tgt, client, budget, batch_id, reserved, commit_every)
-                for batch_id, reserved in submitted))
+            await _collect_all(tgt, client, budget, submitted, commit_every)
             if len(unembedded_chunks(tgt, min_chars)) < len(rows):
                 stalled = 0
                 continue

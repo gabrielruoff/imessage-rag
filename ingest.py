@@ -35,6 +35,7 @@ import argparse
 import calendar
 import datetime
 import http.client
+import json
 import re
 import shutil
 import sqlite3
@@ -435,6 +436,23 @@ def _move_message(tgt, old_id, new_id):
     tgt.execute("UPDATE messages SET id = ? WHERE id = ?", (new_id, old_id))
     for table, col in _MESSAGE_ID_REFS:
         tgt.execute(f"UPDATE {table} SET {col} = ? WHERE {col} = ?", (new_id, old_id))
+    # Ids inside JSON: an event cites a message of its own chunk only.
+    for chunk_id, events_json in tgt.execute(
+            "SELECT a.chunk_id, a.events_json FROM chunk_annotations a "
+            "JOIN messages m ON m.chunk_id = a.chunk_id WHERE m.id = ?",
+            (new_id,)).fetchall():
+        events = json.loads(events_json or "[]")
+        if any(ev.get("message_id") == old_id for ev in events):
+            for ev in events:
+                if ev.get("message_id") == old_id:
+                    ev["message_id"] = new_id
+            tgt.execute("UPDATE chunk_annotations SET events_json = ? WHERE chunk_id = ?",
+                        (json.dumps(events), chunk_id))
+    tgt.execute(
+        "UPDATE conflicts SET peak_signal_json = "
+        "json_set(peak_signal_json, '$.peak_gap_message_id', ?) "
+        "WHERE json_extract(peak_signal_json, '$.peak_gap_message_id') = ?",
+        (new_id, old_id))
 
 
 def _claim_rowid(tgt, rowid, guid):

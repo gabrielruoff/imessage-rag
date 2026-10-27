@@ -3520,8 +3520,11 @@ tokens × $0.0804/M = **$1.31**. Haiku with the cached prefix, sync, ≈ **$6.3�
   reserves its worst case before it is sent: UTF-8 bytes × input price (byte-level
   BPE never yields more tokens than bytes), plus `max_tokens` × output price for
   OpenRouter. The request then settles at the reported cost. Voyage reports usage
-  per output line, and a batch settles at their sum. A 4xx or 429 settles at 0;
-  a 5xx or timeout without usage settles at the worst case. Chat-time query
+  per output line, and a batch settles at their sum. Any error status without
+  usage (4xx, 429, 5xx) settles at 0, per OpenRouter's zero completion
+  insurance; it once settled 5xx at the worst case, which let a provider outage
+  drain the cap with retries that were never billed. A transport timeout may
+  have run upstream, so it still settles at the worst case. Chat-time query
   embeddings (~20 tokens) are not budgeted. The cost of worst-case reservation:
   the full corpus is 55.0M bytes, which reserves $4.42 for a $1.31 batch, so a
   first full run needs `--budget` ≥ ~4.5.

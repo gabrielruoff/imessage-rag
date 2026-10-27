@@ -135,8 +135,10 @@ class Annotator:
         """One request under the budget and the limiter -> (response or
         transport exception, parsed JSON or None). Reserves the worst case
         (UTF-8 bytes of the body, schema included, x input price + max_tokens
-        x output price) and settles at max(usage.cost, tokens x price); a 4xx
-        without usage at 0, anything else without usage at the worst case."""
+        x output price) and settles at max(usage.cost, tokens x price); an
+        error status without usage at 0 (OpenRouter's zero completion insurance
+        bills none), anything else without usage -- a transport failure, which
+        may have run upstream -- at the worst case."""
         worst = (len(json.dumps(body).encode()) * self.in_price
                  + config.OPENROUTER_MAX_TOKENS * self.out_price)
         if not self.budget.reserve(worst):
@@ -151,7 +153,7 @@ class Annotator:
                 actual = max(float(usage.get("cost") or 0.0),
                              (usage.get("prompt_tokens") or 0) * self.in_price
                              + (usage.get("completion_tokens") or 0) * self.out_price)
-            elif 400 <= resp.status_code < 500:
+            elif resp.status_code >= 400:
                 actual = 0.0
             return resp, data
         except hosted.REQUEST_ERRORS as exc:

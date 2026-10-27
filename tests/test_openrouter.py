@@ -154,8 +154,15 @@ class TestAnnotateOne(OpenRouterTestCase):
         self.assertEqual(h.budget.spent, 0.0)
         self.assertEqual(h.budget.reserved, 0.0)
 
-    def test_budget_settles_5xx_without_usage_at_worst_case(self):
+    def test_budget_settles_5xx_without_usage_at_zero(self):
         h = Harness([httpx.Response(502), ok()])
+        h.run(["a"])
+        actual = max(0.00001, 100 * IN_PRICE + 10 * OUT_PRICE)
+        self.assertAlmostEqual(h.budget.spent, actual)
+        self.assertAlmostEqual(h.budget.reserved, 0.0)
+
+    def test_budget_settles_timeout_at_worst_case(self):
+        h = Harness([httpx.ReadTimeout("slow"), ok()])
         h.run(["a"])
         worst = (len(json.dumps(h.bodies[0]).encode()) * IN_PRICE
                  + config.OPENROUTER_MAX_TOKENS * OUT_PRICE)
