@@ -362,7 +362,8 @@ def embed_chunks(
 # ingest_state keys: voyage_batch_ids (JSON list of batches not yet collected),
 # voyage_batch_space ("<EMBED_MODEL>|<EMBED_DIM>" they were submitted under),
 # voyage_pending_input_file (an uploaded input file whose batch id is not yet
-# saved; "" when none).
+# saved; "" when none), voyage_pending_input_space (the space that file was
+# uploaded under).
 
 # Rounds in a row that may leave the missing count unchanged before the run stops.
 _VOYAGE_MAX_STALLED_ROUNDS = 3
@@ -395,12 +396,15 @@ def _track_batch(tgt, batch_id):
 
 
 def _voyage_row(tgt, custom_id, vec):
-    """The insert row for one output line, or None when its chunk is gone or
-    its text changed since submit (the vector is stale; the chunk stays
-    missing and is resubmitted)."""
+    """The insert row for one output line, or None when its chunk is gone, its
+    text changed since submit (the vector is stale; the chunk stays missing and
+    is resubmitted), or it already has a vector (a resumed batch re-streams
+    lines an interrupted collect committed; vec0 rejects a second insert)."""
     import voyage
 
     chunk_id, digest = voyage.parse_custom_id(custom_id)
+    if tgt.execute("SELECT 1 FROM chunk_vectors WHERE chunk_id = ?", (chunk_id,)).fetchone():
+        return None
     row = tgt.execute("SELECT chat_id, first_date, last_date, text FROM chunks WHERE id = ?",
                       (chunk_id,)).fetchone()
     if row is None or voyage.text_hash(row[3]) != digest:
@@ -410,18 +414,25 @@ def _voyage_row(tgt, custom_id, vec):
 
 async def _reconcile_pending_input(tgt, client):
     """A previous run uploaded an input file but never saved its batch id:
-    adopt the batch Voyage created from it, else delete the file."""
+    adopt the batch Voyage created from it -- unless the file was uploaded
+    under another embedding space, when the batch and its files are deleted
+    and nothing is stored -- else delete the file."""
     file_id = get_state(tgt, "voyage_pending_input_file")
     if not file_id:
         return
     batch = await client.find_batch(file_id)
-    if batch:
+    if batch and get_state(tgt, "voyage_pending_input_space", _voyage_space()) == _voyage_space():
         print(f"Adopting Voyage batch {batch['id']} from an interrupted submit")
         _track_batch(tgt, batch["id"])
+        return
+    if batch:
+        print(f"warning: not adopting Voyage batch {batch['id']}: it was submitted under "
+              f"another EMBED_MODEL/EMBED_DIM; its chunks are resubmitted")
+        await _delete_batch_files(client, batch)
     else:
         await client.delete_file(file_id)
-        set_state(tgt, "voyage_pending_input_file", "")
-        tgt.commit()
+    set_state(tgt, "voyage_pending_input_file", "")
+    tgt.commit()
 
 
 async def _submit_voyage_batch(tgt, client, budget, batch_rows, lines):
@@ -437,6 +448,7 @@ async def _submit_voyage_batch(tgt, client, budget, batch_rows, lines):
     file_id = await client.upload(b"".join(lines))
     # Saved first: if create_batch's outcome is lost, the next run reconciles.
     set_state(tgt, "voyage_pending_input_file", file_id)
+    set_state(tgt, "voyage_pending_input_space", _voyage_space())
     tgt.commit()
     batch = await client.create_batch(file_id)
     _track_batch(tgt, batch["id"])

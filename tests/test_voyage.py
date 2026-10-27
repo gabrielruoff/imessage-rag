@@ -27,6 +27,7 @@ from db import get_state, load_vec_extension
 
 DIM = 4
 MODEL = "voyage/voyage-4-large"
+REAL_RETRY_DELAY = hosted.retry_delay  # the fixture patches it to 0
 
 
 class FakeVoyage:
@@ -193,7 +194,6 @@ class TestPacking(unittest.TestCase):
                 self.assertTrue(raw.endswith(b"\n"))
                 line = json.loads(raw)
                 self.assertEqual(line["body"]["input"], [text])
-                self.assertLessEqual(len(line["body"]["input"]), config.VOYAGE_LINE_MAX_INPUTS)
                 self.assertEqual(voyage.parse_custom_id(line["custom_id"])[0], cid)
 
     def test_emoji_text_round_trips_and_reserves_by_utf8_bytes(self):
@@ -529,6 +529,78 @@ class TestReviewRegressions(VoyageFixture):
         self.assertIn("1 failed", out.getvalue())
         self.assertIn("('invalid_line', 1)", out.getvalue())
         self.assertNotIn("quoted input text", out.getvalue())
+
+    def test_s4_resume_after_partial_collect_embeds_each_chunk_once(self):
+        self.add_chunks(["placeholder one", "placeholder two", "placeholder three"])
+        real_row, calls = chunking._voyage_row, []
+
+        def dies_on_second_line(tgt, custom_id, vec):
+            calls.append(custom_id)
+            if len(calls) == 2:
+                raise KeyboardInterrupt
+            return real_row(tgt, custom_id, vec)
+        with mock.patch.object(chunking, "_voyage_row", dies_on_second_line), \
+                self.assertRaises(KeyboardInterrupt), \
+                contextlib.redirect_stdout(io.StringIO()):
+            chunking.embed_chunks_voyage(self.con, hosted.Budget(1.0), 1, commit_every=1)
+        self.assertEqual(len(self.vectors()), 1)  # one committed before the crash
+        self.assertEqual(json.loads(get_state(self.con, "voyage_batch_ids")), ["batch-0"])
+        self.run_voyage()
+        self.assertEqual(sorted(self.vectors()), [1, 2, 3])
+        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM chunk_vectors").fetchone()[0], 3)
+        self.assertEqual(self.fake.n_created(), 1)
+
+    def test_s4_pending_input_from_another_space_is_not_adopted(self):
+        self.add_chunks(["placeholder one"])
+        self.save_batch("batch-orphan", [(1, "placeholder one")])
+        file_id = self.fake.batches["batch-orphan"]["input_file_id"]
+        self.con.execute("UPDATE ingest_state SET value = '[]' WHERE key = 'voyage_batch_ids'")
+        self.con.execute("INSERT INTO ingest_state(key, value) VALUES "
+                         "('voyage_pending_input_file', ?), "
+                         "('voyage_pending_input_space', 'voyage/voyage-3|4')", (file_id,))
+        self.con.commit()
+        out = self.run_voyage()
+        self.assertIn("not adopting Voyage batch batch-orphan", out)
+        self.assertNotIn(("GET", "/v1/batches/batch-orphan"), self.fake.requests)
+        self.assertIn(file_id, self.fake.deleted)
+        self.assertEqual(self.fake.n_created(), 1)  # resubmitted under the current space
+        self.assertEqual(sorted(self.vectors()), [1])
+        self.assertEqual(get_state(self.con, "voyage_pending_input_file"), "")
+
+    def test_s4_sync_gives_up_when_retry_after_exceeds_the_cap(self):
+        self.fake.script[("POST", "/v1/embeddings")] = [
+            httpx.Response(429, headers={"Retry-After": "3600"})]
+        with mock.patch.object(hosted, "retry_delay", REAL_RETRY_DELAY), \
+                mock.patch.object(config, "HOSTED_BACKOFF_MAX_SECONDS", 60), \
+                mock.patch.object(voyage.time, "sleep") as sleep, \
+                self.assertRaisesRegex(RuntimeError, "Retry-After 3600s"):
+            voyage.embed_sync(["q"], "query", transport=self.fake.transport())
+        sleep.assert_not_called()
+        self.assertEqual(len(self.fake.requests), 1)
+
+    def test_s4_sync_and_batch_retry_a_decoding_error(self):
+        def bad(request):
+            raise httpx.DecodingError("placeholder bad encoding")
+        self.fake.script[("POST", "/v1/embeddings")] = [bad]
+        vecs = voyage.embed_sync(["q"], "query", transport=self.fake.transport())
+        self.assertEqual(vecs, [[0.0] * DIM])
+        self.add_chunks(["placeholder one"])
+        self.fake.script[("POST", "/v1/files")] = [bad]
+        self.run_voyage()
+        self.assertEqual(sorted(self.vectors()), [1])
+
+    def test_s4_stop_never_quotes_the_response_body(self):
+        self.add_chunks(["placeholder one"])
+        self.fake.script[("POST", "/v1/files")] = [
+            httpx.Response(400, text="echo: placeholder private text")]
+        with self.assertRaises(hosted.HostedStop) as ctx:
+            self.run_voyage()
+        self.assertEqual(ctx.exception.cause, "Voyage: HTTP 400")
+        self.fake.script[("POST", "/v1/files")] = [
+            httpx.Response(400, json={"detail": "placeholder bad request"})]
+        with self.assertRaises(hosted.HostedStop) as ctx:
+            self.run_voyage()
+        self.assertEqual(ctx.exception.cause, "Voyage: HTTP 400 placeholder bad request")
 
 
 class TestIngestFlags(unittest.TestCase):

@@ -30,7 +30,7 @@ def client():
     """One AsyncClient per run (connection reuse). Never logs the key."""
     return httpx.AsyncClient(
         base_url=BASE_URL, timeout=httpx.Timeout(config.HOSTED_TIMEOUT),
-        headers={"Authorization": f"Bearer {config.OPEN_ROUTER_API_KEY}"})
+        headers={"Authorization": f"Bearer {config.OPEN_ROUTER_API_KEY.strip()}"})
 
 
 def reasoning_for(think):
@@ -77,22 +77,25 @@ def _json(resp):
 
 
 def _error(resp, data):
-    """(status, message) for a failed request; never includes request text."""
+    """(status, message) for a failed request: the HTTP status and the
+    provider's short error.message, never the raw body or metadata (either can
+    quote request text). A transport exception gives only its type name: its
+    text can quote request headers, i.e. the API key."""
     if not isinstance(resp, httpx.Response):
-        return type(resp).__name__, str(resp)
-    err = data.get("error") if isinstance(data, dict) else None
-    msg = err.get("message") if isinstance(err, dict) else None
-    return resp.status_code, (msg or resp.text)[:300]
+        return "transport error", type(resp).__name__
+    return resp.status_code, hosted.error_message(data)
 
 
 async def fetch_prices(http, model_ids):
     """{model_id: (usd per input token, usd per output token)} from the live
-    model list. A model not listed is a HostedStop."""
+    model list. A model not listed, or priced <= 0 (OpenRouter's "-1" marks a
+    variable-priced route; a non-positive price would let every budget
+    reservation through), is a HostedStop."""
     attempt = 0
     while True:
         try:
             resp = await http.get("/models")
-        except httpx.TransportError as exc:
+        except hosted.REQUEST_ERRORS as exc:
             resp = exc
         kind = hosted.classify(resp)
         if kind == "ok":
@@ -107,8 +110,13 @@ async def fetch_prices(http, model_ids):
     missing = [m for m in model_ids if m not in listing]
     if missing:
         raise hosted.HostedStop(f"not listed on OpenRouter: {', '.join(missing)}")
-    return {m: (float(listing[m]["prompt"]), float(listing[m]["completion"]))
-            for m in model_ids}
+    prices = {m: (float(listing[m]["prompt"]), float(listing[m]["completion"]))
+              for m in model_ids}
+    unpriced = [m for m, pair in prices.items() if min(pair) <= 0]
+    if unpriced:
+        raise hosted.HostedStop(f"no positive per-token price on OpenRouter: "
+                                f"{', '.join(unpriced)}")
+    return prices
 
 
 class Annotator:
@@ -149,7 +157,7 @@ class Annotator:
             elif 400 <= resp.status_code < 500:
                 actual = 0.0
             return resp, data
-        except httpx.TransportError as exc:
+        except hosted.REQUEST_ERRORS as exc:
             return exc, None
         finally:
             self.budget.settle(worst, actual)

@@ -207,10 +207,8 @@ HOSTED_BACKOFF_MAX_SECONDS = int(os.getenv("HOSTED_BACKOFF_MAX_SECONDS") or "60"
 # Voyage batch price, USD per million tokens; the budget reserves UTF-8 bytes x
 # this before each upload and settles at the reported usage.
 VOYAGE_BATCH_PRICE_PER_M = float(os.getenv("VOYAGE_BATCH_PRICE_PER_M") or "0.0804")
-# Voyage batch limits: inputs per batch, and inputs / UTF-8 bytes per JSONL line.
+# Voyage batch limit: inputs per batch.
 VOYAGE_BATCH_MAX_INPUTS = int(os.getenv("VOYAGE_BATCH_MAX_INPUTS") or "100000")
-VOYAGE_LINE_MAX_INPUTS = int(os.getenv("VOYAGE_LINE_MAX_INPUTS") or "1000")
-VOYAGE_LINE_MAX_BYTES = int(os.getenv("VOYAGE_LINE_MAX_BYTES") or "120000")
 
 # --- CLI progress -------------------------------------------------------------
 # 'auto' draws a live bar on a terminal and falls back to periodic plain lines

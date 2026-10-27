@@ -218,7 +218,7 @@ doctor:  ## Check the environment: venv, brew, Ollama, models, hosted keys, sour
 # install-ollama never pulls them. HOSTED_KEYS prints KEY_VAR=1|0 for each
 # hosted backend the env selects -- whether its key is set, never the key.
 MODEL_LIST = .venv/bin/python3 -c 'import config as c; print(" ".join(sorted(m for m in {c.EMBED_MODEL, c.CHAT_MODEL, c.ANNOTATE_MODEL, c.TOPIC_MODEL, c.WRAPPED_MODEL} if not (c.is_apple_model(m) or c.is_openrouter_model(m) or c.is_voyage_model(m)))))'
-HOSTED_KEYS = .venv/bin/python3 -c 'import config as c; k = {"VOYAGE_API_KEY": c.VOYAGE_API_KEY} if c.is_voyage_model(c.EMBED_MODEL) else {}; k.update({"OPEN_ROUTER_API_KEY": c.OPEN_ROUTER_API_KEY} if c.is_openrouter_model(c.ANNOTATE_MODEL) else {}); print(" ".join(f"{n}={int(bool(v))}" for n, v in k.items()))'
+HOSTED_KEYS = .venv/bin/python3 -c 'import config as c; k = {"VOYAGE_API_KEY": c.VOYAGE_API_KEY} if c.is_voyage_model(c.EMBED_MODEL) else {}; k.update({"OPEN_ROUTER_API_KEY": c.OPEN_ROUTER_API_KEY} if c.is_openrouter_model(c.ANNOTATE_MODEL) else {}); print(" ".join(f"{n}={int(bool(v.strip()))}" for n, v in k.items()))'
 OLLAMA_ADDR = $$(.venv/bin/python3 -c 'import config; print(f"{config.OLLAMA_HOST}:{config.OLLAMA_PORT}")' 2>/dev/null || echo localhost:11434)
 SOURCE_DB_PATH = $$(.venv/bin/python3 -c 'import config; print(config.SOURCE_DB)' 2>/dev/null || echo source_data/chat.db)
 

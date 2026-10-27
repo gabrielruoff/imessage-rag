@@ -4,9 +4,9 @@ Retry timing, classification, the concurrency gate and the stop come from
 hosted.py; every tunable from config.py.
 
 Contracts:
-- embed_sync is the chat-time query path: bounded retries, then RuntimeError
-  (the semantic tools fall back to FTS). It prints nothing -- under the MCP
-  server stdout is the wire.
+- embed_sync is the chat-time query path: bounded retries, then RuntimeError,
+  which propagates to the semantic tool and comes back as a tool error. It
+  prints nothing -- under the MCP server stdout is the wire.
 - BatchClient retries transient errors without limit and raises HostedStop on
   anything else (NotFound for a 404). Input JSONL is built in memory and
   uploaded from bytes; it is never written to disk (it holds message text).
@@ -47,7 +47,9 @@ def model_id():
 
 
 def embed_sync(texts, input_type, transport=None):
-    """POST /v1/embeddings; one vector per text, in input order."""
+    """POST /v1/embeddings; one vector per text, in input order. A retry never
+    waits longer than HOSTED_BACKOFF_MAX_SECONDS: when Retry-After asks for
+    more, it gives up at once (RuntimeError) rather than hang a chat turn."""
     body = {"input": list(texts), "model": model_id(), "input_type": input_type,
             "output_dimension": config.EMBED_DIM, "output_dtype": "float"}
     with httpx.Client(timeout=config.HOSTED_TIMEOUT, transport=transport) as client:
@@ -56,7 +58,7 @@ def embed_sync(texts, input_type, transport=None):
             try:
                 response = client.post(f"{API}/embeddings", json=body, headers=_headers())
                 verdict = hosted.classify(response)
-            except httpx.TransportError as e:
+            except hosted.REQUEST_ERRORS as e:
                 verdict, cause = hosted.classify(e), type(e).__name__
             else:
                 cause = f"HTTP {response.status_code}"
@@ -66,7 +68,11 @@ def embed_sync(texts, input_type, transport=None):
             if verdict != "retry":
                 break
             if attempt + 1 < SYNC_ATTEMPTS:
-                time.sleep(hosted.retry_delay(attempt, response))
+                delay = hosted.retry_delay(attempt, response)
+                if delay > config.HOSTED_BACKOFF_MAX_SECONDS:
+                    cause += f", Retry-After {delay:.0f}s"
+                    break
+                time.sleep(delay)
     raise RuntimeError(f"Voyage query embedding failed ({cause})")
 
 
@@ -101,10 +107,8 @@ def pack_lines(rows):
     One input per line: its custom_id names the chunk on its own, so a batch
     persisted by id can be collected by a later process with no in-memory id
     list, and output order never matters. Per-line overhead is unbilled. A
-    one-input line is always within VOYAGE_LINE_MAX_INPUTS, and within the
-    per-line token limit too (an input is truncated at 32K tokens, the line
-    limit is 120K), so the line byte cap cannot bind here."""
-    assert config.VOYAGE_LINE_MAX_INPUTS >= 1
+    one-input line is always within Voyage's per-line input and token limits
+    (an input is truncated at 32K tokens, the line limit is 120K)."""
     lines = [
         (json.dumps({"custom_id": make_custom_id(cid, text), "body": {"input": [text]}},
                     ensure_ascii=False) + "\n").encode()
@@ -140,7 +144,7 @@ class BatchClient:
         async with self.limiter:
             try:
                 return await self.http.request(method, path, **kwargs), None
-            except httpx.TransportError as e:
+            except hosted.REQUEST_ERRORS as e:
                 return None, (hosted.classify(e), type(e).__name__)
 
     def _verdict(self, response, cause):
@@ -153,7 +157,11 @@ class BatchClient:
                 self.limiter.throttled()
         elif response is not None:
             stop = NotFound if response.status_code == 404 else hosted.HostedStop
-            raise stop(f"Voyage: HTTP {response.status_code} {response.text[:200]}")
+            try:  # the provider's short message only: the raw body can quote input
+                msg = hosted.error_message(response.json())
+            except (ValueError, httpx.ResponseNotRead):
+                msg = ""
+            raise stop(f"Voyage: HTTP {response.status_code} {msg}".rstrip())
         else:
             raise hosted.HostedStop(f"Voyage: {cause[1]}")
         return verdict
@@ -234,7 +242,7 @@ class BatchClient:
                         else:
                             await r.aread()
                         response = r
-                except httpx.TransportError as e:
+                except hosted.REQUEST_ERRORS as e:
                     response, cause = None, (hosted.classify(e), type(e).__name__)
             if self._verdict(response, cause) == "ok":
                 return

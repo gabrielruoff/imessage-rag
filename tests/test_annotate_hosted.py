@@ -229,6 +229,40 @@ class TestHostedRun(HostedFixture):
         self.assertEqual(get_state(self.con, "annotate_model"), LOCAL)
 
 
+    def test_s4_decoding_error_mid_run_is_retried(self):
+        calls = []
+
+        def handler(request):
+            calls.append(1)
+            if len(calls) == 2:
+                raise httpx.DecodingError("placeholder bad encoding")
+            return completion()
+        self.handler = handler
+        self.main()
+        self.assertEqual(self.n_rows(), self.N_CHUNKS)
+        self.assertEqual(len(calls), self.N_CHUNKS + 1)
+
+    def test_s4_other_exception_still_commits_written_rows(self):
+        real_write = annotate._write_annotation
+        writes = []
+
+        def failing(con, chunk_id, data, source="llm"):
+            writes.append(chunk_id)
+            if len(writes) == 3:
+                raise sqlite3.OperationalError("placeholder disk I/O error")
+            real_write(con, chunk_id, data, source=source)
+        with mock.patch.object(annotate, "_write_annotation", failing), \
+                self.assertRaises(sqlite3.OperationalError):
+            self.main()
+        self.assertEqual(self.n_rows(), 2)  # read on a separate connection: committed
+
+    def test_s4_whitespace_only_key_counts_as_unset(self):
+        with mock.patch.object(config, "OPEN_ROUTER_API_KEY", " \n"), \
+                self.assertRaisesRegex(SystemExit, "OPEN_ROUTER_API_KEY is not set"):
+            self.main()
+        self.assertEqual(self.requests, [])
+
+
 class TestQualityRules(HostedFixture):
     def test_distilled_or_hybrid_flag_refused(self):
         for quality in ("distilled", "hybrid"):
