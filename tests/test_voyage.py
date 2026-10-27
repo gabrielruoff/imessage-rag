@@ -36,13 +36,15 @@ class FakeVoyage:
     input order. `fail_once` chunk ids land in the error file the first time
     they are submitted; `stale_once` ids get a wrong-hash custom_id once;
     `script` maps (method, path-prefix) to a queue of canned responses served
-    before the normal handler."""
+    before the normal handler. `redirect_content` makes file downloads answer
+    307 to a signed storage URL, as the live API does."""
 
     def __init__(self):
         self.files, self.batches, self.deleted = {}, {}, []
         self.requests = []
         self.fail_once, self.stale_once, self.script = set(), set(), {}
         self.batch_status = "completed"
+        self.redirect_content, self.storage_auth = False, []
 
     def transport(self):
         return httpx.MockTransport(self.handle)
@@ -52,6 +54,10 @@ class FakeVoyage:
 
     def handle(self, request):
         method, path = request.method, request.url.path
+        if request.url.host == "storage.example.com":
+            self.storage_auth.append(request.headers.get("authorization"))
+            file_id = request.url.params["f"]
+            return httpx.Response(200, content=b"".join(ln + b"\n" for ln in self.files[file_id]))
         self.requests.append((method, path))
         for (m, prefix), queue in self.script.items():
             if m == method and path.startswith(prefix) and queue:
@@ -92,6 +98,9 @@ class FakeVoyage:
             return httpx.Response(200, json=batch)
         if method == "GET" and path.endswith("/content"):
             file_id = path.split("/")[3]
+            if self.redirect_content:
+                return httpx.Response(307, headers={
+                    "Location": f"https://storage.example.com/signed?x=1&f={file_id}"})
             return httpx.Response(200, content=b"".join(ln + b"\n" for ln in self.files[file_id]))
         if method == "DELETE" and path.startswith("/v1/files/"):
             self.deleted.append(path.rsplit("/", 1)[1])
@@ -301,6 +310,28 @@ class TestBatchRun(VoyageFixture):
         resubmitted = [voyage.parse_custom_id(json.loads(ln)["custom_id"])[0]
                        for ln in self.fake.files[self.fake.batches["batch-1"]["input_file_id"]]]
         self.assertEqual(sorted(resubmitted), [1, 3])
+
+    def test_output_file_307_to_storage_is_followed_without_the_key(self):
+        self.fake.redirect_content = True
+        self.add_chunks(["placeholder one", "placeholder two", "placeholder three"])
+        self.run_voyage()
+        vecs = self.vectors()
+        self.assertEqual(sorted(vecs), [1, 2, 3])
+        for cid, vec in vecs.items():
+            self.assertEqual(json.loads(vec), self.fake._vec(cid))
+        self.assertTrue(self.fake.storage_auth)
+        self.assertEqual(self.fake.storage_auth, [None] * len(self.fake.storage_auth))
+
+    def test_error_file_307_to_storage_is_followed(self):
+        self.fake.redirect_content = True
+        self.add_chunks(["placeholder one", "placeholder two", "placeholder three"])
+        self.fake.fail_once = {1, 3}
+        out = self.run_voyage()
+        self.assertEqual(sorted(self.vectors()), [1, 2, 3])
+        self.assertIn("2 errored", out)
+        # batch-0's output and error files, batch-1's output file
+        self.assertEqual(len(self.fake.storage_auth), 3)
+        self.assertEqual(self.fake.storage_auth, [None] * 3)
 
     def test_429_with_retry_after_then_success(self):
         self.add_chunks(["placeholder one"])

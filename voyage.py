@@ -229,7 +229,10 @@ class BatchClient:
             response, cause = None, None
             async with self.limiter:
                 try:
-                    async with self.http.stream("GET", f"/files/{file_id}/content") as r:
+                    # The live API 307s to a signed storage URL; httpx drops the
+                    # Authorization header on that cross-origin hop.
+                    async with self.http.stream("GET", f"/files/{file_id}/content",
+                                                follow_redirects=True) as r:
                         if hosted.classify(r) == "ok":
                             seen = 0
                             async for line in r.aiter_lines():
