@@ -684,5 +684,53 @@ class LookbackIngestTest(unittest.TestCase):
                          {1, 2, 3, 6})
 
 
+class FullRereadTest(unittest.TestCase):
+    """A run without --since-last re-reads every message; the upsert must keep
+    the derived chunk_id so build_chunks does not re-chunk them, and keep the
+    external-content FTS index in step with the text."""
+
+    _apple_ns = LookbackIngestTest._apple_ns
+    _fake_src = LookbackIngestTest._fake_src
+    _fresh_tgt = LookbackIngestTest._fresh_tgt
+
+    def _run(self, src, tgt):
+        ingest.ingest_messages_and_reactions(src, tgt, 0, None, None)
+        ingest.build_chunks(tgt)
+        tgt.commit()
+
+    def _chunks(self, tgt):
+        return tgt.execute("SELECT id, first_message_id, last_message_id FROM chunks "
+                           "ORDER BY id").fetchall()
+
+    def _stamps(self, tgt):
+        return tgt.execute("SELECT id, chunk_id FROM messages ORDER BY id").fetchall()
+
+    def _fts(self, tgt, term):
+        return {r[0] for r in tgt.execute(
+            "SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?", (term,))}
+
+    def test_rerun_builds_no_new_chunks_and_keeps_chunk_id(self):
+        src, tgt = self._fake_src(), self._fresh_tgt()
+        self._run(src, tgt)
+        chunks, stamps = self._chunks(tgt), self._stamps(tgt)
+        self.assertTrue(chunks)
+        self._run(src, tgt)
+        self._run(src, tgt)
+        self.assertEqual(self._chunks(tgt), chunks)
+        self.assertEqual(self._stamps(tgt), stamps)
+        self.assertEqual(self._fts(tgt, "msg2"), {2})
+
+    def test_source_text_edit_reaches_fts_and_keeps_chunk_id(self):
+        src, tgt = self._fake_src(), self._fresh_tgt()
+        self._run(src, tgt)
+        stamps = self._stamps(tgt)
+        src.execute("UPDATE message SET text = 'edited words' WHERE ROWID = 2")
+        self._run(src, tgt)
+        self.assertEqual(self._fts(tgt, "edited"), {2})
+        self.assertEqual(self._fts(tgt, "msg2"), set())   # old tokens gone
+        self.assertEqual(self._fts(tgt, "msg3"), {3})     # untouched row still found
+        self.assertEqual(self._stamps(tgt), stamps)
+
+
 if __name__ == "__main__":
     unittest.main()

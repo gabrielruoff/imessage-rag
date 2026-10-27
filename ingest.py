@@ -402,6 +402,21 @@ def ingest_handles(src, tgt, contacts, handle_to_contact):
     print(f"Ingested {len(rows)} handles ({matched} matched to a contact)")
 
 
+# A true upsert, not INSERT OR REPLACE: REPLACE deletes the row, so the derived
+# chunk_id (absent from this column list) reset to NULL and a full re-read
+# re-chunked everything; and with recursive_triggers off the delete skipped
+# messages_ad, leaving stale FTS tokens. DO UPDATE fires messages_au instead.
+# Contract: an edited message keeps its chunk_id, so its chunk text may be stale.
+_MESSAGE_SOURCE_COLS = (
+    "guid", "chat_id", "handle_id", "is_from_me", "text", "decode_failed",
+    "date", "date_read", "date_delivered", "item_type", "is_emote", "has_attachment")
+_MESSAGE_UPSERT_SQL = (
+    f"INSERT INTO messages(id, {', '.join(_MESSAGE_SOURCE_COLS)}) "
+    f"VALUES ({', '.join('?' * (len(_MESSAGE_SOURCE_COLS) + 1))}) "
+    "ON CONFLICT(id) DO UPDATE SET "
+    + ", ".join(f"{c} = excluded.{c}" for c in _MESSAGE_SOURCE_COLS))
+
+
 def ingest_messages_and_reactions(src, tgt, since_rowid=0, allowed_chat_ids=None,
                                   since_date_ns=None):
     params = [since_rowid]
@@ -462,11 +477,7 @@ def ingest_messages_and_reactions(src, tgt, since_rowid=0, allowed_chat_ids=None
                 )
                 n_react += 1
             else:
-                tgt.execute(
-                    "INSERT OR REPLACE INTO messages"
-                    "(id, guid, chat_id, handle_id, is_from_me, text, decode_failed, "
-                    " date, date_read, date_delivered, item_type, is_emote, has_attachment) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                tgt.execute(_MESSAGE_UPSERT_SQL,
                     (rowid, guid, chat_id, handle_id, is_from_me, text, decode_failed,
                      apple_ns_to_iso(date), apple_ns_to_iso(date_read),
                      apple_ns_to_iso(date_delivered), item_type, is_emote,
