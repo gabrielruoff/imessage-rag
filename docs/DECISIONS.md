@@ -3633,3 +3633,45 @@ provider's copy**: the response reported both OpenRouter's copy and Anthropic's 
 deleted. A future implementation should delete each batch once its results are
 written, rather than leave message-derived output on third-party servers for the
 30-day retention.
+
+## 2026-10-26: message upsert
+
+`ingest_messages_and_reactions` wrote messages with `INSERT OR REPLACE`. REPLACE
+deletes the conflicting row and inserts a new one, so the derived `chunk_id`
+(not in the column list) reset to NULL and every full re-read (`since_rowid=0`
+or `--lookback`) re-chunked the whole corpus. With `recursive_triggers` off, the
+REPLACE delete also skipped `messages_ad`, leaving stale FTS tokens. It became
+`INSERT ... ON CONFLICT(id) DO UPDATE` (f15d491), which keeps `chunk_id` and
+fires `messages_au`.
+
+**The guid clash.** `messages.guid` is UNIQUE too. REPLACE silently cleared a
+guid clash by deleting the other row; `ON CONFLICT(id)` does not, so when chat.db
+gives existing messages new ROWIDs (iCloud resync, restore onto a new Mac) the
+next full re-read aborted on `UNIQUE constraint failed: messages.guid`. A second
+`ON CONFLICT(guid)` clause can't fix it: on a restore the new ROWID is usually
+held by a *different* message, and the row conflicts on both keys.
+
+Options considered:
+
+- **Delete the stale row, insert the new one** (REPLACE's behaviour, done with a
+  plain DELETE so `messages_ad` fires). FTS stays right, but `chunk_id` is lost,
+  the old chunk becomes an orphan duplicate, and a restore re-chunks (and, on a
+  hosted backend, re-pays for) the corpus.
+- **Keep the old id, update by guid.** Chunks and FTS stay put, but
+  `messages.id` stops being the source ROWID, so attachments (keyed by the
+  source message ROWID) no longer join, and the double clash still raises.
+- **Re-key (chosen).** guid is the message's identity, ROWID only its current
+  address. `_claim_rowid` parks any *other* message holding the incoming ROWID
+  at a fresh negative id, then moves the row that holds the incoming guid to the
+  new ROWID. `_move_message` carries every stored reference
+  (`_MESSAGE_ID_REFS`: attachments, chunk/session bounds, dyad_terms,
+  loose_threads, conflict_signals); `messages_au` now also fires on `id` so the
+  FTS entry moves. The newest source row wins, `chunk_id` survives, and no
+  message is deleted. A parked row whose guid never comes back (deleted at the
+  source, or outside a `--lookback`/`--senders` scope) stays at its negative id.
+
+**`messages_au` was firing on every re-read row.** `DO UPDATE SET text =
+excluded.text` counts as an update of `text` even when the value is unchanged,
+so each re-read did an FTS delete and re-insert per message. The trigger now has
+`WHEN old.id IS NOT new.id OR old.text IS NOT new.text`. `create_schema` already
+drops `messages_au` every run, so existing DBs pick up the new body.

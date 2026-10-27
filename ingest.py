@@ -402,11 +402,11 @@ def ingest_handles(src, tgt, contacts, handle_to_contact):
     print(f"Ingested {len(rows)} handles ({matched} matched to a contact)")
 
 
-# A true upsert, not INSERT OR REPLACE: REPLACE deletes the row, so the derived
-# chunk_id (absent from this column list) reset to NULL and a full re-read
-# re-chunked everything; and with recursive_triggers off the delete skipped
-# messages_ad, leaving stale FTS tokens. DO UPDATE fires messages_au instead.
-# Contract: an edited message keeps its chunk_id, so its chunk text may be stale.
+# A true upsert (never INSERT OR REPLACE -- see docs/DECISIONS.md, "message
+# upsert"): source columns are refreshed in place, derived columns (chunk_id)
+# survive. Contract: an edited message keeps its chunk_id, so its chunk text may
+# be stale. ON CONFLICT covers only `id`; a `guid` clash is resolved first by
+# _claim_rowid.
 _MESSAGE_SOURCE_COLS = (
     "guid", "chat_id", "handle_id", "is_from_me", "text", "decode_failed",
     "date", "date_read", "date_delivered", "item_type", "is_emote", "has_attachment")
@@ -415,6 +415,48 @@ _MESSAGE_UPSERT_SQL = (
     f"VALUES ({', '.join('?' * (len(_MESSAGE_SOURCE_COLS) + 1))}) "
     "ON CONFLICT(id) DO UPDATE SET "
     + ", ".join(f"{c} = excluded.{c}" for c in _MESSAGE_SOURCE_COLS))
+
+
+# Every column outside `messages` that stores a messages.id. A re-key must
+# carry all of them, or the row's chunk/session/nudge/attachment links dangle.
+_MESSAGE_ID_REFS = (
+    ("attachments", "message_id"),
+    ("chunks", "first_message_id"), ("chunks", "last_message_id"),
+    ("sessions", "first_message_id"), ("sessions", "last_message_id"),
+    ("dyad_terms", "first_message_id"),
+    ("loose_threads", "anchor_message_id"),
+    ("conflict_signals", "message_id"),
+)
+
+
+def _move_message(tgt, old_id, new_id):
+    """Re-key one messages row and every stored reference to it. messages_au
+    moves its FTS entry; chunk_id and all other columns travel with the row."""
+    tgt.execute("UPDATE messages SET id = ? WHERE id = ?", (new_id, old_id))
+    for table, col in _MESSAGE_ID_REFS:
+        tgt.execute(f"UPDATE {table} SET {col} = ? WHERE {col} = ?", (new_id, old_id))
+
+
+def _claim_rowid(tgt, rowid, guid):
+    """Make (rowid, guid) safe for _MESSAGE_UPSERT_SQL when chat.db has moved
+    messages to new ROWIDs (iCloud resync, restore onto a new Mac): guid is the
+    message's identity, ROWID is only its current address.
+
+    - Another message holds `rowid`: park it at a fresh negative id (a row with
+      no current source ROWID) so the upsert cannot overwrite it. Its guid
+      re-arriving later moves it to its new ROWID; until then it stays, since
+      ingest never deletes a message.
+    - This guid sits at another id: move that row to `rowid`, keeping its
+      chunk_id and references, so the newest source row wins without a re-chunk.
+    """
+    held = tgt.execute("SELECT guid FROM messages WHERE id = ?", (rowid,)).fetchone()
+    if held and held[0] != guid:
+        park = tgt.execute(
+            "SELECT MIN(COALESCE(MIN(id), 0), 0) - 1 FROM messages").fetchone()[0]
+        _move_message(tgt, rowid, park)
+    prev = tgt.execute("SELECT id FROM messages WHERE guid = ?", (guid,)).fetchone()
+    if prev and prev[0] != rowid:
+        _move_message(tgt, prev[0], rowid)
 
 
 def ingest_messages_and_reactions(src, tgt, since_rowid=0, allowed_chat_ids=None,
@@ -477,6 +519,7 @@ def ingest_messages_and_reactions(src, tgt, since_rowid=0, allowed_chat_ids=None
                 )
                 n_react += 1
             else:
+                _claim_rowid(tgt, rowid, guid)
                 tgt.execute(_MESSAGE_UPSERT_SQL,
                     (rowid, guid, chat_id, handle_id, is_from_me, text, decode_failed,
                      apple_ns_to_iso(date), apple_ns_to_iso(date_read),
