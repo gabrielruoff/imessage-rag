@@ -278,7 +278,11 @@ class DBFixture(unittest.TestCase):
         # Pinned to the documented UNSET values so a test asserts
         # the code's behavior and not the machine's; a test wanting another
         # value patches over this (mock.patch stacks).
-        for module, knob, value in ((annotate, "ANNOTATE_THINK", ""),
+        # ANNOTATE_MODEL is pinned local because an openrouter/ value sends
+        # main() down the hosted path (spend cap required) before any tier runs.
+        for module, knob, value in ((annotate, "ANNOTATE_MODEL", _MODEL),
+                                    (annotate, "ANNOTATE_QUALITY", "distilled"),
+                                    (annotate, "ANNOTATE_THINK", ""),
                                     (annotate, "ANNOTATE_BATCH_SIZE", 0),
                                     (annotate, "ANNOTATE_TOP_DYADS", 20),
                                     (annotate, "ANNOTATE_COMMIT_EVERY", 50),
