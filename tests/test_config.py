@@ -388,7 +388,8 @@ class EnvExampleParityTest(unittest.TestCase):
             ["CHAT_THINK", "CONFLICT_THINK", "DRIFT_PHASE_THRESHOLDS",
              "DRIFT_WEIGHTS", "HOSTED_LIMIT_RECOVER_AFTER", "HOSTED_MAX_PARALLEL",
              "MCP_RESULT_MAX_CHARS", "NUDGES_THINK",
-             "TOOL_RESULT_MAX_CHARS", "TOPIC_THINK", "WRAPPED_THINK"])
+             "TOOL_RESULT_MAX_CHARS", "TOPIC_THINK", "VOYAGE_MAX_STALLED_ROUNDS",
+             "VOYAGE_SYNC_ATTEMPTS", "WRAPPED_THINK"])
 
         # .env.example is a bare commented inventory: `# VAR=default` lines,
         # every one of which must STAY commented (make env copies it verbatim).
