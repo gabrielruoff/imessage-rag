@@ -179,6 +179,38 @@ class TestAnnotateOne(OpenRouterTestCase):
         h.run(["a"] * 5)
         self.assertNotIn("prompt cache not hit", self.out.getvalue())
 
+    def test_s4_decoding_error_is_retried(self):
+        h = Harness([httpx.DecodingError("placeholder bad encoding"), ok()])
+        self.assertEqual(h.run(["a"]), [("ok", GOOD)])
+        self.assertEqual(len(h.bodies), 2)
+
+    def test_s4_key_never_reaches_the_stop(self):
+        key = "sk-placeholder-secret \n"
+        with mock.patch.object(config, "OPEN_ROUTER_API_KEY", key):
+            async def headers():
+                async with openrouter.client() as http:
+                    return http.headers["Authorization"]
+            self.assertEqual(asyncio.run(headers()), "Bearer sk-placeholder-secret")
+        h = Harness([httpx.LocalProtocolError(f"Illegal header value {key!r}")])
+        with self.assertRaises(hosted.HostedStop) as cm:
+            h.run(["a"])
+        self.assertNotIn("sk-placeholder", str(cm.exception))
+        self.assertIn("LocalProtocolError", cm.exception.cause)
+        self.assertNotIn("sk-placeholder", self.out.getvalue())
+
+    def test_s4_stop_never_quotes_input_text(self):
+        h = Harness([err(400, "Input rejected", metadata={
+            "flagged_input": "placeholder private text"})])
+        with self.assertRaises(hosted.HostedStop) as cm:
+            h.run(["a"])
+        self.assertIn("400: Input rejected", cm.exception.cause)
+        self.assertNotIn("placeholder private text", cm.exception.cause)
+        h = Harness([httpx.Response(400, text="echo: placeholder private text")])
+        with self.assertRaises(hosted.HostedStop) as cm:
+            h.run(["a"])
+        self.assertIn("400", cm.exception.cause)
+        self.assertNotIn("placeholder private text", cm.exception.cause)
+
 
 class TestFetchPrices(OpenRouterTestCase):
     def fetch(self, handler, ids):
@@ -202,6 +234,14 @@ class TestFetchPrices(OpenRouterTestCase):
         with self.assertRaises(hosted.HostedStop):
             self.fetch(lambda r: httpx.Response(200, json=listing), ["test/other"])
 
+
+    def test_s4_non_positive_price_is_a_stop(self):
+        for price in ("-1", "0"):
+            listing = {"data": [{"id": MODEL, "pricing": {"prompt": price,
+                                                          "completion": "0.0000005"}}]}
+            with self.subTest(price=price), \
+                    self.assertRaisesRegex(hosted.HostedStop, MODEL):
+                self.fetch(lambda r: httpx.Response(200, json=listing), [MODEL])
 
 if __name__ == "__main__":
     unittest.main()

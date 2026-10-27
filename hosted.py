@@ -18,6 +18,8 @@ import httpx
 
 import config
 
+# Longest provider error message quoted in a stop; a longer one is dropped.
+ERROR_MESSAGE_MAX_CHARS = 300
 
 class Budget:
     """Hard USD cap. reserve() a worst case before each request (refused when
@@ -84,14 +86,15 @@ def retry_delay(attempt, response=None):
 
 def classify(response_or_exc):
     """One retry table for both clients: "ok" (2xx), "retry" (408, 429, 5xx,
-    timeouts, network errors, a server-side protocol error), "moderation" (an
+    timeouts, network errors, a server-side protocol error, an undecodable
+    response body), "moderation" (an
     OpenRouter 403 whose body says moderation/flagged: reroute away from that
     provider), else "stop" (401/402/400, every other 4xx, and transport errors
     that cannot heal)."""
     if isinstance(response_or_exc, httpx.HTTPStatusError):
         response_or_exc = response_or_exc.response
     if isinstance(response_or_exc, (httpx.TimeoutException, httpx.NetworkError,
-                                    httpx.RemoteProtocolError)):
+                                    httpx.RemoteProtocolError, httpx.DecodingError)):
         return "retry"  # other TransportErrors (bad URL, bad header, proxy) never heal
     if not isinstance(response_or_exc, httpx.Response):
         return "stop"
@@ -108,6 +111,24 @@ def classify(response_or_exc):
         if "moderation" in body or "flagged" in body:
             return "moderation"
     return "stop"
+
+
+# What a request can raise that classify() judges; both clients catch exactly
+# this. DecodingError is a RequestError but not a TransportError.
+REQUEST_ERRORS = (httpx.TransportError, httpx.DecodingError)
+
+
+def error_message(data):
+    """The provider's top-level error text from a parsed error body (OpenRouter
+    error.message, Voyage detail/message) when it is a short string, else "".
+    Never the raw body or metadata: either can quote request text."""
+    if not isinstance(data, dict):
+        return ""
+    err = data.get("error")
+    msg = err.get("message") if isinstance(err, dict) else err
+    if not isinstance(msg, str):
+        msg = data.get("detail") or data.get("message")
+    return msg if isinstance(msg, str) and len(msg) <= ERROR_MESSAGE_MAX_CHARS else ""
 
 
 class HostedStop(RuntimeError):

@@ -5,7 +5,8 @@ hosted.Limiter, with writes and commits on the loop thread.
 Completeness: a chunk is done only once its annotation row is written. A
 transient failure is retried until it succeeds; an unparseable reply or a
 provider refusal is never written and keeps the chunk pending; a HostedStop or
-an exhausted budget stops dispatch, drains what is in flight and commits. The
+an exhausted budget stops dispatch, drains what is in flight and commits; any
+other exception still commits what was written, then propagates. The
 run ends by recounting pending chunks from the DB and exits non-zero unless
 none remain.
 
@@ -88,7 +89,7 @@ def annotate_chunks_hosted(con, model, *, all_chats, top_dyads, limit, dry_run,
     if not pending:
         return 0
     spend = hosted.Budget(hosted.resolve_budget_usd(budget))
-    if not config.OPEN_ROUTER_API_KEY:
+    if not config.OPEN_ROUTER_API_KEY.strip():
         raise SystemExit("OPEN_ROUTER_API_KEY is not set (needed for an openrouter/ model)")
     # Records the configured openrouter/ value, never a model id a response echoes.
     annotate._check_model_guard(con, model)
@@ -96,17 +97,18 @@ def annotate_chunks_hosted(con, model, *, all_chats, top_dyads, limit, dry_run,
 
     st = {"done": 0, "stop": None, "refused": [], "unparseable": []}
     try:
-        with progress.track("Annotating chunks", total=len(pending), header=False) as p:
-            asyncio.run(_drive(con, pending, model, think, spend, max_parallel, st, p))
+        try:
+            with progress.track("Annotating chunks", total=len(pending), header=False) as p:
+                asyncio.run(_drive(con, pending, model, think, spend, max_parallel, st, p))
+        finally:  # every written (paid) annotation is kept, whatever ended the run
+            con.commit()
     except KeyboardInterrupt:
-        con.commit()
         print(f"\nInterrupted -- committed {st['done']} annotations "
               f"({len(st['refused']) + len(st['unparseable'])} skipped); rerun to resume.")
         print(spend.report())
         return st["done"]
     except hosted.HostedStop as exc:  # before dispatch: price lookup
         st["stop"] = exc.cause
-    con.commit()
 
     # Recount from the DB, not from counters. --limit is not reapplied: the
     # question is how many of THIS run's chunks are still pending.
