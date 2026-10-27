@@ -453,11 +453,11 @@ class FtsTriggerTest(unittest.TestCase):
             "    INSERT INTO messages_fts(rowid, text) VALUES (new.id, new.text);\n"
             "END;"
         )
-        self.assertNotIn("UPDATE OF text", _object_sql(con, "messages_au"))
+        self.assertNotIn("UPDATE OF id, text", _object_sql(con, "messages_au"))
 
         schema.create_schema(con)
 
-        self.assertIn("UPDATE OF text", _object_sql(con, "messages_au"))
+        self.assertIn("UPDATE OF id, text", _object_sql(con, "messages_au"))
 
     def test_stamping_chunk_id_does_not_rewrite_the_fts_entry(self):
         # The behavioral half of the scoping contract: chunk building stamps

@@ -66,6 +66,22 @@ submodule eagerly — a top-level import would freeze config before `run` applie
 | `p3` | P3 | `wrapped`/`--judge` only | generator evals: `wrapped`, `check-wrapped`, `annotate-sample`, `topics-sample` |
 | `report` | P4 | no | aggregate grades + checks into `scorecard.json`/`.md`; `--compare` for regression diffs, `--strict` gating |
 
+Hosted-model harnesses (they produced the evidence in `docs/DECISIONS.md`,
+"hosted embeddings (Voyage) and hosted annotation (OpenRouter)"). The ones that
+upload message text say so and need `--confirm-upload` or a `--budget`:
+
+| Command | Ollama? | What it does |
+|---|---|---|
+| `recall-labels` | **yes** | the local model writes one synthetic search query per sampled chunk (the gold set) |
+| `recall-embed` | no | **uploads** the gold chunks + `--pool` distractors to Voyage (`--dim` is sent as `output_dimension`); `--confirm-upload` |
+| `recall` | no | recall@1/@10 and MRR, `EMBED_MODEL` vs the Voyage vectors, over the gold queries |
+| `distill-ab` | no | k-fold kNN-label agreement, `EMBED_MODEL` vs Voyage vectors (**uploads**; `--confirm-upload`) |
+| `annotate-pilot` | no | **uploads** sampled chunks to OpenRouter and compares `--model` with `--reference` and the local labels; `--budget` is a hard USD cap (reserved per attempt on the full request body; an unpriced model stops the run) |
+
+Voyage vectors are cached in `eval/results/recall/<model>-<db stem>.db`, one per
+source DB, and a cache built at another dimension is refused before any upload.
+An older untagged `<model>.db` cache is ignored; rename it to keep it.
+
 ## Quick verification (no Ollama, no real DB needed for the first two)
 
 ```

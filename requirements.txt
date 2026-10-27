@@ -1,3 +1,5 @@
 python-dotenv==1.2.2
 sqlite-vec==0.1.9
 rich==13.9.4
+# Hosted backends (voyage.py, openrouter.py) and the web-API tests' TestClient.
+httpx==0.28.1

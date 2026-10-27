@@ -13,8 +13,12 @@ from unittest import mock
 import annotate
 import ollama
 import schema
-from config import ANNOTATE_MODEL, ANNOTATE_TERMS_MAX_FAILURES
+from config import ANNOTATE_TERMS_MAX_FAILURES
 from db import get_state, load_vec_extension, set_state
+
+# Pinned local model: a hosted (openrouter/) ANNOTATE_MODEL in the developer's
+# .env would route main() down the hosted path, so annotate's copy is patched to this.
+ANNOTATE_MODEL = "test-annotate-model"
 
 
 def _reply(payload):
@@ -63,6 +67,14 @@ class AnnotateFixture(unittest.TestCase):
         patcher = mock.patch.object(annotate, "DB_PATH", self.db_path)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # Hermetic against .env: annotate binds these at import. Pinned to a local
+        # model and the documented unset values; a test wanting another patches over.
+        for knob, value in (("ANNOTATE_MODEL", ANNOTATE_MODEL),
+                            ("ANNOTATE_THINK", ""),
+                            ("ANNOTATE_QUALITY", "distilled")):
+            patcher = mock.patch.object(annotate, knob, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def annotation(self, chunk_id=1):
         return self.con.execute(

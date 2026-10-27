@@ -20,6 +20,7 @@ from config import (
     OLLAMA_PORT,
     OLLAMA_TIMEOUT,
     is_apple_model,
+    is_voyage_model,
 )
 
 _thread_local = threading.local()
@@ -65,6 +66,14 @@ def embed_texts(texts: list, kind: str = "document") -> list:
         # never touches the shim client. _fit_dim/EMBED_DIM still apply, identically.
         import applefm
         return [_fit_dim(v) for v in applefm.embed_texts_apple(texts, kind)]
+    if is_voyage_model(EMBED_MODEL):
+        # Voyage carries the task in input_type, so nomic's prefixes are
+        # skipped. Documents go through ingest's Batch API path only.
+        # Lazy import, like apple: the Ollama-only path never loads the client.
+        if kind != "query":
+            raise RuntimeError("voyage document embeddings are batch-only -- run ingest")
+        import voyage
+        return voyage.embed_sync(texts, "query")
     prefix = EMBED_QUERY_PREFIX if kind == "query" else EMBED_DOC_PREFIX
     if prefix:
         texts = [prefix + t for t in texts]
@@ -94,4 +103,6 @@ def detect_embed_dim() -> int:
     apple backend auto-detects the same way (embed_texts routes the probe
     through embed_texts_apple): NLContextualEmbedding is expected to be 512-dim,
     but the probe measures the true dim rather than assuming it."""
+    if is_voyage_model(EMBED_MODEL):
+        return EMBED_DIM  # Voyage's output_dimension, validated in config: no paid probe
     return len(embed_texts(["dimension probe"], kind="document")[0])

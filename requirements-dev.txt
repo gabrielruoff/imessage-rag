@@ -1,3 +1,1 @@
 ruff==0.15.21
-# FastAPI/Starlette TestClient dependency for the web-API layer's tests.
-httpx==0.28.1

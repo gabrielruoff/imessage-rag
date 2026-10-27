@@ -3,7 +3,8 @@
 Makes iMessage history queryable and analyzable by an LLM. Ingests the
 macOS Messages `chat.db` into a normalized SQLite store
 (`imessage_analysis.db`) with keyword search (FTS5) and semantic search
-over conversation chunks (`sqlite-vec` + local Ollama embeddings), then
+over conversation chunks (`sqlite-vec` + local Ollama embeddings, or opt-in
+Voyage AI embeddings), then
 exposes that store as tool calls for a local Ollama-hosted chat model to
 query — instead of pasting message history into a prompt.
 
@@ -24,7 +25,10 @@ sent or received, and every message anyone has ever sent *you*.
   hosted API. **The optional MCP server is the exception:** it hands the messages
   its tools retrieve to whatever agent you connect, and an agent running a hosted
   model (Claude Code, Claude Desktop, …) sends them to that model's provider. See
-  [`docs/MCP.md`](docs/MCP.md#privacy--security-model).
+  [`docs/MCP.md`](docs/MCP.md#privacy--security-model). **Hosted models are
+  the other exception:** a `voyage/` `EMBED_MODEL` or an `openrouter/`
+  `ANNOTATE_MODEL` uploads chunk text to that provider (see
+  [Hosted models](#hosted-models-opt-in-paid)).
 - **`imessage_analysis.db` is unencrypted** and contains full message text.
   It is gitignored — keep it that way, and don't sync it to cloud storage.
 - **Generated Wrapped reports quote real messages verbatim**, including
@@ -172,6 +176,19 @@ and set only `CHAT_MODEL=apple`, say). Two things worth knowing:
   small-model-versus-big-model tradeoff, it's a small-*window* one, and
   multi-hop questions are what suffer. A great zero-setup, fully-private
   option; everything still stays on your machine, exactly as with Ollama.
+
+## Hosted models (opt-in, paid)
+
+Two pipelines can run on a hosted API instead: embeddings on Voyage AI
+(`EMBED_MODEL=voyage/voyage-4-large`, measurably better retrieval than
+nomic-embed-text) and chunk annotation on OpenRouter
+(`ANNOTATE_MODEL=openrouter/anthropic/claude-haiku-5.5`). **Both upload chunk
+text to that provider.** Choosing the model is the consent; each run prints
+what it uploads and where, and refuses to start without a spend cap
+(`--budget` or `HOSTED_BUDGET_USD`). Chat, topics, Wrapped and the suite stay
+local. A full-corpus run costs roughly $1.31 (Voyage) plus $6–8 (Haiku). Keys,
+costs and the step-by-step run are in the
+[`docs/DEMO.md` "Hosted models" runbook](docs/DEMO.md#hosted-models-opt-in-paid).
 
 ## Analytics
 

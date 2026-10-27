@@ -684,5 +684,105 @@ class LookbackIngestTest(unittest.TestCase):
                          {1, 2, 3, 6})
 
 
+class FullRereadTest(unittest.TestCase):
+    """A run without --since-last re-reads every message; the upsert must keep
+    the derived chunk_id so build_chunks does not re-chunk them, and keep the
+    external-content FTS index in step with the text."""
+
+    _apple_ns = LookbackIngestTest._apple_ns
+    _fake_src = LookbackIngestTest._fake_src
+    _fresh_tgt = LookbackIngestTest._fresh_tgt
+
+    def _run(self, src, tgt):
+        ingest.ingest_messages_and_reactions(src, tgt, 0, None, None)
+        ingest.build_chunks(tgt)
+        tgt.commit()
+
+    def _chunks(self, tgt):
+        return tgt.execute("SELECT id, first_message_id, last_message_id FROM chunks "
+                           "ORDER BY id").fetchall()
+
+    def _stamps(self, tgt):
+        return tgt.execute("SELECT id, chunk_id FROM messages ORDER BY id").fetchall()
+
+    def _fts(self, tgt, term):
+        return {r[0] for r in tgt.execute(
+            "SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?", (term,))}
+
+    def test_rerun_builds_no_new_chunks_and_keeps_chunk_id(self):
+        src, tgt = self._fake_src(), self._fresh_tgt()
+        self._run(src, tgt)
+        chunks, stamps = self._chunks(tgt), self._stamps(tgt)
+        self.assertTrue(chunks)
+        self._run(src, tgt)
+        self._run(src, tgt)
+        self.assertEqual(self._chunks(tgt), chunks)
+        self.assertEqual(self._stamps(tgt), stamps)
+        self.assertEqual(self._fts(tgt, "msg2"), {2})
+
+    def test_source_text_edit_reaches_fts_and_keeps_chunk_id(self):
+        src, tgt = self._fake_src(), self._fresh_tgt()
+        self._run(src, tgt)
+        stamps = self._stamps(tgt)
+        src.execute("UPDATE message SET text = 'edited words' WHERE ROWID = 2")
+        self._run(src, tgt)
+        self.assertEqual(self._fts(tgt, "edited"), {2})
+        self.assertEqual(self._fts(tgt, "msg2"), set())   # old tokens gone
+        self.assertEqual(self._fts(tgt, "msg3"), {3})     # untouched row still found
+        self.assertEqual(self._stamps(tgt), stamps)
+
+    def _by_guid(self, tgt):
+        return {g: (i, c) for i, g, c in tgt.execute(
+            "SELECT id, guid, chunk_id FROM messages")}
+
+    def test_guid_at_new_rowid_moves_row_keeping_chunk_and_fts(self):
+        """chat.db resync/restore: same guid, new ROWID. Must not raise
+        UNIQUE(guid); the row moves to the new id with its chunk_id."""
+        src, tgt = self._fake_src(), self._fresh_tgt()
+        self._run(src, tgt)
+        chunks, before = self._chunks(tgt), self._by_guid(tgt)
+        src.execute("UPDATE message SET ROWID = 100 WHERE ROWID = 2")
+        src.execute("UPDATE chat_message_join SET message_id = 100 WHERE message_id = 2")
+        self._run(src, tgt)
+        after = self._by_guid(tgt)
+        self.assertEqual(after["guid2"], (100, before["guid2"][1]))
+        self.assertEqual(tgt.execute("SELECT COUNT(*) FROM messages WHERE guid = 'guid2'")
+                         .fetchone()[0], 1)
+        self.assertEqual(self._fts(tgt, "msg2"), {100})
+        self.assertEqual(tgt.execute("SELECT first_message_id, last_message_id FROM chunks "
+                                     "WHERE id = ?", (before["guid2"][1],)).fetchone(),
+                         (100, 100))
+        self.assertEqual(len(self._chunks(tgt)), len(chunks))
+
+    def test_swapped_rowids_follow_their_guids(self):
+        """Two messages trade ROWIDs: each id is held by the other guid."""
+        src, tgt = self._fake_src(), self._fresh_tgt()
+        self._run(src, tgt)
+        n_chunks, before = len(self._chunks(tgt)), self._by_guid(tgt)
+        src.execute("UPDATE message SET ROWID = -2 WHERE ROWID = 2")
+        src.execute("UPDATE message SET ROWID = 2 WHERE ROWID = 3")
+        src.execute("UPDATE message SET ROWID = 3 WHERE ROWID = -2")
+        src.execute("UPDATE chat_message_join SET message_id = 5 - message_id "
+                    "WHERE message_id IN (2, 3)")
+        self._run(src, tgt)
+        after = self._by_guid(tgt)
+        self.assertEqual(after["guid2"], (3, before["guid2"][1]))
+        self.assertEqual(after["guid3"], (2, before["guid3"][1]))
+        self.assertEqual(self._fts(tgt, "msg2"), {3})
+        self.assertEqual(self._fts(tgt, "msg3"), {2})
+        self.assertFalse(tgt.execute("SELECT 1 FROM messages WHERE id < 0").fetchone())
+        self.assertEqual(len(self._chunks(tgt)), n_chunks)
+
+    def test_unchanged_reread_does_not_touch_fts(self):
+        src, tgt = self._fake_src(), self._fresh_tgt()
+        self._run(src, tgt)
+        # Drop row 2 from the index by hand; an unchanged re-read that rewrote
+        # FTS would put it back.
+        tgt.execute("INSERT INTO messages_fts(messages_fts, rowid, text) "
+                    "VALUES ('delete', 2, 'msg2')")
+        self._run(src, tgt)
+        self.assertEqual(self._fts(tgt, "msg2"), set())
+
+
 if __name__ == "__main__":
     unittest.main()

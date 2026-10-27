@@ -46,10 +46,17 @@ curation ANNOTATE_TERMS_MAX_FAILURES times is parked in
 dyad_terms.curate_failures rather than retried by every later run;
 --retry-failed unparks.
 
+An openrouter/<id> model (ANNOTATE_MODEL or --model) sends the per-chunk tiers
+to OpenRouter, one chunk per request (annotate_hosted.py). It uploads chunk
+text, needs a spend cap (--budget or HOSTED_BUDGET_USD) and refuses distilled
+and hybrid; an env/default distilled runs balanced instead. --terms always
+curates locally: under a hosted ANNOTATE_MODEL it uses CHAT_MODEL.
+
 Usage (chunks): annotate.py [--all | --top-dyads N] [--limit N]
                    [--model NAME]
                    [--quality distilled|hybrid|fast|balanced|max]
                    [--upgrade-distilled] [--dry-run]
+                   [--budget USD] [--max-parallel N]   (openrouter/ models only)
 Usage (terms):  annotate.py --terms [--limit N] [--model NAME]
                    [--retry-failed] [--dry-run]
 --terms and --quality/--upgrade-distilled are mutually exclusive.
@@ -60,8 +67,10 @@ import http.client
 import json
 
 import annotate_distill
+import annotate_hosted
 import annotate_hybrid
 import config
+import hosted
 import ollama
 import progress
 import schema
@@ -81,7 +90,9 @@ from config import (
 from db import (
     check_model_guard,
     connect_default,
+    get_state,
     run_cli,
+    set_state,
 )
 from function_words import EMOTION_LABELS
 
@@ -286,14 +297,17 @@ def _pending_chunks(con, all_chats, top_dyads, limit, upgrade_distilled=False):
     return con.execute(sql, params).fetchall()
 
 
-def _check_model_guard(con, model, table="chunk_annotations", predicate="1"):
+def _check_model_guard(con, model, table="chunk_annotations", predicate="1",
+                       key="annotate_model"):
     """Refuse to mix annotation models within one artifact -- db.check_model_guard
     (the shared shape, also chunking.build_vec_table's embedding guard) with this
     pipeline's key, table and remedy sentence. `predicate` narrows the count to
     the rows this model actually produced (dyad_terms holds uncurated rows too).
-    Records the chosen model when proceeding."""
+    Records the chosen model when proceeding. `key` is the ingest_state key:
+    terms_model for dyad-term verdicts, so hosted chunks and local terms never
+    trip each other's guard."""
     check_model_guard(
-        con, key="annotate_model", model=model, table=table, predicate=predicate,
+        con, key=key, model=model, table=table, predicate=predicate,
         message=(
             "{table} holds {n} rows annotated by {prev}, but the "
             "model is now {model}. Mixing annotation models skews every "
@@ -301,6 +315,19 @@ def _check_model_guard(con, model, table="chunk_annotations", predicate="1"):
             "to switch, or rerun with --model {prev}."
         ),
     )
+
+
+def _migrate_terms_guard(con):
+    """Dyad-term verdicts used to share the annotate_model key. Carry the
+    recorded model over to terms_model once, before any guard runs, since a
+    later hosted chunk run overwrites annotate_model. Idempotent."""
+    if get_state(con, "terms_model") is not None:
+        return
+    prev = get_state(con, "annotate_model")
+    if prev and con.execute(
+            "SELECT 1 FROM dyad_terms WHERE llm_verdict IS NOT NULL LIMIT 1").fetchone():
+        set_state(con, "terms_model", prev)
+        con.commit()
 
 
 def _ensure_column(con, table, column, dry_run=False):
@@ -845,7 +872,8 @@ def _build_parser():
                         help="process at most N rows this run (hybrid: at most N "
                              "upgrades WRITTEN, not dispatched)")
     parser.add_argument("--model", default=None,
-                        help=f"Ollama model (default {ANNOTATE_MODEL})")
+                        help=f"Ollama model, or openrouter/<id> for hosted per-chunk "
+                             f"tiers (default {ANNOTATE_MODEL})")
     parser.add_argument("--quality", choices=sorted(QUALITY_PRESETS), default=None,
                         help="speed/quality tradeoff: distilled = LLM seed sample + "
                              "kNN classify the rest from embeddings (~1 min corpus-"
@@ -865,6 +893,12 @@ def _build_parser():
                              "terms so this run retries them")
     parser.add_argument("--dry-run", action="store_true",
                         help="print the pending scope and exit without LLM calls or writes")
+    parser.add_argument("--budget", type=float, metavar="USD", default=None,
+                        help="openrouter/ models only: hard USD spend cap for this "
+                             "run (default HOSTED_BUDGET_USD; one of the two is required)")
+    parser.add_argument("--max-parallel", type=int, metavar="N", default=None,
+                        help="openrouter/ models only: requests in flight "
+                             f"(default {config.HOSTED_MAX_PARALLEL})")
     return parser
 
 
@@ -874,6 +908,35 @@ def main(argv=None):
 
     model = args.model or ANNOTATE_MODEL
     quality = args.quality or ANNOTATE_QUALITY
+    # Term curation is never hosted: a hosted ANNOTATE_MODEL falls back to the
+    # local CHAT_MODEL, and an explicit openrouter/ --model is refused.
+    if args.terms and config.is_openrouter_model(model):
+        if args.model:
+            parser.error("--terms curates locally (Ollama); an openrouter/ --model "
+                         "does not apply to it")
+        model = config.CHAT_MODEL
+        print(f"note: term curation runs locally on CHAT_MODEL ({model}), not the "
+              f"hosted ANNOTATE_MODEL")
+    hosted_run = not args.terms and config.is_openrouter_model(model)
+    if not hosted_run and (args.budget is not None or args.max_parallel is not None):
+        parser.error("--budget / --max-parallel only apply to hosted (openrouter/) models")
+    if hosted_run:
+        # Hosted runs only the per-chunk tiers, one chunk per request.
+        if args.quality in ("distilled", "hybrid"):
+            parser.error(f"--quality {args.quality} does not support a hosted model; "
+                         f"use max, balanced or fast")
+        if quality == "hybrid":
+            parser.error("ANNOTATE_QUALITY=hybrid does not support a hosted model; "
+                         "pass --quality max, balanced or fast")
+        if quality == "distilled":
+            print("note: distilled does not support a hosted model; running balanced")
+            quality = "balanced"
+        if quality == "fast":
+            print("note: hosted models annotate one chunk per request; fast's "
+                  "batch size is ignored")
+        max_parallel = hosted.check_max_parallel(
+            args.max_parallel if args.max_parallel is not None
+            else config.HOSTED_MAX_PARALLEL)
     # A negative row cap is never a smaller run, whichever tier reads it. On the
     # per-chunk tiers and on --terms it reaches a SQL `LIMIT ?`, where -1 means
     # NO limit; in hybrid's phase 3a it reaches a list slice, where
@@ -938,6 +1001,8 @@ def main(argv=None):
         parser.error("--retry-failed only applies to --terms")
     con = _connect()
     try:
+        if not args.dry_run:  # a preview writes nothing; it runs no guard either
+            _migrate_terms_guard(con)
         if args.terms:
             curate_terms(con, model, limit=args.limit, dry_run=args.dry_run,
                          think=_resolve_terms_think(), workers=ANNOTATE_WORKERS,
@@ -965,6 +1030,21 @@ def main(argv=None):
                 dry_run=args.dry_run,
                 batch_size=batch_size,
             )
+        elif hosted_run:
+            try:
+                annotate_hosted.annotate_chunks_hosted(
+                    con, model,
+                    all_chats=args.all,
+                    top_dyads=top_dyads,
+                    limit=args.limit,
+                    dry_run=args.dry_run,
+                    think=think,
+                    upgrade_distilled=args.upgrade_distilled,
+                    budget=args.budget,
+                    max_parallel=max_parallel,
+                )
+            except hosted.HostedStop as exc:
+                raise SystemExit(f"stopped: {exc.cause}") from None
         else:
             annotate_chunks(
                 con, model,

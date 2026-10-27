@@ -201,7 +201,8 @@ def curate_terms(con, model, limit=None, dry_run=False, think=False, workers=1,
         return 0
     # Verdicts are model-derived and survive dyad_terms rebuilds, exactly like
     # chunk_annotations rows -- so they get the same anti-mixing guard.
-    annotate._check_model_guard(con, model, "dyad_terms", "llm_verdict IS NOT NULL")
+    annotate._check_model_guard(con, model, "dyad_terms", "llm_verdict IS NOT NULL",
+                                key="terms_model")
 
     n_done = n_skipped = 0
     parked = []

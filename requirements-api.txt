@@ -1,6 +1,6 @@
 # Optional web-API layer. Installed separately from the core requirements.txt
 # (which stays minimal so the CLIs/pipelines clone-and-run) via `make api-install`.
-# httpx (the test client dep) lives in requirements-dev.txt, not here.
+# httpx (the TestClient dep) is a core dep, pinned in requirements.txt.
 fastapi==0.120.4
 uvicorn[standard]==0.38.0
 # 3.x is required to co-install with mcp 2.x (requirements-mcp.txt).

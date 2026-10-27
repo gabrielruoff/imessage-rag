@@ -7,6 +7,7 @@ measurements and dead ends behind the defaults live in docs/DECISIONS.md;
 comments here state the contract, not the history.
 """
 
+import math
 import os
 from pathlib import Path
 
@@ -80,6 +81,15 @@ def _think(name, default=None):
 
 CHAT_THINK = _think("CHAT_THINK")
 
+
+def _positive_int_env(name, default):
+    """An int knob that must be > 0; an empty value means unset."""
+    raw = os.getenv(name) or str(default)
+    if int(raw) <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {raw!r}")
+    return int(raw)
+
+
 # Model families that read 'low'/'medium'/'high' as a reasoning-EFFORT LEVEL.
 # To every other model an effort string is merely TRUTHY and buys a FULL pass,
 # which is why an effort level is not portable. The EFFORT family is listed
@@ -134,6 +144,83 @@ APPLE_ANSWER_MAX_TOKENS = int(os.getenv("APPLE_ANSWER_MAX_TOKENS", "0"))
 APPLE_MAX_TOOL_ITERATIONS = int(os.getenv("APPLE_MAX_TOOL_ITERATIONS", "8"))
 APPLE_NO_PROGRESS_LIMIT = int(os.getenv("APPLE_NO_PROGRESS_LIMIT", "2"))
 
+# --- Hosted backends (opt-in, paid, uploads text) ------------------------------
+# Selected by a model-name PREFIX, like the apple sentinel: EMBED_MODEL=
+# "voyage/<id>" (Voyage AI) and ANNOTATE_MODEL="openrouter/<id>" (OpenRouter,
+# annotate.py per-chunk tiers only). Choosing the model is the upload consent;
+# every hosted run prints what it uploads and where (hosted.upload_notice).
+
+
+def is_openrouter_model(name) -> bool:
+    """True when a *_MODEL value selects OpenRouter. annotate.py dispatches its
+    per-chunk tiers on it; ollama.py's seam (chat_once, chat_once_json,
+    chat_stream) refuses it, so no other pipeline reaches the cloud."""
+    return isinstance(name, str) and name.startswith("openrouter/")
+
+
+def is_voyage_model(name) -> bool:
+    """True when EMBED_MODEL selects Voyage AI. embeddings.py (query: sync;
+    document: batch-only), chunking/ingest (the batch path) and the EMBED_DIM
+    rule below gate on it."""
+    return isinstance(name, str) and name.startswith("voyage/")
+
+
+def hosted_model_id(name) -> str:
+    """The provider's model id: the "openrouter/" or "voyage/" prefix stripped.
+    The full prefixed value is what guards and ingest_state record."""
+    for prefix in ("openrouter/", "voyage/"):
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
+
+# API keys, read here only; never printed or logged.
+OPEN_ROUTER_API_KEY = os.getenv("OPEN_ROUTER_API_KEY", "")
+VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY", "")
+# Spend cap (USD) shared by both clients. No default on purpose: a hosted
+# ingest/annotate run refuses to start without this or its --budget flag.
+HOSTED_BUDGET_USD = os.getenv("HOSTED_BUDGET_USD", "").strip() or None
+if HOSTED_BUDGET_USD is not None:
+    HOSTED_BUDGET_USD = float(HOSTED_BUDGET_USD)
+# nan/inf would disable the cap, so only a finite positive value is accepted.
+if HOSTED_BUDGET_USD is not None and not (
+        math.isfinite(HOSTED_BUDGET_USD) and HOSTED_BUDGET_USD > 0):
+    raise ValueError(
+        f"HOSTED_BUDGET_USD must be finite and > 0, got {HOSTED_BUDGET_USD!r}")
+# Max hosted requests in flight per client per run (--max-parallel). 1 = strictly
+# sequential. Separate from EMBED_MAX_WORKERS/ANNOTATE_WORKERS (Ollama only).
+HOSTED_MAX_PARALLEL = _positive_int_env("HOSTED_MAX_PARALLEL", 1)
+# hosted.Limiter halves its effective parallelism on a 429 and climbs back by 1
+# after this many consecutive successes (never above --max-parallel).
+HOSTED_LIMIT_RECOVER_AFTER = _positive_int_env("HOSTED_LIMIT_RECOVER_AFTER", 10)
+# Output-token cap per OpenRouter annotation request; also the worst-case
+# completion size the budget reserves.
+OPENROUTER_MAX_TOKENS = int(os.getenv("OPENROUTER_MAX_TOKENS") or "1024")
+# Read timeout (s) for one hosted completion / sync embedding request.
+HOSTED_TIMEOUT = int(os.getenv("HOSTED_TIMEOUT") or "180")
+# Timeout (s) for a Voyage batch file upload or download.
+VOYAGE_TIMEOUT = int(os.getenv("VOYAGE_TIMEOUT") or "600")
+# Seconds between Voyage batch status polls.
+VOYAGE_POLL_SECONDS = int(os.getenv("VOYAGE_POLL_SECONDS") or "30")
+# Cap (s) on the exponential retry backoff when no Retry-After is given.
+HOSTED_BACKOFF_MAX_SECONDS = int(os.getenv("HOSTED_BACKOFF_MAX_SECONDS") or "60")
+# Voyage batch price, USD per million tokens; the budget reserves UTF-8 bytes x
+# this before each upload and settles at the reported usage.
+VOYAGE_BATCH_PRICE_PER_M = float(os.getenv("VOYAGE_BATCH_PRICE_PER_M") or "0.0804")
+# Voyage batch limit: inputs per batch.
+VOYAGE_BATCH_MAX_INPUTS = int(os.getenv("VOYAGE_BATCH_MAX_INPUTS") or "100000")
+# Voyage batch rounds in a row that may leave the missing-vector count unchanged
+# before an ingest run stops.
+VOYAGE_MAX_STALLED_ROUNDS = _positive_int_env("VOYAGE_MAX_STALLED_ROUNDS", 3)
+# Attempts on the chat-time Voyage query call before it errors (a chat turn must
+# not hang on a dead API).
+VOYAGE_SYNC_ATTEMPTS = _positive_int_env("VOYAGE_SYNC_ATTEMPTS", 3)
+# Parse failures on one OpenRouter chunk retried before it is reported unparseable.
+OPENROUTER_UNPARSEABLE_RETRIES = int(os.getenv("OPENROUTER_UNPARSEABLE_RETRIES") or "3")
+# Successful OpenRouter calls after the first that may all read 0 cached tokens
+# before the one-time "prompt cache is not hitting" warning.
+OPENROUTER_CACHE_CHECK_CALLS = int(os.getenv("OPENROUTER_CACHE_CHECK_CALLS") or "3")
+
 # --- CLI progress -------------------------------------------------------------
 # 'auto' draws a live bar on a terminal and falls back to periodic plain lines
 # when piped; 'plain' forces the lines; 'off' silences progress (start/summary
@@ -147,6 +234,14 @@ PROGRESS_LOG_EVERY = int(os.getenv("PROGRESS_LOG_EVERY", "200"))
 # ingest time. Setting it truncates + renormalizes to the first EMBED_DIM
 # components (Matryoshka reduction -- only meaningful for MRL-trained models).
 EMBED_DIM = int(os.getenv("EMBED_DIM") or "0")
+# On a voyage/ EMBED_MODEL, EMBED_DIM is instead Voyage's output_dimension: no
+# probe, no truncation; unset means 1024, and only these values are accepted.
+VOYAGE_OUTPUT_DIMS = (256, 512, 1024, 2048)
+if is_voyage_model(EMBED_MODEL):
+    EMBED_DIM = EMBED_DIM or 1024
+    if EMBED_DIM not in VOYAGE_OUTPUT_DIMS:
+        raise ValueError(f"EMBED_DIM must be one of {VOYAGE_OUTPUT_DIMS} for "
+                         f"{EMBED_MODEL}, got {EMBED_DIM}")
 # Task prefixes prepended to embedded text; these are what nomic-embed-text was
 # trained with, and skipping them measurably degrades retrieval. Set both to ''
 # for models without task prefixes.
@@ -162,13 +257,6 @@ MAX_TOOL_ITERATIONS = int(os.getenv("MAX_TOOL_ITERATIONS", "20"))  # tool round-
 # Minimum gap (minutes) between two consecutive same-sender messages for the
 # second to count as a double-text rather than a multi-part message.
 DOUBLE_TEXT_MIN_MINUTES = int(os.getenv("DOUBLE_TEXT_MIN_MINUTES", "10"))
-def _positive_int_env(name, default):
-    """An int knob that must be > 0; an empty value means unset."""
-    raw = os.getenv(name) or str(default)
-    if int(raw) <= 0:
-        raise ValueError(f"{name} must be a positive integer, got {raw!r}")
-    return int(raw)
-
 
 # Hard cap on one tool result's JSON (chars) before it enters the chat context.
 # Ollama truncates per whole MESSAGE: a single message larger than the window is

@@ -1,7 +1,7 @@
 """
 Derived-artifact stages of the ingest pipeline: group ingested messages into
-conversation chunks, then embed the chunks via local Ollama into the
-sqlite-vec chunk_vectors table.
+conversation chunks, then embed the chunks (local Ollama, or the Voyage Batch
+API for a voyage/ EMBED_MODEL) into the sqlite-vec chunk_vectors table.
 
 Everything here operates only on imessage_analysis.db (the target DB), never
 the chat.db snapshot. Chunk building and chunk embedding live together
@@ -11,6 +11,7 @@ ingest.py runs both stages after source ingestion and re-exports them, so
 `ingest.build_chunks` etc. keep working.
 """
 
+import asyncio
 import datetime
 import http.client
 import json
@@ -30,6 +31,7 @@ from config import (
     EMBED_MAX_WORKERS,
     EMBED_MODEL,
 )
+import config
 import progress
 from db import CONTACT_LABEL_SQL, get_state, iso_to_day, load_vec_extension, set_state
 
@@ -255,6 +257,30 @@ def build_vec_table(tgt: sqlite3.Connection, dim: int):
     set_state(tgt, "embed_dim", dim)
 
 
+def unembedded_chunks(tgt: sqlite3.Connection, min_chars=CHUNK_MIN_CHARS):
+    """(id, chat_id, first_date, last_date, text) of every chunk that should
+    have a vector and doesn't -- the one "pending" predicate both backends
+    and their end-of-run checks share."""
+    return tgt.execute("""
+        SELECT c.id, c.chat_id, c.first_date, c.last_date, c.text
+        FROM chunks c
+        LEFT JOIN chunk_vectors v ON v.chunk_id = c.id
+        WHERE v.chunk_id IS NULL
+          AND length(c.text) >= ?
+    """, (min_chars,)).fetchall()
+
+
+def _insert_vectors(tgt, rows):
+    """rows: (chunk_id, chat_id, first_date, last_date, vector)."""
+    tgt.executemany(
+        "INSERT OR REPLACE INTO chunk_vectors"
+        "(chunk_id, embedding, chat_id, first_day, last_day) VALUES (?, ?, ?, ?, ?)",
+        [(chunk_id, sqlite_vec.serialize_float32(vec), chat_id,
+          iso_to_day(first_date), iso_to_day(last_date))
+         for chunk_id, chat_id, first_date, last_date, vec in rows],
+    )
+
+
 def embed_chunks(
     tgt: sqlite3.Connection,
     min_chars=CHUNK_MIN_CHARS,
@@ -262,13 +288,7 @@ def embed_chunks(
     max_workers=EMBED_MAX_WORKERS,
     batch_commit_every=EMBED_COMMIT_EVERY,
 ):
-    rows = tgt.execute("""
-        SELECT c.id, c.chat_id, c.first_date, c.last_date, c.text
-        FROM chunks c
-        LEFT JOIN chunk_vectors v ON v.chunk_id = c.id
-        WHERE v.chunk_id IS NULL
-          AND length(c.text) >= ?
-    """, (min_chars,)).fetchall()
+    rows = unembedded_chunks(tgt, min_chars)
 
     print(f"Embedding {len(rows)} conversation chunks via Ollama ({EMBED_MODEL})...")
     batches = [rows[i:i + batch_size] for i in range(0, len(rows), batch_size)]
@@ -297,13 +317,7 @@ def embed_chunks(
                     # bar stalls short of its total and reads as a hang.
                     p.advance(len(batch))
                     continue
-                tgt.executemany(
-                    "INSERT OR REPLACE INTO chunk_vectors"
-                    "(chunk_id, embedding, chat_id, first_day, last_day) VALUES (?, ?, ?, ?, ?)",
-                    [(chunk_id, sqlite_vec.serialize_float32(vec), chat_id,
-                      iso_to_day(first_date), iso_to_day(last_date))
-                     for (chunk_id, chat_id, first_date, last_date, _), vec in zip(batch, vecs)],
-                )
+                _insert_vectors(tgt, [(*row[:4], vec) for row, vec in zip(batch, vecs)])
                 n_done += len(batch)
                 n_processed += len(batch)
                 p.advance(len(batch))
@@ -340,3 +354,264 @@ def embed_chunks(
             f"warning: {n_err} chunks failed to embed and have no vector. Semantic\n"
             f"  search is incomplete until you re-run ingest (it retries only those)."
         )
+
+
+# ---------------------------------------------------------------------------
+# Embeddings via the Voyage Batch API (EMBED_MODEL="voyage/<id>")
+# ---------------------------------------------------------------------------
+# ingest_state keys: voyage_batch_ids (JSON list of batches not yet collected),
+# voyage_batch_space ("<EMBED_MODEL>|<EMBED_DIM>" they were submitted under),
+# voyage_pending_input_file (an uploaded input file whose batch id is not yet
+# saved; "" when none), voyage_pending_input_space (the space that file was
+# uploaded under).
+
+
+class _DiscardBatch(Exception):
+    """A batch whose results must not be stored (gone, or another embedding
+    space). Its id is dropped; its chunks stay missing."""
+
+
+def _voyage_space():
+    return f"{EMBED_MODEL}|{config.EMBED_DIM}"
+
+
+def _saved_batch_ids(tgt):
+    return json.loads(get_state(tgt, "voyage_batch_ids", "[]"))
+
+
+def _save_batch_ids(tgt, ids):
+    set_state(tgt, "voyage_batch_ids", json.dumps(ids))
+    tgt.commit()
+
+
+def _track_batch(tgt, batch_id):
+    """Save a new batch id (and its space) and clear the pending input file,
+    in one commit."""
+    set_state(tgt, "voyage_batch_space", _voyage_space())
+    set_state(tgt, "voyage_pending_input_file", "")
+    _save_batch_ids(tgt, _saved_batch_ids(tgt) + [batch_id])
+
+
+def _voyage_row(tgt, custom_id, vec):
+    """The insert row for one output line, or None when its chunk is gone, its
+    text changed since submit (the vector is stale; the chunk stays missing and
+    is resubmitted), or it already has a vector (a resumed batch re-streams
+    lines an interrupted collect committed; vec0 rejects a second insert)."""
+    import voyage
+
+    chunk_id, digest = voyage.parse_custom_id(custom_id)
+    if tgt.execute("SELECT 1 FROM chunk_vectors WHERE chunk_id = ?", (chunk_id,)).fetchone():
+        return None
+    row = tgt.execute("SELECT chat_id, first_date, last_date, text FROM chunks WHERE id = ?",
+                      (chunk_id,)).fetchone()
+    if row is None or voyage.text_hash(row[3]) != digest:
+        return None
+    return (chunk_id, *row[:3], vec)
+
+
+async def _reconcile_pending_input(tgt, client):
+    """A previous run uploaded an input file but never saved its batch id:
+    adopt the batch Voyage created from it -- unless the file was uploaded
+    under another embedding space, when the batch and its files are deleted
+    and nothing is stored -- else delete the file."""
+    file_id = get_state(tgt, "voyage_pending_input_file")
+    if not file_id:
+        return
+    batch = await client.find_batch(file_id)
+    if batch and get_state(tgt, "voyage_pending_input_space", _voyage_space()) == _voyage_space():
+        print(f"Adopting Voyage batch {batch['id']} from an interrupted submit")
+        _track_batch(tgt, batch["id"])
+        return
+    if batch:
+        print(f"warning: not adopting Voyage batch {batch['id']}: it was submitted under "
+              f"another EMBED_MODEL/EMBED_DIM; its chunks are resubmitted")
+        await _delete_batch_files(client, batch)
+    else:
+        await client.delete_file(file_id)
+    set_state(tgt, "voyage_pending_input_file", "")
+    tgt.commit()
+
+
+async def _submit_voyage_batch(tgt, client, budget, batch_rows, lines):
+    """Reserve the worst case, upload, create, and persist the batch id before
+    any polling. Returns (batch_id, reserved_usd)."""
+    import hosted
+    import voyage
+
+    reserved = voyage.worst_case_usd([text for _, text in batch_rows])
+    if not budget.reserve(reserved):
+        raise hosted.HostedStop(f"budget cap reached: the next batch needs up to "
+                                f"${reserved:.4f} ({budget.report()})")
+    file_id = await client.upload(b"".join(lines))
+    # Saved first: if create_batch's outcome is lost, the next run reconciles.
+    set_state(tgt, "voyage_pending_input_file", file_id)
+    set_state(tgt, "voyage_pending_input_space", _voyage_space())
+    tgt.commit()
+    batch = await client.create_batch(file_id)
+    _track_batch(tgt, batch["id"])
+    print(f"Submitted Voyage batch {batch['id']} ({len(lines)} chunks)")
+    return batch["id"], reserved
+
+
+async def _collect_voyage_batch(tgt, client, budget, batch_id, reserved, commit_every,
+                                resumed, bar):
+    """Poll to a terminal state, stream the output into chunk_vectors, count
+    the error file, settle the budget, forget the id, then delete its files
+    (only after the results are committed). `bar` is _collect_all's handle."""
+    import voyage
+
+    batch = await client.get_batch(batch_id)
+    if resumed and (
+            get_state(tgt, "voyage_batch_space", _voyage_space()) != _voyage_space()
+            or batch.get("model", voyage.model_id()) != voyage.model_id()):
+        raise _DiscardBatch(batch, "it was submitted under another EMBED_MODEL/EMBED_DIM")
+    total = (batch.get("request_counts") or {}).get("total") or None
+    with progress.track(f"Waiting on Voyage batch {batch_id}", total=total,
+                        parent=bar) as p:
+        seen = 0
+        while True:
+            counts = batch.get("request_counts") or {}
+            done = counts.get("completed", 0) + counts.get("failed", 0)
+            p.advance(max(0, done - seen))
+            seen = max(seen, done)
+            if batch["status"] in voyage.TERMINAL:
+                break
+            await asyncio.sleep(config.VOYAGE_POLL_SECONDS)
+            batch = await client.get_batch(batch_id)
+
+    n_stored, n_stale, n_failed, n_errored, tokens, pending = 0, 0, 0, 0, 0, []
+    if batch.get("output_file_id"):
+        async for line in client.stream_file(batch["output_file_id"]):
+            rec = json.loads(line)
+            response = rec.get("response") or {}
+            if response.get("status_code") != 200:
+                n_failed += 1  # stays missing; the next round resubmits it
+                continue
+            body = response["body"]
+            tokens += (body.get("usage") or {}).get("total_tokens", 0)
+            vec = body["data"][0]["embedding"]
+            if len(vec) != config.EMBED_DIM:
+                raise _DiscardBatch(batch, f"it returned {len(vec)}-dim vectors, "
+                                           f"EMBED_DIM is {config.EMBED_DIM}")
+            row = _voyage_row(tgt, rec["custom_id"], vec)
+            if row is None:
+                n_stale += 1
+                continue
+            pending.append(row)
+            if len(pending) >= commit_every:
+                _insert_vectors(tgt, pending)
+                tgt.commit()
+                n_stored += len(pending)
+                pending = []
+    _insert_vectors(tgt, pending)
+    tgt.commit()
+    n_stored += len(pending)
+    budget.settle(reserved, tokens * config.VOYAGE_BATCH_PRICE_PER_M / 1e6)
+    if batch.get("error_file_id"):
+        async for _ in client.stream_file(batch["error_file_id"]):
+            n_errored += 1  # their chunks stay missing and join the next round
+    summary = (f"Voyage batch {batch_id} {batch['status']}: {n_stored} vectors stored, "
+               f"{n_stale} stale discarded, {n_failed} failed, {n_errored} errored")
+    if batch["status"] == "failed":
+        # codes and line numbers only: an error message may quote input text
+        errors = (batch.get("errors") or {}).get("data") or []
+        summary += f" ({[(e.get('code'), e.get('line')) for e in errors]})"
+    print(summary)
+
+    _save_batch_ids(tgt, [b for b in _saved_batch_ids(tgt) if b != batch_id])
+    await _delete_batch_files(client, batch)
+
+
+async def _delete_batch_files(client, batch):
+    for file_id in (batch.get("input_file_id"), batch.get("output_file_id"),
+                    batch.get("error_file_id")):
+        if file_id:
+            await client.delete_file(file_id)
+
+
+async def _finish_voyage_batch(tgt, client, budget, batch_id, reserved, commit_every,
+                               resumed, bar):
+    """_collect_voyage_batch, dropping a batch that must not be stored: one
+    from another embedding space, or (on resume only) one Voyage no longer
+    serves. Its chunks stay missing, so nothing is paid twice."""
+    import voyage
+
+    try:
+        await _collect_voyage_batch(tgt, client, budget, batch_id, reserved, commit_every,
+                                    resumed, bar)
+    except (_DiscardBatch, voyage.NotFound) as e:
+        if isinstance(e, voyage.NotFound) and not resumed:
+            raise
+        why = e.args[1] if isinstance(e, _DiscardBatch) else "Voyage no longer has it"
+        print(f"warning: dropping Voyage batch {batch_id}: {why}; its chunks are resubmitted")
+        budget.settle(reserved, reserved)
+        _save_batch_ids(tgt, [b for b in _saved_batch_ids(tgt) if b != batch_id])
+        if isinstance(e, _DiscardBatch):
+            await _delete_batch_files(client, e.args[0])
+
+
+async def _collect_all(tgt, client, budget, batches, commit_every, resumed=False):
+    """Finish (batch_id, reserved) pairs concurrently under one live display.
+    Each batch's bar nests under this one: a second top-level track would see
+    sys.stdout already redirected by the first's Live (not a tty) and fall
+    back to plain lines."""
+    with progress.track("Collecting Voyage batches", total=len(batches),
+                        bar_only=True) as bar:
+        async def finish(batch_id, reserved):
+            await _finish_voyage_batch(tgt, client, budget, batch_id, reserved,
+                                       commit_every, resumed, bar)
+            bar.advance()
+        await asyncio.gather(*(finish(b, r) for b, r in batches))
+
+
+async def _embed_voyage(tgt, budget, max_parallel, min_chars, commit_every):
+    import hosted
+    import voyage
+
+    # One Limiter per event loop; every batch of this run shares it.
+    async with voyage.BatchClient(hosted.Limiter(max_parallel)) as client:
+        # Saved batches finish before anything new is submitted: never pay twice.
+        await _reconcile_pending_input(tgt, client)
+        await _collect_all(tgt, client, budget,
+                           [(b, 0.0) for b in _saved_batch_ids(tgt)], commit_every,
+                           resumed=True)
+        stalled = 0
+        while True:
+            rows = unembedded_chunks(tgt, min_chars)
+            if not rows:
+                return
+            print(f"Embedding {len(rows)} conversation chunks via the Voyage Batch API "
+                  f"({EMBED_MODEL})...")
+            submitted = [
+                await _submit_voyage_batch(tgt, client, budget, batch_rows, lines)
+                for batch_rows, lines in voyage.pack_lines([(r[0], r[4]) for r in rows])]
+            await _collect_all(tgt, client, budget, submitted, commit_every)
+            if len(unembedded_chunks(tgt, min_chars)) < len(rows):
+                stalled = 0
+                continue
+            stalled += 1
+            if stalled >= config.VOYAGE_MAX_STALLED_ROUNDS:
+                raise hosted.HostedStop(f"{stalled} Voyage rounds in a row embedded nothing")
+
+
+def embed_chunks_voyage(tgt: sqlite3.Connection, budget, max_parallel,
+                        min_chars=CHUNK_MIN_CHARS, commit_every=EMBED_COMMIT_EVERY):
+    """Embed every pending chunk through the Voyage Batch API: finish batches a
+    previous run saved in ingest_state.voyage_batch_ids, then submit, poll and
+    collect until nothing is missing. Raises hosted.HostedStop on a
+    non-transient stop; SystemExit(1) when the final re-count from the DB is
+    not 0."""
+    try:
+        asyncio.run(_embed_voyage(tgt, budget, max_parallel, min_chars, commit_every))
+    except KeyboardInterrupt:
+        print("\nInterrupted -- submitted Voyage batches stay saved; the next "
+              "ingest collects them before submitting anything new.")
+        raise
+    finally:
+        tgt.commit()
+        print(budget.report())
+    missing = len(unembedded_chunks(tgt, min_chars))
+    print(f"{missing} chunks without a vector")
+    if missing:
+        raise SystemExit(f"error: {missing} chunks still have no vector -- re-run ingest "
+                         f"to resubmit them")

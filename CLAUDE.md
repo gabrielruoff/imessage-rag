@@ -4,7 +4,8 @@ Makes iMessage history queryable by a local LLM: ingest macOS `chat.db` into a
 normalized SQLite store (`imessage_analysis.db`) with FTS5 keyword search and
 sqlite-vec semantic search over conversation chunks, exposed to an Ollama chat
 model (or opt-in Apple Foundation Models) as tool calls. Retrieval, not
-context-stuffing — the corpus never enters the prompt.
+context-stuffing — the corpus never enters the prompt. Opt-in, paid hosted
+backends: Voyage embeddings and OpenRouter annotation (`docs/DEMO.md`).
 
 Design history and rationale: [`docs/DECISIONS.md`](docs/DECISIONS.md). Feature
 runbook: `docs/DEMO.md`. Every tunable: `config.py` (the single source;
@@ -60,6 +61,7 @@ gotcha.
 | Shared libs | `config.py`, `db.py`, `ollama.py`/`applefm.py`, `embeddings.py`, `progress.py`, `stats.py`, `consent.py`, `wellbeing.py`, `chat_floor.py` |
 | Retrieval tools | `query_tools/` (37 schemas, 5 flag-gated); `_shared.py` owns connection/caps/date-bounds/scope/identity |
 | Optional web layer | `api/` (FastAPI SSE over `chat.run_turn_events`) + `frontend/` (Vite/React) — transport only |
+| Hosted backends (opt-in) | `hosted.py` (budget, retry/classify, `Limiter`, upload notice), `voyage.py` (`voyage/` EMBED_MODEL: batch documents, sync queries), `openrouter.py` + `annotate_hosted.py` (`openrouter/` ANNOTATE_MODEL) |
 | Optional MCP layer | `mcp_server/` (stdio, 21 read-only tools; transport only) |
 | Eval | `eval/evalkit/` (S1–S17 regression + F4 gates) |
 
@@ -97,6 +99,10 @@ App DB (web UI only, `config.APP_DB`): `api/store.py`.
   Search tools return an envelope
   (`rows`/`total_matching`/`returned`/`order`/`truncated`), not a bare list.
 - `REPO_REVIEW.md` / `REPO_FIX_PLAN.md` are gitignored working files — never commit.
+- **Subagent defaults:** implementing agents (implementation and fix work)
+  default to Opus 5.5 (`model: "opus"`) at `effort: "medium"`; reviewer agents
+  default to Opus 5.5 at `effort: "xhigh"`. An explicit user instruction
+  overrides either default.
 
 ## Gotchas (load-bearing)
 
@@ -151,7 +157,11 @@ App DB (web UI only, `config.APP_DB`): `api/store.py`.
   client launches use `make -s --no-print-directory -C … mcp`.
 - **Never read the live `chat.db`** (WAL sidecars) — only the snapshot from
   `ingest.snapshot_source`. Ingestion is append-only; `--senders`/`--lookback`
-  scope what a run reads, never what it deletes.
+  scope what a run reads, never what it deletes. `messages` is upserted
+  (`ON CONFLICT(id) DO UPDATE`; a guid that comes back under a new ROWID is
+  re-keyed by `ingest._claim_rowid`), never `INSERT OR REPLACE`: REPLACE resets
+  the derived `chunk_id` (every full re-read duplicates chunks) and skips the FTS
+  delete trigger.
 - **Paths resolve relative to `config.py`'s directory**, not the CWD, and
   `load_dotenv` is pinned there — a worktree never inherits a parent `.env`.
 - **`make pipeline`/`suite` must stay serial** (never `-j`): they hold a SQLite
@@ -161,4 +171,16 @@ App DB (web UI only, `config.APP_DB`): `api/store.py`.
   Apple `format="json"` is not a guided schema (use `applefm.respond(schema=…)`
   for constrained decoding). Batch annotation there packs by chars, not
   batch size.
+- **Hosted backends** are selected by a model-name prefix, like `apple`.
+  `openrouter/` is annotate-only (per-chunk tiers): the `ollama.py` seam
+  (`chat_once`/`chat_once_json`/`chat_stream`) refuses it, so never add an
+  OpenRouter dispatch there. Voyage documents are batch-only
+  (`embed_texts(kind="document")` raises); only chat-time queries go sync,
+  unbudgeted and printing nothing. Hosted ingest/annotate runs refuse to start
+  without `--budget` or `HOSTED_BUDGET_USD` (no default), never skip a chunk,
+  and exit non-zero on a DB recount with anything pending. Guards record the
+  configured prefixed name, never a provider-echoed model id.
+- **Dyad terms guard on `terms_model`**, not `annotate_model`, and always
+  curate locally (`CHAT_MODEL` under a hosted `ANNOTATE_MODEL`), so hosted
+  chunks and local terms don't trip each other.
 - **Don't read or modify `tests/`** unless the task is about tests.

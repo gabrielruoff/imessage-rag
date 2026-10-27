@@ -7,9 +7,11 @@ Pipeline:
   3. Join message/handle/chat/attachment tables into a normalized schema,
      enriching handles with contact names from ./address_book.abcddb if present
   4. Build an FTS5 index over message text
-  5. Group messages into conversation chunks and embed them via local Ollama
-     (nomic-embed-text) into a sqlite-vec table -- both stages live in
-     chunking.py; this module runs them (and re-exports them for callers)
+  5. Group messages into conversation chunks and embed them into a sqlite-vec
+     table -- via local Ollama (nomic-embed-text), or for EMBED_MODEL=voyage/<id>
+     via the Voyage Batch API (submit, save the batch ids in ingest_state, poll,
+     collect; an interrupted run's batches are finished first next time). Both
+     stages live in chunking.py; this module runs them (and re-exports them)
 
 Usage:
     python3 ingest.py                  # full pipeline
@@ -24,12 +26,16 @@ Usage:
     python3 ingest.py --lookback=3mo    # only ingest messages from the last 3 months
                                         # (units d/w/mo/y); an extra lower bound on
                                         # message.date, combines with the flags above
+    python3 ingest.py --budget 2 --max-parallel 4
+                                        # voyage/ EMBED_MODEL only: USD spend cap
+                                        # (else HOSTED_BUDGET_USD) and requests in flight
 """
 
 import argparse
 import calendar
 import datetime
 import http.client
+import json
 import re
 import shutil
 import sqlite3
@@ -37,8 +43,24 @@ import sys
 from pathlib import Path
 
 import progress
-from chunking import build_chunks, build_vec_table, embed_chunks
-from config import ADDRESS_BOOK_PATH, SNAPSHOT_DB, SOURCE_DB, TARGET_DB
+from chunking import (
+    build_chunks,
+    build_vec_table,
+    embed_chunks,
+    embed_chunks_voyage,
+    unembedded_chunks,
+)
+from config import (
+    ADDRESS_BOOK_PATH,
+    EMBED_MODEL,
+    HOSTED_MAX_PARALLEL,
+    SNAPSHOT_DB,
+    SOURCE_DB,
+    TARGET_DB,
+    VOYAGE_API_KEY,
+    hosted_model_id,
+    is_voyage_model,
+)
 from db import get_state, load_vec_extension, set_state, strip_reaction_guid_prefix
 from lexicon_build import build_dyad_terms, build_person_period_lexicon
 from sessions import build_sessions
@@ -381,6 +403,80 @@ def ingest_handles(src, tgt, contacts, handle_to_contact):
     print(f"Ingested {len(rows)} handles ({matched} matched to a contact)")
 
 
+# A true upsert (never INSERT OR REPLACE -- see docs/DECISIONS.md, "message
+# upsert"): source columns are refreshed in place, derived columns (chunk_id)
+# survive. Contract: an edited message keeps its chunk_id, so its chunk text may
+# be stale. ON CONFLICT covers only `id`; a `guid` clash is resolved first by
+# _claim_rowid.
+_MESSAGE_SOURCE_COLS = (
+    "guid", "chat_id", "handle_id", "is_from_me", "text", "decode_failed",
+    "date", "date_read", "date_delivered", "item_type", "is_emote", "has_attachment")
+_MESSAGE_UPSERT_SQL = (
+    f"INSERT INTO messages(id, {', '.join(_MESSAGE_SOURCE_COLS)}) "
+    f"VALUES ({', '.join('?' * (len(_MESSAGE_SOURCE_COLS) + 1))}) "
+    "ON CONFLICT(id) DO UPDATE SET "
+    + ", ".join(f"{c} = excluded.{c}" for c in _MESSAGE_SOURCE_COLS))
+
+
+# Every column outside `messages` that stores a messages.id. A re-key must
+# carry all of them, or the row's chunk/session/nudge/attachment links dangle.
+_MESSAGE_ID_REFS = (
+    ("attachments", "message_id"),
+    ("chunks", "first_message_id"), ("chunks", "last_message_id"),
+    ("sessions", "first_message_id"), ("sessions", "last_message_id"),
+    ("dyad_terms", "first_message_id"),
+    ("loose_threads", "anchor_message_id"),
+    ("conflict_signals", "message_id"),
+)
+
+
+def _move_message(tgt, old_id, new_id):
+    """Re-key one messages row and every stored reference to it. messages_au
+    moves its FTS entry; chunk_id and all other columns travel with the row."""
+    tgt.execute("UPDATE messages SET id = ? WHERE id = ?", (new_id, old_id))
+    for table, col in _MESSAGE_ID_REFS:
+        tgt.execute(f"UPDATE {table} SET {col} = ? WHERE {col} = ?", (new_id, old_id))
+    # Ids inside JSON: an event cites a message of its own chunk only.
+    for chunk_id, events_json in tgt.execute(
+            "SELECT a.chunk_id, a.events_json FROM chunk_annotations a "
+            "JOIN messages m ON m.chunk_id = a.chunk_id WHERE m.id = ?",
+            (new_id,)).fetchall():
+        events = json.loads(events_json or "[]")
+        if any(ev.get("message_id") == old_id for ev in events):
+            for ev in events:
+                if ev.get("message_id") == old_id:
+                    ev["message_id"] = new_id
+            tgt.execute("UPDATE chunk_annotations SET events_json = ? WHERE chunk_id = ?",
+                        (json.dumps(events), chunk_id))
+    tgt.execute(
+        "UPDATE conflicts SET peak_signal_json = "
+        "json_set(peak_signal_json, '$.peak_gap_message_id', ?) "
+        "WHERE json_extract(peak_signal_json, '$.peak_gap_message_id') = ?",
+        (new_id, old_id))
+
+
+def _claim_rowid(tgt, rowid, guid):
+    """Make (rowid, guid) safe for _MESSAGE_UPSERT_SQL when chat.db has moved
+    messages to new ROWIDs (iCloud resync, restore onto a new Mac): guid is the
+    message's identity, ROWID is only its current address.
+
+    - Another message holds `rowid`: park it at a fresh negative id (a row with
+      no current source ROWID) so the upsert cannot overwrite it. Its guid
+      re-arriving later moves it to its new ROWID; until then it stays, since
+      ingest never deletes a message.
+    - This guid sits at another id: move that row to `rowid`, keeping its
+      chunk_id and references, so the newest source row wins without a re-chunk.
+    """
+    held = tgt.execute("SELECT guid FROM messages WHERE id = ?", (rowid,)).fetchone()
+    if held and held[0] != guid:
+        park = tgt.execute(
+            "SELECT MIN(COALESCE(MIN(id), 0), 0) - 1 FROM messages").fetchone()[0]
+        _move_message(tgt, rowid, park)
+    prev = tgt.execute("SELECT id FROM messages WHERE guid = ?", (guid,)).fetchone()
+    if prev and prev[0] != rowid:
+        _move_message(tgt, prev[0], rowid)
+
+
 def ingest_messages_and_reactions(src, tgt, since_rowid=0, allowed_chat_ids=None,
                                   since_date_ns=None):
     params = [since_rowid]
@@ -441,11 +537,8 @@ def ingest_messages_and_reactions(src, tgt, since_rowid=0, allowed_chat_ids=None
                 )
                 n_react += 1
             else:
-                tgt.execute(
-                    "INSERT OR REPLACE INTO messages"
-                    "(id, guid, chat_id, handle_id, is_from_me, text, decode_failed, "
-                    " date, date_read, date_delivered, item_type, is_emote, has_attachment) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                _claim_rowid(tgt, rowid, guid)
+                tgt.execute(_MESSAGE_UPSERT_SQL,
                     (rowid, guid, chat_id, handle_id, is_from_me, text, decode_failed,
                      apple_ns_to_iso(date), apple_ns_to_iso(date_read),
                      apple_ns_to_iso(date_delivered), item_type, is_emote,
@@ -522,18 +615,56 @@ def _build_parser():
                           "(units d=days/w=weeks/mo=months/y=years); an extra lower "
                           "bound on message.date, combines with --since-last/--senders/"
                           "--exclude")
+    ap.add_argument("--budget", type=float, default=None, metavar="USD",
+                     help="voyage/ EMBED_MODEL only: spend cap for this run "
+                          "(else HOSTED_BUDGET_USD; one of the two is required)")
+    ap.add_argument("--max-parallel", type=int, default=None, metavar="N",
+                     help="voyage/ EMBED_MODEL only: max Voyage requests in flight "
+                          f"(default HOSTED_MAX_PARALLEL={HOSTED_MAX_PARALLEL})")
     return ap
+
+
+def _embed_voyage(tgt, budget, max_parallel):
+    """The voyage/ embedding step. A HostedStop becomes an exit naming the
+    cause and how many chunks are still pending."""
+    import hosted
+
+    hosted.upload_notice(f"Voyage AI ({hosted_model_id(EMBED_MODEL)})", "chunk text")
+    build_vec_table(tgt, detect_embed_dim())
+    tgt.commit()
+    try:
+        embed_chunks_voyage(tgt, budget, max_parallel)
+    except hosted.HostedStop as e:
+        pending = len(unembedded_chunks(tgt))
+        raise SystemExit(f"error: Voyage run stopped: {e.cause}\n"
+                         f"  {pending} chunks still have no vector; re-run ingest to "
+                         f"resume.") from None
 
 
 def main():
     ap = _build_parser()
     args = ap.parse_args()
+    use_voyage = is_voyage_model(EMBED_MODEL)
+    if not use_voyage and (args.budget is not None or args.max_parallel is not None):
+        ap.error("--budget / --max-parallel only apply to hosted models "
+                 f"(EMBED_MODEL={EMBED_MODEL})")
+    if args.no_embed and (args.budget is not None or args.max_parallel is not None):
+        ap.error("--budget / --max-parallel have no effect with --no-embed")
 
     senders = _split_csv(args.senders)
     excluded = _split_csv(args.exclude)
     # Parse-and-validate before the (potentially multi-GB) snapshot copy so a
     # typo fails instantly rather than minutes in.
     lookback = _parse_lookback(args.lookback)
+    if use_voyage and not args.no_embed:
+        import hosted
+
+        if not VOYAGE_API_KEY.strip():
+            raise SystemExit(f"EMBED_MODEL={EMBED_MODEL} needs VOYAGE_API_KEY (set it in "
+                             f".env), or re-run with --no-embed")
+        budget = hosted.Budget(hosted.resolve_budget_usd(args.budget))
+        max_parallel = hosted.check_max_parallel(
+            HOSTED_MAX_PARALLEL if args.max_parallel is None else args.max_parallel)
 
     snapshot_source(SOURCE_DB, SNAPSHOT_DB)
 
@@ -609,7 +740,9 @@ def main():
             build_person_period_lexicon(tgt)
             build_dyad_terms(tgt)
 
-            if not args.no_embed:
+            if not args.no_embed and use_voyage:
+                _embed_voyage(tgt, budget, max_parallel)
+            elif not args.no_embed:
                 try:
                     dim = detect_embed_dim()
                 except (http.client.HTTPException, OSError, RuntimeError) as e:

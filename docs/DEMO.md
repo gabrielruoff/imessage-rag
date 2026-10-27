@@ -4,7 +4,8 @@ This is an operator runbook for demoing every feature in the **Close Read** anal
 suite (Waves 0–4) against your **real, already-ingested** iMessage history. Everything
 here is deterministic local compute narrated by a local model (`CHAT_MODEL`, by default
 `qwen3.5:4b` on Ollama) — the corpus is queried by tool calls, never stuffed into a
-prompt, and nothing leaves the machine.
+prompt, and nothing leaves the machine (unless you opt into
+[Hosted models](#hosted-models-opt-in-paid), which upload chunk text).
 
 Every step below is a copy-pasteable command or an exact chat prompt, with a one-line
 "what you'll see." Where a `make` target exists it's shown first; the underlying
@@ -651,6 +652,140 @@ claude mcp add imessage --scope user -- make -s --no-print-directory -C /ABS/PAT
 #    mcp__imessage__* tool calls (approve each one as it is asked for).
 claude
 ```
+
+---
+
+## Hosted models (opt-in, paid)
+
+Two pipelines can run on a hosted API instead of Ollama. Everything else (the
+chat model, topics, Wrapped, the analytical suite, dyad-term curation) stays
+local, and `openrouter/` is refused anywhere but `annotate.py`. **Choosing the
+model is the consent:** there is no extra flag, and each run prints one line
+saying what it uploads and where. Rationale and evidence:
+[`DECISIONS.md`](DECISIONS.md), "2026-10-26: hosted embeddings (Voyage) and
+hosted annotation (OpenRouter)".
+
+| Pipeline | Setting | Uploads | To | Full-corpus cost (77,696 chunks) |
+|---|---|---|---|---|
+| Embeddings, ingest | `EMBED_MODEL=voyage/voyage-4-large` | every chunk's text, as one Batch API file | Voyage AI | ≈ **$1.31** |
+| Embeddings, chat-time | (same) | each semantic search's query string | Voyage AI (sync endpoint) | ≈ $0.000003/query, not budgeted |
+| Annotation | `ANNOTATE_MODEL=openrouter/anthropic/claude-haiku-5.5` | each chunk's text, one request per chunk | OpenRouter (Anthropic-family upstream) | ≈ **$6.3–7.7** with `--all` |
+
+### 1. Keys
+
+Put them in `.env` and nowhere else: `VOYAGE_API_KEY=…` and
+`OPEN_ROUTER_API_KEY=…`. **Never print them**: no `cat .env`, no `echo $VOYAGE_API_KEY`,
+no pasting them into a chat. `make doctor` reports `[ ok ]`/`[fail]` for the key a
+hosted model needs without showing it, and a hosted run with its key empty is
+refused before anything is uploaded.
+
+### 2. Use a separate DB
+
+```bash
+export TARGET_DB=imessage_analysis_voyage.db
+export EMBED_MODEL=voyage/voyage-4-large
+export ANNOTATE_MODEL=openrouter/anthropic/claude-haiku-5.5
+```
+
+- **Switching `EMBED_MODEL` is always `reset_db.py` plus a re-ingest**:
+  `chunk_vectors` is dimensioned for one model (1024 here, `EMBED_DIM`; one of
+  256/512/1024/2048) and the guard refuses to mix spaces. A separate `TARGET_DB`
+  keeps your local DB intact for comparison.
+- The `annotate_model` guard also refuses Haiku rows on top of local
+  `source='llm'` rows. The pilot found the local labels are the noisy side, so the
+  two are never mixed.
+- **Every later command, chat included, needs the same `TARGET_DB` and
+  `EMBED_MODEL`**: query vectors must come from the model that built the table. To
+  make it permanent, put the three lines in `.env` (unexported).
+
+### 3. Embed with Voyage
+
+```bash
+.venv/bin/python3 reset_db.py -f     # a no-op on a new path; clears it on a redo
+.venv/bin/python3 ingest.py --budget 5
+```
+
+(`make ingest INGEST_ARGS='--budget 5'` works too, but checks that Ollama is up
+first.) What you'll see and what it does:
+
+- `uploading chunk text to Voyage AI (voyage-4-large)`, then
+  `Submitted Voyage batch <id>`. Documents go **only** through the Batch API (33%
+  off); the input file is built in memory and never written to disk.
+- **The batch id is saved in `ingest_state` before polling starts.** Ingest polls
+  every `VOYAGE_POLL_SECONDS` (30) with a progress line until the batch is done
+  (Voyage's completion window is 12 h). **Ctrl-C is safe:** the next ingest
+  finishes the saved batches *before* it submits anything new, so nothing is paid
+  for twice. Don't delete the DB while a batch is in flight, or its id is lost.
+- Results stream into `chunk_vectors` and commit every `EMBED_COMMIT_EVERY`. A
+  vector whose chunk text changed since submit (ingest rebuilds tail chunks) is
+  discarded as stale, and that chunk is resubmitted. Errored lines go into
+  follow-up batches until nothing errors. After `VOYAGE_MAX_STALLED_ROUNDS` (3)
+  rounds in a row that embed nothing, the run stops.
+- Once a batch's results are committed, its input, output and error files are
+  deleted on Voyage. This is best-effort and only warns on failure; Voyage would
+  otherwise keep them for about 30 days.
+- The run ends with `N chunks without a vector`, recounted from the DB, and exits
+  non-zero unless N is 0. A rerun resubmits only what's missing, and so does
+  every later incremental ingest (which also needs a budget).
+- **Budget.** Before each upload the run reserves the worst case (UTF-8 bytes of
+  every input × `VOYAGE_BATCH_PRICE_PER_M`) and refuses if it doesn't fit. Voyage
+  reports usage per output line, and the spend settles at their sum. On the
+  reference corpus, 55.0M bytes reserve **$4.42 for a $1.31 batch**, so a full
+  first run needs `--budget` ≥ ~4.5.
+
+### 4. Annotate with Haiku
+
+```bash
+ANNOTATE_THINK=false HOSTED_BUDGET_USD=10 make annotate-all
+# or, with flags:
+ANNOTATE_THINK=false .venv/bin/python3 annotate.py --all --budget 10 --max-parallel 4
+```
+
+- **`ANNOTATE_THINK=false` is deliberate:** an explicit env value wins over the
+  tier's preset, so an `ANNOTATE_THINK=true` in `.env` would make Haiku send
+  `reasoning: {enabled: true}`, which was never measured and bills reasoning
+  tokens. `false` is the measured setting (0 reasoning tokens).
+- **The full-corpus run is `--all` / `make annotate-all`.** Plain `make annotate`
+  covers only the top `ANNOTATE_TOP_DYADS` (20) chats, and the cost above is for
+  `--all`. `make` forwards no flags, so the budget comes from `HOSTED_BUDGET_USD`.
+  The target's second line, `annotate.py --terms`, curates terms locally on
+  `CHAT_MODEL` with a printed note, so Ollama must be running.
+- **Spend cap, required:** `--budget USD` or `HOSTED_BUDGET_USD`. There is no
+  default, and a run with neither refuses to start. Each request reserves its worst
+  case (prompt bytes × input price + 1,024 × output price) and settles at the
+  reported cost. $10 covers the estimate with headroom.
+- **`--max-parallel N`**: requests in flight (default `HOSTED_MAX_PARALLEL=1`,
+  strictly sequential). The effective limit halves on a 429 and climbs back, never
+  above N. `--budget`/`--max-parallel` with a local model is an error.
+- **Tiers:** only the per-chunk ones, always one chunk per request with a cached
+  system+schema prefix. The default `distilled` (from the env) runs `balanced`
+  with a note, `fast`'s batch size is ignored, and `--quality distilled|hybrid`
+  or `ANNOTATE_QUALITY=hybrid` is refused.
+- What prints: `uploading chunk text (anthropic/claude-haiku-5.5) to OpenRouter`;
+  once per run, `OpenRouter served <id>`, which may be a dated snapshot id such as
+  `…-20261007` (the guard records your configured value, not this); and a
+  warning if `cached_tokens` stays 0 after the first `OPENROUTER_CACHE_CHECK_CALLS`
+  (3) calls following the first. In that case every
+  request pays the full prefix and the cost runs about 2× the estimate.
+- 429s, 5xx and timeouts are retried until they succeed, and a moderation 403 is
+  rerouted to another upstream provider. Nothing is skipped. The run ends with
+  `pending: N` (recounted from the DB) and the spend, and exits non-zero listing
+  any chunk ids that stayed unparseable (after `OPENROUTER_UNPARSEABLE_RETRIES`,
+  3) or refused. Ctrl-C commits what was written, then exits non-zero (chunks
+  are still pending, so a `make pipeline` stops there); rerun to resume.
+
+### 5. Chat against it
+
+```bash
+make chat ARGS='-p "When did we talk about moving?"'   # same TARGET_DB / EMBED_MODEL
+```
+
+`search_conversations`, hybrid search and the other tools that embed a query
+(`draft_reply`, the conflict trace) do it through
+Voyage's sync endpoint, which uploads the query text, prints nothing and isn't
+budgeted. If that call still fails after 3 attempts, the semantic tool returns an
+error to the model, as it does when Ollama is down. **There is no automatic
+fallback to FTS**; the keyword tools keep working.
 
 ---
 

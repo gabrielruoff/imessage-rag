@@ -224,10 +224,12 @@ CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
     INSERT INTO messages_fts(messages_fts, rowid, text) VALUES ('delete', old.id, old.text);
 END;
 
--- UPDATE OF text (not any column): chunk building stamps chunk_id on every
--- message, and an unscoped trigger would pointlessly rewrite the FTS entry
--- for each of those updates.
-CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE OF text ON messages BEGIN
+-- Touches FTS only when the indexed (rowid, text) pair actually changes:
+-- chunk building stamps chunk_id on every message, a full re-read rewrites
+-- every row's text to the same value, and ingest's re-key (_move_message)
+-- changes only id. Each of those must cost no FTS work beyond the real change.
+CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE OF id, text ON messages
+WHEN old.id IS NOT new.id OR old.text IS NOT new.text BEGIN
     INSERT INTO messages_fts(messages_fts, rowid, text) VALUES ('delete', old.id, old.text);
     INSERT INTO messages_fts(rowid, text) VALUES (new.id, new.text);
 END;
@@ -342,8 +344,8 @@ def create_schema(con: sqlite3.Connection):
             if col not in lex_cols:
                 con.execute(f"ALTER TABLE person_period_lexicon ADD COLUMN {col} INTEGER")
 
-    # The update trigger used to fire on ANY messages update; drop it so
-    # FTS_SCHEMA recreates it scoped to UPDATE OF text (see comment there).
+    # Always drop the update trigger so FTS_SCHEMA recreates it from its
+    # current definition (IF NOT EXISTS would keep an older body forever).
     con.execute("DROP TRIGGER IF EXISTS messages_au")
 
     con.executescript(SCHEMA)
