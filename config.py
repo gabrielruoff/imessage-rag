@@ -209,6 +209,17 @@ HOSTED_BACKOFF_MAX_SECONDS = int(os.getenv("HOSTED_BACKOFF_MAX_SECONDS") or "60"
 VOYAGE_BATCH_PRICE_PER_M = float(os.getenv("VOYAGE_BATCH_PRICE_PER_M") or "0.0804")
 # Voyage batch limit: inputs per batch.
 VOYAGE_BATCH_MAX_INPUTS = int(os.getenv("VOYAGE_BATCH_MAX_INPUTS") or "100000")
+# Voyage batch rounds in a row that may leave the missing-vector count unchanged
+# before an ingest run stops.
+VOYAGE_MAX_STALLED_ROUNDS = _positive_int_env("VOYAGE_MAX_STALLED_ROUNDS", 3)
+# Attempts on the chat-time Voyage query call before it errors (a chat turn must
+# not hang on a dead API).
+VOYAGE_SYNC_ATTEMPTS = _positive_int_env("VOYAGE_SYNC_ATTEMPTS", 3)
+# Parse failures on one OpenRouter chunk retried before it is reported unparseable.
+OPENROUTER_UNPARSEABLE_RETRIES = int(os.getenv("OPENROUTER_UNPARSEABLE_RETRIES") or "3")
+# Successful OpenRouter calls after the first that may all read 0 cached tokens
+# before the one-time "prompt cache is not hitting" warning.
+OPENROUTER_CACHE_CHECK_CALLS = int(os.getenv("OPENROUTER_CACHE_CHECK_CALLS") or "3")
 
 # --- CLI progress -------------------------------------------------------------
 # 'auto' draws a live bar on a terminal and falls back to periodic plain lines

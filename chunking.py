@@ -365,9 +365,6 @@ def embed_chunks(
 # saved; "" when none), voyage_pending_input_space (the space that file was
 # uploaded under).
 
-# Rounds in a row that may leave the missing count unchanged before the run stops.
-_VOYAGE_MAX_STALLED_ROUNDS = 3
-
 
 class _DiscardBatch(Exception):
     """A batch whose results must not be stored (gone, or another embedding
@@ -581,7 +578,7 @@ async def _embed_voyage(tgt, budget, max_parallel, min_chars, commit_every):
                 stalled = 0
                 continue
             stalled += 1
-            if stalled >= _VOYAGE_MAX_STALLED_ROUNDS:
+            if stalled >= config.VOYAGE_MAX_STALLED_ROUNDS:
                 raise hosted.HostedStop(f"{stalled} Voyage rounds in a row embedded nothing")
 
 

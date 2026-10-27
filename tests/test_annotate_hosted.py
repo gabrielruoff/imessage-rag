@@ -256,6 +256,21 @@ class TestHostedRun(HostedFixture):
             self.main()
         self.assertEqual(self.n_rows(), 2)  # read on a separate connection: committed
 
+    def test_interrupt_commits_written_rows_and_propagates(self):
+        real_write = annotate._write_annotation
+        writes = []
+
+        def interrupting(con, chunk_id, data, source="llm"):
+            writes.append(chunk_id)
+            if len(writes) == 3:
+                raise KeyboardInterrupt
+            real_write(con, chunk_id, data, source=source)
+        with mock.patch.object(annotate, "_write_annotation", interrupting), \
+                self.assertRaises(KeyboardInterrupt):  # never a 0 exit with chunks pending
+            self.main()
+        self.assertEqual(self.n_rows(), 2)
+        self.assertIn("Interrupted -- committed 2 annotations", self.out.getvalue())
+
     def test_s4_whitespace_only_key_counts_as_unset(self):
         with mock.patch.object(config, "OPEN_ROUTER_API_KEY", " \n"), \
                 self.assertRaisesRegex(SystemExit, "OPEN_ROUTER_API_KEY is not set"):

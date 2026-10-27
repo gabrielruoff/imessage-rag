@@ -28,8 +28,7 @@ import hosted
 API = "https://api.voyageai.com/v1"
 # A batch in one of these states will not change again.
 TERMINAL = {"completed", "failed", "cancelled", "expired"}
-# The query path's attempt bound (a chat turn must not hang on a dead API).
-SYNC_ATTEMPTS = 3
+SYNC_ATTEMPTS = config.VOYAGE_SYNC_ATTEMPTS
 # GET /v1/batches page size (Voyage's maximum).
 _LIST_PAGE = 100
 
@@ -227,26 +226,33 @@ class BatchClient:
         yielded, attempt = 0, 0
         while True:
             response, cause = None, None
-            async with self.limiter:
-                try:
+            try:
+                # The slot covers the request and headers only, never a yield: a
+                # consumer that raises mid-stream leaves this generator suspended
+                # and unclosed, and a slot held there deadlocks its next request.
+                async with self.limiter:
                     # The live API 307s to a signed storage URL; httpx drops the
                     # Authorization header on that cross-origin hop.
-                    async with self.http.stream("GET", f"/files/{file_id}/content",
-                                                follow_redirects=True) as r:
-                        if hosted.classify(r) == "ok":
-                            seen = 0
-                            async for line in r.aiter_lines():
-                                if not line.strip():
-                                    continue
-                                seen += 1
-                                if seen > yielded:
-                                    yielded = seen
-                                    yield line
-                        else:
-                            await r.aread()
-                        response = r
-                except hosted.REQUEST_ERRORS as e:
-                    response, cause = None, (hosted.classify(e), type(e).__name__)
+                    r = await self.http.send(
+                        self.http.build_request("GET", f"/files/{file_id}/content"),
+                        stream=True, follow_redirects=True)
+                try:
+                    if hosted.classify(r) == "ok":
+                        seen = 0
+                        async for line in r.aiter_lines():
+                            if not line.strip():
+                                continue
+                            seen += 1
+                            if seen > yielded:
+                                yielded = seen
+                                yield line
+                    else:
+                        await r.aread()
+                finally:
+                    await r.aclose()
+                response = r
+            except hosted.REQUEST_ERRORS as e:
+                response, cause = None, (hosted.classify(e), type(e).__name__)
             if self._verdict(response, cause) == "ok":
                 return
             await asyncio.sleep(hosted.retry_delay(attempt, response))

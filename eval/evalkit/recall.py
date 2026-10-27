@@ -23,10 +23,9 @@ agreement with the held-out LLM labels (uploads those chunks to Voyage).
 
 import json
 import random
+import re
 import sys
 import time
-import urllib.error
-import urllib.request
 
 from . import EVAL_DIR, RESULTS_DIR
 from .manifest import resolve_db_path, write_json_atomic
@@ -47,17 +46,35 @@ _QUERY_PROMPT = (
 )
 
 
+def _db_tag(db_path):
+    """Cache key suffix for a source DB: chunk ids are only unique within one."""
+    return "-" + db_path.stem.replace(":", "_")
+
+
 def _voyage_db_path(model, tag=""):
-    """tag keys the cache to a source DB: chunk ids are only unique within one."""
+    """tag (from _db_tag) keys the cache to a source DB."""
     return RECALL_DIR / f"{model}{tag}.db"
+
+
+def _cache_dim(con):
+    """Declared FLOAT[n] of the cache's chunk_vectors, or None when absent."""
+    row = con.execute("SELECT sql FROM sqlite_master WHERE name = 'chunk_vectors'").fetchone()
+    m = re.search(r"FLOAT\[(\d+)\]", row[0]) if row else None
+    return int(m.group(1)) if m else None
 
 
 def _open_voyage_db(model, dim=None, tag=""):
     import db
 
     RECALL_DIR.mkdir(parents=True, exist_ok=True)
-    con = db.connect(str(_voyage_db_path(model, tag)), rows=False)
+    path = _voyage_db_path(model, tag)
+    con = db.connect(str(path), rows=False)
     if dim is not None:
+        have = _cache_dim(con)
+        if have is not None and have != dim:
+            # refuse before anything is uploaded: the insert would fail after billing
+            raise SystemExit(f"{path} holds {have}-dim vectors, not --dim {dim}; "
+                             f"delete it or pass --dim {have}")
         con.execute(
             "CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vectors USING vec0("
             f"chunk_id INTEGER PRIMARY KEY, embedding FLOAT[{dim}] distance_metric=cosine)"
@@ -65,30 +82,48 @@ def _open_voyage_db(model, dim=None, tag=""):
     return con
 
 
-def _voyage_embed(texts, model, input_type, api_key, retries=6):
-    """One Voyage request -> vectors in input order. Retries 429/5xx with
-    backoff; a 400 on a multi-text batch is split in half (token cap)."""
-    body = json.dumps({"input": texts, "model": model, "input_type": input_type}).encode()
-    req = urllib.request.Request(
-        VOYAGE_URL, data=body,
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-    )
-    for attempt in range(retries):
-        try:
-            with urllib.request.urlopen(req, timeout=300) as resp:
-                data = json.loads(resp.read())["data"]
-            return [d["embedding"] for d in sorted(data, key=lambda d: d["index"])]
-        except urllib.error.HTTPError as e:
-            if e.code == 400 and len(texts) > 1:
+def _voyage_embed(texts, model, input_type, dim, api_key, retries=6):
+    """One Voyage request at output_dimension `dim` -> vectors in input order.
+    Retries transient failures per hosted.classify/retry_delay; a 400 on a
+    multi-text batch is split in half (per-request token cap). Errors carry the
+    status and hosted.error_message only, never the raw body (it can quote
+    uploaded text) or a transport exception's text (it can quote the key)."""
+    import httpx
+
+    import config
+    import hosted
+
+    body = {"input": texts, "model": model, "input_type": input_type,
+            "output_dimension": dim, "output_dtype": "float"}
+    with httpx.Client(timeout=config.HOSTED_TIMEOUT) as client:
+        for attempt in range(retries):
+            response = None
+            try:
+                response = client.post(VOYAGE_URL, json=body,
+                                       headers={"Authorization": f"Bearer {api_key}"})
+                verdict = hosted.classify(response)
+            except hosted.REQUEST_ERRORS as e:
+                verdict, cause = hosted.classify(e), type(e).__name__
+            else:
+                cause = f"HTTP {response.status_code}"
+            if verdict == "ok":
+                data = sorted(response.json()["data"], key=lambda d: d["index"])
+                return [d["embedding"] for d in data]
+            if response is not None and response.status_code == 400 and len(texts) > 1:
                 mid = len(texts) // 2
-                return (_voyage_embed(texts[:mid], model, input_type, api_key)
-                        + _voyage_embed(texts[mid:], model, input_type, api_key))
-            if e.code != 429 and e.code < 500:
-                raise RuntimeError(f"Voyage {e.code}: {e.read().decode(errors='replace')}")
-        except (urllib.error.URLError, TimeoutError):
-            pass
-        time.sleep(2 ** attempt)
-    raise RuntimeError("Voyage request failed after retries")
+                return (_voyage_embed(texts[:mid], model, input_type, dim, api_key)
+                        + _voyage_embed(texts[mid:], model, input_type, dim, api_key))
+            if verdict != "retry":
+                if response is not None:
+                    try:
+                        msg = hosted.error_message(response.json())
+                    except ValueError:
+                        msg = ""
+                    cause += f": {msg}" if msg else ""
+                break
+            if attempt + 1 < retries:
+                time.sleep(hosted.retry_delay(attempt, response))
+    raise RuntimeError(f"Voyage embedding failed ({cause})")
 
 
 def _api_key():
@@ -152,7 +187,7 @@ def cmd_embed(args):
     import db
 
     src = db.connect(str(db_path), rows=False)
-    dst = _open_voyage_db(args.model, dim=args.dim)
+    dst = _open_voyage_db(args.model, dim=args.dim, tag=_db_tag(db_path))
     have = {r[0] for r in dst.execute("SELECT chunk_id FROM chunk_vectors")}
     wanted = [r[0] for r in src.execute("SELECT chunk_id FROM chunk_vectors ORDER BY chunk_id")]
     if args.pool:
@@ -162,7 +197,7 @@ def cmd_embed(args):
         sample = set(random.Random(args.seed).sample(rest, min(args.pool, len(rest))))
         wanted = sorted(gold | sample)
     print(f"{len(have)} already embedded, {len(set(wanted) - have)} to go")
-    _embed_missing(src, dst, wanted, args.model, api_key)
+    _embed_missing(src, dst, wanted, args.model, args.dim, api_key)
     return 0
 
 
@@ -206,9 +241,9 @@ def cmd_recall(args):
     n_base = base.execute("SELECT COUNT(*) FROM chunk_vectors").fetchone()[0]
     backends = {config.EMBED_MODEL: (base, "chunk_vectors")}
     scope = f"full corpus ({n_base} chunks)"
-    vpath = _voyage_db_path(args.model)
+    vpath = _voyage_db_path(args.model, _db_tag(db_path))
     if vpath.exists():
-        vcon = _open_voyage_db(args.model)
+        vcon = _open_voyage_db(args.model, tag=_db_tag(db_path))
         pool = [r[0] for r in vcon.execute("SELECT chunk_id FROM chunk_vectors")]
         missing = {c for lab in labels for c in lab["chunk_ids"]} - set(pool)
         if missing:
@@ -238,10 +273,10 @@ def cmd_recall(args):
     queries = [lab["query"] for lab in labels]
     qvecs = {config.EMBED_MODEL: embeddings.embed_texts(queries, kind="query")}
     if args.model in backends:
-        api_key = _api_key()
+        api_key, vdim = _api_key(), _cache_dim(vcon)  # queries must match the docs' dim
         qvecs[args.model] = [v for i in range(0, len(queries), VOYAGE_BATCH)
                              for v in _voyage_embed(queries[i:i + VOYAGE_BATCH],
-                                                    args.model, "query", api_key)]
+                                                    args.model, "query", vdim, api_key)]
 
     per_query, report = [dict(lab) for lab in labels], {}
     for name, (con, table) in backends.items():
@@ -259,7 +294,7 @@ def cmd_recall(args):
     return 0
 
 
-def _embed_missing(src, dst, ids, model, api_key):
+def _embed_missing(src, dst, ids, model, dim, api_key):
     """Voyage-embed whichever of `ids` (chunk ids in src) dst lacks; commits per batch."""
     import progress
     import sqlite_vec
@@ -271,7 +306,7 @@ def _embed_missing(src, dst, ids, model, api_key):
             batch = todo[i:i + VOYAGE_BATCH]
             marks = ",".join("?" * len(batch))
             texts = dict(src.execute(f"SELECT id, text FROM chunks WHERE id IN ({marks})", batch))
-            vecs = _voyage_embed([texts[c] for c in batch], model, "document", api_key)
+            vecs = _voyage_embed([texts[c] for c in batch], model, "document", dim, api_key)
             dst.executemany(
                 "INSERT INTO chunk_vectors(chunk_id, embedding) VALUES (?, ?)",
                 [(c, sqlite_vec.serialize_float32(v)) for c, v in zip(batch, vecs)])
@@ -351,9 +386,8 @@ def cmd_distill_ab(args):
     chat_of = {r[0]: r[5] for r in rows}
     corpus_sizes = dict(base.execute("SELECT chat_id, COUNT(*) FROM chunks GROUP BY chat_id"))
     ids = sorted(labels)
-    tag = "-" + db_path.stem.replace(":", "_")
-    vcon = _open_voyage_db(args.model, dim=args.dim, tag=tag)
-    _embed_missing(base, vcon, ids, args.model, api_key)
+    vcon = _open_voyage_db(args.model, dim=args.dim, tag=_db_tag(db_path))
+    _embed_missing(base, vcon, ids, args.model, args.dim, api_key)
 
     backends = {
         config.EMBED_MODEL: (base, {r[0]: r[1] for r in rows},
@@ -416,7 +450,7 @@ def add_parser(subparsers):
     emb = subparsers.add_parser("recall-embed", help="embed all chunks with Voyage (uploads)")
     emb.add_argument("--db")
     emb.add_argument("--model", default="voyage-4-large")
-    emb.add_argument("--dim", type=int, default=1024, help="Voyage default output dimension")
+    emb.add_argument("--dim", type=int, default=1024, help="Voyage output_dimension")
     emb.add_argument("--pool", type=int, default=0,
                      help="embed only the gold chunks + this many random distractors (0 = all)")
     emb.add_argument("--seed", type=int, default=0)

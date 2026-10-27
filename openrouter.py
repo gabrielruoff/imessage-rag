@@ -19,11 +19,8 @@ import config
 import hosted
 
 BASE_URL = "https://openrouter.ai/api/v1"
-# Parse failures on one chunk retried before it is reported unparseable.
-UNPARSEABLE_RETRIES = 3
-# Successful calls after the first that may all read 0 cached tokens before the
-# one-time "prompt cache is not hitting" warning.
-CACHE_CHECK_CALLS = 3
+UNPARSEABLE_RETRIES = config.OPENROUTER_UNPARSEABLE_RETRIES
+CACHE_CHECK_CALLS = config.OPENROUTER_CACHE_CHECK_CALLS
 
 
 def client():

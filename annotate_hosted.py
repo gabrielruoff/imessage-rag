@@ -106,7 +106,7 @@ def annotate_chunks_hosted(con, model, *, all_chats, top_dyads, limit, dry_run,
         print(f"\nInterrupted -- committed {st['done']} annotations "
               f"({len(st['refused']) + len(st['unparseable'])} skipped); rerun to resume.")
         print(spend.report())
-        return st["done"]
+        raise  # chunks are still pending: never exit 0 (a `make pipeline` must stop here)
     except hosted.HostedStop as exc:  # before dispatch: price lookup
         st["stop"] = exc.cause
 

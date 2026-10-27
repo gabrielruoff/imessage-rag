@@ -6,6 +6,7 @@ No network and no real key: every request goes to an in-process fake Voyage
 behind httpx.MockTransport; temp SQLite only; the poll interval and the retry
 backoff are patched to ~0."""
 
+import asyncio
 import contextlib
 import io
 import json
@@ -633,6 +634,23 @@ class TestReviewRegressions(VoyageFixture):
             self.run_voyage()
         self.assertEqual(ctx.exception.cause, "Voyage: HTTP 400 placeholder bad request")
 
+
+    def test_stream_file_frees_its_slot_when_the_consumer_raises(self):
+        # limit=1: a slot kept by the suspended generator would hang delete_file.
+        self.fake.files["file-x"] = [b'{"n": 1}', b'{"n": 2}']
+
+        async def run():
+            limiter = hosted.Limiter(1)
+            async with voyage.BatchClient(limiter) as client:
+                try:
+                    async for _ in client.stream_file("file-x"):
+                        raise ValueError("consumer fails mid-stream")
+                except ValueError:  # the live traceback keeps the generator alive
+                    self.assertEqual(limiter.in_flight, 0)
+                    await asyncio.wait_for(client.delete_file("file-x"), 5)
+
+        asyncio.run(run())
+        self.assertEqual(self.fake.deleted, ["file-x"])
 
 class TestIngestFlags(unittest.TestCase):
     def test_voyage_refuses_without_key_before_snapshot(self):
