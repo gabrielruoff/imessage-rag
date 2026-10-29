@@ -20,6 +20,7 @@ __pycache__/
 .claude/settings.local.json
 
 # local working plan/audit artifacts (never committed)
+scripts/token_usage.csv
 REPO_REVIEW.md
 REPO_FIX_PLAN.md
 APPLE_FM_PLAN.md
